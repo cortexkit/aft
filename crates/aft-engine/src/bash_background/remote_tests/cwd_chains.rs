@@ -14,13 +14,10 @@ fn runon_cwd_chains_restore_checkout_root_after_pipeline() {
     let command = r#"set -eo pipefail; cd rune && cargo fmt --check && cargo clippy --locked | head -6; cd ..; S=$(mktemp -d); rsync -a --exclude target --exclude .git ./ "$S/"; cd "$S/rune""#;
     let root = Path::new(&request.workspace_key);
     assert_eq!(runon_cd_refusal(command, &request).unwrap(), None);
+    assert_eq!(runon_write_refusal(command, &request), None);
+    let deadline = Instant::now() + Duration::from_secs(2);
     let targets = crate::bash_permissions::scan::top_level_directory_targets(command, root, &|p| {
-        runon_snapshot_directory_known(
-            root,
-            p,
-            Path::new("git"),
-            Instant::now() + Duration::from_secs(2),
-        )
+        runon_snapshot_directory_known(root, p, Path::new("git"), deadline)
     });
     let paths: Vec<_> = targets.into_iter().map(|target| target.path).collect();
     assert_eq!(paths, [root.join("rune"), root.to_path_buf()]);

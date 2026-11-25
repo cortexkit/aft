@@ -296,9 +296,9 @@ pub(crate) struct DirectoryTarget {
 /// invalid. Shell behavior the check cannot follow continues to run as before.
 /// Follow reachable outer-shell folder and physical-mode alternatives, keeping
 /// successful and failed commands separate so `&&` and `||` stay correlated.
-/// `known_directory` identifies existing directories copied to the runner. Treat
-/// valid initial `cd` changes as successful, but stop trusting the snapshot after
-/// any non-`cd` command. Keep tracking cwd independently of snapshot trust.
+/// Treat a valid `cd` to a known copied directory as successful until a command
+/// could modify the copied directories or affect how `cd` resolves paths. Keep
+/// tracking cwd even when the `known_directory` probe can no longer prove success.
 /// Before a command after `;` or a newline, use an unknown cwd if a speculative
 /// `cd` failure would leave a different folder than success. Directory changes
 /// inside child shells never replace the outer shell's folder.
@@ -469,6 +469,24 @@ pub(super) fn walk_shell_commands(
                 failure: paths,
             }
         }
+        fn followed_by(self, condition: Condition, evaluate: impl FnOnce(Paths) -> Self) -> Self {
+            match condition {
+                Condition::And => {
+                    let right = evaluate(self.success);
+                    Self {
+                        success: right.success,
+                        failure: self.failure.union(right.failure),
+                    }
+                }
+                Condition::Or => {
+                    let right = evaluate(self.failure);
+                    Self {
+                        success: self.success.union(right.success),
+                        failure: right.failure,
+                    }
+                }
+            }
+        }
         fn all(self) -> Paths {
             let mut paths = self.success.union(self.failure);
             let mode = paths.mode();
@@ -487,10 +505,15 @@ pub(super) fn walk_shell_commands(
             paths
         }
     }
-    enum Operator {
-        Sequence,
+    #[derive(Clone, Copy)]
+    enum Condition {
         And,
         Or,
+    }
+    enum ChainPart<'tree> {
+        Operand { node: Node<'tree>, redirected: bool },
+        Pipe,
+        Condition(Condition),
     }
     enum SetModeChange {
         Unchanged,
@@ -534,19 +557,19 @@ pub(super) fn walk_shell_commands(
             && !negative_index
             && (options_ended || !word.starts_with('-'))
     }
-    /// Non-literal arguments while parsing `set` options may change physical mode.
-    fn set_mode_change(parts: &[Part]) -> SetModeChange {
+    /// Return the physical-mode change and whether the arguments are only known options.
+    fn set_options(parts: &[Part]) -> (SetModeChange, bool) {
         let mut change = SetModeChange::Unchanged;
         let mut args = parts.iter().skip(1);
         while let Some(part) = args.next() {
             let Some(word) = literal_word(&part.text) else {
-                return SetModeChange::Unknown;
+                return (SetModeChange::Unknown, false);
             };
             if matches!(word.as_str(), "--" | "-" | "+") {
-                break;
+                return (change, false);
             }
             if !word.starts_with(['-', '+']) {
-                break;
+                return (change, false);
             }
             let enabled = word.starts_with('-');
             let mut flags = word[1..].chars().peekable();
@@ -555,13 +578,13 @@ pub(super) fn walk_shell_commands(
                     'P' => change = SetModeChange::Set(enabled),
                     'o' => {
                         if flags.peek().is_some() {
-                            return SetModeChange::Unknown;
+                            return (SetModeChange::Unknown, false);
                         }
                         let Some(option) = args.next() else {
-                            return change;
+                            return (change, true);
                         };
                         let Some(option) = literal_word(&option.text) else {
-                            return SetModeChange::Unknown;
+                            return (SetModeChange::Unknown, false);
                         };
                         if option == "physical" {
                             change = SetModeChange::Set(enabled);
@@ -593,15 +616,15 @@ pub(super) fn walk_shell_commands(
                                 | "vi"
                                 | "xtrace"
                         ) {
-                            return SetModeChange::Unknown;
+                            return (SetModeChange::Unknown, false);
                         }
                     }
                     flag if "abefhkmnptuvxBCEHT".contains(flag) => {}
-                    _ => return SetModeChange::Unknown,
+                    _ => return (SetModeChange::Unknown, false),
                 }
             }
         }
-        change
+        (change, parts.len() > 1)
     }
     fn resolve_target(
         head: &str,
@@ -791,6 +814,130 @@ pub(super) fn walk_shell_commands(
         }
         found
     }
+    fn collect_chain<'tree>(node: Node<'tree>, parts: &mut Vec<ChainPart<'tree>>) {
+        match node.kind() {
+            "list" | "pipeline" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "|" | "|&" => parts.push(ChainPart::Pipe),
+                        "&&" => parts.push(ChainPart::Condition(Condition::And)),
+                        "||" => parts.push(ChainPart::Condition(Condition::Or)),
+                        "comment" => {}
+                        _ if child.is_named() => collect_chain(child, parts),
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            "redirected_statement" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let first = parts.len();
+                    collect_chain(body, parts);
+                    if let Some(ChainPart::Operand { redirected, .. }) = parts[first..].last_mut() {
+                        *redirected = true;
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+        parts.push(ChainPart::Operand {
+            node,
+            redirected: false,
+        });
+    }
+    fn evaluate_chain(
+        node: Node<'_>,
+        source: &str,
+        incoming: Paths,
+        targets: &mut Targets<'_>,
+        known_directory: &dyn Fn(&Path) -> bool,
+    ) -> Flow {
+        // A redirection can make tree-sitter group an AND-OR list as a pipeline
+        // stage or redirection body. Recover shell precedence before isolating
+        // pipeline stages; explicit shell groups stay opaque to this pass.
+        let mut parts = Vec::new();
+        collect_chain(node, &mut parts);
+        let mut flow = Flow::success(incoming);
+        let mut connector = Condition::And;
+        for segment in parts.split_inclusive(|part| matches!(part, ChainPart::Condition(_))) {
+            let (pipeline, next) = match segment.split_last() {
+                Some((ChainPart::Condition(condition), rest)) => (rest, *condition),
+                _ => (segment, Condition::And),
+            };
+            flow = flow.followed_by(connector, |entry| {
+                evaluate_pipeline(pipeline, source, entry, targets, known_directory)
+            });
+            connector = next;
+        }
+        flow
+    }
+    fn evaluate_pipeline(
+        parts: &[ChainPart<'_>],
+        source: &str,
+        incoming: Paths,
+        targets: &mut Targets<'_>,
+        known_directory: &dyn Fn(&Path) -> bool,
+    ) -> Flow {
+        let isolated = parts.iter().any(|part| matches!(part, ChainPart::Pipe));
+        for part in parts {
+            let ChainPart::Operand { node, redirected } = part else {
+                continue;
+            };
+            let entry = if *redirected {
+                incoming.clone().invalidate_snapshot()
+            } else {
+                incoming.clone()
+            };
+            let inner = evaluate(*node, source, entry.clone(), targets, known_directory);
+            if !isolated {
+                return if *redirected {
+                    // A failed redirection prevents this operand from running.
+                    Flow {
+                        success: inner.success,
+                        failure: inner.failure.union(entry),
+                    }
+                } else {
+                    inner
+                };
+            }
+        }
+        Flow::either(incoming.invalidate_snapshot())
+    }
+    fn keeps_loop_cwd(node: Node<'_>, source: &str) -> bool {
+        match node.kind() {
+            "command" => command_parts(source, node)
+                .first()
+                .and_then(|part| literal_word(&part.text))
+                .is_some_and(|head| {
+                    !matches!(
+                        head.as_str(),
+                        "cd" | "pushd"
+                            | "popd"
+                            | "source"
+                            | "."
+                            | "eval"
+                            | "set"
+                            | "shopt"
+                            | "builtin"
+                            | "command"
+                            | "exec"
+                            | "trap"
+                    )
+                }),
+            "do_group" | "list" | "pipeline" => {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .all(|child| keeps_loop_cwd(child, source))
+            }
+            "redirected_statement" => node
+                .child_by_field_name("body")
+                .is_none_or(|body| keeps_loop_cwd(body, source)),
+            "subshell" | "comment" => true,
+            _ => false,
+        }
+    }
     fn evaluate(
         node: Node<'_>,
         source: &str,
@@ -806,22 +953,35 @@ pub(super) fn walk_shell_commands(
                 let _ = evaluate_sequence(node, source, incoming.clone(), targets, known_directory);
                 return Flow::either(incoming.invalidate_snapshot());
             }
-            "pipeline" => {
+            "list" | "pipeline" => {
+                return evaluate_chain(node, source, incoming, targets, known_directory);
+            }
+            "for_statement" => {
+                if let Some(body) = node
+                    .child_by_field_name("body")
+                    .filter(|body| keeps_loop_cwd(*body, source))
+                {
+                    // A loop may skip or repeat its body. Preserve cwd only
+                    // when an iteration has no outer-shell directory effects.
+                    let incoming = incoming.invalidate_snapshot();
+                    let mut cursor = node.walk();
+                    for value in node.children_by_field_name("value", &mut cursor) {
+                        inspect_substitutions(value, source, &incoming, targets, known_directory);
+                    }
+                    let _ = evaluate(body, source, incoming.clone(), targets, known_directory);
+                    return Flow::either(incoming);
+                }
                 inspect_independent_children(
                     node,
                     source,
-                    incoming.clone(),
+                    Paths::Unknown(None),
                     targets,
                     known_directory,
                 );
-                return Flow::either(incoming.invalidate_snapshot());
+                return Flow::either(Paths::Unknown(None));
             }
             "function_definition" => return Flow::success(incoming.invalidate_snapshot()),
-            "if_statement"
-            | "for_statement"
-            | "c_style_for_statement"
-            | "while_statement"
-            | "case_statement" => {
+            "if_statement" | "c_style_for_statement" | "while_statement" | "case_statement" => {
                 // Unsupported control flow loses cwd precision; independently
                 // resolvable targets remain inspectable without choosing a branch.
                 inspect_independent_children(
@@ -844,27 +1004,15 @@ pub(super) fn walk_shell_commands(
                 return Flow::either(incoming);
             }
             "redirected_statement" => {
-                let incoming = incoming.invalidate_snapshot();
-                let mut cursor = node.walk();
-                let body = node.child_by_field_name("body").or_else(|| {
-                    node.named_children(&mut cursor)
-                        .find(|child| !child.kind().contains("redirect"))
-                });
-                let inner = body
-                    .map(|body| evaluate(body, source, incoming.clone(), targets, known_directory))
-                    .unwrap_or_else(|| Flow::either(incoming.clone()));
-                if body.is_none() {
-                    let cwd = match &incoming {
-                        Paths::Known(states) if states.len() == 1 => Some(states[0].cwd.as_path()),
-                        _ => None,
-                    };
-                    (targets.on_command)(node, cwd);
+                if node.child_by_field_name("body").is_some() {
+                    return evaluate_chain(node, source, incoming, targets, known_directory);
                 }
-                // Redirection can fail before the body changes directory.
-                return Flow {
-                    success: inner.success,
-                    failure: inner.failure.union(incoming),
+                let cwd = match &incoming {
+                    Paths::Known(states) if states.len() == 1 => Some(states[0].cwd.as_path()),
+                    _ => None,
                 };
+                (targets.on_command)(node, cwd);
+                return Flow::either(incoming.invalidate_snapshot());
             }
             "command" => {
                 let cwd = match &incoming {
@@ -879,7 +1027,18 @@ pub(super) fn walk_shell_commands(
                     inspect_substitutions(node, source, &incoming, targets, known_directory);
                 let parts = command_parts(source, node);
                 let head = parts.first().and_then(|part| literal_word(&part.text));
-                let incoming = if head.as_deref() == Some("cd") && !has_substitution {
+                let set = (head.as_deref() == Some("set")).then(|| set_options(&parts));
+                let command_has_setup = || {
+                    let mut cursor = node.walk();
+                    let found = node.named_children(&mut cursor).any(|child| {
+                        child.kind().contains("redirect") || child.kind() == "variable_assignment"
+                    });
+                    found
+                };
+                let preserves_snapshot = head.as_deref() == Some("cd")
+                    || (matches!(set, Some((SetModeChange::Unchanged, true)))
+                        && !command_has_setup());
+                let incoming = if preserves_snapshot && !has_substitution {
                     incoming
                 } else {
                     incoming.invalidate_snapshot()
@@ -894,7 +1053,7 @@ pub(super) fn walk_shell_commands(
                     },
                     Some("source" | "." | "eval") | None => Flow::either(Paths::Unknown(None)),
                     Some("set") => {
-                        let flow = match set_mode_change(&parts) {
+                        let flow = match set.unwrap().0 {
                             SetModeChange::Unchanged => Flow::success(incoming.clone()),
                             SetModeChange::Set(physical) => {
                                 Flow::success(incoming.clone().with_physical(Some(physical)))
@@ -943,17 +1102,17 @@ pub(super) fn walk_shell_commands(
         known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
         let mut flow: Option<Flow> = None;
-        let mut operator = Operator::Sequence;
+        let mut condition = None;
         let mut asynchronous_entry = incoming.clone();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
                 "&&" => {
-                    operator = Operator::And;
+                    condition = Some(Condition::And);
                     continue;
                 }
                 "||" => {
-                    operator = Operator::Or;
+                    condition = Some(Condition::Or);
                     continue;
                 }
                 "&" => {
@@ -971,7 +1130,7 @@ pub(super) fn walk_shell_commands(
                         };
                         Flow::success(entry)
                     });
-                    operator = Operator::Sequence;
+                    condition = None;
                     continue;
                 }
                 "comment" => continue,
@@ -980,8 +1139,8 @@ pub(super) fn walk_shell_commands(
             }
             flow = Some(match flow.take() {
                 None => evaluate(child, source, incoming.clone(), targets, known_directory),
-                Some(left) => match operator {
-                    Operator::Sequence => {
+                Some(left) => match condition.take() {
+                    None => {
                         asynchronous_entry = left.all();
                         evaluate(
                             child,
@@ -991,23 +1150,12 @@ pub(super) fn walk_shell_commands(
                             known_directory,
                         )
                     }
-                    Operator::And => {
-                        let right = evaluate(child, source, left.success, targets, known_directory);
-                        Flow {
-                            success: right.success,
-                            failure: left.failure.union(right.failure),
-                        }
-                    }
-                    Operator::Or => {
-                        let right = evaluate(child, source, left.failure, targets, known_directory);
-                        Flow {
-                            success: left.success.union(right.success),
-                            failure: right.failure,
-                        }
-                    }
+                    Some(condition) => left.followed_by(condition, |entry| {
+                        evaluate(child, source, entry, targets, known_directory)
+                    }),
                 },
             });
-            operator = Operator::Sequence;
+            condition = None;
         }
         flow.unwrap_or_else(|| Flow::either(incoming))
     }
@@ -1641,6 +1789,11 @@ mod tests {
                 ],
             ),
             ("cd a || cd ..", vec![cwd.join("a")]),
+            ("set -eo pipefail; cd a || cd ..", vec![cwd.join("a")]),
+            (
+                "set -o physical; cd a || cd ..",
+                vec![cwd.join("a"), cwd.parent().unwrap().to_path_buf()],
+            ),
             (
                 "cd a >/not-writable || cd ..",
                 vec![cwd.join("a"), cwd.parent().unwrap().to_path_buf()],
@@ -1652,6 +1805,49 @@ mod tests {
                 .collect();
             assert_eq!(paths, expected, "{command}");
         }
+    }
+
+    #[test]
+    fn directory_targets_keep_main_shell_outside_redirected_pipeline_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(cwd.join("a")).unwrap();
+        let parent = cwd.parent().unwrap().to_path_buf();
+        for (command, expected) in [
+            ("cd a && x 2>&1 | b && cd ..", cwd.clone()),
+            ("cd a && x 2>&1 | b || cd ..", cwd.clone()),
+            ("cd a && x 2>&1 | b; cd ..", cwd.clone()),
+            ("cd a 2>&1 | b && cd ..", parent.clone()),
+            ("cd a 2>&1 | b; cd ..", parent),
+        ] {
+            let paths: Vec<_> = top_level_directory_targets(command, &cwd, &|p| p == cwd.join("a"))
+                .into_iter()
+                .map(|target| target.path)
+                .collect();
+            assert_eq!(paths, [cwd.join("a"), expected], "{command}");
+        }
+    }
+
+    #[test]
+    fn directory_targets_keep_cwd_only_for_loops_without_directory_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let targets = |command| {
+            top_level_directory_targets(command, &cwd, &|path| path == cwd.join("a"))
+                .into_iter()
+                .map(|target| target.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            targets(
+                "cd a && for c in first second; do bash run.sh \"$c\" >/dev/null; done && cd .."
+            ),
+            [cwd.join("a"), cwd.clone()]
+        );
+        assert_eq!(
+            targets("cd a && for c in first second; do cd ../b; done && cd .."),
+            [cwd.join("a")]
+        );
     }
 
     #[test]
