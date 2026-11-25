@@ -928,8 +928,8 @@ pub(super) fn walk_shell_commands(
                 }),
             "do_group" | "list" | "pipeline" => {
                 let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .all(|child| keeps_loop_cwd(child, source))
+                let mut children = node.named_children(&mut cursor);
+                children.all(|child| keeps_loop_cwd(child, source))
             }
             "redirected_statement" => node
                 .child_by_field_name("body")
