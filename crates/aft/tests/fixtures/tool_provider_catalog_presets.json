@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "e5d45c53f04a94bcb87d52e63db9460d81312c79f7f017e440bcdc416fbe8a21",
-      "catalog_digest": "e5d45c53f04a94bcb87d52e63db9460d81312c79f7f017e440bcdc416fbe8a21",
+      "generation": "fe679bcadd9b803766f05ea59bfa4cf25a18f48e7f1ee64e2b128adb423d29a3",
+      "catalog_digest": "fe679bcadd9b803766f05ea59bfa4cf25a18f48e7f1ee64e2b128adb423d29a3",
       "tools": [
         {
           "name": "status",
@@ -70,7 +70,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -1289,8 +1289,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "9e7325c396be74755221a6661c625bea5c5b82c70fbe26bfc90b63ed02514061",
-      "catalog_digest": "9e7325c396be74755221a6661c625bea5c5b82c70fbe26bfc90b63ed02514061",
+      "generation": "61d1ffbcffb5fd28510362101380301c8360c55c574c97ac61d19d03ca3f7098",
+      "catalog_digest": "61d1ffbcffb5fd28510362101380301c8360c55c574c97ac61d19d03ca3f7098",
       "tools": [
         {
           "name": "status",
@@ -1349,7 +1349,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -3564,8 +3564,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "7ad20a9712459e3238093964a273d2cc3e901af98b908800363905e061c699d7",
-      "catalog_digest": "7ad20a9712459e3238093964a273d2cc3e901af98b908800363905e061c699d7",
+      "generation": "626bee1748054e2f54d16f72827b507490947fab2815024ab081de307835bedf",
+      "catalog_digest": "626bee1748054e2f54d16f72827b507490947fab2815024ab081de307835bedf",
       "tools": [
         {
           "name": "status",
@@ -3624,7 +3624,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -4856,8 +4856,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "deb4ebf190a42c830a63d2cee7d32c98b1cd43d415438b36eb0cfb66ff28337a",
-      "catalog_digest": "deb4ebf190a42c830a63d2cee7d32c98b1cd43d415438b36eb0cfb66ff28337a",
+      "generation": "70a33ce394d4c8598746959233228de69402ab7eb2436eda64cb8df36ca48ae0",
+      "catalog_digest": "70a33ce394d4c8598746959233228de69402ab7eb2436eda64cb8df36ca48ae0",
       "tools": [
         {
           "name": "status",
@@ -4916,7 +4916,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -6222,8 +6222,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "35cb8d4da4e680ce978f78fc9017e8a1a690ec696a3ce71bd8db85e7a2bce839",
-      "catalog_digest": "35cb8d4da4e680ce978f78fc9017e8a1a690ec696a3ce71bd8db85e7a2bce839",
+      "generation": "e78de997bbeffa03da82b6b5731818f2c81d6646d39cf7deb1523fd71b987bcf",
+      "catalog_digest": "e78de997bbeffa03da82b6b5731818f2c81d6646d39cf7deb1523fd71b987bcf",
       "tools": [
         {
           "name": "status",
@@ -6282,7 +6282,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -7435,8 +7435,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "9a591074012d9244969d5cec49728baa328e0a0d888b2c4b9d167fe431651d39",
-      "catalog_digest": "9a591074012d9244969d5cec49728baa328e0a0d888b2c4b9d167fe431651d39",
+      "generation": "1ff56b2feadb52d1d846a5bac2708cf1eec301ba955d214e8c73473b874187db",
+      "catalog_digest": "1ff56b2feadb52d1d846a5bac2708cf1eec301ba955d214e8c73473b874187db",
       "tools": [
         {
           "name": "status",
@@ -7495,7 +7495,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -8729,8 +8729,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "788e5b4204e1afcf52bcb07a2235240d5d940111a8d1510ba4c0c2c8ced36d46",
-      "catalog_digest": "788e5b4204e1afcf52bcb07a2235240d5d940111a8d1510ba4c0c2c8ced36d46",
+      "generation": "f3626417b5a7558370aaa22aae5f28b9e25f742dde1e47b1724b8f968e0c9d5e",
+      "catalog_digest": "f3626417b5a7558370aaa22aae5f28b9e25f742dde1e47b1724b8f968e0c9d5e",
       "tools": [
         {
           "name": "bash",
@@ -8772,7 +8772,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -9866,8 +9866,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "b51f6571e4f51988b04debd058b8d10065b5067c7ef1a3890cdf025fc5a1b685",
-      "catalog_digest": "b51f6571e4f51988b04debd058b8d10065b5067c7ef1a3890cdf025fc5a1b685",
+      "generation": "f18def03fc091a3e7646fc42a3211c3ca0e462943e5d3bbbc2f80c9c7b0fe52f",
+      "catalog_digest": "f18def03fc091a3e7646fc42a3211c3ca0e462943e5d3bbbc2f80c9c7b0fe52f",
       "tools": [
         {
           "name": "bash",
@@ -9909,7 +9909,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -11095,8 +11095,8 @@
       "hashline": true
     },
     "reply": {
-      "generation": "c1bda61dc6fdf185c31671000b147eb9cafb82385a5a447781801973a6e83268",
-      "catalog_digest": "c1bda61dc6fdf185c31671000b147eb9cafb82385a5a447781801973a6e83268",
+      "generation": "1eef22b29b29a7acafcff68d057998dc70998cb45ffef5fde4d470e8ff740b00",
+      "catalog_digest": "1eef22b29b29a7acafcff68d057998dc70998cb45ffef5fde4d470e8ff740b00",
       "tools": [
         {
           "name": "bash",
@@ -11138,7 +11138,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {

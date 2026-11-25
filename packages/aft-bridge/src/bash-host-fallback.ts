@@ -12,7 +12,7 @@ export const BASH_HOST_FALLBACK_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const BASH_HOST_FALLBACK_REFUSAL = "AFT module connection is down";
 
 /** The bash `description` prompt shared by both plugins and the generated catalog. */
-export const BASH_DESCRIPTION = "In about 5 to 8 words, say why you’re running this command.";
+export const BASH_DESCRIPTION = "Human-readable description shown in UI (5-10 words)";
 
 // Agent-visible text, approved by Ufuk; change it only with his approval.
 const BASH_RUNON_MEMORY_DESCRIPTION =

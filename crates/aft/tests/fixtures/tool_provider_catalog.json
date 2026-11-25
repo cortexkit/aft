@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "aa06c58988fecc2fad997f1e9ad9f7cada9617b5c26c9ab6ec0e15abac694499",
-      "catalog_digest": "aa06c58988fecc2fad997f1e9ad9f7cada9617b5c26c9ab6ec0e15abac694499",
+      "generation": "2e0f9e2c2611e83760ea9a77f190121c4ecc7c5cdf575284bd70ae2db7ed03c8",
+      "catalog_digest": "2e0f9e2c2611e83760ea9a77f190121c4ecc7c5cdf575284bd70ae2db7ed03c8",
       "tools": [
         {
           "name": "status",
@@ -76,7 +76,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -1240,8 +1240,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9c0cc0360b270859f4580e9c3e0d02535e4503ed0ca29a768ac7359f6b8613b9",
-      "catalog_digest": "9c0cc0360b270859f4580e9c3e0d02535e4503ed0ca29a768ac7359f6b8613b9",
+      "generation": "ba442f7ab7ad20fbbd696e8721529ebf245e36fabe20321b8975a834506b57ba",
+      "catalog_digest": "ba442f7ab7ad20fbbd696e8721529ebf245e36fabe20321b8975a834506b57ba",
       "tools": [
         {
           "name": "status",
@@ -1300,7 +1300,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -3608,8 +3608,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f9960e6f9a8595363039454e55e7b7f64478defa6fbc2ddf71b74e5198fca0dd",
-      "catalog_digest": "f9960e6f9a8595363039454e55e7b7f64478defa6fbc2ddf71b74e5198fca0dd",
+      "generation": "530d361fd25572b0681a17837a3f87bc698217b069dd7d6a5d5ed05546739921",
+      "catalog_digest": "530d361fd25572b0681a17837a3f87bc698217b069dd7d6a5d5ed05546739921",
       "tools": [
         {
           "name": "status",
@@ -3668,7 +3668,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -4786,8 +4786,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "abc55af96df67bf31e90d86759a23526dfadf8eacfa85109bc2eae40efac4767",
-      "catalog_digest": "abc55af96df67bf31e90d86759a23526dfadf8eacfa85109bc2eae40efac4767",
+      "generation": "8dee01796723acedb037e66bbc0d3cec959063968abbb09e43e44b603205156f",
+      "catalog_digest": "8dee01796723acedb037e66bbc0d3cec959063968abbb09e43e44b603205156f",
       "tools": [
         {
           "name": "status",
@@ -4846,7 +4846,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -5962,8 +5962,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "80dbd58c7b218d931ac4b8e19620815023f679789ad1d0d056f5d37f895d8ef5",
-      "catalog_digest": "80dbd58c7b218d931ac4b8e19620815023f679789ad1d0d056f5d37f895d8ef5",
+      "generation": "4fe60d9c561c9abfbd8615d641271b9690480f349ac77b05b348aeb8bcc98abf",
+      "catalog_digest": "4fe60d9c561c9abfbd8615d641271b9690480f349ac77b05b348aeb8bcc98abf",
       "tools": [
         {
           "name": "status",
@@ -6022,7 +6022,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -7080,8 +7080,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2e394b173fd99aec3c3e1948956cc88f7f969ba78a67c115fdc4011e6c0b22cc",
-      "catalog_digest": "2e394b173fd99aec3c3e1948956cc88f7f969ba78a67c115fdc4011e6c0b22cc",
+      "generation": "c9a3eb8502d446dc7b225c52484065fd9bfa3f3d2f1e95376437ec88de689f62",
+      "catalog_digest": "c9a3eb8502d446dc7b225c52484065fd9bfa3f3d2f1e95376437ec88de689f62",
       "tools": [
         {
           "name": "status",
@@ -7140,7 +7140,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -8195,8 +8195,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "df0dea7ad974c02c0152a2ef9909991f9a565d1a950f10373b2ed2e50097d712",
-      "catalog_digest": "df0dea7ad974c02c0152a2ef9909991f9a565d1a950f10373b2ed2e50097d712",
+      "generation": "c623841954e6d67b06693a502de3d5536994097bd9fa5340a44e23d11505b038",
+      "catalog_digest": "c623841954e6d67b06693a502de3d5536994097bd9fa5340a44e23d11505b038",
       "tools": [
         {
           "name": "status",
@@ -8255,7 +8255,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -9306,8 +9306,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "573927d08eb0942e96fbeb46539494869fb6bb53dcd32de5a0f4c24253340dcb",
-      "catalog_digest": "573927d08eb0942e96fbeb46539494869fb6bb53dcd32de5a0f4c24253340dcb",
+      "generation": "0edc7818bf30cff756a9539bd946735f6e92592fb9586f31de0f01964bcba165",
+      "catalog_digest": "0edc7818bf30cff756a9539bd946735f6e92592fb9586f31de0f01964bcba165",
       "tools": [
         {
           "name": "status",
@@ -9366,7 +9366,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -10411,8 +10411,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "76d99887c80af080f4d5bc5282d6512664996a0dd2c6eb3575be1189a84e4286",
-      "catalog_digest": "76d99887c80af080f4d5bc5282d6512664996a0dd2c6eb3575be1189a84e4286",
+      "generation": "1611db7a681091f3f81586c2a4714d0a16d2d2c2caa9cc55a4d569391222c89b",
+      "catalog_digest": "1611db7a681091f3f81586c2a4714d0a16d2d2c2caa9cc55a4d569391222c89b",
       "tools": [
         {
           "name": "status",
@@ -10471,7 +10471,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -11710,8 +11710,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8c13bff2dfbda25029c9acba6f860861862215ab4c9424631f05f0d822e8c3ab",
-      "catalog_digest": "8c13bff2dfbda25029c9acba6f860861862215ab4c9424631f05f0d822e8c3ab",
+      "generation": "fbf12e3001b8b57ae8fd088160d7a0729d446d75d80d8480b6301322647d2d32",
+      "catalog_digest": "fbf12e3001b8b57ae8fd088160d7a0729d446d75d80d8480b6301322647d2d32",
       "tools": [
         {
           "name": "status",
@@ -11770,7 +11770,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -14228,8 +14228,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2d0b2c3f4146a855fad57b794d72d998d3eb920e5087f1488af108466dadc00a",
-      "catalog_digest": "2d0b2c3f4146a855fad57b794d72d998d3eb920e5087f1488af108466dadc00a",
+      "generation": "1b3feb9e4a215a84949e234b378f3eda47cfee5f1de17d0a7f9338825c76ba91",
+      "catalog_digest": "1b3feb9e4a215a84949e234b378f3eda47cfee5f1de17d0a7f9338825c76ba91",
       "tools": [
         {
           "name": "status",
@@ -14288,7 +14288,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -15481,8 +15481,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "b6faf16f3d45763b2d00662a5fa794a92cd6eaafb43c714b0f67eb0cb18cd6fc",
-      "catalog_digest": "b6faf16f3d45763b2d00662a5fa794a92cd6eaafb43c714b0f67eb0cb18cd6fc",
+      "generation": "d347dc67e76a0949d8f4bf879a14ea71e60faf15dce6042084b2b98fd3da4eaa",
+      "catalog_digest": "d347dc67e76a0949d8f4bf879a14ea71e60faf15dce6042084b2b98fd3da4eaa",
       "tools": [
         {
           "name": "status",
@@ -15541,7 +15541,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -16732,8 +16732,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "0d3b7c074f721410c2d6a027b74274925f47c6cf6f8d9375f184667a521c9250",
-      "catalog_digest": "0d3b7c074f721410c2d6a027b74274925f47c6cf6f8d9375f184667a521c9250",
+      "generation": "d726ec311e27c77a8daf25c77fc8f10cf9a99156a93b15b5b664acdec66a1016",
+      "catalog_digest": "d726ec311e27c77a8daf25c77fc8f10cf9a99156a93b15b5b664acdec66a1016",
       "tools": [
         {
           "name": "status",
@@ -16792,7 +16792,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -17925,8 +17925,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "36db10b35ed9a459ed946d2bd869c2663b1aa6ed7b2cef608aa677b84ffc2ce9",
-      "catalog_digest": "36db10b35ed9a459ed946d2bd869c2663b1aa6ed7b2cef608aa677b84ffc2ce9",
+      "generation": "f53a680aa13d89104bd767b92b9d63df7b5860cdfd5742c25c01648045f3985e",
+      "catalog_digest": "f53a680aa13d89104bd767b92b9d63df7b5860cdfd5742c25c01648045f3985e",
       "tools": [
         {
           "name": "status",
@@ -17985,7 +17985,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -19115,8 +19115,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "499d32a0a20d012cb8fd9a81665280f967c68ccc79d34d010fd5c5e38b66719e",
-      "catalog_digest": "499d32a0a20d012cb8fd9a81665280f967c68ccc79d34d010fd5c5e38b66719e",
+      "generation": "c822eb572a6ea04c9c51dd7df229df6b3dfc913200124fd3c1f0ab3f60a618bb",
+      "catalog_digest": "c822eb572a6ea04c9c51dd7df229df6b3dfc913200124fd3c1f0ab3f60a618bb",
       "tools": [
         {
           "name": "status",
@@ -19175,7 +19175,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -20301,8 +20301,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1f2a2fcb477a2f35fde692277effa4db4cebe9ac9ed33a505fdbf53774949d95",
-      "catalog_digest": "1f2a2fcb477a2f35fde692277effa4db4cebe9ac9ed33a505fdbf53774949d95",
+      "generation": "89aca621a33661330a5180193afc30fce271812212d43309cf5c91806f3ee303",
+      "catalog_digest": "89aca621a33661330a5180193afc30fce271812212d43309cf5c91806f3ee303",
       "tools": [
         {
           "name": "status",
@@ -20361,7 +20361,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "In about 5 to 8 words, say why you’re running this command.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {

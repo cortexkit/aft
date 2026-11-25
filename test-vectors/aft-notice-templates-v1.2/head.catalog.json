@@ -1,6 +1,6 @@
 {
-  "generation": "f1db5de22d68b2e3d503bcd9907e7490a6f4da116d12939ac7847e2980a4d9be",
-  "catalog_digest": "f1db5de22d68b2e3d503bcd9907e7490a6f4da116d12939ac7847e2980a4d9be",
+  "generation": "c92a3903d020e14cd0f956d7105002dac2551c000789c51413d9814010e7fbea",
+  "catalog_digest": "c92a3903d020e14cd0f956d7105002dac2551c000789c51413d9814010e7fbea",
   "tools": [
     {
       "name": "status",
@@ -59,7 +59,7 @@
             "type": "string"
           },
           "description": {
-            "description": "In about 5 to 8 words, say why you’re running this command.",
+            "description": "Human-readable description shown in UI (5-10 words)",
             "type": "string"
           },
           "wait": {

@@ -60,7 +60,7 @@
           "type": "string"
         },
         "description": {
-          "description": "In about 5 to 8 words, say why you’re running this command.",
+          "description": "Human-readable description shown in UI (5-10 words)",
           "type": "string"
         },
         "wait": {
