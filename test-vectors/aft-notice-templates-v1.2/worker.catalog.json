@@ -1,6 +1,6 @@
 {
-  "generation": "1175f7ed91d90aadc173fda1f63ce5a3b5ebaab7786b6fdfbae1d9c75dac1423",
-  "catalog_digest": "1175f7ed91d90aadc173fda1f63ce5a3b5ebaab7786b6fdfbae1d9c75dac1423",
+  "generation": "4323b960ca2a2976f9807cd25f9366e4241651df019790dc35ea10055bd1d59c",
+  "catalog_digest": "4323b960ca2a2976f9807cd25f9366e4241651df019790dc35ea10055bd1d59c",
   "tools": [
     {
       "name": "status",
@@ -21,7 +21,7 @@
     },
     {
       "name": "bash",
-      "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+      "schema_digest": "c0483a7bcb53cbe7b3779c216e2eb7b238a6d6348254d98b46ac985decccc9b0",
       "semantics": 3,
       "modes": [
         "classic",
@@ -59,7 +59,7 @@
             "type": "string"
           },
           "description": {
-            "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+            "description": "In about 5 to 8 words, say why you’re running this command.",
             "type": "string"
           },
           "wait": {
@@ -97,7 +97,8 @@
           }
         },
         "required": [
-          "command"
+          "command",
+          "description"
         ]
       }
     },
