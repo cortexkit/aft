@@ -7296,18 +7296,8 @@ fn runon_cd_snapshot_missing_git_keeps_failure_branch() {
     .is_some());
 }
 
-#[test]
-fn runon_cd_sequential_command_after_setup_is_allowed() {
-    let (_dir, request) = runon_cd_snapshot_fixture();
-    let checkout = Path::new(&request.workspace_key);
-    for package in ["plugin", "e2e-tests"] {
-        let path = checkout.join("packages").join(package);
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("source.ts"), "source\n").unwrap();
-    }
-    let command = "printf setup; cd packages/plugin && bun test src/__tests__; cd ../e2e-tests && bun test src/__tests__";
-    assert_eq!(runon_cd_refusal(command, &request).unwrap(), None);
-}
+#[path = "remote_tests/cwd_chains.rs"]
+mod cwd_chains;
 
 #[test]
 fn runon_cd_scoped_and_unknown_directories_preserve_refusals() {
