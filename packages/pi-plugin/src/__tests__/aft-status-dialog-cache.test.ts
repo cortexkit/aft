@@ -28,32 +28,70 @@ describe("aft-status dialog cache", () => {
     bridge.cacheStatusSnapshot({ version: "stale", session: { id: "old-session" } });
 
     let renderCount = 0;
-    let component: { dispose?: () => void } | undefined;
-    try {
-      await showAftStatusDialog(
-        {} as ExtensionAPI,
-        {
-          cwd: projectRoot,
-          sessionManager: { getSessionId: () => "new-session" },
-          ui: {
-            custom: async (factory: (...args: unknown[]) => unknown) => {
-              component = factory(
-                { requestRender: () => renderCount++ },
-                {},
-                {},
-                () => undefined,
-              ) as { dispose?: () => void };
-            },
+    await showAftStatusDialog(
+      {} as ExtensionAPI,
+      {
+        cwd: projectRoot,
+        sessionManager: { getSessionId: () => "new-session" },
+        ui: {
+          custom: async (factory: (...args: unknown[]) => unknown, options: unknown) => {
+            expect(options).toEqual({
+              overlay: true,
+              overlayOptions: { anchor: "center", width: 84 },
+            });
+            let dismissed = false;
+            const dialog = factory(
+              { requestRender: () => renderCount++, terminal: { kittyProtocolActive: true } },
+              {},
+              {},
+              () => {
+                dismissed = true;
+              },
+            ) as { handleInput(data: string): void };
+            // With Kitty active, a raw newline is a Shift+Enter binding, not Return.
+            dialog.handleInput("\n");
+            expect(dismissed).toBe(false);
+            await waitUntil(() => calls.length === 1 && renderCount > 0);
+            dialog.handleInput("\r");
+            expect(dismissed).toBe(true);
           },
-        } as never,
-        makePluginContext(bridge),
-      );
+        },
+      } as never,
+      makePluginContext(bridge),
+    );
+    expect(calls[0].params).toEqual({ session_id: "new-session" });
+  });
 
-      await waitUntil(() => calls.length === 1 && renderCount > 0);
-      expect(calls[0].params).toEqual({ session_id: "new-session" });
-    } finally {
-      component?.dispose?.();
-    }
+  test("OMP opens and dismisses status as a rows overlay without Pi positioning options", async () => {
+    const { bridge } = makeMockBridge(() => ({
+      success: true,
+      version: "fixture",
+      session: { id: "omp-session" },
+    }));
+    let repaints = 0;
+    let dismissed = false;
+    await showAftStatusDialog(
+      { arktype: {} } as unknown as ExtensionAPI,
+      {
+        cwd: projectRoot,
+        sessionManager: { getSessionId: () => "omp-session" },
+        ui: {
+          custom: async (factory: (...args: unknown[]) => unknown, options: unknown) => {
+            expect(options).toEqual({ overlay: true });
+            const identity = (text: string) => text;
+            const theme = { fg: (_tone: string, text: string) => text, bold: identity };
+            const dialog = factory({ requestRender: () => repaints++ }, theme, {}, () => {
+              dismissed = true;
+            }) as { render(width: number): string[]; handleInput(data: string): void };
+            await waitUntil(() => repaints > 0);
+            expect(dialog.render(84).join("\n")).toContain("AFT Status   vfixture");
+            dialog.handleInput("\u001b[27u");
+            expect(dismissed).toBe(true);
+          },
+        },
+      } as never,
+      makePluginContext(bridge),
+    );
   });
 });
 

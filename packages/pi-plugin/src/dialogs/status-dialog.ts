@@ -19,6 +19,7 @@ import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-wor
 import {
   type Component,
   matchesKey,
+  setKittyProtocolActive,
   type TUI,
   truncateToWidth,
   visibleWidth,
@@ -26,6 +27,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import packageJson from "../../package.json";
+import { detectPiHarness } from "../harness.js";
 import {
   type AftStatusSnapshot,
   coerceAftStatus,
@@ -49,29 +51,29 @@ export async function showAftStatusDialog(
   extCtx: ExtensionCommandContext,
   pluginCtx: PluginContext,
 ): Promise<void> {
-  await extCtx.ui.custom<undefined>(
-    (tui, theme, _keybindings, done) =>
-      new AftStatusDialogComponent({
-        pi,
-        extCtx,
-        pluginCtx,
-        theme,
-        tui,
-        done,
-      }),
-    {
-      overlay: true,
-      overlayOptions: { anchor: "center", width: OVERLAY_WIDTH },
-    },
-  );
+  const isOmp = detectPiHarness(pi) === "omp";
+  let dialog: AftStatusDialogComponent | undefined;
+  try {
+    await extCtx.ui.custom<undefined>(
+      (tui, theme, _keybindings, done) => {
+        dialog = new AftStatusDialogComponent({ extCtx, pluginCtx, theme, tui, done });
+        return dialog;
+      },
+      // OMP owns the overlay placement; upstream Pi accepts a centered fixed width.
+      isOmp
+        ? { overlay: true }
+        : { overlay: true, overlayOptions: { anchor: "center", width: OVERLAY_WIDTH } },
+    );
+  } finally {
+    dialog?.dispose();
+  }
 }
 
 interface DialogProps {
-  pi: ExtensionAPI;
   extCtx: ExtensionCommandContext;
   pluginCtx: PluginContext;
   theme: Theme;
-  tui: TUI;
+  tui: Pick<TUI, "requestRender"> & { terminal?: Pick<TUI["terminal"], "kittyProtocolActive"> };
   done: (value: undefined) => void;
 }
 
@@ -127,6 +129,8 @@ class AftStatusDialogComponent implements Component {
   }
 
   handleInput(data: string): void {
+    // Pi's terminal negotiates Kitty mode; the bundled key parser has its own state.
+    setKittyProtocolActive(this.props.tui.terminal?.kittyProtocolActive ?? false);
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "return")) {
       this.close();
     }
@@ -134,11 +138,7 @@ class AftStatusDialogComponent implements Component {
 
   private close(): void {
     if (this.closed) return;
-    this.closed = true;
-    if (this.refreshTimer) {
-      clearInterval(this.refreshTimer);
-      this.refreshTimer = null;
-    }
+    this.dispose();
     this.props.done(undefined);
   }
 
@@ -154,6 +154,7 @@ class AftStatusDialogComponent implements Component {
   }
 
   dispose(): void {
+    this.closed = true;
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer);
       this.refreshTimer = null;
