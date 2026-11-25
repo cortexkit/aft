@@ -1414,6 +1414,7 @@ fn per_file_pulls_close_temporary_documents_at_each_open_version() {
         ServerKind::Rust,
         crate::fake_lsp_test_helper::fake_server_binary(),
     );
+    manager.lock().set_extra_env("AFT_FAKE_LSP_PULL", "1");
     std::fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = 'temporary-pulls'\nversion = '0.0.0'\n",
@@ -1428,6 +1429,7 @@ fn per_file_pulls_close_temporary_documents_at_each_open_version() {
                 .unwrap();
         let mut manager = manager.lock();
         assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].outcome, PullFileOutcome::Full { .. }));
         assert_eq!(
             manager.documents[&key].version(&file),
             Some(initial_version)
@@ -1466,6 +1468,68 @@ fn per_file_pulls_close_temporary_documents_at_each_open_version() {
         .collect::<Vec<_>>();
     manager.close_documents_opened_for_pulls(&file, &results);
     assert_eq!(manager.documents[&key].version(&file), Some(4));
+}
+
+#[test]
+fn lsp_inspect_keeps_push_only_document_open_to_certify_a_later_push() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(dir.path()).unwrap();
+    let file = root.join("src").join("lib.rs");
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(&file, "pub fn f() {}\n").unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = 'push-only'\n").unwrap();
+    let key = key(&root);
+    let ctx = crate::context::AppContext::new(
+        crate::context::default_language_provider_factory(),
+        Config {
+            project_root: Some(root),
+            ..Config::default()
+        },
+    );
+    {
+        let mut manager = ctx.lsp();
+        manager.override_binary(
+            key.kind.clone(),
+            crate::fake_lsp_test_helper::fake_server_binary(),
+        );
+        manager.set_extra_env("AFT_FAKE_LSP_PULL", "0");
+        manager.set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    }
+    let req = serde_json::from_value(json!({"id":"inspect", "command":"lsp_inspect", "file":file}))
+        .unwrap();
+    let inspect = crate::commands::lsp_inspect::handle_lsp_inspect(&req, &ctx);
+    assert_eq!(
+        inspect.data["pull_results"][0]["status"],
+        "pull_not_supported"
+    );
+
+    let mut manager = ctx.lsp();
+    let document = manager.documents[&key]
+        .entry(&file)
+        .expect("push-only document stays open");
+    let (version, received_after_sync) = (document.version, document.sync_order.unwrap() + 1);
+    manager.handle_publish_diagnostics_ordered(
+        key.kind.clone(),
+        key.root.clone(),
+        &json!({
+            "uri": uri_for_path(&file).unwrap(),
+            "diagnostics": [{
+                "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":3}},
+                "severity": 1, "code": "late", "message": "late push-only diagnostic"
+            }]
+        }),
+        Some(received_after_sync),
+    );
+    let entry = manager
+        .diagnostics
+        .report_for_server_file(&key, &file)
+        .unwrap();
+    assert_eq!(entry.version, Some(version));
+    assert_eq!(entry.content_hash, file_content_hash(&file));
+    assert_eq!(
+        manager.get_diagnostics_for_file(&file)[0].message,
+        "late push-only diagnostic"
+    );
 }
 
 #[test]

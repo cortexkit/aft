@@ -4798,8 +4798,8 @@ impl LspManager {
 
     /// Make sure the file's servers are running and have the document open
     /// with current content, then send a pull request to each server that
-    /// supports it. The replies are waited for separately (see
-    /// [`DocumentPull::wait`]), so the caller can release the manager lock.
+    /// supports it. Push-only documents stay open so later publishes can be
+    /// verified. Wait for replies separately via [`DocumentPull::wait`].
     pub(crate) fn begin_file_pulls(
         &mut self,
         file_path: &Path,
@@ -4817,7 +4817,7 @@ impl LspManager {
                 let newly_opened = opened.newly_opened.contains(&key);
                 let instance = self.clients.get(&key).map(|client| client.instance);
                 let mut pull = self.begin_open_document_pull(key, &canonical_path, &uri, deadline);
-                if newly_opened {
+                if newly_opened && !matches!(pull.state, DocumentPullState::Done(_)) {
                     pull.opened_for_pull = instance.zip(pull.document_version);
                 }
                 pull
