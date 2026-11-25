@@ -2,7 +2,8 @@ use super::*;
 use cortexkit_role_tool_display::RecordSchema;
 use occipital_lang::{
     CatalogVersion, CheckContext, Decimal, HostProjection, HostValues, LayoutContext,
-    MeasureRevision, Metrics, Network, Placement, Profile, TextStyle, ToolInputs,
+    MeasureRevision, Metrics, Network, Placement, Profile, TextStyle, ToolInputs, Tree, TreeNode,
+    TreeValue,
 };
 use occipital_registry::{view as registry, Template};
 use serde_json::json;
@@ -131,7 +132,77 @@ fn bash_samples(has_tail: bool) -> Vec<Value> {
                 "completion":sample["result"]["calls"]["ck_test"]["completion"]}));
         }
     }
+    samples.extend(bash_row_samples());
     samples
+}
+
+fn bash_row_samples() -> Vec<Value> {
+    serde_json::from_str(include_str!(
+        "../../../tests/fixtures/tool_views/bash-row-samples.json"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn bash_rows_keep_both_ends_and_prefer_the_description() {
+    let samples = bash_row_samples();
+    for pin in VERSIONED_VIEW_PINS
+        .iter()
+        .filter(|pin| pin.starts_with("tp2:bash:"))
+    {
+        let manifest = view(pin).unwrap();
+        let input_schema = &manifest.tool.as_ref().unwrap().input_schema;
+        let schema = &manifest.record_schema;
+        let reports = registry::check_view(&manifest.template, schema, input_schema).unwrap();
+        assert_eq!(reports.len(), 2);
+        for report in reports {
+            assert!(
+                report.passed(),
+                "{pin}: {:?} {:?}",
+                report.problems,
+                report.diagnostics
+            );
+        }
+        for sample in &samples {
+            let heights = registry::row_heights(
+                &manifest.template["row"],
+                schema,
+                input_schema,
+                &sample["input"],
+                None,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{pin}: {sample}: {error}"));
+            assert_eq!(
+                heights
+                    .iter()
+                    .map(|height| height.width)
+                    .collect::<Vec<_>>(),
+                registry::SAMPLE_WIDTHS
+            );
+            assert!(heights.iter().all(|height| height.waiting == height.filled));
+            let tree = evaluate(
+                pin,
+                &manifest.template["row"],
+                schema,
+                input_schema,
+                sample,
+                Profile::ToolRow,
+            );
+            let [TreeNode::Component { name, props, .. }] = tree.blocks.as_slice() else {
+                panic!("{pin}: expected a tool header, got {:?}", tree.blocks);
+            };
+            assert_eq!(name.as_str(), "ToolHeader");
+            let props = |key| {
+                props.iter().find_map(|(name, value)| match value {
+                    TreeValue::String(value) if name.as_str() == key => Some(value.as_str()),
+                    _ => None,
+                })
+            };
+            assert_eq!(props("title"), sample["title"].as_str(), "{pin}: {sample}");
+            assert_eq!(props("truncate"), Some("middle"), "{pin}: {sample}");
+        }
+    }
 }
 
 fn notice_samples(pin: &str) -> Vec<Value> {
@@ -160,8 +231,48 @@ fn measure_page(
     input_schema: &Value,
     sample: &Value,
 ) {
+    let tree = evaluate(
+        file,
+        document,
+        schema,
+        input_schema,
+        sample,
+        Profile::ToolPage,
+    );
+    let revision = MeasureRevision {
+        instance_epoch: 0,
+        revision: 0,
+        state_hash: "",
+        tree: &tree,
+        first: None,
+    };
+    for width in registry::SAMPLE_WIDTHS {
+        let layout = LayoutContext {
+            width: units(i128::from(width)),
+            content_size_category: "large".into(),
+            network: Network::Unknown,
+            placement: Placement::Page,
+        };
+        let measured =
+            occipital_lang::measure(&revision, &layout, &FixedMetrics).unwrap_or_else(|error| {
+                panic!("{file}: page sample {sample_index}: width {width}: {error:?}")
+            });
+        println!(
+            "{file}: page sample {sample_index}: width {width}: passed ({:?})",
+            measured.height
+        );
+    }
+}
+
+fn evaluate(
+    file: &str,
+    document: &Value,
+    schema: &RecordSchema,
+    input_schema: &Value,
+    sample: &Value,
+    profile: Profile,
+) -> Tree {
     let template = Template::parse(&serde_json::to_vec(document).unwrap()).unwrap();
-    let profile = Profile::ToolPage;
     let mut context = CheckContext::new(profile);
     context.catalog = CatalogVersion::Tool1_1;
     context.execution_dialect = template.execution_dialect;
@@ -187,36 +298,13 @@ fn measure_page(
         &context,
         &HostValues::default(),
     )
-    .unwrap_or_else(|error| panic!("{file}: page sample {sample_index}: {error:?}"));
+    .unwrap_or_else(|error| panic!("{file}: {sample}: {error:?}"));
     assert!(
         evaluated.abort.is_none(),
-        "{file}: page sample {sample_index}: {:?}",
+        "{file}: {sample}: {:?}",
         evaluated.abort
     );
-    let tree = evaluated.tree.expect("evaluated page");
-    let revision = MeasureRevision {
-        instance_epoch: 0,
-        revision: 0,
-        state_hash: "",
-        tree: &tree,
-        first: None,
-    };
-    for width in registry::SAMPLE_WIDTHS {
-        let layout = LayoutContext {
-            width: units(i128::from(width)),
-            content_size_category: "large".into(),
-            network: Network::Unknown,
-            placement: Placement::Page,
-        };
-        let measured =
-            occipital_lang::measure(&revision, &layout, &FixedMetrics).unwrap_or_else(|error| {
-                panic!("{file}: page sample {sample_index}: width {width}: {error:?}")
-            });
-        println!(
-            "{file}: page sample {sample_index}: width {width}: passed ({:?})",
-            measured.height
-        );
-    }
+    evaluated.tree.expect("evaluated template")
 }
 
 // Match the CLI's synthetic metrics (not app fonts or points).

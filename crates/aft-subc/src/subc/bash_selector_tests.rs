@@ -67,7 +67,7 @@ pub(super) async fn call_v1_bash(
     preset: Option<&str>,
 ) -> bash::BashDeferredCompletion {
     let routes = HashMap::from([(route_key(41, 1), identity)]);
-    let mut body = json!({"name":"bash","arguments":{"command":command}});
+    let mut body = json!({"name":"bash","arguments":{"command":command,"description":"Print the requested test output"}});
     if let Some(preset) = preset {
         body["preset"] = json!(preset);
     }

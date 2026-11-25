@@ -1,1 +1,15 @@
-<ToolHeader icon="terminal" title={input.description ?? input.command} failed={(view.completion.endReason ?? view.record.endReason) == "timed_out" || (view.completion.endReason ?? view.record.endReason) == "killed" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true} />
+export const command = Trim(input.command)
+export const hasCd = input.description == null && StartsWith(command, "cd ")
+export const andParts = hasCd ? Split(command, "&&") : []
+export const semiParts = hasCd ? Split(command, ";") : []
+export const canSplit = hasCd && !IsError(andParts) && !IsError(semiParts)
+export const andPrefix = canSplit ? First(andParts) ?? command : command
+export const semiPrefix = canSplit ? First(semiParts) ?? command : command
+export const useAnd = Len(andPrefix) < Len(semiPrefix)
+export const prefix = useAnd ? andPrefix : semiPrefix
+export const dir = canSplit ? Trim(Slice(Trim(prefix), 3)) : ""
+export const plainDir = dir != "" && !Contains(dir, " ") && !Contains(dir, "\t") && !Contains(dir, "\n") && !Contains(dir, "\r") && !Contains(dir, "'") && !Contains(dir, "\"") && !Contains(dir, "$") && !Contains(dir, "\\") && !Contains(dir, "`") && !Contains(dir, "|") && !Contains(dir, "&") && !Contains(dir, "<") && !Contains(dir, ">") && !Contains(dir, "(") && !Contains(dir, ")") && !Contains(dir, "#")
+export const rest = plainDir ? Trim(Slice(command, Len(prefix) + (useAnd ? 2 : 1))) : ""
+export const hasRest = rest != "" && !StartsWith(rest, "#") && !StartsWith(rest, ";") && !StartsWith(rest, "&") && !StartsWith(rest, "|")
+
+<ToolHeader icon="terminal" title={input.description ?? (hasRest ? rest : input.command)} truncate="middle" failed={(view.completion.endReason ?? view.record.endReason) == "timed_out" || (view.completion.endReason ?? view.record.endReason) == "killed" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true} />

@@ -348,7 +348,7 @@ fn result_probes() -> Vec<CallSpec> {
         ("status".into(), json!({})),
         (
             "bash".into(),
-            json!({"command":"exit 7", "wait":true, "pty":true}),
+            json!({"description":"Exercise the shell conformance case","command":"exit 7", "wait":true, "pty":true}),
         ),
         (
             "powershell".into(),
@@ -1691,7 +1691,7 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
     let marker = root.join("project/should-not-run");
     for body in [
         json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"blocked-read"}),
-        json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"blocked-bash"}),
+        json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)},"call_key":"blocked-bash"}),
     ] {
         let frame = route.raw(body, false).await;
         let response = response_json(&frame);
@@ -1733,7 +1733,7 @@ async fn s1_keyless_untrusted_shell_keeps_slice_a_refusal() {
     let marker = root.join("project/keyless-marker");
     let reply = route
         .raw(
-            json!({"name":"bash","arguments":{"command":marker_command(&marker)}}),
+            json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)}}),
             true,
         )
         .await;
@@ -1843,7 +1843,7 @@ async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() 
     let marker = root.join("project/no-elicitation-marker");
     let reply = route
         .raw(
-            json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"no-elicitation"}),
+            json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)},"call_key":"no-elicitation"}),
             false,
         )
         .await;
@@ -1905,8 +1905,7 @@ async fn s1_untrusted_keyed_shell_denial_and_elicitation_errors_never_spawn() {
         ),
     ] {
         let marker = root.join(format!("project/{case}-marker"));
-        let mut call =
-            json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":case});
+        let mut call = json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)},"call_key":case});
         route.adapt_preset(&mut call);
         let mut wire = route.wire.lock().await;
         let corr = wire.corr();
@@ -1964,12 +1963,12 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
         .await
         .unwrap();
     warm.raw(
-        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":"printf warm"}}),
         false,
     )
     .await;
     let marker = root.join("project/cancelled-repeat");
-    let mut body = json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"cancelled-repeat"});
+    let mut body = json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)},"call_key":"cancelled-repeat"});
     route.adapt_preset(&mut body);
     let mut wire = route.wire.lock().await;
     let first = wire.corr();
@@ -2057,12 +2056,12 @@ async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execu
         .await
         .unwrap();
     warm.raw(
-        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":"printf warm"}}),
         false,
     )
     .await;
     let marker = root.join("project/executions");
-    let mut body = json!({"name":"bash","arguments":{"command":format!("printf x >> '{}'; sleep 1",marker.display())},"call_key":"held-repeat"});
+    let mut body = json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":format!("printf x >> '{}'; sleep 1",marker.display())},"call_key":"held-repeat"});
     route.adapt_preset(&mut body);
     let mut wire = route.wire.lock().await;
     let first = wire.corr();
@@ -2155,12 +2154,12 @@ async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
         .await
         .unwrap();
     warm.raw(
-        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":"printf warm"}}),
         false,
     )
     .await;
     let marker = root.join("project/cross-actor");
-    let mut body = json!({"name":"bash","arguments":{"command":format!("printf x >> '{}'",marker.display())},"call_key":"cross-actor"});
+    let mut body = json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":format!("printf x >> '{}'",marker.display())},"call_key":"cross-actor"});
     route.adapt_preset(&mut body);
     let mut wire = route.wire.lock().await;
     let first = wire.corr();
@@ -2192,7 +2191,7 @@ async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
         .unwrap();
     second_warm
         .raw(
-            json!({"name":"bash","arguments":{"command":"printf warm"}}),
+            json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":"printf warm"}}),
             false,
         )
         .await;
@@ -2269,7 +2268,7 @@ async fn crash_before_dispatch(point: &str, shell: &str) {
     } else {
         marker_command(&marker)
     };
-    let body = json!({"name":shell,"arguments":{"command":command},"call_key":"crash"});
+    let body = json!({"name":shell,"arguments":{"description":"Exercise the shell conformance case","command":command},"call_key":"crash"});
     let trigger: Trigger<'_> = Box::pin(async {
         let frame = route.raw(body, true).await;
         panic!(
@@ -2307,7 +2306,7 @@ async fn crash_before_dispatch(point: &str, shell: &str) {
     let route = Subject::head().route(&process, &stamp).await.unwrap();
     let replay = route
         .raw(
-            json!({"name":shell,"arguments":{"command":command},"call_key":"crash"}),
+            json!({"name":shell,"arguments":{"description":"Exercise the shell conformance case","command":command},"call_key":"crash"}),
             false,
         )
         .await;
@@ -2364,8 +2363,7 @@ async fn s1_unarmed_shell_commits_both_held_states_and_replays_before_injections
         .unwrap();
     let marker = root.join("project/marker");
     assert!(!root.join("ledger-control.json").exists());
-    let body =
-        json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"unarmed"});
+    let body = json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)},"call_key":"unarmed"});
     let first = route.raw(body.clone(), true).await;
     assert_approved_scoped_shell_result(&first, &marker);
     if !cfg!(windows) {
@@ -2399,7 +2397,7 @@ async fn restart_recovers_shell_once(hold_running_record: bool) {
         .await
         .unwrap();
     warm.raw(
-        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":"printf warm"}}),
         false,
     )
     .await;
@@ -2428,8 +2426,7 @@ async fn restart_recovers_shell_once(hold_running_record: bool) {
         marker_command(&started),
         marker_command(&finished)
     );
-    let mut body =
-        json!({"name":"bash","arguments":{"command":command},"call_key":"recover-shell"});
+    let mut body = json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":command},"call_key":"recover-shell"});
     route.adapt_preset(&mut body);
     let mut wire = route.wire.lock().await;
     let corr = wire.corr();
@@ -2713,13 +2710,12 @@ async fn s2_withdrawn_held_request_ends_not_started_and_never_runs() {
         .await
         .unwrap();
     warm.raw(
-        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":"printf warm"}}),
         false,
     )
     .await;
     let marker = root.join("project/withdrawn-marker");
-    let body =
-        json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"held"});
+    let body = json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)},"call_key":"held"});
     let mut held = route.start(body.clone()).await;
     let ask = route.wire.lock().await.next().await.unwrap();
     assert_eq!(ask.header.ty, FrameType::Request);
@@ -2799,7 +2795,7 @@ async fn s2_withdraw_before_the_question_is_filed_ends_the_request_not_started()
         .await
         .unwrap();
     warm.raw(
-        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":"printf warm"}}),
         false,
     )
     .await;
@@ -2808,7 +2804,7 @@ async fn s2_withdraw_before_the_question_is_filed_ends_the_request_not_started()
     std::fs::write(&gate, b"hold").unwrap();
     let marker = root.join("project/unfiled-marker");
     let mut held = route
-        .start(json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"unfiled"}))
+        .start(json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)},"call_key":"unfiled"}))
         .await;
     // Admission committed `Prepared`; the request has not reached the frame loop.
     wait_for_file(&held_signal).await;
@@ -2855,12 +2851,12 @@ async fn s2_withdraw_of_a_running_keyed_bash_kills_only_that_task() {
         .unwrap();
     route
         .raw(
-            json!({"name":"bash","arguments":{"command":"printf warm"}}),
+            json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":"printf warm"}}),
             false,
         )
         .await;
     let started = |name: &str| root.join(format!("project/{name}-started"));
-    let call = |name: &str, seconds: u64| json!({"name":"bash","arguments":{"command":format!("{}; sleep {seconds}", marker_command(&started(name)))},"call_key":name});
+    let call = |name: &str, seconds: u64| json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":format!("{}; sleep {seconds}", marker_command(&started(name)))},"call_key":name});
     let mut withdrawn = route.start(call("withdrawn", 30)).await;
     let mut spared = route.start(call("spared", 6)).await;
     wait_for_file(&started("withdrawn")).await;
@@ -3050,7 +3046,7 @@ async fn s2_completed_scoped_bash_reaches_only_its_carrier_once_and_is_acked_onc
     let marker = root.join("project/completed-marker");
     let completed = carrier
         .raw(
-            json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"completed"}),
+            json!({"name":"bash","arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)},"call_key":"completed"}),
             true,
         )
         .await;
@@ -3686,7 +3682,7 @@ impl ToolProviderSubject for Subject {
         Some(cortexkit_role_tool_provider_conformance::CallModeProbe {
             call: (
                 "bash".into(),
-                serde_json::json!({"command":"echo mode-probe"}),
+                serde_json::json!({"description":"Exercise the shell conformance case","command":"echo mode-probe"}),
             ),
             unlisted_mode: cortexkit_role_tool_provider::CallMode::Flow,
         })
@@ -3744,7 +3740,7 @@ impl ToolProviderSubject for Subject {
         self.serves_shell().then(|| {
             (
                 "bash".into(),
-                json!({"command": "sleep 5", "wait": true, "timeout": 5000}),
+                json!({"description":"Exercise the shell conformance case","command": "sleep 5", "wait": true, "timeout": 5000}),
             )
         })
     }
@@ -3759,7 +3755,10 @@ impl ToolProviderSubject for Subject {
             return None;
         }
         *self.stand_in.markers.lock().unwrap() = marker.parent().map(Path::to_path_buf);
-        Some(("bash".into(), json!({"command": marker_command(marker)})))
+        Some((
+            "bash".into(),
+            json!({"description":"Exercise the shell conformance case","command": marker_command(marker)}),
+        ))
     }
     async fn await_held(&self, key: &str) -> Result<(), HarnessError> {
         self.stand_in
@@ -3840,7 +3839,7 @@ async fn cold_bash_admission_on_one_mib_module_stack() {
             let reply = route
                 .start(json!({
                     "op": "tool.call", "preset": "head", "name": "bash",
-                    "arguments": {"command": "exit 7", "wait": true, "pty": true}
+                    "arguments": {"description":"Exercise the shell conformance case","command": "exit 7", "wait": true, "pty": true}
                 }))
                 .await
                 .terminal(Duration::from_secs(30))
@@ -4695,7 +4694,7 @@ async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() 
     for (index, state) in ["Authorized", "DispatchStarted"].into_iter().enumerate() {
         let marker = root.join(format!("project/authorization-{index}-marker"));
         let call_key = format!("authorization-{index}");
-        let mut call = json!({"name":"bash", "arguments":{"command":marker_command(&marker)}, "call_key":call_key});
+        let mut call = json!({"name":"bash", "arguments":{"description":"Exercise the shell conformance case","command":marker_command(&marker)}, "call_key":call_key});
         route.adapt_preset(&mut call);
         let mut wire = route.wire.lock().await;
         let corr = wire.corr();

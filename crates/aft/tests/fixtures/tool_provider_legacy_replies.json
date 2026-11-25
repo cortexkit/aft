@@ -718,6 +718,7 @@
         "tool": "bash",
         "arguments": {
           "command": "exit 7",
+          "description": "Exercise the shell conformance case",
           "wait": true,
           "pty": true
         },
@@ -1588,6 +1589,7 @@
         "tool": "bash",
         "arguments": {
           "command": "exit 7",
+          "description": "Exercise the shell conformance case",
           "wait": true,
           "pty": true
         },

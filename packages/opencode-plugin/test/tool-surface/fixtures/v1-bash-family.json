@@ -20,7 +20,7 @@
           "type": "string"
         },
         "description": {
-          "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+          "description": "In about 5 to 8 words, say why you’re running this command.",
           "type": "string"
         },
         "wait": {
@@ -58,7 +58,8 @@
         }
       },
       "required": [
-        "command"
+        "command",
+        "description"
       ]
     }
   },

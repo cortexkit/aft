@@ -147,12 +147,16 @@ fn every_served_legacy_variant_and_permanent_view_is_in_the_history() {
             let pin = SchemaPin::new(&variant.name, &variant.schema_digest, variant.semantics)
                 .encode()
                 .unwrap();
-            assert_eq!(SHIPPED.get(&pin), Some(&1), "{pin}");
+            assert_eq!(
+                SHIPPED.get(&pin),
+                Some(&variant.version.unwrap().major),
+                "{pin}"
+            );
         }
     }
     assert_eq!(names, VERSIONS.iter().map(|(name, _)| *name).collect());
     for pin in crate::subc::tool_views::SHIPPED.keys() {
-        assert_eq!(SHIPPED.get(pin), Some(&1), "{pin}");
+        assert!(SHIPPED.contains_key(pin), "{pin}");
     }
     for key in SHIPPED.keys() {
         assert!(
