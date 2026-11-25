@@ -232,35 +232,55 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
             .then_some(())
     })
     .await;
-    let route = eventually(&daemon, "scoped project route ready", || async {
-        match consumer
-            .open_route_scoped(
-                RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-                BindIdentity::new("runner", "settings-project-test"),
-                ScopeSelector::new(
-                    Principal::Reserved {
-                        module_id: "entorhinal".into(),
+    let probe = serde_json::to_vec(&json!({"name":"bash","preset":"head","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}})).unwrap();
+    let route = eventually(
+        &daemon,
+        "scoped route resolves the workspace settings",
+        || async {
+            match consumer
+                .open_route_scoped(
+                    RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
                     },
-                    SCOPE,
-                    Some(1),
-                ),
-                CallOptions::default(),
-            )
-            .await
-        {
-            Ok(route) => Some(route),
-            Err(error)
-                if error
-                    .route_open_refusal()
-                    .is_some_and(|refusal| refusal.code == "actor_not_ready") =>
+                    BindIdentity::new("runner", "settings-project-test"),
+                    ScopeSelector::new(
+                        Principal::Reserved {
+                            module_id: "entorhinal".into(),
+                        },
+                        SCOPE,
+                        Some(1),
+                    ),
+                    CallOptions::default(),
+                )
+                .await
             {
-                None
+                Ok(route) => {
+                    let output = consumer
+                        .request(&route, probe.clone(), CallOptions::default())
+                        .await
+                        .unwrap();
+                    if String::from_utf8_lossy(&output).contains("from_user:from_workspace:") {
+                        return Some(route);
+                    }
+                    // The registry can still be unavailable when the first route
+                    // binds. A subsequent bind retries its user-view fallback.
+                    consumer
+                        .close_handle(&route, Default::default())
+                        .await
+                        .unwrap();
+                    None
+                }
+                Err(error)
+                    if error
+                        .route_open_refusal()
+                        .is_some_and(|refusal| refusal.code == "actor_not_ready") =>
+                {
+                    None
+                }
+                Err(error) => panic!("project route refused: {error:?}"),
             }
-            Err(error) => panic!("project route refused: {error:?}"),
-        }
-    })
+        },
+    )
     .await;
     let project_file = daemon.home.path().join("project/.cortexkit/aft.jsonc");
     for (candidate, path) in [
@@ -302,18 +322,17 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
         shown.effective["bash"]["env"],
         json!({"SETTINGS_USER":"from_user","SETTINGS_WORKSPACE":"from_workspace","SETTINGS_PROJECT":"from_project"})
     );
-    let body = json!({"name":"bash","preset":"head","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}});
     let output = consumer
-        .request(
-            &route,
-            serde_json::to_vec(&body).unwrap(),
-            CallOptions::default(),
-        )
+        .request(&route, probe, CallOptions::default())
         .await
         .unwrap();
     let output = String::from_utf8_lossy(&output);
-    assert!(
-        output.contains("from_user:from_workspace:from_project"),
-        "{output}"
-    );
+    if !output.contains("from_user:from_workspace:from_project") {
+        let aft = consumer
+            .supervisor_stderr_tail("aft", Some(50), Some(12000))
+            .await;
+        panic!(
+            "expected the running AFT route to use the merged environment: {output}; aft={aft:?}"
+        );
+    }
 }
