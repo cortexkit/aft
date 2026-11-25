@@ -7151,6 +7151,42 @@ mod tests {
     }
 
     #[test]
+    fn configure_git_probe_fixture_does_not_invert_process_env_lock() {
+        use crate::root_identity::key::git_root_commit_probe_override_lock_for_test;
+        use crate::test_env::{process_env_lock, process_env_lock_is_available};
+
+        let hang_guard = Duration::from_secs(5);
+        let (probe_held, wait_probe_held) = mpsc::channel();
+        let (env_checked, wait_env_checked) = mpsc::channel();
+        let (probe_released, wait_probe_released) = mpsc::channel();
+        let probe_thread = std::thread::spawn(move || {
+            {
+                let _probe = git_root_commit_probe_override_lock_for_test();
+                if probe_held.send(()).is_err()
+                    || wait_env_checked.recv_timeout(hang_guard).is_err()
+                {
+                    return;
+                }
+                let _env = process_env_lock();
+            }
+            let _ = probe_released.send(());
+        });
+
+        wait_probe_held
+            .recv_timeout(hang_guard)
+            .expect("probe fixture did not acquire its lock");
+        // With distinct locks this thread can take env while the worker holds
+        // probe. Waiting for probe's release instead of locking it directly
+        // closes the same cycle, but lets the test release env on timeout.
+        let env = process_env_lock_is_available().then(process_env_lock);
+        env_checked.send(()).unwrap();
+        let released = wait_probe_released.recv_timeout(hang_guard);
+        drop(env);
+        released.expect("probe fixture deadlocked waiting for the process env lock");
+        probe_thread.join().unwrap();
+    }
+
+    #[test]
     fn configure_cancellation_stops_the_git_probe_retry_ladder() {
         let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
