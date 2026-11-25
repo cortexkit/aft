@@ -278,10 +278,11 @@ mod tests {
         assert_eq!(counts["latest_push_files"], 1);
         assert_eq!(counts["latest_pull_files"], 1);
         assert_eq!(counts["unproven_compiler_report_files"], 1);
+        let compiler_retry_bytes = items::<(FileKey, Option<[u8; 32]>)>(1);
         assert_eq!(
             counts["push_pull_bytes"],
             items::<(FileKey, Vec<StoredDiagnostic>)>(2)
-                + items::<FileKey>(1)
+                + compiler_retry_bytes
                 + items::<StoredDiagnostic>(3)
         );
         assert_eq!(
@@ -312,6 +313,6 @@ mod tests {
         let drained = manager.estimated_memory();
         assert_eq!(drained.counts["event_channel_items"], 0);
         assert_eq!(drained.counts["event_channel_bytes"], 0);
-        assert_eq!(drained.counts["push_pull_bytes"], items::<FileKey>(1));
+        assert_eq!(drained.counts["push_pull_bytes"], compiler_retry_bytes);
     }
 }
