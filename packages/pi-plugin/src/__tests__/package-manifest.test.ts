@@ -71,6 +71,11 @@ describe("package manifest", () => {
       "@oh-my-pi/pi-tui/text/width",
       "@earendil-works/pi-tui/dist/index.js",
     ]);
-    expect(bundledTuiSpecifiers("// import '@earendil-works/pi-tui'")).toEqual([]);
+    expect(
+      bundledTuiSpecifiers(`
+        // import '@earendil-works/pi-tui'
+        let manifest = { devDependencies: { '@earendil-works/pi-tui': '0.80.2' } };
+      `),
+    ).toEqual([]);
   });
 });

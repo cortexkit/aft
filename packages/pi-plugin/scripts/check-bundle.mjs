@@ -5,9 +5,17 @@ const TUI_SPECIFIER = /^@(?:earendil-works|oh-my-pi)\/pi-tui(?:\/|$)/;
 export function bundledTuiSpecifiers(source) {
   const file = ts.createSourceFile("index.js", source, ts.ScriptTarget.Latest, true);
   const specifiers = new Set();
+  function check(node) {
+    if (node && ts.isStringLiteralLike(node) && TUI_SPECIFIER.test(node.text)) {
+      specifiers.add(node.text);
+    }
+  }
   function visit(node) {
-    // Check literals rather than call names: Bun can rename the generated require helper.
-    if (ts.isStringLiteralLike(node) && TUI_SPECIFIER.test(node.text)) specifiers.add(node.text);
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      check(node.moduleSpecifier);
+    }
+    // Check call arguments regardless of the callee: Bun can rename its require helper.
+    if (ts.isCallExpression(node)) check(node.arguments[0]);
     ts.forEachChild(node, visit);
   }
   visit(file);
