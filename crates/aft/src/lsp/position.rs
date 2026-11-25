@@ -359,7 +359,9 @@ mod tests {
         assert_eq!(url_to_path(&uri).expect("path"), PathBuf::from(path));
     }
 
-    #[cfg(unix)]
+    // macOS file systems refuse names that are not valid UTF-8 (EILSEQ), so
+    // such a file can't exist there; Linux and the BSDs allow any bytes.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn distinct_unix_filename_bytes_round_trip_through_lsp_uris() {
         use std::ffi::OsStr;
