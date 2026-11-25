@@ -4675,7 +4675,7 @@ where
         using_registration,
     )
     .await?;
-    let gated = manage_settings && hello.gated();
+    let (gated, project_views) = hello.settings_modes(manage_settings);
     let rich_ui_proofs = hello.rich_ui;
     let hello_at = hello.at;
 
@@ -4757,7 +4757,7 @@ where
         match settings::wait_for_first_view(
             &control,
             startup_ctx.as_ref().expect("gated startup context"),
-            user_config_path.as_deref(),
+            (user_config_path.as_deref(), project_views),
             &mut reader_rx,
             &control_replies,
             &writer_tx,

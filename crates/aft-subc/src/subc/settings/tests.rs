@@ -269,7 +269,7 @@ async fn exercise_bootstrap() {
         startup::drive_first_view(
             &control,
             &ctx,
-            Some((declaration, Schema::new(schema).unwrap())),
+            (Some((declaration, Schema::new(schema).unwrap())), false),
             &mut incoming_rx,
             &replies,
             &writer,
@@ -411,7 +411,7 @@ async fn settings_first_declaration_timeout_is_retried_without_a_push() {
             startup::drive_first_view(
                 &control,
                 &ctx,
-                Some((declaration, Schema::new(schema).unwrap())),
+                (Some((declaration, Schema::new(schema).unwrap())), false),
                 &mut incoming_rx,
                 &replies,
                 &writer,
@@ -485,6 +485,7 @@ async fn settings_changed_fetches_and_applies_pending_generation_before_ack() {
             Arc::new(Schema::new(sample_schema()).unwrap()),
             tier,
             old,
+            false,
         ));
         session.mark_ready();
         let task = {
@@ -691,7 +692,7 @@ async fn settings_two_routes_share_the_project_view_and_unknown_falls_back() {
         let user_view = ConfigView::new(3, json!({"format_on_edit":true,"lsp":{"max_servers":6}}), Default::default(), vec![], ConfigStatus::Active);
         let user = validate_user(&user_view.effective).unwrap();
         let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
-        let session = Arc::new(Session::new(schema.clone(), user, user_view));
+        let session = Arc::new(Session::new(schema.clone(), user, user_view, true));
         session.mark_ready();
         let projects = &session.projects;
         let first_route = projects.slot("registered", session.user(), &schema);

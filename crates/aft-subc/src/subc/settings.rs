@@ -65,20 +65,29 @@ async fn request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     control: &readiness::DaemonControl,
     body: &T,
 ) -> Result<R, &'static str> {
-    match tokio::time::timeout(CONFIG_TIMEOUT, control.config_request(body)).await {
-        Ok(Ok(reply)) => Ok(reply),
-        Ok(Err(readiness::ControlError::Refused { code, .. })) if code == "config_gated" => {
+    match request_reply(control, body).await {
+        Ok(reply) => Ok(reply),
+        Err(readiness::ControlError::Refused { code, .. }) if code == "config_gated" => {
             Err("no_approved_config")
         }
-        Ok(Err(readiness::ControlError::Refused { code, .. })) if code == "unknown_project" => {
+        Err(readiness::ControlError::Refused { code, .. }) if code == "unknown_project" => {
             Err("unknown_project")
         }
-        Ok(Err(readiness::ControlError::Refused { code, .. })) => {
+        Err(readiness::ControlError::Refused { code, .. }) => {
             log::warn!("daemon refused settings control request ({code})");
             Err("settings_request_failed")
         }
         _ => Err("settings_request_failed"),
     }
+}
+
+async fn request_reply<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+    control: &readiness::DaemonControl,
+    body: &T,
+) -> Result<R, readiness::ControlError> {
+    tokio::time::timeout(CONFIG_TIMEOUT, control.config_request(body))
+        .await
+        .unwrap_or(Err(readiness::ControlError::Timeout))
 }
 
 fn view_from_reply(reply: ConfigGetReply) -> Result<ConfigView, &'static str> {
@@ -193,12 +202,13 @@ pub(super) struct Session {
     user_changed: AtomicBool,
     project_hints: parking_lot::Mutex<HashSet<String>>,
     projects: projects::Projects,
+    project_views: bool,
     pending: AtomicBool,
     ready: AtomicBool,
 }
 
 impl Session {
-    fn new(schema: Arc<Schema>, user: ConfigTier, view: ConfigView) -> Self {
+    fn new(schema: Arc<Schema>, user: ConfigTier, view: ConfigView, project_views: bool) -> Self {
         Self {
             schema,
             user: ApprovedUser::new(user),
@@ -208,6 +218,7 @@ impl Session {
             user_changed: AtomicBool::new(false),
             project_hints: Default::default(),
             projects: Default::default(),
+            project_views,
             ready: AtomicBool::new(false),
         }
     }
@@ -299,7 +310,7 @@ impl Session {
     ) -> Result<bool, SubcError> {
         if let Some(change) = changed(frame) {
             if let Some(project) = change.project_id {
-                if self.projects.existing(&project).is_some() {
+                if self.project_views && self.projects.existing(&project).is_some() {
                     self.project_hints.lock().insert(project);
                     self.hint.notify_one();
                 }

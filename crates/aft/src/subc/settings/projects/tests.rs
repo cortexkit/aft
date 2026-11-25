@@ -1,5 +1,7 @@
 use super::*;
 
+mod compatibility;
+
 fn project(id: &str, registered: bool) -> Arc<Project> {
     let user = ApprovedUser::new(validate_user(&json!({})).unwrap());
     let schema = Arc::new(Schema::new(crate::subc::settings::tests::sample_schema()).unwrap());

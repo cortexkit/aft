@@ -11,9 +11,26 @@ pub(in crate::subc) struct Project {
     pub(in crate::subc) settings: ApprovedUser,
     schema: Arc<Schema>,
     registered: AtomicBool,
-    // Outermost None means no fetch has finished. Some(None) remembers an
-    // unknown project until the daemon supplies a subsequent change hint.
-    view: tokio::sync::Mutex<Option<Option<ConfigView>>>,
+    view: tokio::sync::Mutex<ViewState>,
+}
+
+#[derive(Default)]
+enum ViewState {
+    #[default]
+    Unloaded,
+    UnknownProject,
+    // A definite refusal uses the user view, but the next bind can retry.
+    // Remember the last refusal code so repeated binds do not flood the log.
+    User(Option<String>),
+    Project(Box<ConfigView>),
+}
+
+impl ViewState {
+    fn keep_or_use_user(&mut self) {
+        if matches!(self, Self::Unloaded) {
+            *self = Self::User(None);
+        }
+    }
 }
 
 impl Projects {
@@ -28,7 +45,7 @@ impl Projects {
             settings: ApprovedUser::project(user),
             schema: schema.clone(),
             registered: AtomicBool::new(false),
-            view: tokio::sync::Mutex::new(None),
+            view: tokio::sync::Mutex::new(ViewState::default()),
         });
         slots.insert(id.into(), Arc::downgrade(&project));
         project
@@ -48,58 +65,127 @@ impl Project {
         &self,
         control: &readiness::DaemonControl,
         executor: &Arc<Executor>,
-        first: bool,
+        binding: bool,
     ) -> Result<(), &'static str> {
+        use readiness::ControlError;
         let mut current = self.view.lock().await;
-        if first && current.is_some() {
+        if binding && matches!(*current, ViewState::UnknownProject | ViewState::Project(_)) {
             return Ok(());
         }
         let mut input = ConfigGetRequest::new();
         input.project_id = Some(self.id.clone());
-        let reply: ConfigGetReply = match request(control, &input).await {
+        let reply: ConfigGetReply = match request_reply(control, &input).await {
             Ok(reply) => reply,
-            Err("unknown_project") => {
+            Err(ControlError::Refused { code, .. }) if code == "unknown_project" => {
                 self.registered.store(false, Ordering::Release);
                 self.settings.use_user_view();
-                *current = Some(None);
+                *current = ViewState::UnknownProject;
                 reload_roots(executor, &self.settings).await;
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(ControlError::Refused { code, .. }) if code == "config_gated" => {
+                current.keep_or_use_user();
+                return Ok(());
+            }
+            Err(ControlError::Refused { code, .. }) => {
+                self.use_user_after_refusal(&mut current, executor, code)
+                    .await;
+                return Ok(());
+            }
+            Err(ControlError::NotAdvertised(_)) => {
+                self.use_user_after_refusal(&mut current, executor, "not_advertised".into())
+                    .await;
+                return Ok(());
+            }
+            Err(ControlError::Timeout | ControlError::ConnectionClosed) => {
+                return if matches!(*current, ViewState::Unloaded) {
+                    Err("settings_request_failed")
+                } else {
+                    Ok(())
+                };
+            }
+            Err(ControlError::Decode(_)) => {
+                self.keep_after_invalid_reply(&mut current, "invalid_settings_view");
+                return Ok(());
+            }
         };
         let recovery = reply.pending.as_ref().and(reply.active.as_ref()).cloned();
-        let next = project_view(reply, Some(&self.id))?;
+        let next = match project_view(reply, Some(&self.id)) {
+            Ok(view) => view,
+            Err(reason) => {
+                self.keep_after_invalid_reply(&mut current, reason);
+                return Ok(());
+            }
+        };
         self.registered.store(true, Ordering::Release);
-        if current
-            .as_ref()
-            .and_then(Option::as_ref)
-            .is_some_and(|old| next.generation < old.generation)
-        {
+        if matches!(&*current, ViewState::Project(old) if next.generation < old.generation) {
             return Ok(());
         }
         match project_tier(&self.schema, &next) {
             Ok(tier) => {
                 self.settings.replace(tier);
                 reload_roots(executor, &self.settings).await;
-                *current = Some(Some(next.clone()));
-                report(control, &next, Ok(())).await
+                self.report(control, &next, Ok(())).await;
+                *current = ViewState::Project(Box::new(next));
             }
             Err(error) => {
-                report(control, &next, Err(error)).await?;
-                if current.is_some() {
-                    return Err(error);
+                self.report(control, &next, Err(error)).await;
+                self.keep_after_invalid_reply(&mut current, error);
+                if !matches!(*current, ViewState::Project(_)) {
+                    if let Some((previous, tier)) = recovery.and_then(|view| {
+                        let view =
+                            project_view(ConfigGetReply::new(Some(view), None), Some(&self.id))
+                                .ok()?;
+                        let tier = project_tier(&self.schema, &view).ok()?;
+                        Some((view, tier))
+                    }) {
+                        self.settings.replace(tier);
+                        reload_roots(executor, &self.settings).await;
+                        *current = ViewState::Project(Box::new(previous));
+                    }
                 }
-                if let Some(previous) = recovery {
-                    let previous =
-                        project_view(ConfigGetReply::new(Some(previous), None), Some(&self.id))?;
-                    self.settings
-                        .replace(project_tier(&self.schema, &previous)?);
-                    *current = Some(Some(previous));
-                } else {
-                    *current = Some(None);
-                }
-                Ok(())
             }
+        }
+        Ok(())
+    }
+
+    async fn use_user_after_refusal(
+        &self,
+        current: &mut ViewState,
+        executor: &Arc<Executor>,
+        code: String,
+    ) {
+        if matches!(current, ViewState::User(Some(last)) if last == &code) {
+            return;
+        }
+        crate::slog_warn!(
+            "project settings refused for {} ({code}); using the user view",
+            self.id
+        );
+        self.settings.use_user_view();
+        *current = ViewState::User(Some(code));
+        reload_roots(executor, &self.settings).await;
+    }
+
+    fn keep_after_invalid_reply(&self, current: &mut ViewState, reason: &'static str) {
+        log::warn!(
+            "project settings reply for {} was not applied: {reason}",
+            self.id
+        );
+        current.keep_or_use_user();
+    }
+
+    async fn report(
+        &self,
+        control: &readiness::DaemonControl,
+        view: &ConfigView,
+        outcome: Result<(), &'static str>,
+    ) {
+        if let Err(reason) = report(control, view, outcome).await {
+            log::warn!(
+                "project settings apply report for {} failed: {reason}",
+                self.id
+            );
         }
     }
 }
@@ -267,7 +353,10 @@ impl BindWaits {
         metrics: &DispatchPathMetrics,
     ) -> Result<Option<DecodedFrame>, SubcError> {
         let incoming = &frame.frame;
-        if incoming.header.ty != FrameType::Request || incoming.header.channel != 0 {
+        if !session.project_views
+            || incoming.header.ty != FrameType::Request
+            || incoming.header.channel != 0
+        {
             return Ok(Some(frame));
         }
         let Ok((
