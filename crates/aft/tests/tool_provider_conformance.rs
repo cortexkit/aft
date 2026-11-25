@@ -38,6 +38,9 @@ use tokio::{
 mod aft_binary;
 #[path = "tool_provider_conformance/versions.rs"]
 mod versions;
+#[cfg(feature = "test-hooks")]
+#[path = "tool_provider_conformance/yield_fixture.rs"]
+mod yield_fixture;
 
 fn legacy_fixtures_path() -> std::path::PathBuf {
     crate::test_helpers::manifest_dir().join("tests/fixtures/tool_provider_legacy_replies.json")
@@ -433,6 +436,12 @@ struct Subject {
     served_tools: Mutex<Option<BTreeSet<String>>>,
     capture_live_status: bool,
     catalog_powershell: bool,
+    #[cfg(feature = "test-hooks")]
+    yield_probe: Mutex<Option<(PathBuf, bool)>>,
+    #[cfg(feature = "test-hooks")]
+    yield_sequence: AtomicU64,
+    #[cfg(feature = "test-hooks")]
+    yield_releases: Mutex<Vec<PathBuf>>,
     legacy_diagnostics: Arc<Mutex<HashMap<String, Value>>>,
     /// Stands in for the consumer's elicitation provider: the permission
     /// questions AFT files for the runner's held calls arrive here.
@@ -448,6 +457,12 @@ impl Subject {
             served_tools: Mutex::new(None),
             capture_live_status: false,
             catalog_powershell: false,
+            #[cfg(feature = "test-hooks")]
+            yield_probe: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            yield_sequence: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            yield_releases: Mutex::new(Vec::new()),
             legacy_diagnostics: Arc::default(),
             stand_in: Arc::default(),
         }
@@ -947,6 +962,8 @@ impl Harness for Subject {
             ))
         })?;
         let mut command = provider_command(root, &connection_path)?;
+        #[cfg(feature = "test-hooks")]
+        command.env("AFT_TEST_CONFORMANCE_READ_GATE", root.join("project"));
         if let Some(bytes) = windows_sized_main_stack().filter(|_| self.one_mib_main_stack) {
             #[cfg(unix)]
             {
@@ -3693,13 +3710,27 @@ impl ToolProviderSubject for Subject {
         stamp: &RouteStamp,
         consumer_capabilities: &[String],
     ) -> Result<Route, HarnessError> {
+        let mut stamp = stamp.clone();
+        if consumer_capabilities
+            .iter()
+            .any(|cap| cap == "call-yield/v1")
+        {
+            stamp.principal = if stamp.principal == "reserved:conformance-carrier" {
+                "direct".into()
+            } else {
+                "reserved:basal".into()
+            };
+            if let Some(scope) = &mut stamp.scope {
+                scope.owner = "reserved:prefrontal".into();
+            }
+        }
         let mut route = bind_route_stamped_with_mode(
             handle,
             &handle.root.join("project"),
             "runner",
             "conformance-session",
             Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
-            stamp,
+            &stamp,
             Some(consumer_capabilities.to_vec()),
             None,
         )
@@ -3735,6 +3766,28 @@ impl ToolProviderSubject for Subject {
         .await?;
         route.scoped_preset = self.preset.or(Some("head"));
         Ok(route)
+    }
+    fn call_yield_call(&self, tagged: bool) -> Option<CallSpec> {
+        #[cfg(feature = "test-hooks")]
+        {
+            yield_fixture::call(self, tagged)
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            let _ = tagged;
+            None
+        }
+    }
+    async fn await_yield_call(&self, key: &str) -> Result<(), HarnessError> {
+        #[cfg(feature = "test-hooks")]
+        {
+            yield_fixture::wait(self, key).await
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            let _ = key;
+            Err(HarnessError::new("no call-yield fixture"))
+        }
     }
     fn slow_call(&self) -> Option<CallSpec> {
         self.serves_shell().then(|| {
@@ -4361,12 +4414,23 @@ async fn conformance_inventory(subject: Subject) {
     let inventory = &fixtures["slice_b"]["presets"][subject.preset.unwrap_or("head")][build];
     let expected =
         |field: &str| serde_json::from_value::<BTreeSet<String>>(inventory[field].clone()).unwrap();
-    let (expected_enabled, mut expected_skipped, expected_inapplicable) = (
+    let (mut expected_enabled, mut expected_skipped, mut expected_inapplicable) = (
         expected("enabled_cases"),
         expected("skipped_cases"),
         expected("inapplicable_cases"),
     );
     expected_skipped.extend(versions::CASES.map(str::to_owned));
+    if !cfg!(feature = "test-hooks") || cfg!(windows) {
+        let unavailable: Vec<_> = expected_enabled
+            .iter()
+            .filter(|name| name.starts_with("call_yield_"))
+            .cloned()
+            .collect();
+        for name in unavailable {
+            expected_enabled.remove(&name);
+            expected_inapplicable.insert(name);
+        }
+    }
     // Case IDs are pinned from the conformance crate: the inventory names
     // every case the crate runs, each exactly once.
     let every: BTreeSet<String> = CASES.iter().map(|case| case.name.to_string()).collect();
@@ -4389,10 +4453,14 @@ async fn conformance_inventory(subject: Subject) {
         .collect();
     assert_eq!(declared, expected("capabilities"));
     let dir = tempfile::tempdir().unwrap();
+    #[cfg(feature = "test-hooks")]
+    let yield_release = yield_fixture::ReleaseGuard(&subject);
     let report =
         cortexkit_role_tool_provider_conformance::run_suite(&subject, &dir.path().join("run"))
             .await
             .unwrap();
+    #[cfg(feature = "test-hooks")]
+    drop(yield_release);
     subject.assert_catalog_powershell_fixture_policy();
     let mut enabled = BTreeSet::new();
     let mut skipped = BTreeSet::new();
