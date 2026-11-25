@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn repeat_reset_does_not_serialize_mutation_content() {
-        let args = serde_json::json!({ "filePath": "data.txt", "content": "x".repeat(8 << 20) });
+        let args = serde_json::json!({ "path": "data.txt", "content": "x".repeat(8 << 20) });
         let call = RepeatCall::new("write", &args);
         assert!(call.mutating);
         assert_eq!(

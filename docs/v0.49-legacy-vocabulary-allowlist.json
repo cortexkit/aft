@@ -7042,11 +7042,11 @@
     },
     {
       "path": "scripts/capture-subc-parity.ts",
-      "line": 484,
+      "line": 504,
       "column": 65,
       "token": "filePath",
-      "text": "{ name: \"read_offset_limit\", tool_name: \"read\", agent_args: { filePath: \"src/../README.md\", offset: 2, limit: 3 } },",
-      "location": "line 484, column 65",
+      "text": "{ name: \"read_offset_limit\", tool_name: \"read\", agent_args: { filePath: \"README.md\", offset: 2, limit: 3 } },",
+      "location": "line 504, column 65",
       "ordinal": 1,
       "class": "audit-implementation",
       "reason": "The audit or capture implementation names the vocabulary it checks."

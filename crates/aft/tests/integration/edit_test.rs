@@ -463,7 +463,7 @@ fn replace_symbol_with_edit_tool(aft: &mut AftProcess, file: &str, symbol: &str,
         "id": "symbol-indent",
         "command": "tool_call",
         "name": "edit",
-        "arguments": { "filePath": file, "symbol": symbol, "content": content },
+        "arguments": { "path": file, "symbol": symbol, "content": content },
     });
     let resp = aft.send(&req.to_string());
     assert_eq!(resp["success"], true, "{file}: {resp:#}");
