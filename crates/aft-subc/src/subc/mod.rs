@@ -5386,6 +5386,10 @@ where
                     }
                 } else { frame };
 
+                if frame.frame.header.ty == FrameType::Goodbye {
+                    settings_waits.cancel(route_key(frame.frame.header.channel, frame.frame.header.epoch));
+                }
+
                 if !(ledger_waited && ledger_edge.is_withdrawn(&frame.frame)) && !ingress_route_should_be_processed(
                     &installed_route_epochs,
                     &reclaimed_routes,
@@ -5431,7 +5435,6 @@ where
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         a0.cancel(channel);
-                        settings_waits.cancel(channel);
                         if let Some(stamp) = routes.get(&channel).and_then(|identity| identity.scope.clone()) {
                             scope_describes.goodbye(stamp);
                         }
@@ -5549,8 +5552,7 @@ where
                             &push_senders,
                             dispatch,
                             user_config_path.as_deref(),
-                            session.as_deref(),
-                            project_view,
+                            session.as_deref().map(|session| (session, project_view)),
                             tool_response_body_limit,
                             Some(&run_scopes),
                             storage_dir,
@@ -7638,40 +7640,6 @@ fn record_bg_runtime_from_snapshots(
     metrics.record_bg_runtime(subscriptions, wake_pending, unacked_total);
 }
 
-async fn send_cached_health_response(
-    tx: &WriterSender,
-    frame: &Frame,
-    shared_app: &App,
-    executor: &Executor,
-    pending_binds: &HashMap<RouteChannel, PendingBind>,
-    metrics: &DispatchPathMetrics,
-    health_rollup_cache: &HealthRollupCache,
-    ownership_summary: Value,
-    settings: Option<&settings::Session>,
-) -> Result<(), SubcError> {
-    let mut report = build_health_report(
-        health_rollup_cache,
-        executor,
-        pending_binds,
-        metrics,
-        shared_app,
-    );
-    settings::note_health(&mut report, settings);
-    health::with_route_ownership_summary(&mut report, ownership_summary);
-    let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(
-        frame.header.ver,
-        FrameType::Response,
-        frame.header.flags,
-        0,
-        0,
-        frame.header.corr,
-        body,
-    )
-    .map_err(SubcError::FrameBuild)?;
-    send_frame(tx, metrics, response).await
-}
-
 /// Channel-0 control requests: RouteBind plus the cached health probe.
 /// Tool-provider binds reconcile RootConfig through the executor's Mutating lane;
 /// management binds install immediately without creating project state.
@@ -7709,8 +7677,7 @@ async fn handle_control_request(
     push_senders: &PushSenders,
     dispatch: DispatchFn,
     user_config_path: Option<&Path>,
-    settings_session: Option<&settings::Session>,
-    project_view: Option<settings::ProjectBind>,
+    bind_settings: Option<settings::BindSettings<'_>>,
     tool_response_body_limit: usize,
     run_scopes: Option<&run_scope::RunScopes>,
     storage_dir: &Path,
@@ -8190,6 +8157,10 @@ async fn handle_control_request(
 
             // Gated binds use only the daemon's effective view. Older daemons
             // keep observing local files; neither accepts config text from the caller.
+            let (user_settings, project_view) = bind_settings
+                .map_or((None, None), |(session, project)| {
+                    (Some(session.user()), project)
+                });
             let project = match project_view {
                 Some(Ok(project)) => Some(project),
                 Some(Err(reason)) => {
@@ -8209,7 +8180,7 @@ async fn handle_control_request(
             let approved = project
                 .as_ref()
                 .map(|project| &project.settings)
-                .or_else(|| settings_session.map(settings::Session::user));
+                .or(user_settings);
             if approved.is_none() {
                 metrics.mark_frame_loop_wait("disk/local_config", None);
             }
@@ -8503,7 +8474,7 @@ async fn handle_control_request(
                     Instant::now(),
                 )
                 .summary(),
-                settings_session,
+                bind_settings.map(|(session, _)| session),
             )
             .await
         }

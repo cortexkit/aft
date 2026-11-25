@@ -96,6 +96,14 @@ impl Project {
     }
 }
 
+impl Drop for Project {
+    fn drop(&mut self) {
+        // A root can retain its source handle after its last route closes.
+        // That handle must not keep the old project's effective text alive.
+        self.settings.use_user_view();
+    }
+}
+
 fn project_tier(schema: &Schema, view: &ConfigView) -> Result<ConfigTier, &'static str> {
     // Before approvals are enabled, the daemon checks the schema but does not
     // ask AFT to review files. Check AFT's additional rules before using the view.
@@ -227,9 +235,9 @@ impl BindWaits {
                     .find_map(|(route, job)| (job.id() == id).then_some(*route))
                 {
                     self.routes.remove(&route);
-                }
-                if let Ok((_, result)) = outcome {
-                    return result;
+                    if let Ok((_, result)) = outcome {
+                        return result;
+                    }
                 }
             }
             if self.jobs.is_empty() {

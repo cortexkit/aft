@@ -173,3 +173,37 @@ fn log_route_bind_rejection(code: &str, message: &str) {
         }
     }
 }
+
+pub(super) async fn send_cached_health_response(
+    tx: &WriterSender,
+    frame: &Frame,
+    shared_app: &App,
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    metrics: &DispatchPathMetrics,
+    health_rollup_cache: &HealthRollupCache,
+    ownership_summary: Value,
+    settings: Option<&settings::Session>,
+) -> Result<(), SubcError> {
+    let mut report = build_health_report(
+        health_rollup_cache,
+        executor,
+        pending_binds,
+        metrics,
+        shared_app,
+    );
+    settings::note_health(&mut report, settings);
+    health::with_route_ownership_summary(&mut report, ownership_summary);
+    let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
+    let response = Frame::build_with_version(
+        frame.header.ver,
+        FrameType::Response,
+        frame.header.flags,
+        0,
+        0,
+        frame.header.corr,
+        body,
+    )
+    .map_err(SubcError::FrameBuild)?;
+    send_frame(tx, metrics, response).await
+}

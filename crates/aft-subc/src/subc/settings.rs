@@ -15,6 +15,7 @@ mod startup;
 #[cfg(test)]
 mod tests;
 pub(super) use projects::{BindWaits, Project, ProjectBind};
+pub(super) type BindSettings<'a> = (&'a Session, Option<ProjectBind>);
 pub(super) use startup::{
     initialize_storage, initialize_task_cleanup, legacy_catalog, negotiate, wait_for_first_view,
     LegacySettings,
