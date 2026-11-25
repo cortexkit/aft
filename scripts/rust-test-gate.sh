@@ -558,9 +558,24 @@ if phase_enabled lib; then
         gate_cargo nextest run --features wasm-grammars --workspace --lib --bins --profile gate -- \
           --skip platform_verifier_tls_client_subprocess
     else
-      run_phase "cargo test --features wasm-grammars --workspace --lib --bins --quiet" \
-        gate_cargo test --features wasm-grammars --workspace --lib --bins --quiet -- \
-          --skip platform_verifier_tls_client_subprocess
+      # Lib tests that exercise the native sandbox launch the real CLI.
+      # Cargo's --lib and --bins test targets build harnesses, not that executable.
+      run_phase "cargo build --features wasm-grammars -p agent-file-tools --bin aft (native lib-test launcher)" \
+        gate_cargo build --features wasm-grammars -p agent-file-tools --bin aft
+      lib_target_dir="${AFT_CI_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | \
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')}"
+      lib_aft_binary="$(cd "$lib_target_dir" && pwd)/debug/aft"
+      if command -v cygpath >/dev/null 2>&1; then
+        lib_aft_binary="$(cygpath -am "$lib_aft_binary.exe")"
+      fi
+      if [[ ! -x "$lib_aft_binary" ]]; then
+        gate_error "native lib-test launcher not found at $lib_aft_binary"
+        exit 1
+      fi
+      AFT_TEST_AFT_BINARY="$lib_aft_binary" \
+        run_phase "cargo test --features wasm-grammars --workspace --lib --bins --quiet" \
+          gate_cargo test --features wasm-grammars --workspace --lib --bins --quiet -- \
+            --skip platform_verifier_tls_client_subprocess
     fi
   fi
 fi
