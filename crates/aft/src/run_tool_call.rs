@@ -69,6 +69,7 @@ pub struct PhaseTrace {
     launch_restore_wait: std::time::Duration,
     executor_submitted: Option<Instant>,
     job_admitted: Option<Instant>,
+    queue_observation: Option<crate::executor::QueueObservation>,
     setup_done: Option<Instant>,
     translate_done: Option<Instant>,
     execute_done: Option<Instant>,
@@ -109,6 +110,8 @@ struct PhaseCpuTrace {
     execute_suspended: bool,
 }
 
+pub(crate) mod read_trace;
+
 pub use crate::tool_progress::{ToolCallPhaseCpu, ToolCallPhaseDurations, WaitingOn};
 
 impl PhaseTrace {
@@ -130,6 +133,7 @@ impl PhaseTrace {
             launch_restore_wait: std::time::Duration::ZERO,
             executor_submitted: None,
             job_admitted: None,
+            queue_observation: None,
             setup_done: None,
             translate_done: None,
             execute_done: None,
@@ -156,6 +160,7 @@ impl PhaseTrace {
         let now = Instant::now();
         self.cpu.job_admitted = ThreadCpuSample::now();
         self.job_admitted = Some(now);
+        self.queue_observation = crate::executor::current_queue_observation();
         if let Some(submitted) = self.executor_submitted {
             crate::logging::note_tool_call_queue_ms(
                 now.duration_since(submitted)
@@ -271,6 +276,7 @@ impl PhaseTrace {
                 egress_prepare: egress.prepare_cpu,
             },
             queue: job_admitted.duration_since(executor_submitted),
+            queue_observation: self.queue_observation,
             setup: setup_done.duration_since(job_admitted),
             translate: translate_done.saturating_duration_since(setup_done),
             execute: execute_done.duration_since(translate_done),
@@ -882,6 +888,10 @@ fn run_tool_call_with_origin(
             let arg_shape = phase_trace
                 .is_some()
                 .then(|| tool_call_arg_shape(&prepared.request));
+            let read_shape = phase_trace
+                .is_some()
+                .then(|| read_trace::Scope::begin(&prepared.request))
+                .flatten();
             let reports_outcome = is_edit_command(&prepared.request.command);
             let reports_search_plan = prepared.request.command == "semantic_search";
             // Named search waits ride on the slow-call line beside the plan
@@ -942,6 +952,9 @@ fn run_tool_call_with_origin(
                             handler.as_secs_f64() * 1000.0,
                             outline_after.unwrap_or_default().as_secs_f64() * 1000.0,
                         ));
+                    }
+                    if let Some(read_shape) = read_shape {
+                        read_shape.append(&mut shape);
                     }
                     trace.note_arg_shape(shape);
                 }
@@ -1456,6 +1469,138 @@ mod tests {
     }
 
     #[test]
+    fn slow_read_lines_report_counts_and_authorized_sizes_without_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let file = "PRIVATE_TARGET.ts";
+        let source = "function hiddenAlpha() { return 'SECRET_BODY'; }\nfunction hiddenBeta() {}\n";
+        std::fs::write(root.join(file), source).unwrap();
+        for (tool, args, symbols, callgraph) in [
+            (
+                "zoom",
+                json!({"batch": [{"target": file, "symbols": "hiddenAlpha, hiddenBeta"}], "callgraph": true}),
+                2,
+                true,
+            ),
+            ("outline", json!({"target": file}), 0, false),
+            ("read", json!({"path": file}), 0, false),
+        ] {
+            let line = slow_tool_line(&ctx, &root, tool, args, &|req, ctx| {
+                let response = match req.command.as_str() {
+                    "zoom" => crate::commands::zoom::handle_zoom(&req, ctx),
+                    "outline" => crate::commands::outline::handle_outline(&req, ctx),
+                    "read" => crate::commands::read::handle_read(&req, ctx),
+                    command => panic!("unexpected dispatch of {command}"),
+                };
+                assert!(response.success, "{:?}", response.data);
+                response
+            });
+            assert!(line.contains(&format!(" cmd={tool} target=file")), "{line}");
+            assert!(
+                line.contains(&format!(
+                    " symbols={symbols} callgraph={callgraph} file_bytes={}",
+                    source.len()
+                )),
+                "{line}"
+            );
+            for private in [file, "hiddenAlpha", "hiddenBeta", "SECRET_BODY"] {
+                assert!(!line.contains(private), "{private} leaked into {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn slow_read_line_distinguishes_root_capacity_from_active_writer() {
+        use crate::executor::{Executor, ExecutorConfig, Lane};
+
+        for (occupied, blocker) in [
+            (Lane::PureRead, "root_capacity"),
+            (Lane::Mutating, "writer"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let root = crate::path_identity::canonicalize_normalized(temp.path());
+            let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
+            let ctx = std::sync::Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(root.clone()),
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    ..Default::default()
+                },
+            ));
+            let ex = Executor::with_config(ExecutorConfig {
+                pool_size: 2,
+                actor_cap: 1,
+                read_cap: 1,
+                ..Default::default()
+            });
+            assert!(ex.register_actor(root_id.clone(), ctx));
+
+            let limit = Duration::from_secs(5);
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            let (_holder, _) = ex.submit_cancellable_async(
+                root_id.clone(),
+                occupied,
+                "holder".into(),
+                Box::new(move |_| {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(limit);
+                    Response::success("holder", json!({}))
+                }),
+            );
+            entered_rx.recv_timeout(limit).expect("holder started");
+            let (line_tx, line_rx) = crossbeam_channel::bounded(1);
+            let (_reader, _) = ex.submit_cancellable_async(
+                root_id,
+                Lane::PureRead,
+                "waiting-outline".into(),
+                Box::new(move |ctx| {
+                    let line = slow_tool_line(
+                        ctx,
+                        &root,
+                        "outline",
+                        json!({"target":"missing.ts"}),
+                        &|req, ctx| crate::commands::outline::handle_outline(&req, ctx),
+                    );
+                    line_tx.send(line).unwrap();
+                    Response::success("waiting-outline", json!({}))
+                }),
+            );
+
+            // The census publishes its queued count after the scheduler has
+            // tried admission, so there is no timing guess before release.
+            let deadline = Instant::now() + limit;
+            while !ex
+                .try_dispatch_liveness_snapshot()
+                .is_some_and(|s| s.interactive.queued == 1)
+            {
+                assert!(Instant::now() < deadline, "reader never queued");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release_tx.send(()).unwrap();
+            let line = line_rx.recv_timeout(limit).expect("outline completed");
+            assert!(
+                line.contains(&format!(
+                    " queue_lane=pure_read queue_waited_on={blocker} queue_epoch_ms="
+                )),
+                "{line}"
+            );
+            assert!(line.contains(" file_bytes=- "), "{line}");
+        }
+    }
+
+    #[test]
     fn slow_search_summary_rejects_content_bearing_plan_labels() {
         for plan in [
             serde_json::json!({"shape": "identifier SECRET_QUERY", "selected_lanes": ["exact"]}),
@@ -1861,6 +2006,7 @@ mod tests {
             launch_restore_wait: Duration::ZERO,
             executor_submitted: Some(t0 + Duration::from_millis(1)),
             job_admitted: Some(t0 + Duration::from_millis(3)),
+            queue_observation: None,
             setup_done: None,
             translate_done: Some(t0 + Duration::from_millis(6)),
             execute_done: Some(t0 + Duration::from_millis(10)),

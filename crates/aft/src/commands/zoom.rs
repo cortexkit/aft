@@ -314,6 +314,7 @@ fn resolve_zoom_file(
             ),
         )
     })?;
+    crate::run_tool_call::read_trace::note_file(source.len() as u64);
     Ok((path, source))
 }
 
@@ -503,6 +504,7 @@ fn handle_zoom_targets(
                 any_usable = true;
                 match zoom_target_symbol_names(req, ctx, file, symbols, &mut memo) {
                     Ok(names) => {
+                        crate::run_tool_call::read_trace::note_symbols(names.len());
                         for name in names {
                             let mut response = zoom_one_target_response(
                                 req,
@@ -887,6 +889,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
             Ok(selector) => selector,
             Err(response) => return response,
         };
+        crate::run_tool_call::read_trace::note_symbols(1);
         return handle_github_zoom(req, ctx, file, &selector);
     }
 
@@ -980,6 +983,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
             }
 
             let content = lines[start_idx..=end_idx].join("\n");
+            crate::run_tool_call::read_trace::note_symbols(0);
             let ctx_start = start_idx.saturating_sub(context_lines);
             let context_before: Vec<String> = if ctx_start < start_idx {
                 lines[ctx_start..start_idx]
@@ -1044,6 +1048,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
         Ok(names) => names,
         Err(resp) => return resp,
     };
+    crate::run_tool_call::read_trace::note_symbols(symbol_names.len());
 
     if symbol_names.is_empty() {
         return Response::error(

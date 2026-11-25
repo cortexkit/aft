@@ -826,6 +826,10 @@ impl<C: ExecutorContext> Executor<C> {
             job_class != JobClass::Maintenance || self.maintenance_root_is_dir(&root_id);
         let response = {
             let mut state = self.inner.state.lock();
+            let worker_pool_full = job_class == JobClass::Interactive
+                && !matches!(lane, Lane::ProviderMetadata | Lane::CallLedger)
+                && !is_configure_request(&request_id)
+                && !can_dispatch_class(&state, job_class);
             match state.actors.get_mut(&root_id) {
                 Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
                 Some(actor) => {
@@ -901,6 +905,12 @@ impl<C: ExecutorContext> Executor<C> {
                     }
 
                     if admission_error.is_none() {
+                        if worker_pool_full {
+                            queue_trace::note(cancellation.as_ref(), QueueBlocker::WorkerPool);
+                        }
+                        if !actor.class_queues(job_class).queue(lane).is_empty() {
+                            queue_trace::note(cancellation.as_ref(), QueueBlocker::Lane);
+                        }
                         actor.push_job(
                             job_class,
                             lane,

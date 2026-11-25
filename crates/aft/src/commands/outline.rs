@@ -245,12 +245,18 @@ fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Resp
         Ok(path) => path,
         Err(resp) => return resp,
     };
-    if crate::bounded_io::metadata(&path).is_err() {
-        return Response::error(
-            &req.id,
-            "file_not_found",
-            format!("file not found: {}", file),
-        );
+    match crate::bounded_io::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            crate::run_tool_call::read_trace::note_file(metadata.len());
+        }
+        Ok(_) => {}
+        Err(_) => {
+            return Response::error(
+                &req.id,
+                "file_not_found",
+                format!("file not found: {}", file),
+            );
+        }
     }
 
     if is_http_url(file)
@@ -2754,6 +2760,9 @@ fn outline_many_files(
                 continue;
             }
         };
+        if metadata.is_file() {
+            crate::run_tool_call::read_trace::note_file(metadata.len());
+        }
         if metadata.len() > MAX_OUTLINE_FILE_BYTES {
             writer.content_incomplete |= downloaded_language(&path).is_some();
             skipped_files.push((index, SkippedFile::new(rel_path, "too_large")));

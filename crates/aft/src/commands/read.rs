@@ -898,6 +898,7 @@ fn start_past_end_error(id: &str, start_line: u64, total_lines: u32) -> Response
 
 fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response {
     let byte_size = bytes.len();
+    crate::run_tool_call::read_trace::note_file(byte_size as u64);
     if let Some(media) = sniff_media(&bytes[..bytes.len().min(MEDIA_MAGIC_BYTES)]) {
         if byte_size as u64 > MAX_FILE_READ_BYTES {
             return media_file_too_large_response(&req.id, byte_size as u64);
@@ -1804,7 +1805,8 @@ fn handle_revision_read(req: &RawRequest, ctx: &AppContext, reference: &str) -> 
         Ok(staged) => staged,
         Err(refusal) => return refusal,
     };
-    let mut response = handle_read_path(req, &staged, false, &mut None).into_response(&req.id);
+    let mut response =
+        handle_read_path(req, &staged, false, &mut None, &mut None).into_response(&req.id);
     session.annotate(&mut response);
     response
 }
@@ -1997,7 +1999,9 @@ fn handle_read_local(
         #[cfg(test)]
         IMAGE_PROCESSING_DELAY.with(|value| value.set(image_delay));
         let mut captured = None;
-        let response = handle_read_path(&owned_req, &path, capture_source, &mut captured);
+        let mut size = None;
+        let response =
+            handle_read_path(&owned_req, &path, capture_source, &mut captured, &mut size);
         #[cfg(test)]
         let observations = (
             crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.get()),
@@ -2005,10 +2009,10 @@ fn handle_read_local(
         );
         #[cfg(not(test))]
         let observations = ();
-        Ok((response, captured, observations))
+        Ok((response, captured, observations, size))
     });
     match result {
-        Ok((response, captured, _observations)) => {
+        Ok((response, captured, _observations, size)) => {
             #[cfg(test)]
             {
                 crate::hashline::snapshot::SOURCE_READS
@@ -2016,6 +2020,9 @@ fn handle_read_local(
                 LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(bytes.get() + _observations.1));
             }
             *captured_source = captured;
+            if let Some(size) = size {
+                crate::run_tool_call::read_trace::note_file(size);
+            }
             // Decoding, resizing and base64 encoding are CPU work, not OS access.
             // Run them after the filesystem helper returns so a slow image uses
             // the image-processing timeout rather than the filesystem deadline.
@@ -2030,6 +2037,7 @@ fn handle_read_path(
     path: &Path,
     capture_source: bool,
     captured_source: &mut Option<CapturedRead>,
+    observed_size: &mut Option<u64>,
 ) -> PreparedPathRead {
     let file = path.to_string_lossy();
     // Check existence
@@ -2064,6 +2072,7 @@ fn handle_read_path(
             "read: only regular files and directories can be read",
         ));
     }
+    *observed_size = Some(metadata.len());
 
     let magic = match read_magic(path) {
         Ok(magic) => magic,
