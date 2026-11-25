@@ -45,6 +45,12 @@ async fn settings_registry_peer() {
         .into_unix_stream();
     socket.set_nonblocking(true).unwrap();
     let mut stream = UnixStream::from_std(socket).unwrap();
+    let connection =
+        subc_transport::connection_file::read(fixture.join("runtime/subc-connection.json"))
+            .unwrap();
+    subc_transport::authenticate_client(&mut stream, &connection, Duration::from_secs(5))
+        .await
+        .unwrap();
     let mut manifest = ModuleManifest::builder("entorhinal", "1.0.0").build();
     manifest.ready = Some(true);
     let hello = ModuleHelloBody {
