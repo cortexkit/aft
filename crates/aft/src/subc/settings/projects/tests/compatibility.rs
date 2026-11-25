@@ -368,3 +368,75 @@ async fn settings_project_timeout_warms_only_without_a_view() {
     .await
     .unwrap();
 }
+
+#[test]
+fn settings_refused_refetch_keeps_the_projects_raised_sandbox() {
+    use crate::config::SandboxMode;
+
+    let codes = ["project_registry_unavailable", "module_ungated"];
+    let logs = capture_runtime(async {
+        let mut fixture = Fixture::new(true).await;
+        fixture.session.user().replace(
+            validate_user(&json!({
+                "format_on_edit": false,
+                "sandbox": {"profile": {"head": "relaxed"}},
+            }))
+            .unwrap(),
+        );
+        let head_mode = |settings: &ApprovedUser| {
+            crate::config_resolve::resolve_config(&[settings.snapshot()])
+                .config
+                .sandbox
+                .profile
+                .head
+        };
+        assert_eq!(head_mode(fixture.session.user()), SandboxMode::Relaxed);
+
+        assert!(fixture.defer_bind().await);
+        let corr = fixture.get().await;
+        let mut reply = Fixture::project_reply(ConfigStatus::Active, None);
+        reply["active"]["effective"]["sandbox"] = json!({"profile": {"head": "strict"}});
+        fixture.respond(corr, FrameType::Response, reply);
+        assert_eq!(fixture.finish_bind().await, Ok(true));
+        let project = fixture.session.projects.existing(PROJECT).unwrap();
+        assert_eq!(head_mode(&project.settings), SandboxMode::Strict);
+
+        let control = fixture.control.clone();
+        let executor = fixture.executor.clone();
+        for code in [codes[0], codes[1], codes[0]] {
+            let (result, ()) = tokio::join!(project.fetch(&control, &executor, false), async {
+                let corr = fixture.get().await;
+                fixture.respond(
+                    corr,
+                    FrameType::Error,
+                    json!(ErrorBody::new(code, "refetch refused")),
+                );
+            });
+            assert!(result.is_ok());
+            assert_eq!(
+                head_mode(&project.settings),
+                SandboxMode::Strict,
+                "refetch refusal {code} loosened the sandbox"
+            );
+        }
+        assert!(fixture.defer_bind().await);
+        assert_eq!(fixture.finish_bind().await, Ok(true));
+        assert!(
+            fixture.written.try_recv().is_err(),
+            "the next bind shares the retained view"
+        );
+    });
+    let warnings: Vec<_> = logs
+        .iter()
+        .filter(|line| line.starts_with("WARN ") && line.contains(PROJECT))
+        .collect();
+    assert_eq!(warnings.len(), codes.len(), "{logs:?}");
+    for code in codes {
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(&format!("({code}); keeping the current project view"))),
+            "{logs:?}"
+        );
+    }
+}

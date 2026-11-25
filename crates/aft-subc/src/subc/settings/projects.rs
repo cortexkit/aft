@@ -22,10 +22,20 @@ enum ViewState {
     // A definite refusal uses the user view, but the next bind can retry.
     // Remember the last refusal code so repeated binds do not flood the log.
     User(Option<String>),
-    Project(Box<ConfigView>),
+    Project {
+        view: Box<ConfigView>,
+        refused_codes: HashSet<String>,
+    },
 }
 
 impl ViewState {
+    fn loaded(view: ConfigView) -> Self {
+        Self::Project {
+            view: Box::new(view),
+            refused_codes: HashSet::new(),
+        }
+    }
+
     fn keep_or_use_user(&mut self) {
         if matches!(self, Self::Unloaded) {
             *self = Self::User(None);
@@ -69,7 +79,12 @@ impl Project {
     ) -> Result<(), &'static str> {
         use readiness::ControlError;
         let mut current = self.view.lock().await;
-        if binding && matches!(*current, ViewState::UnknownProject | ViewState::Project(_)) {
+        if binding
+            && matches!(
+                *current,
+                ViewState::UnknownProject | ViewState::Project { .. }
+            )
+        {
             return Ok(());
         }
         let mut input = ConfigGetRequest::new();
@@ -88,12 +103,11 @@ impl Project {
                 return Ok(());
             }
             Err(ControlError::Refused { code, .. }) => {
-                self.use_user_after_refusal(&mut current, executor, code)
-                    .await;
+                self.handle_refusal(&mut current, executor, code).await;
                 return Ok(());
             }
             Err(ControlError::NotAdvertised(_)) => {
-                self.use_user_after_refusal(&mut current, executor, "not_advertised".into())
+                self.handle_refusal(&mut current, executor, "not_advertised".into())
                     .await;
                 return Ok(());
             }
@@ -118,7 +132,8 @@ impl Project {
             }
         };
         self.registered.store(true, Ordering::Release);
-        if matches!(&*current, ViewState::Project(old) if next.generation < old.generation) {
+        if matches!(&*current, ViewState::Project { view, .. } if next.generation < view.generation)
+        {
             return Ok(());
         }
         match project_tier(&self.schema, &next) {
@@ -126,12 +141,12 @@ impl Project {
                 self.settings.replace(tier);
                 reload_roots(executor, &self.settings).await;
                 self.report(control, &next, Ok(())).await;
-                *current = ViewState::Project(Box::new(next));
+                *current = ViewState::loaded(next);
             }
             Err(error) => {
                 self.report(control, &next, Err(error)).await;
                 self.keep_after_invalid_reply(&mut current, error);
-                if !matches!(*current, ViewState::Project(_)) {
+                if !matches!(*current, ViewState::Project { .. }) {
                     if let Some((previous, tier)) = recovery.and_then(|view| {
                         let view =
                             project_view(ConfigGetReply::new(Some(view), None), Some(&self.id))
@@ -141,7 +156,7 @@ impl Project {
                     }) {
                         self.settings.replace(tier);
                         reload_roots(executor, &self.settings).await;
-                        *current = ViewState::Project(Box::new(previous));
+                        *current = ViewState::loaded(previous);
                     }
                 }
             }
@@ -149,22 +164,34 @@ impl Project {
         Ok(())
     }
 
-    async fn use_user_after_refusal(
+    async fn handle_refusal(
         &self,
         current: &mut ViewState,
         executor: &Arc<Executor>,
         code: String,
     ) {
-        if matches!(current, ViewState::User(Some(last)) if last == &code) {
-            return;
+        match current {
+            ViewState::Project { refused_codes, .. } => {
+                // Falling back could undo a stricter sandbox or a project-specific limit.
+                if refused_codes.insert(code.clone()) {
+                    crate::slog_warn!(
+                        "project settings refused for {} ({code}); keeping the current project view",
+                        self.id
+                    );
+                }
+            }
+            ViewState::UnknownProject => {}
+            ViewState::User(Some(last)) if last == &code => {}
+            ViewState::Unloaded | ViewState::User(_) => {
+                crate::slog_warn!(
+                    "project settings refused for {} ({code}); using the user view",
+                    self.id
+                );
+                self.settings.use_user_view();
+                *current = ViewState::User(Some(code));
+                reload_roots(executor, &self.settings).await;
+            }
         }
-        crate::slog_warn!(
-            "project settings refused for {} ({code}); using the user view",
-            self.id
-        );
-        self.settings.use_user_view();
-        *current = ViewState::User(Some(code));
-        reload_roots(executor, &self.settings).await;
     }
 
     fn keep_after_invalid_reply(&self, current: &mut ViewState, reason: &'static str) {
