@@ -219,7 +219,7 @@ function withOmpRenderers<TParams extends TSchema, TDetails, TState>(
     renderCall:
       renderCall &&
       ((args, theme, context) => {
-        // OMP passes (args, options, theme) rather than (args, theme, context).
+        // oh-my-pi (OMP) passes (args, options, theme) rather than (args, theme, context).
         const ompTheme = context as unknown as Theme;
         if (typeof ompTheme?.fg !== "function") return renderCall(args, theme, context);
         return renderCall(args, ompTheme, {
@@ -231,7 +231,7 @@ function withOmpRenderers<TParams extends TSchema, TDetails, TState>(
     renderResult:
       renderResult &&
       ((result, options, theme, context) => {
-        // OMP's options carry argsComplete and its fourth argument is just the call arguments.
+        // oh-my-pi (OMP) includes argsComplete in options; its fourth parameter is the tool arguments.
         if (!("argsComplete" in (options ?? {})) || typeof context?.invalidate === "function") {
           return renderResult(result, options, theme, context);
         }

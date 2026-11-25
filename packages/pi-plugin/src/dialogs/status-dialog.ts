@@ -57,7 +57,7 @@ export async function showAftStatusDialog(
         dialog = new AftStatusDialogComponent({ extCtx, pluginCtx, theme, tui, done });
         return dialog;
       },
-      // OMP owns the overlay placement; upstream Pi accepts a centered fixed width.
+      // oh-my-pi (OMP) owns the overlay placement; upstream Pi accepts a centered fixed width.
       isOmp
         ? { overlay: true }
         : { overlay: true, overlayOptions: { anchor: "center", width: OVERLAY_WIDTH } },
