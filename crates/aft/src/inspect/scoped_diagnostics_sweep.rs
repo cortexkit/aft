@@ -284,6 +284,10 @@ pub(crate) fn sweep_scoped_files(
             continue;
         }
         let mut lsp = ctx.lsp();
+        // Push servers can answer didOpen immediately. Apply their queued
+        // reports as the sweep opens files so it does not fill LSP ingress
+        // before reaching the wait for diagnostics.
+        lsp.drain_events();
         // A document left open (by an AFT edit, say) still holds the text
         // the server was last sent. When the file changed on disk since, send
         // the current text first, so the decisions below are about the
