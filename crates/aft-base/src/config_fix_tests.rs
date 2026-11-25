@@ -1472,6 +1472,49 @@ fn stale_migration_lock_removal_cannot_take_a_fresh_lock() {
 }
 
 #[test]
+fn config_migration_lock_nonce_is_a_valid_file_name_part() {
+    let nonce = migration_lock_nonce();
+    assert!(
+        nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-'),
+        "{nonce} must not hold characters Windows refuses in file names"
+    );
+}
+
+/// A stale lock that cannot be moved aside (here, a read-only folder) must
+/// end in `Busy` at the deadline instead of retrying in a busy loop.
+#[cfg(unix)]
+#[test]
+fn unmovable_stale_migration_lock_ends_busy_at_the_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime};
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("aft.jsonc");
+    let lock = dir.path().join(".aft.jsonc.migrate.lock");
+    let stale = std::fs::File::create(&lock).unwrap();
+    stale
+        .set_modified(SystemTime::now() - MIGRATION_LOCK_STALE - Duration::from_secs(60))
+        .unwrap();
+    drop(stale);
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::File::create(dir.path().join("probe")).is_ok() {
+        // Running as root ignores the folder's mode, so nothing can be shown.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done_tx.send(acquire_migration_lock(&target)).unwrap());
+    let attempt = done_rx.recv_timeout(MIGRATION_LOCK_WAIT + Duration::from_secs(10));
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(attempt, Ok(LockAttempt::Busy)),
+        "an unmovable stale lock must end busy at the deadline"
+    );
+    assert!(lock.exists());
+}
+
+#[test]
 fn config_migration_failure_reason_names_the_settings_file() {
     let _release = feature_config::override_running_release_for_test((0, 64));
     let dir = tempfile::tempdir().unwrap();

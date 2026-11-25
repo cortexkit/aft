@@ -686,7 +686,9 @@ fn migration_lock_nonce() -> String {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
     let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{}:{now}:{sequence}", std::process::id())
+    // Only digits and dashes: the nonce becomes part of a file name, and
+    // Windows refuses names containing ':'.
+    format!("{}-{now}-{sequence}", std::process::id())
 }
 
 /// The lock's contents and age when it is older than the stale limit.
@@ -702,23 +704,25 @@ fn stale_lock(path: &Path) -> Option<Vec<u8>> {
 /// Remove the stale lock this loader inspected, and only that one. Another
 /// loader may have replaced it with a fresh lock since the inspection, so move
 /// whatever is there aside first (an atomic step), then delete it only if it is
-/// still the stale lock; otherwise put the fresh lock back.
-fn remove_stale_lock(path: &Path, seen: &[u8], nonce: &str) {
+/// still the stale lock; otherwise put the fresh lock back. Returns false when
+/// the lock could not be moved, so the caller waits instead of retrying at once.
+fn remove_stale_lock(path: &Path, seen: &[u8], nonce: &str) -> bool {
     let mut aside = path.as_os_str().to_owned();
     aside.push(format!(".{nonce}.stale"));
     let aside = PathBuf::from(aside);
     if std::fs::rename(path, &aside).is_err() {
-        return;
+        return false;
     }
     if stale_lock(&aside).is_some_and(|held| held == seen) {
         let _ = std::fs::remove_file(&aside);
-        return;
+        return true;
     }
     // A link never replaces a lock taken after the move; that holder keeps it.
     if let Err(error) = std::fs::hard_link(&aside, path) {
         log::warn!("config migration lock could not be restored: {error}");
     }
     let _ = std::fs::remove_file(&aside);
+    true
 }
 
 enum LockAttempt {
@@ -758,8 +762,11 @@ fn acquire_migration_lock(target: &Path) -> LockAttempt {
                             hook();
                         }
                     });
-                    remove_stale_lock(&path, &seen, &nonce);
-                    continue;
+                    // A lock that cannot be moved aside falls through to the
+                    // deadline check, so it cannot become a busy loop.
+                    if remove_stale_lock(&path, &seen, &nonce) {
+                        continue;
+                    }
                 }
                 if std::time::Instant::now() >= deadline {
                     return LockAttempt::Busy;
