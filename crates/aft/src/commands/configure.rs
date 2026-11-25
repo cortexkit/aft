@@ -7172,9 +7172,12 @@ mod tests {
             let _ = probe_released.send(());
         });
 
+        // Taking the first lock can wait behind other tests that hold the shared
+        // env lock across slow setup, so this wait is unbounded. Only the
+        // handshake below can deadlock, and only that part is bounded.
         wait_probe_held
-            .recv_timeout(hang_guard)
-            .expect("probe fixture did not acquire its lock");
+            .recv()
+            .expect("probe fixture thread ended before taking its lock");
         // With distinct locks this thread can take env while the worker holds
         // probe. Waiting for probe's release instead of locking it directly
         // closes the same cycle, but lets the test release env on timeout.
