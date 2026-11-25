@@ -10031,7 +10031,6 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
     if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
         return true;
     }
-
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
         Some(

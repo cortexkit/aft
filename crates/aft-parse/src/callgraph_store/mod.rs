@@ -31,8 +31,11 @@ use crate::callgraph::{self, FileCallData, TraceToSymbolCandidate};
 use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{parse_source_with_cached_parser, LangId};
+
+mod lang_labels;
 use crate::symbols::SymbolKind;
 use join::syntax_index::{Direct, Nav};
+pub use lang_labels::{lang_from_label, lang_label};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -5000,86 +5003,6 @@ fn import_kind_label(kind: ImportKind) -> &'static str {
         ImportKind::Value => "value",
         ImportKind::Type => "type",
         ImportKind::SideEffect => "side_effect",
-    }
-}
-
-pub fn lang_label(lang: LangId) -> &'static str {
-    match lang {
-        LangId::TypeScript => "typescript",
-        LangId::Tsx => "tsx",
-        LangId::JavaScript => "javascript",
-        LangId::Python => "python",
-        LangId::Rust => "rust",
-        LangId::Go => "go",
-        LangId::C => "c",
-        LangId::Cpp => "cpp",
-        LangId::Cuda => "cuda",
-        LangId::Metal => "metal",
-        LangId::Zig => "zig",
-        LangId::CSharp => "csharp",
-        LangId::Bash => "bash",
-        LangId::Html => "html",
-        LangId::Markdown => "markdown",
-        LangId::Solidity => "solidity",
-        LangId::Scss => "scss",
-        LangId::Vue => "vue",
-        LangId::Json => "json",
-        LangId::Scala => "scala",
-        LangId::Java => "java",
-        LangId::Ruby => "ruby",
-        LangId::Kotlin => "kotlin",
-        LangId::Swift => "swift",
-        LangId::Php => "php",
-        LangId::Lua => "lua",
-        LangId::Luau => "luau",
-        LangId::Perl => "perl",
-        LangId::Yaml => "yaml",
-        LangId::Pascal => "pascal",
-        LangId::R => "r",
-        LangId::Groovy => "groovy",
-        LangId::ObjC => "objc",
-        LangId::Toml => "toml",
-        LangId::Nix => "nix",
-    }
-}
-
-pub fn lang_from_label(label: &str) -> Option<LangId> {
-    match label {
-        "typescript" => Some(LangId::TypeScript),
-        "tsx" => Some(LangId::Tsx),
-        "javascript" => Some(LangId::JavaScript),
-        "python" => Some(LangId::Python),
-        "rust" => Some(LangId::Rust),
-        "go" => Some(LangId::Go),
-        "c" => Some(LangId::C),
-        "cpp" => Some(LangId::Cpp),
-        "cuda" => Some(LangId::Cuda),
-        "metal" => Some(LangId::Metal),
-        "zig" => Some(LangId::Zig),
-        "csharp" => Some(LangId::CSharp),
-        "bash" => Some(LangId::Bash),
-        "html" => Some(LangId::Html),
-        "markdown" => Some(LangId::Markdown),
-        "solidity" => Some(LangId::Solidity),
-        "scss" => Some(LangId::Scss),
-        "vue" => Some(LangId::Vue),
-        "json" => Some(LangId::Json),
-        "scala" => Some(LangId::Scala),
-        "java" => Some(LangId::Java),
-        "ruby" => Some(LangId::Ruby),
-        "kotlin" => Some(LangId::Kotlin),
-        "swift" => Some(LangId::Swift),
-        "php" => Some(LangId::Php),
-        "lua" => Some(LangId::Lua),
-        "perl" => Some(LangId::Perl),
-        "yaml" => Some(LangId::Yaml),
-        "pascal" => Some(LangId::Pascal),
-        "r" => Some(LangId::R),
-        "groovy" => Some(LangId::Groovy),
-        "objc" => Some(LangId::ObjC),
-        "toml" => Some(LangId::Toml),
-        "nix" => Some(LangId::Nix),
-        _ => None,
     }
 }
 

@@ -5441,12 +5441,10 @@ fn skipped_languages(files: &[PathBuf], mode: LanguageSkipMode) -> Vec<String> {
 fn skipped_language(file: &Path, mode: LanguageSkipMode) -> Option<String> {
     let Some(language) = crate::parser::detect_language(file) else {
         return match mode {
-            LanguageSkipMode::Duplicates => Some("unknown".to_string()),
-            LanguageSkipMode::Cycles => Some("unknown".to_string()),
+            LanguageSkipMode::Duplicates | LanguageSkipMode::Cycles => Some("unknown".to_string()),
             LanguageSkipMode::UnusedExports => None,
         };
     };
-
     let skipped = match mode {
         LanguageSkipMode::Duplicates => !duplicates_supports_language(language),
         LanguageSkipMode::Cycles => !is_js_ts_language(language),
