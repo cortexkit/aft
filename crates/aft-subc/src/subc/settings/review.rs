@@ -105,7 +105,7 @@ fn review(
             layers.push(LayerValue::new(layer, value));
         }
     }
-    let context = ValidationContext::new(AFT_MODULE, project_id);
+    let context = ValidationContext::new(AFT_MODULE, project_id.clone());
     let tuple = schema
         .review_tuple(&layers, &context)
         .map_err(|error| invalid(error.path))?;

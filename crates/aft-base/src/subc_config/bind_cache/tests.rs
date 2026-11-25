@@ -199,10 +199,10 @@ fn bad_file_is_reparsed_and_refused_until_fixed() {
 }
 
 #[test]
-fn next_bind_uses_changed_approved_settings_without_reading_local_user_file() {
+fn next_bind_uses_changed_approved_settings_without_reading_either_local_file() {
     let files = ConfigFiles::new();
     write_at(&files.user, "{ ignored and invalid", old_time());
-    write_at(&files.project, "{}", old_time());
+    write_at(&files.project, "{ also ignored and invalid", old_time());
     let tier = |doc: &str| ConfigTier {
         tier: "user".into(),
         source: "approved".into(),
@@ -225,7 +225,7 @@ fn next_bind_uses_changed_approved_settings_without_reading_local_user_file() {
             .resolved()
             .url_fetch_allow_private
     );
-    assert_eq!(cache.file_parses(), 1);
+    assert_eq!(cache.file_parses(), 0);
 }
 
 #[test]
