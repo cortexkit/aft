@@ -232,67 +232,35 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
             .then_some(())
     })
     .await;
-    let probe = serde_json::to_vec(&json!({"name":"bash","preset":"head","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}})).unwrap();
-    let first_fallback = tokio::sync::OnceCell::new();
-    let route = eventually(
-        &daemon,
-        "scoped route resolves the workspace settings",
-        || async {
-            match consumer
-                .open_route_scoped(
-                    RouteTarget::ToolProvider {
-                        module_id: "aft".into(),
+    let route = eventually(&daemon, "scoped project route ready", || async {
+        match consumer
+            .open_route_scoped(
+                RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                BindIdentity::new("runner", "settings-project-test"),
+                ScopeSelector::new(
+                    Principal::Reserved {
+                        module_id: "entorhinal".into(),
                     },
-                    BindIdentity::new("runner", "settings-project-test"),
-                    ScopeSelector::new(
-                        Principal::Reserved {
-                            module_id: "entorhinal".into(),
-                        },
-                        SCOPE,
-                        Some(1),
-                    ),
-                    CallOptions::default(),
-                )
-                .await
+                    SCOPE,
+                    Some(1),
+                ),
+                CallOptions::default(),
+            )
+            .await
+        {
+            Ok(route) => Some(route),
+            Err(error)
+                if error
+                    .route_open_refusal()
+                    .is_some_and(|refusal| refusal.code == "actor_not_ready") =>
             {
-                Ok(route) => {
-                    let output = consumer
-                        .request(&route, probe.clone(), CallOptions::default())
-                        .await
-                        .unwrap();
-                    if String::from_utf8_lossy(&output).contains("from_user:from_workspace:") {
-                        return Some(route);
-                    }
-                    first_fallback
-                        .get_or_init(|| async {
-                            let aft = consumer
-                                .supervisor_stderr_tail("aft", Some(40), Some(12000))
-                                .await;
-                            eprintln!(
-                                "initial project bind served a fallback: {}; aft={aft:?}",
-                                String::from_utf8_lossy(&output)
-                            );
-                        })
-                        .await;
-                    // The registry can still be unavailable when the first route
-                    // binds. A subsequent bind retries its user-view fallback.
-                    consumer
-                        .close_handle(&route, Default::default())
-                        .await
-                        .unwrap();
-                    None
-                }
-                Err(error)
-                    if error
-                        .route_open_refusal()
-                        .is_some_and(|refusal| refusal.code == "actor_not_ready") =>
-                {
-                    None
-                }
-                Err(error) => panic!("project route refused: {error:?}"),
+                None
             }
-        },
-    )
+            Err(error) => panic!("project route refused: {error:?}"),
+        }
+    })
     .await;
     let project_file = daemon.home.path().join("project/.cortexkit/aft.jsonc");
     for (candidate, path) in [
@@ -322,24 +290,41 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
     )
     .unwrap();
     let generation = approve(&mut operator, "config.plan").await;
-    let shown = eventually(&daemon, "project generation activation", || async {
-        let shown = consumer
-            .config_show("aft", Some(ID.into()), None)
-            .await
-            .ok()?;
-        (shown.base_generation == generation).then_some(shown)
-    })
+    let shown = eventually(
+        &daemon,
+        "approved project settings are inspectable",
+        || async {
+            let shown = consumer
+                .config_show("aft", Some(ID.into()), None)
+                .await
+                .ok()?;
+            (shown.base_generation == generation).then_some(shown)
+        },
+    )
     .await;
     assert_eq!(
         shown.effective["bash"]["env"],
         json!({"SETTINGS_USER":"from_user","SETTINGS_WORKSPACE":"from_workspace","SETTINGS_PROJECT":"from_project"})
     );
-    let output = consumer
-        .request(&route, probe, CallOptions::default())
-        .await
-        .unwrap();
-    let output = String::from_utf8_lossy(&output);
-    if !output.contains("from_user:from_workspace:from_project") {
+    let probe = serde_json::to_vec(&json!({"name":"bash","preset":"head","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}})).unwrap();
+    let mut output = String::new();
+    // The desktop shows approved settings before the daemon has delivered
+    // them to AFT. Check the existing route, not just the desktop view.
+    let applied = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let bytes = consumer
+                .request(&route, probe.clone(), CallOptions::default())
+                .await
+                .unwrap();
+            output = String::from_utf8_lossy(&bytes).into_owned();
+            if output.contains("from_user:from_workspace:from_project") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if applied.is_err() {
         let aft = consumer
             .supervisor_stderr_tail("aft", Some(50), Some(12000))
             .await;
