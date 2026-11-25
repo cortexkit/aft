@@ -8,7 +8,9 @@ export const semiPrefix = canSplit ? First(semiParts) ?? command : command
 export const useAnd = Len(andPrefix) < Len(semiPrefix)
 export const prefix = useAnd ? andPrefix : semiPrefix
 export const dir = canSplit ? Trim(Slice(Trim(prefix), 3)) : ""
-export const plainDir = dir != "" && !Contains(dir, " ") && !Contains(dir, "\t") && !Contains(dir, "\n") && !Contains(dir, "\r") && !Contains(dir, "'") && !Contains(dir, "\"") && !Contains(dir, "$") && !Contains(dir, "\\") && !Contains(dir, "`") && !Contains(dir, "|") && !Contains(dir, "&") && !Contains(dir, "<") && !Contains(dir, ">") && !Contains(dir, "(") && !Contains(dir, ")") && !Contains(dir, "#")
+export const oneWord = dir != "" && !Contains(dir, " ") && !Contains(dir, "\t") && !Contains(prefix, "\n") && !Contains(prefix, "\r")
+export const literal = !Contains(dir, "'") && !Contains(dir, "\"") && !Contains(dir, "$") && !Contains(dir, "\\") && !Contains(dir, "`") && !Contains(dir, "*") && !Contains(dir, "?") && !Contains(dir, "[") && !Contains(dir, "{")
+export const plainDir = oneWord && literal && !Contains(dir, "|") && !Contains(dir, "&") && !Contains(dir, "<") && !Contains(dir, ">") && !Contains(dir, "(") && !Contains(dir, ")") && !Contains(dir, "#")
 export const rest = plainDir ? Trim(Slice(command, Len(prefix) + (useAnd ? 2 : 1))) : ""
 export const hasRest = rest != "" && !StartsWith(rest, "#") && !StartsWith(rest, ";") && !StartsWith(rest, "&") && !StartsWith(rest, "|")
 

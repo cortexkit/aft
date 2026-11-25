@@ -65,7 +65,7 @@ fn export_occipital_check_inputs() {
 
 fn tool_samples(name: &str, schema: &Value, record_schema: &RecordSchema) -> Vec<Value> {
     match name {
-        "bash" => bash_samples(record_schema.completion_fields.contains_key("tail")),
+        "bash" => bash_samples(schema, record_schema.completion_fields.contains_key("tail")),
         "edit" => {
             let page: Value =
                 fixture_json("tool_views/phone-reader-tool-display-v8/01-page-with-call-keys.json");
@@ -91,7 +91,7 @@ fn tool_samples(name: &str, schema: &Value, record_schema: &RecordSchema) -> Vec
     }
 }
 
-fn bash_samples(has_tail: bool) -> Vec<Value> {
+fn bash_samples(input_schema: &Value, has_tail: bool) -> Vec<Value> {
     let input = json!({"command":"printf ok"});
     let mut samples = Vec::new();
     for (end_reason, exit_code, outcome) in [
@@ -132,8 +132,25 @@ fn bash_samples(has_tail: bool) -> Vec<Value> {
                 "completion":sample["result"]["calls"]["ck_test"]["completion"]}));
         }
     }
-    samples.extend(bash_row_samples());
+    if requires_bash_description(input_schema) {
+        for sample in &mut samples {
+            sample["input"]
+                .as_object_mut()
+                .unwrap()
+                .entry("description")
+                .or_insert(json!("Print the requested test output"));
+        }
+    }
+    samples.extend(bash_row_samples().into_iter().filter(|sample| {
+        !requires_bash_description(input_schema) || sample["input"]["description"].is_string()
+    }));
     samples
+}
+
+fn requires_bash_description(input_schema: &Value) -> bool {
+    input_schema["required"]
+        .as_array()
+        .is_some_and(|fields| fields.iter().any(|field| field == "description"))
 }
 
 fn bash_row_samples() -> Vec<Value> {
@@ -164,6 +181,12 @@ fn bash_rows_keep_both_ends_and_prefer_the_description() {
             );
         }
         for sample in &samples {
+            // Only historical schemas can project a call made without a description.
+            if requires_bash_description(input_schema)
+                && !sample["input"]["description"].is_string()
+            {
+                continue;
+            }
             let heights = registry::row_heights(
                 &manifest.template["row"],
                 schema,

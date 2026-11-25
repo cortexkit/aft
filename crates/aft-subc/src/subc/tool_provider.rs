@@ -7147,14 +7147,11 @@ mod tests {
                 Some("session")
             );
             // A route without a daemon scope stamp still runs plain calls.
-            assert!(admit_plain(
-                &call(name, json!({"command": "echo x"})),
-                &[],
-                true,
-                "session",
-                true
-            )
-            .is_ok());
+            let mut arguments = json!({"command": "echo x"});
+            if name == "bash" {
+                arguments["description"] = json!("Print the requested test output");
+            }
+            assert!(admit_plain(&call(name, arguments), &[], true, "session", true).is_ok());
         }
         for key in [
             "foreground_orchestrate",
