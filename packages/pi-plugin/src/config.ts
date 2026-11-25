@@ -1138,7 +1138,9 @@ const AftConfigFieldsSchema = z.object({
         if (value === "nixfmt" && language !== "nix") {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            path: ["formatter", language],
+            // Relative to the field: zod prefixes "formatter", so the
+            // rendered issue path stays `formatter.<language>`.
+            path: [language],
             message: `nixfmt formats Nix files only; formatter.${language} = "nixfmt" is refused (remove it to restore ${language} formatter detection)`,
           });
         }

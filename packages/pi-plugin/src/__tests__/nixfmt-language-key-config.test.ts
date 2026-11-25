@@ -12,7 +12,7 @@ test("nixfmt is accepted only under the nix formatter key", () => {
     expect(bad.success).toBe(false);
     if (!bad.success) {
       const issue = bad.error.issues.find((i) => i.path[0] === "formatter");
-      expect(issue?.path).toEqual(["formatter", "formatter", language]);
+      expect(issue?.path).toEqual(["formatter", language]);
       expect(issue?.message).toContain("nixfmt formats Nix files only");
     }
   }

@@ -239,6 +239,10 @@ pub(crate) struct NixApostropheGuard {
     /// cached; a later pair in the same run repeats it, so each run pays for
     /// at most one unresolved scan.
     memo_j: usize,
+    /// The `has_start` value the memoized verdict was computed under: a
+    /// terminal fall-through verdict carries `has`, which flips from false
+    /// to true as the run grows, so a hit additionally requires equality.
+    memo_has: bool,
     memo_verdict: bool,
     memo_ok: bool,
     /// Memo key check: a path decision consults `states`, so a cached verdict
@@ -304,6 +308,7 @@ impl NixApostropheGuard {
             run_start,
             has_start,
             memo_j: usize::MAX,
+            memo_has: false,
             memo_verdict: false,
             memo_ok: false,
             memo_states: std::ptr::null(),
@@ -320,9 +325,14 @@ impl NixApostropheGuard {
             return false; // previous byte cannot be part of an identifier
         }
         let key = states.as_ptr();
-        if self.memo_j != j || !self.memo_ok || self.memo_states != key {
+        if self.memo_j != j
+            || self.memo_has != self.has_start[i]
+            || !self.memo_ok
+            || self.memo_states != key
+        {
             let (verdict, resolved) = self.scan_run(bytes, i, j, self.has_start[i], states);
             self.memo_j = j;
+            self.memo_has = self.has_start[i];
             self.memo_verdict = verdict;
             self.memo_ok = resolved;
             self.memo_states = key;
@@ -1464,6 +1474,32 @@ mod nix_guard_linear_time {
             elapsed < Duration::from_millis(500),
             "apostrophe guard rescanned the identifier: {width} bytes took {elapsed:?} — lexing a pattern must stay linear"
         );
+    }
+
+    #[test]
+    fn nix_digit_led_apostrophe_runs_keep_the_pre_guard_lex_tables() {
+        // Regression: the guard memo carries the terminal fall-through
+        // verdict, which depends on whether the run already holds an
+        // identifier-start byte. Digit-led runs start without one and gain
+        // it mid-run; a memo hit computed before the flip must not be
+        // reused. Every table below is the pre-guard (base 2703b1479)
+        // lexer's output for that pattern.
+        for (pattern, base_table) in [
+            ("9''x''b''", "100000111"),
+            ("0''a''b''", "100000111"),
+            ("9''a9'9''", "100000000"),
+            ("12''x''y", "11000001"),
+            ("0''x''b''", "100000111"),
+            ("9x''y''z", "11111111"),
+            ("99''a''b''", "1100000111"),
+            ("3''a''b''c''", "100000111111"),
+        ] {
+            let got: String = nix_lex_code_states(pattern.as_bytes())
+                .iter()
+                .map(|&code| if code { '1' } else { '0' })
+                .collect();
+            assert_eq!(got, base_table, "lex states diverged for {pattern:?}");
+        }
     }
 }
 
