@@ -1003,9 +1003,9 @@ fn infer_cd_workdir<'a>(
     let (prefix, rest) = line.trim_start_matches([' ', '\t']).split_once("&&")?;
     let dir = prefix.strip_prefix("cd ")?.trim_matches([' ', '\t']);
     let rest = rest.trim_start_matches([' ', '\t', '\n']);
-    // A literal directory is one word, not an option, expansion, or redirect.
+    // Apart from the HOME forms below, the directory must be a literal word.
     if dir.is_empty()
-        || dir.starts_with(['-', '~'])
+        || dir.starts_with('-')
         || dir.chars().any(char::is_whitespace)
         || dir.contains([
             '\'', '"', '$', '\\', '`', '*', '?', '[', '{', '|', '&', ';', '<', '>', '(', ')', '#',
@@ -1015,7 +1015,24 @@ fn infer_cd_workdir<'a>(
     {
         return None;
     }
-    let dir = Path::new(dir);
+    let expanded_home;
+    let dir = if let Some(suffix) = dir.strip_prefix('~') {
+        if !suffix.is_empty() && !suffix.starts_with('/') {
+            return None;
+        }
+        // Bash's env argument, bash.env config, and shell environment providers
+        // cannot set HOME. Local children inherit it from this process. Append
+        // the suffix as text: Path::join would replace HOME with a rooted suffix.
+        let mut home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+        if home.as_encoded_bytes().starts_with(b"-") {
+            return None;
+        }
+        home.push(suffix);
+        expanded_home = PathBuf::from(home);
+        expanded_home.as_path()
+    } else {
+        Path::new(dir)
+    };
     // Bash can search CDPATH instead of using cwd for an ordinary relative word.
     if may_use_cdpath && !dir.is_absolute() && !dir.starts_with(".") && !dir.starts_with("..") {
         return None;
