@@ -78,7 +78,7 @@ fn check_registries(dir: &Path) {
     );
     assert_eq!((fake.request_count(), luau.request_count()), (1, 0));
 
-    write(dir, "clock", "10000");
+    replace_polled(dir, "clock", "10000");
     assert_eq!(outline(&luau_file).data["language"], "luau");
     settled(luau);
     assert_eq!(
@@ -93,11 +93,13 @@ fn check_registries(dir: &Path) {
         let entry = grammar::manifest(language).unwrap();
         let filename = format!("{}.wasm", entry.sha256);
         let bytes = std::fs::read(fixtures.join(&filename)).unwrap();
-        write(&dir.join("transport"), &filename, &bytes);
+        let transport = dir.join("transport");
+        std::fs::create_dir_all(&transport).unwrap();
+        replace_polled(&transport, &filename, &bytes);
         (grammar::test_seams::stored_path(&cache, entry), bytes)
     };
     let (fake_artifact, fake_bytes) = supply_artifact("fake");
-    write(dir, "clock", "30000");
+    replace_polled(dir, "clock", "30000");
     outline(&fake_file);
     settled(fake);
     // The fixture exports Luau, not fake: download verification passes but loading cannot.
@@ -121,7 +123,7 @@ fn check_registries(dir: &Path) {
     );
 
     let (luau_artifact, luau_bytes) = supply_artifact("luau");
-    write(dir, "clock", "40000");
+    replace_polled(dir, "clock", "40000");
     outline(&luau_file);
     settled(luau);
     assert_eq!(
