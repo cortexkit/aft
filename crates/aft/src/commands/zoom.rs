@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::url_resolution::resolve_file_or_url;
 use crate::commands::read::{handle_github_zoom, is_github_read_target};
 use crate::commands::symbol_render::{
-    build_container_outline, might_have_container_members, qualified_symbol_name,
+    build_container_outline, might_have_container_members, qualified_symbol_name_with_separator,
     render_container_member_menu, should_return_member_menu, symbol_kind_string,
 };
 use crate::context::AppContext;
@@ -1570,7 +1570,11 @@ fn zoom_one_symbol_inner(
             .map(|candidate| PathBuf::from(&candidate.file)),
     );
     if matches.len() > 1 {
-        let suggestions = ambiguous_symbol_selectors(&matches);
+        let separator = match crate::data_layer::grammar::downloaded_language(path) {
+            Some("systemverilog") => "::",
+            _ => ".",
+        };
+        let suggestions = ambiguous_symbol_selectors(&matches, separator);
         let content = render_ambiguous_symbol_menu(symbol_name, &matches, &suggestions);
         let candidates = matches
             .iter()
@@ -1964,10 +1968,10 @@ fn render_ambiguous_symbol_menu(
     lines.join("\n")
 }
 
-fn ambiguous_symbol_selectors(matches: &[SymbolMatch]) -> Vec<String> {
+fn ambiguous_symbol_selectors(matches: &[SymbolMatch], separator: &str) -> Vec<String> {
     let qualified_names = matches
         .iter()
-        .map(|candidate| qualified_symbol_name(&candidate.symbol))
+        .map(|candidate| qualified_symbol_name_with_separator(&candidate.symbol, separator))
         .collect::<Vec<_>>();
     let mut counts = HashMap::new();
     for name in &qualified_names {
@@ -2098,12 +2102,9 @@ fn resolve_zoom_symbol(
             .filter(|symbol| {
                 symbol.name == name
                     || (language == "systemverilog"
-                        && name.rsplit_once("::").is_some_and(|(scope, leaf)| {
-                            symbol.name == leaf
-                                && scope
-                                    .split("::")
-                                    .eq(symbol.scope_chain.iter().map(String::as_str))
-                        }))
+                        && symbol.scope_chain.iter().try_fold(name, |rest, scope| {
+                            rest.strip_prefix(scope.as_str())?.strip_prefix("::")
+                        }) == Some(symbol.name.as_str()))
                     || symbol.parent.as_ref().is_some_and(|parent| {
                         format!("{parent}.{}", symbol.name) == name
                             || format!("{parent}:{}", symbol.name) == name

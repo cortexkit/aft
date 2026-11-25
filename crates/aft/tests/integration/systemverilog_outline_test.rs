@@ -144,6 +144,32 @@ fn systemverilog_cached_grammar_outlines_and_zooms_the_design_offline() {
     assert!(text.contains("return value + 1'b1;"), "{text}");
     assert!(!text.contains("$display"), "{text}");
 
+    let methods = root.path().join("methods.sv");
+    fs::write(&methods, "package p;\nclass C;\nstatic function int run(); return 1; endfunction\nendclass\nclass D;\nstatic function int run(); return 2; endfunction\nendclass\nendpackage\n").unwrap();
+    let zoom_args =
+        |name: &str| json!({"batch":[{"target":methods,"symbols":name}],"contextLines":1});
+    let menu = request(&mut aft, "zoom", zoom_args("run"), false);
+    let selectors: Vec<_> = menu["text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            line.split_once("- `")?
+                .1
+                .split_once('`')
+                .map(|(selector, _)| selector)
+        })
+        .collect();
+    assert_eq!(selectors, ["p::C::run", "p::D::run"]);
+    for (selector, expected) in selectors.into_iter().zip(["return 1;", "return 2;"]) {
+        let body = request(&mut aft, "zoom", zoom_args(selector), false);
+        assert_eq!(body["success"], true, "{body:#}");
+        assert!(
+            body["text"].as_str().unwrap().contains(expected),
+            "{body:#}"
+        );
+    }
+
     let typedef = root.path().join("typedef.sv");
     fs::write(
         &typedef,

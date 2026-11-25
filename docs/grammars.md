@@ -11,7 +11,8 @@ Files ending in `.luau` get outlines, symbol navigation (`aft_outline`, `aft_zoo
 Files ending in `.sv`, `.svh`, `.v`, or `.vh` get outlines and symbol navigation
 (`aft_outline`, `aft_zoom`). They show written declarations, including modules,
 interfaces, packages, functions, and tasks. They do not preprocess includes or
-macros or elaborate a design. The grammar is downloaded on first use and can
+macros or elaborate a design. Zoom uses declaration scopes such as `p::C::run`.
+SystemVerilog files are not indexed for meaning search. The grammar is downloaded on first use and can
 then be reused offline.
 
 ## How a grammar is fetched and stored
