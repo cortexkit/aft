@@ -237,7 +237,10 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
     .unwrap();
     let generation = approve(&mut operator, "config.plan").await;
     let shown = eventually(&daemon, "project generation activation", || async {
-        let shown = consumer.config_show("aft", Some(ID), None).await.ok()?;
+        let shown = consumer
+            .config_show("aft", Some(ID.into()), None)
+            .await
+            .ok()?;
         (shown.base_generation == generation).then_some(shown)
     })
     .await;
