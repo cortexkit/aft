@@ -45,8 +45,10 @@ async fn settings_registry_peer() {
         .into_unix_stream();
     socket.set_nonblocking(true).unwrap();
     let mut stream = UnixStream::from_std(socket).unwrap();
+    let mut manifest = ModuleManifest::builder("entorhinal", "1.0.0").build();
+    manifest.ready = Some(true);
     let hello = ModuleHelloBody {
-        manifest: ModuleManifest::builder("entorhinal", "1.0.0").build(),
+        manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec!["projects.enumerate".to_string()]),
         launch_nonce: None,
@@ -153,18 +155,36 @@ fn configure_fixture(fixture: &Path) {
 #[ignore = "requires CK_SUBC_DEV_BIN with project settings and scripted Linux approval"]
 async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
     let (daemon, consumer) = Daemon::launch(true, configure_fixture).await;
-    eventually(&daemon, "registry and settings ready", || async {
-        (daemon.home.path().join("registry.ready").exists()
-            && consumer
-                .catalog_list()
-                .await
-                .ok()?
-                .modules
-                .iter()
-                .any(|row| row.module_id == "aft" && row.ready))
-        .then_some(())
+    if tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if daemon.home.path().join("registry.ready").exists()
+                && consumer
+                    .catalog_list()
+                    .await
+                    .unwrap()
+                    .modules
+                    .iter()
+                    .any(|row| row.module_id == "aft" && row.ready)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     })
-    .await;
+    .await
+    .is_err()
+    {
+        let registry = consumer
+            .supervisor_stderr_tail("entorhinal", Some(22), Some(4096))
+            .await;
+        let aft = consumer
+            .supervisor_stderr_tail("aft", Some(22), Some(4096))
+            .await;
+        panic!(
+            "registry and settings not ready: registry={registry:?} aft={aft:?}; {}",
+            daemon.log()
+        );
+    }
     let mut operator = desktop(&daemon).await;
     approve(&mut operator, "config.stamp").await;
     let route = consumer
