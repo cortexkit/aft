@@ -6,6 +6,7 @@ use crate::subc_config::BindConfigCache;
 pub(super) struct RootChannels {
     pub(super) channels: HashMap<ProjectRootId, HashSet<RouteChannel>>,
     pub(super) config: BindConfigCache,
+    pub(super) projects: HashMap<ProjectRootId, HashMap<String, Arc<settings::Project>>>,
 }
 
 impl std::ops::Deref for RootChannels {
@@ -24,6 +25,7 @@ impl RootChannels {
     pub(super) fn remove(&mut self, root: &ProjectRootId) {
         self.channels.remove(root);
         self.config.release_project(root.as_path());
+        self.projects.remove(root);
     }
 
     pub(super) fn release_if_unbound(
@@ -36,7 +38,7 @@ impl RootChannels {
             .values()
             .any(|bind| &bind.bind_root_id == root);
         if should_quiesce_removed_root(root, self, has_pending_bind, replacement_root) {
-            self.config.release_project(root.as_path());
+            self.remove(root);
             true
         } else {
             false

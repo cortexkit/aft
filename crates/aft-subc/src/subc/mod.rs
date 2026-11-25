@@ -208,6 +208,8 @@ use a0_egress::{A0Egress, ControlCompletion};
 mod bash;
 mod bind_candidates;
 mod bind_log;
+mod bind_reply;
+use bind_reply::*;
 mod call_policy;
 pub(crate) mod call_yield;
 mod carrier_read_only;
@@ -4935,6 +4937,7 @@ where
         HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels = RootChannels::default();
+    let mut settings_waits = settings::BindWaits::default();
     let mut session_identity = SessionIdentities::default();
     let mut push_buffer = PushBuffer::default();
     let mut retry_buffer: RetryBuffer = HashMap::new();
@@ -5335,15 +5338,16 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            (maybe_frame, database_waited, ledger_waited) = async {
+            (maybe_frame, database_waited, ledger_waited, project_view) = async {
                 if let Some(frame) = candidate_requests.next_ready() {
-                    return (Some(Ok(frame)), false, false);
+                    return (Some(Ok(frame)), false, false, None);
                 }
                 tokio::select! {
-                    frame = reader_rx.recv() => (frame, false, false),
-                    frame = run_scopes.next_ready(&mut run_ready_rx) => (frame.map(Ok), false, false),
-                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false),
-                    frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true),
+                    frame = reader_rx.recv() => (frame, false, false, None),
+                    frame = run_scopes.next_ready(&mut run_ready_rx) => (frame.map(Ok), false, false, None),
+                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false, None),
+                    frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true, None),
+                    (frame, view) = settings_waits.next(), if settings_waits.waiting() => (Some(Ok(frame)), false, false, Some(view)),
                 }
             } => {
                 let frame = match maybe_frame {
@@ -5374,6 +5378,13 @@ where
                     Ok(None) => continue,
                     Err(error) => break Err(error),
                 };
+                let frame = if let (Some(session), None) = (session.as_deref(), &project_view) {
+                    match settings_waits.defer(frame, session, &control, &executor, &a0.writer, &dispatch_path_metrics).await {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => continue,
+                        Err(error) => break Err(error),
+                    }
+                } else { frame };
 
                 if !(ledger_waited && ledger_edge.is_withdrawn(&frame.frame)) && !ingress_route_should_be_processed(
                     &installed_route_epochs,
@@ -5418,8 +5429,9 @@ where
                         break Ok(ModuleLoopExit::Graceful);
                     }
                     FrameType::Goodbye => {
-                        a0.cancel(route_key(frame.header.channel, frame.header.epoch));
                         let channel = route_key(frame.header.channel, frame.header.epoch);
+                        a0.cancel(channel);
+                        settings_waits.cancel(channel);
                         if let Some(stamp) = routes.get(&channel).and_then(|identity| identity.scope.clone()) {
                             scope_describes.goodbye(stamp);
                         }
@@ -5538,6 +5550,7 @@ where
                             dispatch,
                             user_config_path.as_deref(),
                             session.as_deref(),
+                            project_view,
                             tool_response_body_limit,
                             Some(&run_scopes),
                             storage_dir,
@@ -7697,6 +7710,7 @@ async fn handle_control_request(
     dispatch: DispatchFn,
     user_config_path: Option<&Path>,
     settings_session: Option<&settings::Session>,
+    project_view: Option<settings::ProjectBind>,
     tool_response_body_limit: usize,
     run_scopes: Option<&run_scope::RunScopes>,
     storage_dir: &Path,
@@ -8174,18 +8188,38 @@ async fn handle_control_request(
                 consumer_elicitation_capable
             );
 
-            // Config is read directly from the CortexKit user and project files;
-            // wire-relayed tiers are ignored so a front cannot inject settings.
-            // The resolver selects only this bind's harness override before it
-            // applies the unchanged user/project trust boundary.
-            metrics.mark_frame_loop_wait("disk/local_config", None);
+            // Gated binds use only the daemon's effective view. Older daemons
+            // keep observing local files; neither accepts config text from the caller.
+            let project = match project_view {
+                Some(Ok(project)) => Some(project),
+                Some(Err(reason)) => {
+                    log::warn!("project settings bind refused: {reason}");
+                    root_channels.release_if_unbound(&bind_root_id, pending_binds, None);
+                    return send_route_bind_error(
+                        tx,
+                        frame,
+                        "actor_not_ready",
+                        "module is warming",
+                        metrics,
+                    )
+                    .await;
+                }
+                None => None,
+            };
+            let approved = project
+                .as_ref()
+                .map(|project| &project.settings)
+                .or_else(|| settings_session.map(settings::Session::user));
+            if approved.is_none() {
+                metrics.mark_frame_loop_wait("disk/local_config", None);
+            }
             // Invalid harnesses still reach configure's existing typed refusal.
             let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
             let prepared_config = match active_harness.as_ref() {
                 Some(harness) => match crate::subc_config::PreparedBindConfig::read_cached(
                     &mut root_channels.config,
                     user_config_path,
-                    settings_session.map(settings::Session::user),
+                    approved,
                     Path::new(&bind_project_root),
                     bind_root_id.as_path(),
                     harness,
@@ -8279,6 +8313,13 @@ async fn handle_control_request(
                 scopes.bind(&route_identity);
             }
             let configure_session = route_identity.session.clone();
+            if let Some(project) = project {
+                root_channels
+                    .projects
+                    .entry(bind_root_id.clone())
+                    .or_default()
+                    .insert(project.id.clone(), project);
+            }
             let bind_session = configure_session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
             metrics.mark_frame_loop_wait(
@@ -9271,179 +9312,6 @@ fn install_bash_compressor(ctx: &AppContext) {
             )
         },
     );
-}
-
-fn route_bind_ack_frame(ver: u8, corr: u64, flags: Flags) -> Result<Frame, SubcError> {
-    let body =
-        serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
-    Frame::build_with_version(ver, FrameType::Response, flags, 0, 0, corr, body)
-        .map_err(SubcError::FrameBuild)
-}
-
-/// Longest decode-error text a refusal carries back to the sender; serde can
-/// quote a whole body in its message.
-const DECODE_ERROR_TEXT_MAX: usize = 240;
-
-/// A serde decode error, shortened for a refusal message and a log line.
-fn brief_decode_error(error: &serde_json::Error) -> String {
-    let text = error.to_string();
-    match text.char_indices().nth(DECODE_ERROR_TEXT_MAX) {
-        Some((cut, _)) => format!("{}...", &text[..cut]),
-        None => text,
-    }
-}
-
-/// Answers a channel-0 request whose body does not decode, and keeps the
-/// module running.
-///
-/// One request AFT cannot read (for example a route bind whose scope stamp
-/// carries a field a deny-unknown-fields type does not know yet) must cost
-/// only that request. Ending the frame loop instead would drop every route on
-/// the connection, fleet-wide, until the daemon respawned the module. Only
-/// transport failures may end the loop.
-async fn refuse_undecodable_control_request(
-    tx: &WriterSender,
-    frame: &Frame,
-    error: &serde_json::Error,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    let reason = brief_decode_error(error);
-    log::warn!(
-        "subc attach: refusing channel-0 request corr={} whose body does not decode ({} bytes): {reason}",
-        frame.header.corr,
-        frame.body.len()
-    );
-    let response = build_error_frame(
-        frame.header.ver,
-        0,
-        0,
-        frame.header.corr,
-        frame.header.flags,
-        UNDECODABLE_CONTROL_REQUEST,
-        &format!("control request does not decode: {reason}"),
-    )?;
-    send_reliable_writer_frame(tx, metrics, response, "undecodable control request error").await
-}
-
-/// Error code for a channel-0 request AFT could not decode.
-pub(crate) const UNDECODABLE_CONTROL_REQUEST: &str = "undecodable_control_request";
-
-async fn send_route_bind_error(
-    tx: &WriterSender,
-    frame: &Frame,
-    code: &str,
-    message: &str,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    send_route_bind_error_parts(
-        tx,
-        frame.header.ver,
-        frame.header.corr,
-        frame.header.flags,
-        code,
-        message,
-        metrics,
-    )
-    .await
-}
-
-/// [`send_route_bind_error`] for a refusal that carries a machine-readable
-/// `detail`, such as the role versions AFT does serve.
-async fn send_route_bind_error_body(
-    tx: &WriterSender,
-    frame: &Frame,
-    refusal: &ErrorBody,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    send_route_bind_error_body_parts(
-        tx,
-        frame.header.ver,
-        frame.header.corr,
-        frame.header.flags,
-        refusal,
-        metrics,
-    )
-    .await
-}
-
-async fn send_route_bind_error_body_parts(
-    tx: &WriterSender,
-    ver: u8,
-    corr: u64,
-    flags: Flags,
-    refusal: &ErrorBody,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    let body = serde_json::to_vec(refusal).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(ver, FrameType::Error, flags, 0, 0, corr, body)
-        .map_err(SubcError::FrameBuild)?;
-    send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
-    log_route_bind_rejection(&refusal.code, &refusal.message);
-    Ok(())
-}
-
-async fn send_route_bind_error_parts(
-    tx: &WriterSender,
-    ver: u8,
-    corr: u64,
-    flags: Flags,
-    code: &str,
-    message: &str,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    let response = build_error_frame(ver, 0, 0, corr, flags, code, message)?;
-    send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
-    log_route_bind_rejection(code, message);
-    Ok(())
-}
-
-/// Per-message rate limit for the bind-rejection warn line. A caller that
-/// re-attaches a dead root forever turns this line into the entire readable
-/// tail of the SHARED daemon log (measured 2026-08-09: 2.08M copies, ~40/sec,
-/// 936MB log — other modules' incident lines pushed out of the tail).
-/// The line itself stays byte-identical so external counters keep matching;
-/// repeats inside the window are summarized with a suppressed count on the
-/// next emission (volume stays diagnosable, per the log-diet convention).
-fn log_route_bind_rejection(code: &str, message: &str) {
-    const WINDOW: Duration = Duration::from_secs(60);
-    static SUPPRESSED: OnceLock<StdMutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
-    let map = SUPPRESSED.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut map = match map.try_lock() {
-        Ok(map) => map,
-        // Contended: log unsuppressed rather than blocking or dropping.
-        Err(_) => {
-            log::warn!("subc attach: route bind rejected ({code}): {message}");
-            return;
-        }
-    };
-    let now = Instant::now();
-    // Bound the map: dead roots churn, and an unbounded suppression map is
-    // its own leak. Sweep expired entries once it grows past a fleet-sized
-    // number of distinct rejection messages.
-    if map.len() > 512 {
-        map.retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
-    }
-    match map.get_mut(message) {
-        Some((window_start, suppressed)) if now.duration_since(*window_start) < WINDOW => {
-            *suppressed += 1;
-        }
-        Some((window_start, suppressed)) => {
-            if *suppressed > 0 {
-                log::warn!(
-                    "subc attach: route bind rejected ({code}): {message} (repeated {}x in last 60s)",
-                    *suppressed
-                );
-            } else {
-                log::warn!("subc attach: route bind rejected ({code}): {message}");
-            }
-            *window_start = now;
-            *suppressed = 0;
-        }
-        None => {
-            log::warn!("subc attach: route bind rejected ({code}): {message}");
-            map.insert(message.to_string(), (now, 0));
-        }
-    }
 }
 
 async fn send_provider_error(

@@ -5,7 +5,13 @@ use serde_json::{json, Value};
 
 mod defaults;
 mod harness;
+mod layers;
 mod titles;
+
+#[doc(hidden)]
+pub fn settings_restart_required(path: &str) -> bool {
+    layers::user_only(path) && restart_required(path)
+}
 
 const MAP_KEY: &str = "^.+$";
 
@@ -109,15 +115,25 @@ fn declare(
     } else {
         default
     };
-    let description = node
+    let mut description = node
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or_else(|| leaf_description(path, parent_description))
         .to_owned();
-    node.insert("x-ck-layers".into(), json!(["user"]));
+    if layers::next_session(path) {
+        description.push(' ');
+        description.push_str(layers::NEXT_SESSION);
+        node.insert("description".into(), json!(description));
+        if let Some(text) = node.get_mut("markdownDescription") {
+            if let Some(markdown) = text.as_str() {
+                *text = json!(format!("{markdown} {}", layers::NEXT_SESSION));
+            }
+        }
+    }
+    layers::set(node, path);
     node.insert(
         "x-ck-apply".into(),
-        json!(if restart_required(path) {
+        json!(if settings_restart_required(path) {
             "module_restart"
         } else {
             "live"

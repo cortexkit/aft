@@ -384,11 +384,41 @@ pub fn reload_config_now(ctx: &AppContext) -> ReloadOutcome {
 }
 
 #[doc(hidden)]
-pub fn reload_approved_user(ctx: &AppContext) -> ReloadOutcome {
+pub fn reload_daemon_settings(
+    ctx: &AppContext,
+    changed: &crate::subc_config::ApprovedUser,
+) -> ReloadOutcome {
     let _reload = ctx.config_live().reload_lock.lock();
+    if !ctx
+        .config_live()
+        .sources()
+        .and_then(|sources| sources.approved_user)
+        .is_some_and(|source| source.uses(changed))
+        || ctx.subc_unbound_quiesced()
+    {
+        return ReloadOutcome::NotConfigured;
+    }
     let outcome = reload_config_inner_with(ctx, true);
     *ctx.config_live().last_outcome.lock() = Some(outcome.clone());
     outcome
+}
+
+#[doc(hidden)]
+pub fn managed_index_update(
+    ctx: &AppContext,
+    changed: &crate::subc_config::ApprovedUser,
+) -> Option<crate::config::IndexesConfig> {
+    let source = ctx.config_live().sources()?.approved_user?;
+    if !source.uses(changed) {
+        return None;
+    }
+    let published = ctx.config_unpinned();
+    let resolved = crate::config_resolve::resolve_config_for_harness(
+        &[source.snapshot()],
+        published.harness.as_ref(),
+    );
+    let indexes = resolved.config.indexes;
+    (resolved.errors.is_empty() && indexes != published.indexes).then_some(indexes)
 }
 
 fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
@@ -534,7 +564,14 @@ fn reload_config_inner_with(ctx: &AppContext, approved_only: bool) -> ReloadOutc
         } else {
             Vec::new()
         };
-        let live = apply_live_config(&published, &candidate, &sources.connected);
+        let mut live = apply_live_config(&published, &candidate, &sources.connected);
+        if sources.approved_user.is_some()
+            && published.experimental_bash_compress != candidate.experimental_bash_compress
+        {
+            live.next.experimental_bash_compress = candidate.experimental_bash_compress;
+            live.applied.push("bash.compress");
+            live.deferred.retain(|key| *key != "bash.compress");
+        }
         if live.applied.is_empty() {
             break (live.applied, live.deferred, dropped, held);
         }
@@ -728,6 +765,9 @@ pub fn reload_log_line(
 /// Call the setters that copy a changed live key into a component that keeps
 /// its own copy.
 fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
+    if before.experimental_bash_compress != after.experimental_bash_compress {
+        ctx.sync_bash_compress_flag();
+    }
     if before.formatter != after.formatter || before.checker != after.checker {
         crate::format::clear_tool_cache_for_root(after.project_root.as_deref());
     }

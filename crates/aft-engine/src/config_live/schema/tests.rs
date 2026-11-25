@@ -133,6 +133,9 @@ fn config_settings_cache_dir_is_json_with_one_full_description() {
 fn annotations(node: &Value, path: &str, found: &mut BTreeSet<(String, String)>) {
     for keyword in ["description", "markdownDescription"] {
         if let Some(text) = node.get(keyword).and_then(Value::as_str) {
+            let text = text
+                .strip_suffix(layers::NEXT_SESSION)
+                .map_or(text, str::trim_end);
             found.insert((format!("{path}/{keyword}"), text.to_owned()));
         }
     }
@@ -244,7 +247,52 @@ fn config_settings_optional_fields_remain_absent_and_maps_are_typed() {
     }
     assert!(schema
         .validate_layer(Layer::Project, &json!({"format_on_edit":true}), &context)
-        .is_err());
+        .is_ok());
+}
+
+#[test]
+fn config_settings_layer_policy_golden() {
+    fn walk(node: &Value, path: &str, output: &mut std::collections::BTreeMap<String, String>) {
+        let layers = &node["x-ck-layers"];
+        let rule = match node["x-ck-bound"].as_str() {
+            Some(kind) => format!("{kind} {}", node["x-ck-ordering"]),
+            None if layers == &json!(["user"]) => "user".into(),
+            None => "all".into(),
+        };
+        if rule != "user" {
+            assert_eq!(layers, &json!(["user", "workspace", "project"]), "{path}");
+        }
+        output.insert(path.to_owned(), rule);
+        if let Some(properties) = node["properties"].as_object() {
+            for (name, child) in properties {
+                walk(child, &format!("{path}/{name}"), output);
+            }
+        }
+        for child in [node.get("items"), node.pointer("/patternProperties/^.+$")]
+            .into_iter()
+            .flatten()
+        {
+            walk(child, &format!("{path}/*"), output);
+        }
+    }
+    let mut policy = std::collections::BTreeMap::new();
+    let declaration = settings_declaration();
+    walk(&declaration, "", &mut policy);
+    for (path, rule) in &policy {
+        if let Some(path) = path.strip_prefix("/harnesses/*/") {
+            assert_eq!(policy.get(&format!("/{path}")), Some(rule), "{path}");
+        }
+    }
+    let actual: String = policy
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with("/harnesses/*/"))
+        .map(|(path, rule)| format!("{path}: {rule}\n"))
+        .collect();
+    assert_eq!(
+        actual,
+        include_str!("../../../tests/fixtures/settings_wire/layers.golden")
+    );
+    validated();
 }
 
 #[test]

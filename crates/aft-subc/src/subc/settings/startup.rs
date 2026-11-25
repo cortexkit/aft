@@ -222,7 +222,7 @@ pub(super) async fn drive_first_view(
             tokio::select! {
                 outcome = &mut fetch => match outcome {
                     Ok(session) => {
-                        if changed { session.hint.notify_one(); }
+                        if changed { session.notify_user_changed(); }
                         return Ok(Ok(session));
                     }
                     Err(error) => { log::warn!("settings startup waiting: {error}"); reason = error; break; }

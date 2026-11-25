@@ -79,11 +79,13 @@ impl PreparedBindConfig {
         };
         let mut project_path = cortexkit_project_config_path(root);
         let mut project = None;
-        for candidate in super::project_config_candidates(root, Some(harness)) {
-            if let (Some(file), _) = cache.observe(&candidate, Some(root_key))? {
-                project_path = candidate;
-                project = Some(file);
-                break;
+        if approved_user.is_none() {
+            for candidate in super::project_config_candidates(root, Some(harness)) {
+                if let (Some(file), _) = cache.observe(&candidate, Some(root_key))? {
+                    project_path = candidate;
+                    project = Some(file);
+                    break;
+                }
             }
         }
         let files = user.iter().chain(&project).map(|file| &file.parsed);
@@ -146,6 +148,8 @@ impl PreparedBindConfig {
             sources.owns_user_watch = false;
             sources.user.path = None;
             sources.user.from_file = false;
+            sources.project.path = None;
+            sources.project.from_file = false;
         }
         sources
     }

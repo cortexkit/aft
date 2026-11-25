@@ -2466,13 +2466,34 @@ pub fn handle_cache_recovery(
     handle_configure_prepared(req, ctx, Some(prepared))
 }
 
+/// Reconcile the existing session's artifact lifecycle without changing its
+/// bind-time settings or restarting its route.
+pub(crate) fn apply_managed_indexes(ctx: &AppContext, settings: &crate::subc_config::ApprovedUser) {
+    let Some((request, generation)) = ctx.retained_configure_request() else {
+        return;
+    };
+    let Some(indexes) = crate::config_live::managed_index_update(ctx, settings) else {
+        return;
+    };
+    if ctx.connect_generation() != generation || ctx.subc_unbound_quiesced() {
+        return;
+    }
+    let published = ctx.config_unpinned();
+    let response = configure_prepared(&request, ctx, Some(&published), Some(indexes));
+    if response.success {
+        crate::data_layer::runtime::rebind_configured(ctx);
+    } else {
+        log::warn!("could not reconcile the project's managed indexes");
+    }
+}
+
 fn handle_configure_prepared(
     req: &RawRequest,
     ctx: &AppContext,
     prepared: Option<&Config>,
 ) -> Response {
     register_runtime_hooks();
-    let response = configure_prepared(req, ctx, prepared);
+    let response = configure_prepared(req, ctx, prepared, None);
     if response.success {
         // The rebind's rescan runs in the configure tail, after this reply;
         // marking it now keeps a query sent at once from answering without it.
@@ -2481,7 +2502,12 @@ fn handle_configure_prepared(
     response
 }
 
-fn configure_prepared(req: &RawRequest, ctx: &AppContext, prepared: Option<&Config>) -> Response {
+fn configure_prepared(
+    req: &RawRequest,
+    ctx: &AppContext,
+    prepared: Option<&Config>,
+    managed_indexes: Option<crate::config::IndexesConfig>,
+) -> Response {
     // The configuration active before a connect, kept only to recognise a
     // refused connect that left it in place.
     let active_before = prepared.is_none().then(|| ctx.config_unpinned());
@@ -2494,7 +2520,7 @@ fn configure_prepared(req: &RawRequest, ctx: &AppContext, prepared: Option<&Conf
     // overrides, and follows installs the file watcher may not report, so the
     // memoized TypeScript server choices are recomputed.
     crate::lsp::typescript_project::clear_typescript_selection();
-    let response = handle_configure_inner(req, ctx, prepared);
+    let response = handle_configure_inner(req, ctx, prepared, managed_indexes);
     crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.
@@ -2516,6 +2542,7 @@ fn handle_configure_inner(
     req: &RawRequest,
     ctx: &AppContext,
     prepared: Option<&Config>,
+    managed_indexes: Option<crate::config::IndexesConfig>,
 ) -> Response {
     let prefix_started_at = Instant::now();
     if let Some(cancelled) = configure_cancelled(&req.id) {
@@ -2585,6 +2612,10 @@ fn handle_configure_inner(
     let previous_canonical_cache_root = ctx.canonical_cache_root_opt();
     wait_on_configure_semantic_snapshot_gate_for_test(&req.id);
     let mut next_config = previous_config.as_ref().clone();
+    let reconciling_indexes = managed_indexes.is_some();
+    if let Some(indexes) = managed_indexes {
+        next_config.indexes = indexes;
+    }
     next_config.project_root = Some(root_path.clone());
     next_config.harness = Some(harness.clone());
 
@@ -3724,7 +3755,8 @@ fn handle_configure_inner(
     // On a normal project this finishes in <1 s and pushes a
     // `ConfigureWarningsFrame` for the plugin to surface; on a huge directory
     // it may take seconds-to-minutes, but configure itself returns now.
-    let warnings_pending = !root_too_broad && ctx.progress_sender_handle().is_some();
+    let warnings_pending =
+        !reconciling_indexes && !root_too_broad && ctx.progress_sender_handle().is_some();
     if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
         let session_id_for_bg = log_ctx::current_session();
