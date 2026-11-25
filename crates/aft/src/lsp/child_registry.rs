@@ -270,7 +270,13 @@ impl LspChildRegistry {
             // PID. The registry mutex is never held across the eventual reap.
             self.signal_client(process, true);
         }
-        process.reap(child)
+        let status = process.reap(child)?;
+        if status.is_some() {
+            // Keep the entry through the final group signal, but not past
+            // the owner's confirmed wait.
+            self.finish_client(process);
+        }
+        Ok(status)
     }
 
     /// Forget a PID (called when the client is dropped or shut down gracefully).

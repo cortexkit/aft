@@ -3418,7 +3418,9 @@ mod tests {
         client
             .send_request_with_timeout::<lsp_types::request::Shutdown>((), Duration::from_secs(3))
             .expect("fake server answered shutdown");
-        client.child.wait().expect("fake server exited");
+        client
+            .wait_for_exit(Duration::from_secs(3))
+            .expect("fake server exited");
         let error = LspError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         assert!(client.abort_live_child_after_shutdown_error(error).is_ok());
         assert!(!registry.pids().contains(&pid));
