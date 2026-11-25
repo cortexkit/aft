@@ -6890,10 +6890,10 @@ fn wait_for_completed_rust_check(
         .watch(&directory, notify::RecursiveMode::NonRecursive)
         .map_err(|error| format!("watch {}: {error}", directory.display()))?;
     ready();
-    // Register before reading so the atomic rename cannot fall between the
-    // absence check and the subscription. Events wake us; record contents prove
-    // the expected check, not an older clean record, reached disk.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Watch before reading so the rename can't slip between. Record contents prove
+    // the expected check reached disk; it trails the first error until cargo check
+    // ends, many seconds on loaded CI, so this positive wait is generous.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(record) = completed_rust_check_record(storage, expected_errors) {
             return Ok(record);
