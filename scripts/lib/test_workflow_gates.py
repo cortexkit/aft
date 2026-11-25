@@ -601,6 +601,11 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
         self.assertIn({"uses": "./.github/actions/setup-nextest"}, job["steps"])
         self.assertIn({"name": "Run ignored real-daemon tool-provider tests",
                        "run": "bash scripts/ci-real-daemon-tests.sh"}, job["steps"])
+        upload = next(step for step in job["steps"] if step.get("name") == "Upload real-daemon diagnostics on failure")
+        self.assertEqual(upload["if"], "failure()")
+        self.assertEqual(upload["uses"], "./.github/actions/upload-artifact-retry")
+        self.assertEqual(upload["with"]["path"], "${{ runner.temp }}/aft-real-daemon-diagnostics/")
+        self.assertLessEqual(int(upload["with"]["retention-days"]), 3)
         root = Path(__file__).resolve().parents[2]
         script = (root / "scripts/ci-real-daemon-tests.sh").read_text()
         for required in (
@@ -642,6 +647,66 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
                 self.assertFalse(fixture.exists(), "runner must clean up even after a failure")
                 homes.append(paths[0])
             self.assertNotEqual(*homes)
+
+    @unittest.skipUnless(sys.platform == "linux", "daemon runner uses GNU stat")
+    def test_real_daemon_gate_exports_only_safe_case_diagnostics_on_failure(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        runner = root / "scripts/ci-real-daemon-test-runner.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            case = base / "fake-case"
+            case.write_text(textwrap.dedent('''\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                mkdir -p "$TMPDIR/.tmpfake/logs" "$TMPDIR/.tmpfake/runtime"
+                printf 'cookie-unseen\n' > "$TMPDIR/.tmpfake/runtime/subc-connection.json"
+                {
+                  printf '%s image_deploy_start\n' "$(date +%s%3N)"
+                  printf '%s daemon_connection_published\n' "$(date +%s%3N)"
+                  printf '%s daemon_route_accepted_aft\n' "$(date +%s%3N)"
+                } >> "$AFT_REAL_DAEMON_CASE_DIR/timeline"
+                printf '%s INFO control.rs:10 module=aft code=- reason=- route.open accepted\n' "$(date +%s%3N)" > "$AFT_REAL_DAEMON_CASE_DIR/daemon.log"
+                printf 'unrecognized daemon message cookie-unseen\n' >> "$AFT_REAL_DAEMON_CASE_DIR/daemon.log"
+                stamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+                {
+                  printf '%s [aft-startup] pid=42 phase=nonce_capture_start elapsed_ms=0\n' "$stamp"
+                  printf '%s [aft] INFO subc attach: authenticated to daemon via cookie-unseen\n' "$stamp"
+                  printf '%s [aft] INFO readiness: flipped ready after 10 ms (cookie-unseen)\n' "$stamp"
+                  for ((i=0; i<3000; i++)); do printf '%s oversized module message cookie-unseen\n' "$stamp"; done
+                  printf '%s [aft] WARN cookie-unseen\n' "$stamp"
+                } > "$TMPDIR/.tmpfake/logs/aft.stderr.log"
+                printf "thread 'case' (42) panicked at crates/aft/tests/tool_provider_subc_e2e.rs:1:2:\\nmodule_warming live=false cookie-unseen\\n" >&2
+                exit "$FIXTURE_EXIT"
+                '''))
+            cargo = base / "cargo"
+            cargo.write_text(textwrap.dedent(f'''\
+                #!/usr/bin/env bash
+                if [[ $2 == --version ]]; then echo 'cargo-nextest fixture'; exit 0; fi
+                exec bash {shlex.quote(str(runner))} bash {shlex.quote(str(case))} tool_provider_subc_e2e::fixture_case
+                '''))
+            cargo.chmod(0o755)
+            env = {**os.environ, "PATH": str(base) + os.pathsep + os.environ["PATH"], "RUNNER_TEMP": directory}
+            export = base / "aft-real-daemon-diagnostics"
+            for code in (0, 7):
+                result = subprocess.run(["bash", str(root / "scripts/ci-real-daemon-tests.sh")],
+                                        capture_output=True, text=True, env={**env, "FIXTURE_EXIT": str(code)})
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertNotIn("cookie-unseen", result.stdout + result.stderr)
+                self.assertFalse(list(base.glob("aft-real-daemon.*")), "raw fixture must be removed")
+                if not code:
+                    self.assertFalse(export.exists(), "do not retain reports from passing gates")
+            logs = {file.name: file.read_text() for file in export.glob("*/*/*") if file.is_file()}
+            self.assertEqual(set(logs), {"daemon.log", "modules.log", "test.stderr.log", "timeline.log"})
+            self.assertIn("route.open accepted", logs["daemon.log"])
+            self.assertIn("panic at tool_provider_subc_e2e.rs:1:2", logs["test.stderr.log"])
+            self.assertIn("module_warming", logs["test.stderr.log"])
+            self.assertIn("aft_stderr WARN (details omitted)", logs["modules.log"])
+            for phase in ("test_start", "image_deploy_start", "daemon_connection_published", "aft_authenticated",
+                          "aft_ready", "daemon_route_accepted_aft", "test_exit 7"):
+                self.assertIn(phase, logs["timeline.log"])
+            for log in logs.values():
+                self.assertNotIn("cookie-unseen", log)
+                self.assertLessEqual(len(log.encode()), 128 * 1024)
 
     @unittest.skipUnless(sys.platform == "linux", "daemon runner uses GNU stat")
     def test_real_daemon_gate_rejects_insecure_ancestors_before_running_tests(self) -> None:

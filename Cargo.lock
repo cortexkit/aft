@@ -552,6 +552,8 @@ dependencies = [
  "tokenizers",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",

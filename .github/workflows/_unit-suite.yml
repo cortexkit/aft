@@ -411,6 +411,14 @@ jobs:
       - uses: ./.github/actions/setup-nextest
       - name: Run ignored real-daemon tool-provider tests
         run: bash scripts/ci-real-daemon-tests.sh
+      - name: Upload real-daemon diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: real-daemon-diagnostics-linux
+          path: ${{ runner.temp }}/aft-real-daemon-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3
 
   plugin-e2e-linux:
     name: Plugin e2e (${{ matrix.suite }}, Linux)

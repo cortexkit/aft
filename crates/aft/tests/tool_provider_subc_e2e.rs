@@ -31,6 +31,8 @@ use tokio::net::TcpStream;
 
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
+#[path = "helpers/real_daemon_diagnostics.rs"]
+mod diagnostics;
 
 /// An embedded daemon with supervised children, all using fixture-only paths.
 /// Aborting its task drops the supervisor and its kill-on-drop children.
@@ -41,6 +43,8 @@ struct HermeticDaemon {
 
 impl HermeticDaemon {
     async fn start(home: &Path) -> Self {
+        diagnostics::phase("daemon_start");
+        diagnostics::install_daemon_trace();
         let connection_file = home.join("runtime/subc-connection.json");
         let config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file, 0)
             .with_daemon_config_path(home.join("config/cortexkit/subc.jsonc"))
@@ -63,6 +67,7 @@ impl HermeticDaemon {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        diagnostics::phase("daemon_connection_published");
         Self {
             task,
             connection_file,
@@ -99,7 +104,11 @@ impl Drop for HermeticDaemon {
 }
 
 fn hermetic_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let temp = tempfile::tempdir().unwrap();
+    // The CI runner owns cleanup while it retains logs for its failure report.
+    let temp = tempfile::Builder::new()
+        .disable_cleanup(diagnostics::enabled())
+        .tempdir()
+        .unwrap();
     let home = std::fs::canonicalize(temp.path()).unwrap();
     for dir in [
         "runtime",
@@ -124,13 +133,16 @@ fn hermetic_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
         "AFT_STORAGE_DIR": home.join("data/aft"),
         "TMPDIR": home.join("tmp"),
     });
+    diagnostics::phase("image_deploy_start");
+    let image = aft_binary::aft_binary();
+    diagnostics::phase("image_deploy_done");
     std::fs::write(
         home.join("config/cortexkit/subc.jsonc"),
         serde_json::to_vec_pretty(&json!({
             "version": 1,
             "storage": {"backend": "sqlite", "data_home": home.join("data")},
             "modules": {"aft": {
-                "program": aft_binary::aft_binary(),
+                "program": image,
                 "args": [],
                 "enabled": true,
                 "env": module_env,
@@ -437,6 +449,7 @@ async fn wait_for_scope_owner(project: &Path) {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    diagnostics::phase("scope_owner_ready");
 }
 
 async fn open(
