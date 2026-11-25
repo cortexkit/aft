@@ -719,14 +719,6 @@ impl DiagnosticsStore {
             .contains_key(&(server.clone(), file.to_path_buf()))
     }
 
-    pub(super) fn report_for_server_file(
-        &self,
-        server: &ServerKey,
-        file: &Path,
-    ) -> Option<&DiagnosticEntry> {
-        self.entries.get(&(server.clone(), file.to_path_buf()))
-    }
-
     /// True if this exact server instance has a non-stale report for this file.
     /// `(file, resultId)` of every current (not stale) report from `server`
     /// that carries a result id: what a workspace pull sends back as
