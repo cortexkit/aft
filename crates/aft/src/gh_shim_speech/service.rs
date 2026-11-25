@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use subc_protocol::scope::ScopeStamp;
 use subc_protocol::session::ModuleControlResponseToModule;
+use tokio::sync::watch;
 
 use super::model::{Binding, LaunchAuthority, PolicySnapshot};
 use super::scope::{validate_scope_identity, Answer, ValidatedEnd};
@@ -190,6 +191,7 @@ pub(crate) struct Service {
     #[cfg(test)]
     test_partners: Mutex<Option<Arc<TestPartners>>>,
     pending_scopes: Mutex<HashSet<ScopeKey>>,
+    committed_scope_ends: watch::Sender<()>,
     pub(crate) admission: Mutex<()>,
     cache: Mutex<HashMap<ScopeKey, Cached>>,
     flights: Mutex<HashMap<ScopeKey, Arc<tokio::sync::Mutex<()>>>>,
@@ -214,6 +216,7 @@ fn new_service(root: PathBuf) -> Arc<Service> {
         #[cfg(test)]
         test_partners: Mutex::new(None),
         pending_scopes: Mutex::new(HashSet::new()),
+        committed_scope_ends: watch::Sender::new(()),
         admission: Mutex::new(()),
         cache: Mutex::new(HashMap::new()),
         flights: Mutex::new(HashMap::new()),
@@ -354,6 +357,10 @@ impl Service {
             .map(|runtime| runtime.generation.clone())
             .unwrap_or_default()
     }
+
+    pub(crate) fn committed_scope_ends(&self) -> watch::Receiver<()> {
+        self.committed_scope_ends.subscribe()
+    }
     pub(crate) fn check_pending(
         &self,
         incarnation: Option<&str>,
@@ -481,6 +488,7 @@ impl Service {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&key);
+            self.committed_scope_ends.send_replace(());
             if self
                 .notified
                 .lock()
@@ -510,6 +518,7 @@ impl Service {
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .remove(&key);
+                        service.committed_scope_ends.send_replace(());
                         if service
                             .notified
                             .lock()

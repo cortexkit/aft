@@ -1138,6 +1138,7 @@ async fn post_captured(
                 )
             },
             durable,
+            service.committed_scope_ends(),
         )
         .await)
     };
