@@ -207,12 +207,11 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.67.0";
+const ANNOUNCEMENT_VERSION = "0.68.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "More precise call graphs for C#, Java and TypeScript, and much less memory for large call-graph builds and refreshes.",
-  "Status and version keep answering while an index builds, and new installs can download ONNX Runtime again.",
-  "New `memory` setting: `lean` uses less memory, and computers with less than 8 GiB pick it automatically.",
-  "Existing call graphs rebuild once after this upgrade; your user config is updated to current setting names, with the old copy kept.",
+  "Background commands stop once their output passes 1 GiB, and a kill always sends its signal, even on a full disk.",
+  "Index status says when indexing is paused for low disk space or waiting for the ONNX Runtime download.",
+  "Idle file watchers no longer wake 20 times a second, and renamed files reuse their stored index data.",
 ];
 
 /**
