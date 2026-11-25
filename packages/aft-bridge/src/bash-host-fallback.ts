@@ -11,6 +11,9 @@ export const BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES = 100 * 1024;
 export const BASH_HOST_FALLBACK_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const BASH_HOST_FALLBACK_REFUSAL = "AFT module connection is down";
 
+/** The bash `description` prompt shared by both plugins and the generated catalog. */
+export const BASH_DESCRIPTION = "In about 5 to 8 words, say why you’re running this command.";
+
 // Agent-visible text, approved by Ufuk; change it only with his approval.
 const BASH_RUNON_MEMORY_DESCRIPTION =
   "On Linux, add `,Ngb` to ask for N GiB of memory, for example `linux,2c,16gb` for a Rust build.";

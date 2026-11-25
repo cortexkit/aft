@@ -65,6 +65,7 @@ export {
   workerWatchStillRunning,
 } from "./bash-hints.js";
 export {
+  BASH_DESCRIPTION,
   BASH_HOST_FALLBACK_BANNER,
   BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES,
   BASH_HOST_FALLBACK_MAX_TIMEOUT_MS,

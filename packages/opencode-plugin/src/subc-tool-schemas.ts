@@ -257,7 +257,15 @@ export function buildSubcToolSchemas(
   // It never carries `runon`: the remote runner runs bash, not PowerShell.
   const powershellSchema = {
     ...bashSchema,
-    properties: { ...bashProperties },
+    properties: {
+      ...bashProperties,
+      description: {
+        ...(bashProperties.description as Record<string, unknown>),
+        description:
+          "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+      },
+    },
+    required: (bashSchema.required as string[]).filter((name) => name !== "description"),
     description:
       "Execute PowerShell commands through AFT's bash task family with UTF-8 output and conservative per-command approval.",
   };

@@ -20,7 +20,7 @@ const VERSIONS: &[(&str, ToolVersion)] = &[
     ("apply_patch", INITIAL),
     ("ast_replace", INITIAL),
     ("ast_search", INITIAL),
-    ("bash", INITIAL),
+    ("bash", ToolVersion::new(2, 0, 0)),
     ("bash_kill", INITIAL),
     ("bash_status", INITIAL),
     ("bash_watch", INITIAL),
