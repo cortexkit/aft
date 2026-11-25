@@ -25,6 +25,36 @@ use crate::parent_search::engine::ChildEngine;
 use crate::parent_search::query::{attach_gaps, Gaps};
 use crate::parent_search::{display_relative, lock, read, Child, ParentSession};
 
+#[cfg(test)]
+#[path = "fan_out_tests.rs"]
+mod fan_out_tests;
+
+fn fan_out_children<T: Sync, U: Sync, R: Send>(
+    children: &[T],
+    checkouts: &[U],
+    run: impl Fn(&T, &U) -> R + Sync,
+) -> Vec<R> {
+    // Child searches hold their engine mutex while using Rayon for file work.
+    // Keep the child jobs off the pool so a Rayon worker waiting for a file
+    // job cannot steal a child search that blocks on the same engine mutex.
+    std::thread::scope(|scope| {
+        let run = &run;
+        let searches = children
+            .iter()
+            .zip(checkouts)
+            .map(|(child, checkout)| scope.spawn(move || run(child, checkout)))
+            .collect::<Vec<_>>();
+        searches
+            .into_iter()
+            .map(|search| {
+                search
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The parent's aft_search
 // ---------------------------------------------------------------------------
@@ -495,12 +525,9 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
         }
         outcomes
     } else {
-        use rayon::prelude::*;
-        children
-            .par_iter()
-            .zip(checkouts.par_iter())
-            .map(|(child, checkout)| run(child, checkout.as_ref(), None, vector.as_ref()).0)
-            .collect::<Vec<_>>()
+        fan_out_children(&children, &checkouts, |child, checkout| {
+            run(child, checkout.as_ref(), None, vector.as_ref()).0
+        })
     };
 
     let mut lists = Vec::new();
