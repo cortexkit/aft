@@ -1954,11 +1954,11 @@ impl Drop for GitRootCommitProbeOverrideGuard {
 }
 
 #[cfg(test)]
-pub(crate) fn git_root_commit_probe_override_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+pub(crate) fn git_root_commit_probe_override_lock_for_test() -> crate::test_env::ProcessEnvLockGuard
+{
+    // Share the reentrant lock used by hermetic_git_env_guard so tests can
+    // protect Git environment settings and probe overrides in either order.
+    crate::test_env::process_env_lock()
 }
 
 #[cfg(test)]
