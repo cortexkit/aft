@@ -301,7 +301,10 @@ pub fn capture_active() -> bool {
 // Keep the session-log filters people set against AFT working across crate boundaries.
 fn canonical_slog_target(target: &str) -> std::borrow::Cow<'_, str> {
     match target.split_once("::") {
-        Some(("aft_base" | "aft_db" | "aft_parse", module)) => format!("aft::{module}").into(),
+        Some((
+            "aft_base" | "aft_db" | "aft_parse" | "aft_engine" | "aft_tools" | "aft_subc",
+            module,
+        )) => format!("aft::{module}").into(),
         _ => target.into(),
     }
 }
@@ -3531,6 +3534,9 @@ pub mod tests {
             ("aft_base::cache_location", "aft::cache_location"),
             ("aft_db::db::write_ledger", "aft::db::write_ledger"),
             ("aft_parse::parser", "aft::parser"),
+            ("aft_engine::lsp::client", "aft::lsp::client"),
+            ("aft_tools::commands::grep", "aft::commands::grep"),
+            ("aft_subc::subc::scope_watch", "aft::subc::scope_watch"),
             ("aft::subc", "aft::subc"),
             ("aft_db_probe::db", "aft_db_probe::db"),
         ] {
