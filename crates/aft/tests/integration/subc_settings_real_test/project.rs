@@ -74,14 +74,14 @@ async fn settings_registry_peer() {
         .with_workdir(Some(project.to_string_lossy().into_owned()))
         .with_project_id(Some(ID.into()))
         .with_carriers(vec![ScopeCarrier::new(Principal::Direct)]);
-    let (_, reply) = rpc(
+    let scope_corr = 2;
+    send(
         &mut stream,
+        FrameType::Request,
+        scope_corr,
         json!({"op":"scope.sync","generation":1,"scopes":[scope]}),
     )
     .await;
-    assert_eq!(reply["op"], "scope.sync", "{reply}");
-    assert_ne!(reply["results"][0]["outcome"], "refused", "{reply}");
-    fs::write(fixture.join("registry.ready"), "ready").unwrap();
     while let Some(frame) = subc_transport::read_frame(&mut stream).await.unwrap() {
         if frame.header.ty == FrameType::Goodbye {
             break;
@@ -101,6 +101,18 @@ async fn settings_registry_peer() {
                 .unwrap();
             continue;
         }
+        if matches!(frame.header.ty, FrameType::Response | FrameType::Error)
+            && frame.header.corr == scope_corr
+        {
+            let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(reply["op"], "scope.sync", "{reply}");
+            assert_ne!(reply["results"][0]["outcome"], "refused", "{reply}");
+            fs::write(fixture.join("registry.ready"), "ready").unwrap();
+            continue;
+        }
+        if frame.header.ty != FrameType::Request {
+            continue;
+        }
         let input: Value = serde_json::from_slice(&frame.body).unwrap();
         if input["op"] == "health.check" {
             send(
@@ -114,7 +126,19 @@ async fn settings_registry_peer() {
             .await;
             continue;
         }
-        assert_eq!(input["op"], "projects.enumerate", "{input}");
+        if input["op"] != "projects.enumerate" {
+            send(
+                &mut stream,
+                FrameType::Error,
+                frame.header.corr,
+                json!(subc_protocol::ErrorBody::new(
+                    "unsupported_request",
+                    "fixture serves the project registry"
+                )),
+            )
+            .await;
+            continue;
+        }
         let root = json!({"root":project, "remotes":[], "incarnation":{"kind":"token","value":"fixture-checkout"}, "registrationEpoch":null, "identity":"bound", "approval":{"state":"approved","journalSeq":1}, "fileId":file_id(&project)});
         send(&mut stream, FrameType::Response, frame.header.corr, json!({
             "op":"projects.enumerate", "result": {
@@ -170,7 +194,11 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
                     .unwrap()
                     .modules
                     .iter()
-                    .any(|row| row.module_id == "aft" && row.ready)
+                    .filter(|row| {
+                        row.ready && matches!(row.module_id.as_str(), "aft" | "entorhinal")
+                    })
+                    .count()
+                    == 2
             {
                 break;
             }
@@ -249,10 +277,12 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
         fs::write(&project_file, candidate.to_string()).unwrap();
         let (_, reply) = rpc(&mut operator, json!({"op":"config.plan"})).await;
         let reply = reply.to_string();
-        assert!(
-            reply.contains("module_review_refused") && reply.contains(path),
-            "{reply}"
-        );
+        if !reply.contains("module_review_refused") || !reply.contains(path) {
+            let registry = consumer
+                .supervisor_stderr_tail("entorhinal", Some(22), Some(4096))
+                .await;
+            panic!("expected refusal for {path}: {reply}; registry={registry:?}");
+        }
     }
     fs::write(
         &project_file,
