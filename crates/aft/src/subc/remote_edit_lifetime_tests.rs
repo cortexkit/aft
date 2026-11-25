@@ -38,7 +38,7 @@ impl consent::ConsentTransport for Cards {
     }
 }
 
-struct Peer {
+pub(super) struct Peer {
     daemon: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     incoming: mpsc::Receiver<Frame>,
     reader: tokio::task::JoinHandle<()>,
@@ -55,7 +55,7 @@ impl Drop for Peer {
 }
 
 impl Peer {
-    async fn start(mut daemon: tokio::io::DuplexStream) -> Self {
+    pub(super) async fn start(mut daemon: tokio::io::DuplexStream) -> Self {
         hello(
             &mut daemon,
             vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
@@ -99,8 +99,9 @@ impl Peer {
         }
     }
 
-    async fn signal(&mut self, ty: FrameType, channel: u16, corr: u64) {
-        let frame = Frame::build(ty, control_flags(), channel, 1, corr, vec![]).unwrap();
+    pub(super) async fn signal(&mut self, ty: FrameType, channel: u16, corr: u64) {
+        let epoch = u32::from(channel != 0);
+        let frame = Frame::build(ty, control_flags(), channel, epoch, corr, vec![]).unwrap();
         write_frame(&mut self.daemon, &frame).await.unwrap();
     }
 
@@ -182,12 +183,16 @@ impl Peer {
         .unwrap_or_else(|_| panic!("no reply on channel {channel} for correlation {corr}"))
     }
 
-    async fn call(&mut self, channel: u16, corr: u64, body: Value) -> Frame {
+    pub(super) async fn call(&mut self, channel: u16, corr: u64, body: Value) -> Frame {
         self.send(channel, corr, body).await;
         self.receive(channel, corr).await
     }
 
-    async fn saw_probe(&mut self, scope_ref: &str) {
+    pub(super) fn describe_unsynced_once(&mut self, scope_ref: &str) {
+        self.unsynced_once.insert(scope_ref.into());
+    }
+
+    pub(super) async fn saw_probe(&mut self, scope_ref: &str) {
         tokio::time::timeout(Duration::from_secs(15), async {
             while !self.probes.contains(scope_ref) {
                 let frame = self.incoming.recv().await.unwrap();
@@ -818,7 +823,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         allow(card(&mut cards, "read").await);
         assert!(text(&reply(peer.receive(1, 720).await)).contains("original"));
         peer.probes.remove("remote-session");
-        peer.unsynced_once.insert("remote-session".into());
+        peer.describe_unsynced_once("remote-session");
         peer.saw_probe("remote-session").await;
         assert!(text(&reply(peer.call(1, 721, read(721)).await)).contains("original"));
         assert_eq!(
