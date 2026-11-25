@@ -235,10 +235,28 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
         r#"{"bash":{"env":{"SETTINGS_PROJECT":"from_project"}}}"#,
     )
     .unwrap();
-    approve(&mut operator, "config.plan").await;
-    eventually(&daemon, "AFT applies the merged project environment", || async {
-        let body = json!({"name":"bash","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}});
-        let output = consumer.request(&route, serde_json::to_vec(&body).unwrap(), CallOptions::default()).await.ok()?;
-        String::from_utf8_lossy(&output).contains("from_user:from_workspace:from_project").then_some(())
-    }).await;
+    let generation = approve(&mut operator, "config.plan").await;
+    let shown = eventually(&daemon, "project generation activation", || async {
+        let shown = consumer.config_show("aft", Some(ID), None).await.ok()?;
+        (shown.base_generation == generation).then_some(shown)
+    })
+    .await;
+    assert_eq!(
+        shown.effective["bash"]["env"],
+        json!({"SETTINGS_USER":"from_user","SETTINGS_WORKSPACE":"from_workspace","SETTINGS_PROJECT":"from_project"})
+    );
+    let body = json!({"name":"bash","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}});
+    let output = consumer
+        .request(
+            &route,
+            serde_json::to_vec(&body).unwrap(),
+            CallOptions::default(),
+        )
+        .await
+        .unwrap();
+    let output = String::from_utf8_lossy(&output);
+    assert!(
+        output.contains("from_user:from_workspace:from_project"),
+        "{output}"
+    );
 }
