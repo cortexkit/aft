@@ -486,7 +486,10 @@ describe("searchTools", () => {
         text: "ok",
       }));
 
-      await tools.grep.execute({ pattern: "needle", path: "src docs" }, createMockSdkContext(project));
+      await tools.grep.execute(
+        { pattern: "needle", path: "src docs" },
+        createMockSdkContext(project),
+      );
 
       expect(toolCallCalls[0]?.rawArgs.path).toEqual([src, docs]);
     } finally {

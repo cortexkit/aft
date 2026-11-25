@@ -189,11 +189,12 @@ describe.skipIf(process.platform === "win32")("ONNX Runtime resolution order", (
           systemSearchPaths: [],
           download: fakeDownload(downloads),
         });
-      const systemEnabled = () => resolveOnnxRuntime(storageDir, {
-        platformInfo,
-        systemSearchPaths: [systemDir],
-        download: fakeDownload(downloads),
-      });
+      const systemEnabled = () =>
+        resolveOnnxRuntime(storageDir, {
+          platformInfo,
+          systemSearchPaths: [systemDir],
+          download: fakeDownload(downloads),
+        });
       // Both calls start before the first asynchronous cache check completes.
       const [managedRuntime, systemRuntimePath] = await Promise.all(
         managedFirst ? [managed(), systemEnabled()] : [systemEnabled(), managed()].reverse(),
