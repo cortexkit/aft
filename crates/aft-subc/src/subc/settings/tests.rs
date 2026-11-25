@@ -169,6 +169,25 @@ async fn settings_review_classifies_harness_overrides_like_their_root_field() {
     }
 }
 
+#[tokio::test]
+async fn settings_review_records_the_cache_choice_as_one_field() {
+    let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
+    let request = ConfigReviewRequest::new(0, vec![], None);
+    let reply = review::response(&schema, &frame(FrameType::Request, 8, json!(request)))
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+    assert!(reply.refusals.is_empty());
+    let paths: Vec<_> = reply
+        .fields
+        .iter()
+        .filter(|field| field.path.starts_with("/storage/cache_dir"))
+        .map(|field| field.path.as_str())
+        .collect();
+    assert_eq!(paths, ["/storage/cache_dir"]);
+}
+
 fn frame(kind: FrameType, corr: u64, body: Value) -> Frame {
     Frame::build(
         kind,

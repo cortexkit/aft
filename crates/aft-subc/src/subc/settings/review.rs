@@ -121,9 +121,13 @@ fn review(
         .transpose()
         .map_err(|_| invalid_snapshot())?;
     let mut paths = std::collections::BTreeSet::new();
-    leaf_paths(&tuple.effective, "", project_id.is_some(), &mut paths);
+    let opaque_cache = schema
+        .normalized()
+        .pointer("/properties/storage/properties/cache_dir/x-ck-kind")
+        .is_some_and(|kind| kind == "json");
+    leaf_paths(&tuple.effective, "", opaque_cache, &mut paths);
     if let Some(base) = &base {
-        leaf_paths(&base.effective, "", project_id.is_some(), &mut paths);
+        leaf_paths(&base.effective, "", opaque_cache, &mut paths);
     }
     let mut fields = Vec::new();
     for path in paths {
@@ -308,12 +312,11 @@ pub(super) fn source(
 fn leaf_paths(
     value: &Value,
     path: &str,
-    project: bool,
+    opaque_cache: bool,
     paths: &mut std::collections::BTreeSet<String>,
 ) {
-    if project && path == "/storage/cache_dir" {
-        // The daemon records this opaque, user-only setting as one value even
-        // when it is inherited by the project.
+    if opaque_cache && path == "/storage/cache_dir" {
+        // The daemon records the cache choice and its path as one value.
         paths.insert(path.into());
         return;
     }
@@ -324,7 +327,7 @@ fn leaf_paths(
             leaf_paths(
                 value,
                 &format!("{path}/{}", pointer_segment(name)),
-                project,
+                opaque_cache,
                 paths,
             );
         }
