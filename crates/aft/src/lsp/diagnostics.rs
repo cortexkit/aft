@@ -142,10 +142,14 @@ pub enum CountReadiness {
 }
 
 impl DiagnosticEntry {
+    pub(super) fn needs_recertification(&self) -> bool {
+        self.stale && self.content_hash.is_none() && self.replaced_certified
+    }
+
     fn count_readiness(&self) -> CountReadiness {
         // For example, gopls sends versionless pushes for closed files. The
         // new report replaces the old one but cannot prove a lower count.
-        if self.stale && self.content_hash.is_none() && self.replaced_certified {
+        if self.needs_recertification() {
             CountReadiness::UncertifiedReplacement
         } else if self.provisional {
             CountReadiness::Provisional
@@ -742,8 +746,15 @@ impl DiagnosticsStore {
     /// this exact file. Pull diagnostics use stale entries as the previous
     /// resultId cache when asking the server whether diagnostics are unchanged.
     pub fn has_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
-        self.entries
-            .contains_key(&(server.clone(), file.to_path_buf()))
+        self.report_for_server_file(server, file).is_some()
+    }
+
+    pub(super) fn report_for_server_file(
+        &self,
+        server: &ServerKey,
+        file: &Path,
+    ) -> Option<&DiagnosticEntry> {
+        self.entries.get(&(server.clone(), file.to_path_buf()))
     }
 
     /// True if this exact server instance has a non-stale report for this file.

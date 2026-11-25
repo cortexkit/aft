@@ -86,6 +86,7 @@ impl Drop for BackgroundDocumentPullPause {
     }
 }
 
+mod background_document_pulls;
 #[path = "manager/document_change.rs"]
 mod document_change;
 #[path = "manager/document_close.rs"]
@@ -101,65 +102,7 @@ mod watched_overflow;
 mod workspace_pulls;
 use memory::DiagnosticMergeCache;
 
-fn run_background_document_pulls(owner: Weak<parking_lot::Mutex<LspManager>>) {
-    let Some(manager) = owner.upgrade() else {
-        return;
-    };
-    let _worker = DocumentPullWorker(owner);
-    loop {
-        let batch = {
-            let mut manager = manager.lock();
-            if manager.background_pull_pending.is_empty() {
-                return;
-            }
-            std::mem::take(&mut manager.background_pull_pending)
-        };
-        // Finish a batch before taking newly coalesced input, so a continuously
-        // edited file cannot starve other open files in the same manager.
-        let mut batch = batch.into_iter();
-        while let Some((key, file)) = batch.next() {
-            let pull = {
-                let mut manager = manager.lock();
-                if manager.background_pull_pauses > 0 {
-                    manager.background_pull_pending.insert((key, file));
-                    manager.background_pull_pending.extend(batch);
-                    return;
-                }
-                let eligible = manager
-                    .clients
-                    .get(&key)
-                    .is_some_and(|client| client.uses_document_pull(Some(&file)))
-                    && manager
-                        .documents
-                        .get(&key)
-                        .is_some_and(|store| store.is_open(&file));
-                if !eligible {
-                    continue;
-                }
-                match manager.begin_document_pull(
-                    &key,
-                    &file,
-                    Instant::now() + LspManager::PULL_FILE_TIMEOUT,
-                ) {
-                    Ok(pull) => {
-                        manager.background_pull_inflight = true;
-                        pull
-                    }
-                    Err(_) => continue,
-                }
-            };
-            // Reuse scoped/post-edit pulls without holding the manager lock
-            // while a language server analyzes the file.
-            let pull = pull.wait();
-            let mut manager = manager.lock();
-            manager.finish_document_pull(pull);
-            manager.background_pull_inflight = false;
-            for waiter in std::mem::take(&mut manager.background_pull_idle_waiters) {
-                let _ = waiter.send(());
-            }
-        }
-    }
-}
+use background_document_pulls::{run_background_document_pulls, ClosedDocumentPulls};
 
 /// Leads the failure reason for TypeScript files that neither an installed
 /// typescript nor a declared typescript dependency covers.
@@ -1084,6 +1027,7 @@ pub struct LspManager {
     retired_events_dropped: u64,
     background_pull_owner: Weak<parking_lot::Mutex<LspManager>>,
     background_pull_pending: HashSet<(ServerKey, PathBuf)>,
+    closed_document_pulls: ClosedDocumentPulls,
     background_pull_running: bool,
     background_pull_inflight: bool,
     background_pull_pauses: usize,
@@ -1443,6 +1387,7 @@ impl LspManager {
             startup_owner: Weak::new(),
             background_pull_owner: Weak::new(),
             background_pull_pending: HashSet::new(),
+            closed_document_pulls: ClosedDocumentPulls::default(),
             background_pull_running: false,
             background_pull_inflight: false,
             background_pull_pauses: 0,
@@ -1553,8 +1498,9 @@ impl LspManager {
 
     fn start_background_document_pull_worker(&mut self) {
         if self.background_pull_running
-            || self.background_pull_pending.is_empty()
+            || (self.background_pull_pending.is_empty() && self.closed_document_pulls.is_empty())
             || self.background_pull_pauses > 0
+            || self.is_quiesced()
         {
             return;
         }
@@ -5381,6 +5327,9 @@ impl LspManager {
             None => self.capacity_slots.clear(),
         }
         let keep = |server: &ServerKey| key.is_some_and(|key| key != server);
+        self.closed_document_pulls.retain_servers(keep);
+        self.background_pull_pending
+            .retain(|(server, _)| keep(server));
         self.inspect_rust_checks.retain(|server, _| keep(server));
         self.server_binaries.retain(|server, _| keep(server));
         self.documents.retain(|server, _| keep(server));
@@ -6460,6 +6409,9 @@ impl LspManager {
         );
         let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
+        if self.discard_duplicate_closed_push(&key, &file, &stored, Instant::now()) {
+            return None;
+        }
         let from_receive_order = version.is_none();
         let proven_version =
             version.or_else(|| self.version_for_unversioned_push(&key, &file, receive_order));
@@ -6569,7 +6521,7 @@ impl LspManager {
                 }
             }
         }
-        self.queue_background_document_pull(&key, &file);
+        self.queue_publish_document_pull(&key, &file);
         if let Some(reason) = self.live_publish_drop_reason(&key, &file) {
             slog_info!(
                 "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=uncertified-because-{} file={} version={}",

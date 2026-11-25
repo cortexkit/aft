@@ -1043,6 +1043,7 @@ pub struct LspClient {
     pending: Arc<Mutex<PendingMap>>,
     /// Last outbound request or document open/change/save, not server-pushed traffic.
     last_used_at: Instant,
+    diagnostic_input_generation: u64,
     /// Next request ID counter.
     next_id: AtomicI64,
     /// Diagnostic capabilities reported by the server in its initialize response.
@@ -1492,6 +1493,7 @@ impl LspClient {
             writer,
             pending,
             last_used_at: Instant::now(),
+            diagnostic_input_generation: 0,
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             diagnostic_registrations,
@@ -2535,6 +2537,16 @@ impl LspClient {
         self.ensure_can_send()?;
         let params = serde_json::to_value(params)?;
         let notification = Notification::new(N::METHOD, (!params.is_null()).then_some(params));
+        if matches!(
+            N::METHOD,
+            "textDocument/didOpen"
+                | "textDocument/didChange"
+                | "textDocument/didSave"
+                | "textDocument/didClose"
+                | "workspace/didChangeWatchedFiles"
+        ) {
+            self.note_diagnostic_input();
+        }
         let order = self
             .writer
             .send_ordered(serde_json::to_string(&notification)?)?;
@@ -2561,6 +2573,15 @@ impl LspClient {
 
     pub(crate) fn last_used_at(&self) -> Instant {
         self.last_used_at
+    }
+
+    pub(super) fn diagnostic_input_generation(&self) -> u64 {
+        self.diagnostic_input_generation
+    }
+
+    fn note_diagnostic_input(&mut self) {
+        // Count before sending: a write that times out can still reach the server.
+        self.diagnostic_input_generation = self.diagnostic_input_generation.wrapping_add(1);
     }
 
     pub(crate) fn has_pending_requests(&self) -> bool {
@@ -2599,6 +2620,7 @@ impl LspClient {
     ) -> Result<u64, LspError> {
         self.ensure_can_send()?;
         let json = full_did_change_message(uri, version, text)?;
+        self.note_diagnostic_input();
         let order = self.writer.send_ordered(json)?;
         // A document change is use: it keeps this server from the per-server
         // idle stop, like every other didOpen/didChange/didSave sender.
@@ -2619,6 +2641,7 @@ impl LspClient {
     ) -> Result<(), LspError> {
         self.ensure_can_send()?;
         let json = did_save_message(uri, text)?;
+        self.note_diagnostic_input();
         self.send_serialized_notification(&json)
     }
 
