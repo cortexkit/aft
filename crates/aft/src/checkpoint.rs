@@ -2800,7 +2800,14 @@ mod tests {
         assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
         fs::write(&path, "edited").unwrap();
         store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
-        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
+        let events = crate::durability::take();
+        // Sync the restored source temp file and, on Unix, its parent
+        // directory after the rename. Restore does not sync checkpoint storage.
+        assert_eq!(
+            crate::durability::sync_count(&events),
+            if cfg!(unix) { 2 } else { 1 },
+            "{events:?}"
+        );
         assert_eq!(fs::read_to_string(path).unwrap(), "original");
     }
 

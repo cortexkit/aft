@@ -7933,7 +7933,7 @@ mod tests {
 
     #[test]
     fn durability_undo_count_and_file_before_metadata() {
-        let (mut store, _storage, _project, path) = durability_store();
+        let (mut store, _storage, project, path) = durability_store();
         for text in ["original", "edited"] {
             fs::write(&path, text).unwrap();
             store.snapshot("durability", &path, "edit").unwrap();
@@ -7942,20 +7942,38 @@ mod tests {
         take();
         store.restore_latest("durability", &path).unwrap();
         let events = take();
+        // Sync the source temp file and the temp file for meta.json. On Unix,
+        // also sync the source and backup directories after their renames.
         assert_eq!(
             sync_count(&events),
-            if cfg!(unix) { 3 } else { 2 },
+            if cfg!(unix) { 4 } else { 2 },
             "{events:?}"
         );
         let restored = events
             .iter()
-            .position(|e| *e == (EventKind::FileSync, path.clone()))
-            .expect("restored user file must be synced");
+            .position(|(kind, path)| {
+                *kind == EventKind::FileSync
+                    && path.parent() == Some(project.path())
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".aft-source-"))
+            })
+            .expect("restored source temp file must be synced");
         let meta = events
             .iter()
             .position(|e| e.0 == EventKind::FileSync && e.1.file_name().unwrap() == "meta.json")
             .unwrap();
         assert!(restored < meta, "{events:?}");
+        #[cfg(unix)]
+        {
+            let parent = events
+                .iter()
+                .position(|(kind, path)| {
+                    *kind == EventKind::DirectorySync && path == project.path()
+                })
+                .expect("restored source parent directory must be synced");
+            assert!(restored < parent && parent < meta, "{events:?}");
+        }
         assert_eq!(fs::read_to_string(path).unwrap(), "edited");
     }
 

@@ -154,6 +154,7 @@ fn atomic_write_source_with(
     restore_mode: Option<u32>,
     mut writer: impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<SourceWriteOutcome> {
+    use crate::durability::{sync_immediately, EventKind};
     use std::fs::{self, OpenOptions};
     use std::io;
     // Follow an existing symlink just as an in-place write would, rather than
@@ -271,7 +272,7 @@ fn atomic_write_source_with(
     }
     drop(write_temp);
     let write_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteSync);
-    aft_store::sync::sync_all(file, &temporary)
+    sync_immediately(file, &temporary, EventKind::FileSync)
         .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
     drop(write_sync);
     cleanup.file.take();
@@ -303,7 +304,7 @@ fn atomic_write_source_with(
     // be reported as a failed edit without implying the original still exists.
     let _dir_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteDirSync);
     if let Ok(directory) = fs::File::open(parent) {
-        let _ = aft_store::sync::sync_all(&directory, parent);
+        let _ = sync_immediately(&directory, parent, EventKind::DirectorySync);
     }
     Ok(SourceWriteOutcome {
         mode: SourceWriteMode::Replaced,
