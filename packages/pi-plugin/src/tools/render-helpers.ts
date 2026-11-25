@@ -6,7 +6,8 @@ import { shortenHomePath as shortenPath } from "@cortexkit/aft-bridge";
 
 export { shortenPath };
 
-import { type AgentToolResult, renderDiff, type Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, Theme } from "@earendil-works/pi-coding-agent";
+import * as piHost from "@earendil-works/pi-coding-agent";
 import { Spacer } from "@earendil-works/pi-tui/dist/components/spacer.js";
 import { Text } from "@earendil-works/pi-tui/dist/components/text.js";
 import { type Component, Container } from "@earendil-works/pi-tui/dist/tui.js";
@@ -285,12 +286,32 @@ export function formatUnifiedDiffForPi(unifiedDiff: string): string {
   );
 }
 
-export function renderUnifiedDiff(unifiedDiff: string): string {
-  const piDiff = formatUnifiedDiffForPi(unifiedDiff);
-  if (!piDiff) return "";
-  try {
-    return normalizeTerminalText(renderDiff(piDiff));
-  } catch {
-    return normalizeTerminalText(piDiff);
+export function renderNumberedDiff(diff: string, theme: Theme): string {
+  // oh-my-pi's compatibility module no longer exports renderDiff. A namespace
+  // import lets Pi use its native renderer without requiring that export on both hosts.
+  if (typeof piHost.renderDiff === "function") {
+    try {
+      return normalizeTerminalText(piHost.renderDiff(diff));
+    } catch {
+      // Pi's theme proxy isn't initialized in non-interactive hosts and tests.
+      return normalizeTerminalText(diff);
+    }
   }
+
+  return normalizeTerminalText(diff)
+    .split("\n")
+    .map((line) => {
+      const tone = line.startsWith("+")
+        ? "toolDiffAdded"
+        : line.startsWith("-")
+          ? "toolDiffRemoved"
+          : "toolDiffContext";
+      return theme.fg(tone, line);
+    })
+    .join("\n");
+}
+
+export function renderUnifiedDiff(unifiedDiff: string, theme: Theme): string {
+  const piDiff = formatUnifiedDiffForPi(unifiedDiff);
+  return piDiff ? renderNumberedDiff(piDiff, theme) : "";
 }

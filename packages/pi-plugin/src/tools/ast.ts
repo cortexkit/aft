@@ -252,7 +252,7 @@ export function buildAstReplaceSections(payload: unknown, theme: Theme): string[
     if (error) {
       lines.push(theme.fg("error", error));
     } else if (diff) {
-      const rendered = renderUnifiedDiff(diff);
+      const rendered = renderUnifiedDiff(diff, theme);
       lines.push(rendered || theme.fg("muted", "No diff available."));
     } else {
       const backupId = asString(fileResult.backup_id);
