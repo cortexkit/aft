@@ -1551,7 +1551,9 @@ mod tests {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
         let home = policy_path(dir.path());
-        let data = home.join(".local/share/cortexkit");
+        // Join one component at a time: the policy builds its paths that way,
+        // and the comparison below is byte-exact, so "/" must not reach Windows.
+        let data = home.join(".local").join("share").join("cortexkit");
         let store = data.join("aft");
         let project = home.join("worktree");
         let external = data.join("other-module");
@@ -1573,9 +1575,9 @@ mod tests {
         let profile = policy.compile_shell(home.clone(), vec![], vec![]).unwrap();
         let expected = [
             data.clone(),
-            home.join(".local/state/cortexkit"),
+            home.join(".local").join("state").join("cortexkit"),
             store,
-            data.join("run/subc-connection.json"),
+            data.join("run").join("subc-connection.json"),
         ];
         let actual: Vec<_> = profile
             .data_policy
