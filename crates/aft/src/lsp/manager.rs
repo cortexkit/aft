@@ -5756,12 +5756,9 @@ impl LspManager {
 
     pub(crate) fn report_content_hash(&self, key: &ServerKey, file: &Path) -> Option<[u8; 32]> {
         self.diagnostics
-            .entries_for_file(file)
-            .into_iter()
-            .find(|(stored, entry)| {
-                *stored == key && self.report_matches_current_content(stored, file, entry)
-            })
-            .and_then(|(_, entry)| entry.content_hash)
+            .report_for_server_file(key, file)
+            .filter(|entry| self.report_matches_current_content(key, file, entry))
+            .and_then(|entry| entry.content_hash)
     }
 
     /// Include stale and empty reports: neither means a changed file is clean.
@@ -6080,11 +6077,8 @@ impl LspManager {
         if client.state() != ServerState::Ready {
             return Some("server-not-ready");
         }
-        let pulled = self
-            .diagnostics
-            .entries_for_file(file)
-            .into_iter()
-            .any(|(stored, entry)| stored == key && entry.from_document_pull && !entry.provisional);
+        let entry = self.diagnostics.report_for_server_file(key, file);
+        let pulled = entry.is_some_and(|entry| entry.from_document_pull && !entry.provisional);
         if (client.uses_analysis_progress()
             && client.analysis_progress_running()
             && !(client.uses_document_pull(Some(file)) && pulled))
@@ -6099,12 +6093,7 @@ impl LspManager {
         else {
             return Some("document-not-open");
         };
-        let Some(entry) = self
-            .diagnostics
-            .entries_for_file(file)
-            .into_iter()
-            .find_map(|(stored_key, entry)| (stored_key == key).then_some(entry))
-        else {
+        let Some(entry) = entry else {
             return Some("report-not-stored");
         };
         if entry.stale {
@@ -6448,17 +6437,12 @@ impl LspManager {
         };
         let diagnostic_count = publish_params.diagnostics.len();
         let version = publish_params.version;
+        let version_label = version.map_or_else(|| "none".to_string(), |value| value.to_string());
         slog_info!(
-            "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=received file={} version={} diagnostics={}",
-            server.id_str(),
-            root.display(),
-            file.display(),
-            version
-                .map(|version| version.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            diagnostic_count
+            "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=received file={} version={version_label} diagnostics={diagnostic_count}",
+            server.id_str(), root.display(), file.display()
         );
-        let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
+        let mut stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
         let from_receive_order = version.is_none();
         let proven_version =
@@ -6472,7 +6456,6 @@ impl LspManager {
         {
             cache.reports.insert(file.clone(), stored.clone());
         }
-        let mut stored = stored;
         if version.is_some() {
             self.versioned_publish_servers.insert(key.clone());
         }
@@ -6530,16 +6513,30 @@ impl LspManager {
                     .remove(&(key.clone(), file.clone()));
             }
         }
+        // A push without content proof must not erase a report for unchanged disk bytes.
+        if self
+            .confirmed_document_hash(&key, &file, proven_version)
+            .is_none()
+            && self
+                .diagnostics
+                .report_for_server_file(&key, &file)
+                .is_some_and(|entry| {
+                    !entry.provisional && self.report_matches_current_content(&key, &file, entry)
+                })
+        {
+            slog_info!(
+                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=skipped-uncertified-push-keeping-current-report file={} version={version_label}",
+                key.kind.id_str(), key.root.display(), file.display()
+            );
+            self.queue_background_document_pull(&key, &file);
+            return None;
+        }
         if let Some(pulled) = self.latest_pull_for_rust.get(&(key.clone(), file.clone())) {
             // A rust-analyzer push in pull mode carries only `cargo check`
             // results; store it together with the pulled diagnostics recorded
             // for the file so storing it does not discard them.
             stored = union_of_diagnostics(pulled.clone(), stored);
         }
-        // Store with the real ServerKey and the published document version
-        // so observation sources can accept only reports that prove which
-        // in-memory document state they describe. The earlier
-        // `publish_with_kind` path silently dropped both facts.
         let provisional = self.clients.get(&key).is_some_and(|client| {
             client.diagnostics_are_provisional()
                 || client.has_analysis_progress()
@@ -6572,14 +6569,11 @@ impl LspManager {
         self.queue_background_document_pull(&key, &file);
         if let Some(reason) = self.live_publish_drop_reason(&key, &file) {
             slog_info!(
-                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=uncertified-because-{} file={} version={}",
+                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=uncertified-because-{} file={} version={version_label}",
                 key.kind.id_str(),
                 key.root.display(),
                 reason,
-                file.display(),
-                version
-                    .map(|version| version.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                file.display()
             );
         }
         Some(file)
