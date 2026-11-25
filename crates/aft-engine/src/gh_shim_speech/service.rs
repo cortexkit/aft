@@ -168,7 +168,7 @@ pub struct Service {
     runtime: Mutex<Option<Runtime>>,
     lease: Mutex<Option<Arc<crate::cache_location::SpeechServingLease>>>,
     lifecycle: Mutex<lifecycle::State>,
-    pending_tasks: Mutex<HashSet<String>>,
+    pending_tasks: Mutex<revocation::PendingTasks>,
     pending_ids: Mutex<HashSet<(String, String)>>,
     #[cfg(any(test, feature = "test-support"))]
     test_partners: Mutex<Option<Arc<TestPartners>>>,
@@ -183,6 +183,7 @@ pub struct Service {
 
 static SERVICES: OnceLock<Mutex<HashMap<PathBuf, Arc<Service>>>> = OnceLock::new();
 pub(crate) mod lifecycle;
+mod revocation;
 
 fn new_service(root: PathBuf) -> Arc<Service> {
     Arc::new(Service {
@@ -191,7 +192,7 @@ fn new_service(root: PathBuf) -> Arc<Service> {
         runtime: Mutex::new(None),
         lease: Mutex::new(None),
         lifecycle: Mutex::new(Default::default()),
-        pending_tasks: Mutex::new(HashSet::new()),
+        pending_tasks: Mutex::new(Default::default()),
         pending_ids: Mutex::new(HashSet::new()),
         #[cfg(any(test, feature = "test-support"))]
         test_partners: Mutex::new(None),
@@ -392,46 +393,6 @@ impl Service {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn revoke(self: &Arc<Self>, incarnation: &str, reason: &str) -> Result<(), Refusal> {
-        let work = self.track_finalization();
-        let _gate = self
-            .admission
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        self.pending_tasks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(incarnation.into());
-        let result = self.store.revoke(incarnation, reason);
-        if result.is_ok() {
-            self.pending_tasks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(incarnation);
-        } else {
-            let service = Arc::clone(self);
-            let inc = incarnation.to_string();
-            let reason = reason.to_string();
-            std::thread::spawn(move || {
-                let _work = work;
-                let mut delay = Duration::from_millis(100);
-                loop {
-                    std::thread::sleep(delay);
-                    if service.store.revoke(&inc, &reason).is_ok() {
-                        service
-                            .pending_tasks
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .remove(&inc);
-                        break;
-                    }
-                    delay = (delay * 2).min(Duration::from_secs(5));
-                }
-            });
-        }
-        result
     }
 
     #[doc(hidden)]
