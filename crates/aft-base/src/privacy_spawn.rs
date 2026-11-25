@@ -545,7 +545,13 @@ mod tests {
     }
     #[test]
     fn real_spawn_is_its_own_responsible_process() {
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        // Run a copy from the temp folder: a self-responsible process launched
+        // from a removable volume (a build folder on an external disk) makes
+        // macOS stop and ask the person for access, which hangs the test.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("responsible-child");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut command = Command::new(&exe);
         command.args([
             "--exact",
             "privacy_spawn::tests::responsible_child",
