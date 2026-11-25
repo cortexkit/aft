@@ -233,6 +233,7 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
     })
     .await;
     let probe = serde_json::to_vec(&json!({"name":"bash","preset":"head","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}})).unwrap();
+    let first_fallback = tokio::sync::OnceCell::new();
     let route = eventually(
         &daemon,
         "scoped route resolves the workspace settings",
@@ -262,6 +263,17 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
                     if String::from_utf8_lossy(&output).contains("from_user:from_workspace:") {
                         return Some(route);
                     }
+                    first_fallback
+                        .get_or_init(|| async {
+                            let aft = consumer
+                                .supervisor_stderr_tail("aft", Some(40), Some(12000))
+                                .await;
+                            eprintln!(
+                                "initial project bind served a fallback: {}; aft={aft:?}",
+                                String::from_utf8_lossy(&output)
+                            );
+                        })
+                        .await;
                     // The registry can still be unavailable when the first route
                     // binds. A subsequent bind retries its user-view fallback.
                     consumer
