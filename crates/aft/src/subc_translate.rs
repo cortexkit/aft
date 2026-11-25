@@ -1032,7 +1032,9 @@ pub fn resolve_path_from_project_root(project_root: &Path, target: &str) -> Path
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        project_root.join(path)
+        // Missing files may never be canonicalized. Build the relative tail
+        // with native separators without resolving its parent components.
+        project_root.join(path.components().collect::<PathBuf>())
     }
 }
 

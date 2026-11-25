@@ -1,6 +1,20 @@
 use super::*;
 use std::{fs, path::Path};
 
+#[test]
+fn tool_relative_missing_path_uses_native_separators() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let expected = root.join(".cortexkit").join("no-such-file.txt");
+    for input in [
+        ".cortexkit/no-such-file.txt",
+        ".cortexkit//no-such-file.txt",
+    ] {
+        let resolved = crate::subc_translate::resolve_path_from_project_root(root, input);
+        assert_eq!(resolved.as_os_str(), expected.as_os_str(), "{input}");
+    }
+}
+
 fn call(root: &Path, name: &str, args: Value) -> ToolCallResult {
     let ctx = AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
