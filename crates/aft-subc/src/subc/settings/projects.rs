@@ -10,6 +10,7 @@ pub(in crate::subc) struct Project {
     pub(in crate::subc) id: String,
     pub(in crate::subc) settings: ApprovedUser,
     schema: Arc<Schema>,
+    registered: AtomicBool,
     // Outermost None means no fetch has finished. Some(None) remembers an
     // unknown project until the daemon supplies a subsequent change hint.
     view: tokio::sync::Mutex<Option<Option<ConfigView>>>,
@@ -26,6 +27,7 @@ impl Projects {
             id: id.into(),
             settings: ApprovedUser::project(user),
             schema: schema.clone(),
+            registered: AtomicBool::new(false),
             view: tokio::sync::Mutex::new(None),
         });
         slots.insert(id.into(), Arc::downgrade(&project));
@@ -38,6 +40,10 @@ impl Projects {
 }
 
 impl Project {
+    pub(in crate::subc) fn registered(&self) -> bool {
+        self.registered.load(Ordering::Acquire)
+    }
+
     pub(super) async fn fetch(
         &self,
         control: &readiness::DaemonControl,
@@ -53,6 +59,7 @@ impl Project {
         let reply: ConfigGetReply = match request(control, &input).await {
             Ok(reply) => reply,
             Err("unknown_project") => {
+                self.registered.store(false, Ordering::Release);
                 self.settings.use_user_view();
                 *current = Some(None);
                 reload_roots(executor, &self.settings).await;
@@ -62,6 +69,7 @@ impl Project {
         };
         let recovery = reply.pending.as_ref().and(reply.active.as_ref()).cloned();
         let next = project_view(reply, Some(&self.id))?;
+        self.registered.store(true, Ordering::Release);
         if current
             .as_ref()
             .and_then(Option::as_ref)
@@ -95,6 +103,9 @@ impl Project {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl Drop for Project {
     fn drop(&mut self) {

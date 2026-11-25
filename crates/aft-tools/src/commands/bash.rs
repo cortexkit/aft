@@ -174,11 +174,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         None
     };
-    // A project's `bash.env` applies only while the project root is trusted at
-    // the time of the call, so trusting or untrusting takes effect on the next
-    // command without a reload.
+    // Only locally read project settings use AFT's trust list. In daemon mode
+    // `bash.env` already comes from the daemon's merged, approved view.
     crate::bash_background::enter_runon_phase("request_environment");
-    let project_trusted = project_env_trusted(ctx);
+    let project_trusted = !ctx.config_live().daemon_managed() && project_env_trusted(ctx);
     let remote_env_plan = if remote_requested {
         crate::commands::bash_remote_env::plan(ctx.config().as_ref())
     } else {

@@ -16,6 +16,24 @@ mod startup;
 mod tests;
 pub(super) use projects::{BindWaits, Project, ProjectBind};
 pub(super) type BindSettings<'a> = (&'a Session, Option<ProjectBind>);
+
+pub(super) fn select_for_bind<'a>(
+    roots: &RootChannels,
+    root: &ProjectRootId,
+    bind: Option<BindSettings<'a>>,
+) -> Result<(Option<&'a ApprovedUser>, Option<Arc<Project>>), (&'static str, &'static str)> {
+    let Some((session, project)) = bind else {
+        return Ok((None, None));
+    };
+    let project = project.transpose().map_err(|reason| {
+        log::warn!("project settings bind refused: {reason}");
+        ("actor_not_ready", "module is warming")
+    })?;
+    let selected = roots
+        .select_project(root, project)
+        .map_err(|reason| ("config_divergence", reason))?;
+    Ok((Some(session.user()), selected))
+}
 pub(super) use startup::{
     initialize_storage, initialize_task_cleanup, legacy_catalog, negotiate, wait_for_first_view,
     LegacySettings,

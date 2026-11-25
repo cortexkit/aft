@@ -89,7 +89,7 @@ impl PreparedBindConfig {
             }
         }
         let files = user.iter().chain(&project).map(|file| &file.parsed);
-        let resolution = resolve_parsed_config_for_harness(
+        let mut resolution = resolve_parsed_config_for_harness(
             files.clone().map(|file| (&file.tier, &file.document)),
             Some(harness),
         );
@@ -98,6 +98,9 @@ impl PreparedBindConfig {
                 code: "config_rejected",
                 detail: format!("configuration rejected: {}", resolution.errors.join(", ")),
             });
+        }
+        if let Some(approved) = approved_user {
+            resolution.config.lsp_user_max_servers = approved.user_lsp_limit();
         }
         let tiers = files.map(|file| file.tier.clone()).collect();
         if let Some(user) = user {
@@ -134,6 +137,9 @@ impl PreparedBindConfig {
     }
     pub fn resolved(&self) -> &crate::config::Config {
         &self.resolved
+    }
+    pub fn daemon_managed(&self) -> bool {
+        self.approved_user.is_some()
     }
     pub fn sources(&self, config: &crate::config::Config) -> crate::config_sources::ConfigSources {
         let mut sources = crate::config_sources::ConfigSources::from_observed_paths(

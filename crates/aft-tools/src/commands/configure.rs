@@ -2693,6 +2693,12 @@ fn handle_configure_inner(
             ),
         );
     }
+    if let Some(snapshot) = bind_config
+        .as_ref()
+        .filter(|snapshot| snapshot.daemon_managed())
+    {
+        next_config.lsp_user_max_servers = snapshot.resolved().lsp_user_max_servers;
+    }
     ctx.begin_configure_ack_step("source_tracking");
     if !recovery {
         let sources = if let Some(snapshot) = bind_config.as_ref() {

@@ -8049,6 +8049,20 @@ async fn handle_control_request(
                         .await;
                     }
                 };
+                if let Some((_, Some(Ok(project)))) = &bind_settings {
+                    if let Err(reason) =
+                        root_channels.select_project(&replacement_root, Some(project.clone()))
+                    {
+                        return send_route_bind_error(
+                            tx,
+                            frame,
+                            "config_divergence",
+                            reason,
+                            metrics,
+                        )
+                        .await;
+                    }
+                }
                 a0.supersede(route_key(route_channel, installed_epoch));
                 teardown_installed_route(
                     legacy_tx,
@@ -8157,26 +8171,14 @@ async fn handle_control_request(
 
             // Gated binds use only the daemon's effective view. Older daemons
             // keep observing local files; neither accepts config text from the caller.
-            let (user_settings, project_view) = bind_settings
-                .map_or((None, None), |(session, project)| {
-                    (Some(session.user()), project)
-                });
-            let project = match project_view {
-                Some(Ok(project)) => Some(project),
-                Some(Err(reason)) => {
-                    log::warn!("project settings bind refused: {reason}");
-                    root_channels.release_if_unbound(&bind_root_id, pending_binds, None);
-                    return send_route_bind_error(
-                        tx,
-                        frame,
-                        "actor_not_ready",
-                        "module is warming",
-                        metrics,
-                    )
-                    .await;
-                }
-                None => None,
-            };
+            let (user_settings, project) =
+                match settings::select_for_bind(root_channels, &bind_root_id, bind_settings) {
+                    Ok(selected) => selected,
+                    Err((code, reason)) => {
+                        root_channels.release_if_unbound(&bind_root_id, pending_binds, None);
+                        return send_route_bind_error(tx, frame, code, reason, metrics).await;
+                    }
+                };
             let approved = project
                 .as_ref()
                 .map(|project| &project.settings)
@@ -8285,11 +8287,7 @@ async fn handle_control_request(
             }
             let configure_session = route_identity.session.clone();
             if let Some(project) = project {
-                root_channels
-                    .projects
-                    .entry(bind_root_id.clone())
-                    .or_default()
-                    .insert(project.id.clone(), project);
+                root_channels.remember_project(&bind_root_id, project);
             }
             let bind_session = configure_session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);

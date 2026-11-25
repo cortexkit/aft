@@ -91,7 +91,6 @@ pub(super) fn next_session(path: &str) -> bool {
             | "bash.background"
             | "bash.detach_on_user_message"
             | "bash.powershell_tool"
-            | "experimental.lsp_ty"
             | "semantic.model"
             | "semantic.timeout_ms"
             | "semantic.max_batch_size"

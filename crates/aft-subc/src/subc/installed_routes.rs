@@ -6,7 +6,7 @@ use crate::subc_config::BindConfigCache;
 pub(super) struct RootChannels {
     pub(super) channels: HashMap<ProjectRootId, HashSet<RouteChannel>>,
     pub(super) config: BindConfigCache,
-    pub(super) projects: HashMap<ProjectRootId, HashMap<String, Arc<settings::Project>>>,
+    projects: HashMap<ProjectRootId, Arc<settings::Project>>,
 }
 
 impl std::ops::Deref for RootChannels {
@@ -18,6 +18,51 @@ impl std::ops::Deref for RootChannels {
 }
 
 impl RootChannels {
+    pub(super) fn select_project(
+        &self,
+        root: &ProjectRootId,
+        incoming: Option<Arc<settings::Project>>,
+    ) -> Result<Option<Arc<settings::Project>>, &'static str> {
+        let current = self.projects.get(root);
+        match (current, incoming.as_ref()) {
+            (Some(current), Some(next))
+                if current.registered() && next.registered() && current.id != next.id =>
+            {
+                log::warn!(
+                    "project settings conflict for {}: bound to {}, requested {}",
+                    root.as_path().display(),
+                    current.id,
+                    next.id
+                );
+                Err("configure failed during route bind")
+            }
+            (_, Some(next)) if next.registered() => Ok(incoming),
+            (Some(current), _) => Ok(Some(current.clone())),
+            _ => Ok(incoming),
+        }
+    }
+
+    pub(super) fn remember_project(
+        &mut self,
+        root: &ProjectRootId,
+        project: Arc<settings::Project>,
+    ) {
+        if self.contains_key(root)
+            && project.registered()
+            && !self
+                .projects
+                .get(root)
+                .is_some_and(|current| current.registered())
+        {
+            log::info!(
+                "project settings upgraded for {}: project {}",
+                root.as_path().display(),
+                project.id
+            );
+        }
+        self.projects.insert(root.clone(), project);
+    }
+
     pub(super) fn clear(&mut self) {
         *self = Self::default();
     }

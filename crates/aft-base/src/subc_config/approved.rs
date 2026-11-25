@@ -41,6 +41,16 @@ impl ApprovedUser {
         }
     }
 
+    pub fn user_lsp_limit(&self) -> Option<usize> {
+        let user = match self.0.as_ref() {
+            Approved::User(_) => self,
+            Approved::Project(_, user) => user,
+        };
+        crate::config_resolve::resolve_config(&[user.snapshot()])
+            .config
+            .lsp_user_max_servers
+    }
+
     pub fn uses(&self, changed: &Self) -> bool {
         Arc::ptr_eq(&self.0, &changed.0)
             || matches!(self.0.as_ref(), Approved::Project(tier, user)

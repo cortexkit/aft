@@ -156,6 +156,13 @@ impl ConfigLiveState {
         self.sources.lock().clone()
     }
 
+    pub(crate) fn daemon_managed(&self) -> bool {
+        self.sources
+            .lock()
+            .as_ref()
+            .is_some_and(|sources| sources.approved_user.is_some())
+    }
+
     pub fn last_outcome(&self) -> Option<ReloadOutcome> {
         self.last_outcome.lock().clone()
     }
@@ -389,13 +396,22 @@ pub fn reload_daemon_settings(
     changed: &crate::subc_config::ApprovedUser,
 ) -> ReloadOutcome {
     let _reload = ctx.config_live().reload_lock.lock();
-    if !ctx
+    let Some(source) = ctx
         .config_live()
         .sources()
         .and_then(|sources| sources.approved_user)
-        .is_some_and(|source| source.uses(changed))
-        || ctx.subc_unbound_quiesced()
-    {
+    else {
+        return ReloadOutcome::NotConfigured;
+    };
+    if ctx.subc_unbound_quiesced() {
+        return ReloadOutcome::NotConfigured;
+    }
+    // A project's cap limits its own language servers, not the shared pool.
+    let user_lsp_limit = source.user_lsp_limit();
+    if ctx.config_unpinned().lsp_user_max_servers != user_lsp_limit {
+        ctx.update_config(|config| config.lsp_user_max_servers = user_lsp_limit);
+    }
+    if !source.uses(changed) {
         return ReloadOutcome::NotConfigured;
     }
     let outcome = reload_config_inner_with(ctx, true);
@@ -537,6 +553,9 @@ fn reload_config_inner_with(ctx: &AppContext, approved_only: bool) -> ReloadOutc
                 format!("configuration rejected: {}", diagnostics.errors.join(", ")),
             );
         }
+        if let Some(settings) = &sources.approved_user {
+            candidate.lsp_user_max_servers = settings.user_lsp_limit();
+        }
         let dropped: Vec<String> = diagnostics
             .dropped
             .iter()
@@ -571,6 +590,13 @@ fn reload_config_inner_with(ctx: &AppContext, approved_only: bool) -> ReloadOutc
             live.next.experimental_bash_compress = candidate.experimental_bash_compress;
             live.applied.push("bash.compress");
             live.deferred.retain(|key| *key != "bash.compress");
+        }
+        if sources.approved_user.is_some()
+            && published.experimental_lsp_ty != candidate.experimental_lsp_ty
+        {
+            live.next.experimental_lsp_ty = candidate.experimental_lsp_ty;
+            live.applied.push("experimental.lsp_ty");
+            live.deferred.retain(|key| *key != "experimental.lsp_ty");
         }
         if live.applied.is_empty() {
             break (live.applied, live.deferred, dropped, held);

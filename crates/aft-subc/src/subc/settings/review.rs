@@ -121,9 +121,9 @@ fn review(
         .transpose()
         .map_err(|_| invalid_snapshot())?;
     let mut paths = std::collections::BTreeSet::new();
-    leaf_paths(&tuple.effective, "", &mut paths);
+    leaf_paths(&tuple.effective, "", project_id.is_some(), &mut paths);
     if let Some(base) = &base {
-        leaf_paths(&base.effective, "", &mut paths);
+        leaf_paths(&base.effective, "", project_id.is_some(), &mut paths);
     }
     let mut fields = Vec::new();
     for path in paths {
@@ -157,6 +157,7 @@ fn review(
             recorded(new_values.pointer(&path)),
             apply,
         );
+        change.project_id.clone_from(&project_id);
         change.old_source = old_source;
         change.new_source = new_source;
         fields.push(change);
@@ -243,13 +244,9 @@ pub(super) fn forbidden_override(value: &Value) -> Option<(String, &'static str)
         let env = value.pointer("/bash/env")?.as_object()?;
         env.keys()
             .find(|name| {
-                let spelling = if cfg!(windows) {
-                    std::borrow::Cow::Owned(name.to_ascii_uppercase())
-                } else {
-                    std::borrow::Cow::Borrowed(name.as_str())
-                };
+                let spelling = name.to_ascii_uppercase();
                 matches!(
-                    spelling.as_ref(),
+                    spelling.as_str(),
                     "PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH" | "BASH_ENV" | "ENV"
                 ) || spelling.starts_with("DYLD_")
             })
@@ -308,12 +305,28 @@ pub(super) fn source(
     }
 }
 
-fn leaf_paths(value: &Value, path: &str, paths: &mut std::collections::BTreeSet<String>) {
+fn leaf_paths(
+    value: &Value,
+    path: &str,
+    project: bool,
+    paths: &mut std::collections::BTreeSet<String>,
+) {
+    if project && path == "/storage/cache_dir" {
+        // The daemon records this opaque, user-only setting as one value even
+        // when it is inherited by the project.
+        paths.insert(path.into());
+        return;
+    }
     if let Some(fields) = value.as_object().filter(|fields| {
         !fields.is_empty() && !(fields.len() == 1 && fields.contains_key("vault_ref"))
     }) {
         for (name, value) in fields {
-            leaf_paths(value, &format!("{path}/{}", pointer_segment(name)), paths);
+            leaf_paths(
+                value,
+                &format!("{path}/{}", pointer_segment(name)),
+                project,
+                paths,
+            );
         }
     } else if !path.is_empty() {
         paths.insert(path.into());

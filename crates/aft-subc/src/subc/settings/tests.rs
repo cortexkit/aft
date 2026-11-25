@@ -568,7 +568,10 @@ async fn settings_review_refuses_the_entire_workspace_or_project_snapshot() {
                 "aft",
                 ConfigLayer::User,
                 "user/aft.jsonc",
-                Some(br#"{"bash":{"env":{"PATH":"user setting"}}}"#.to_vec()),
+                Some(
+                    br#"{"bash":{"env":{"INHERITED":"user setting"},"disclaim_privacy":true}}"#
+                        .to_vec(),
+                ),
             );
             user.project_id = Some("p".into());
             let mut snapshot = ConfigLayerSnapshot::file(
@@ -635,8 +638,26 @@ async fn settings_review_refuses_the_entire_workspace_or_project_snapshot() {
         assert!(body
             .fields
             .iter()
+            .all(|field| field.project_id.as_deref() == Some("p")));
+        assert!(body
+            .fields
+            .iter()
+            .any(|field| field.path == "/storage/cache_dir"));
+        assert!(body
+            .fields
+            .iter()
             .any(|field| field.path == "/bash/env/EXAMPLE"
                 && field.new_source == layer.known_layer().unwrap()));
+        let loosening = review(json!({"harnesses":{"pi":{"bash":{"disclaim_privacy":false}}}}));
+        let reply = review::response(&schema, &loosening)
+            .await
+            .unwrap()
+            .unwrap();
+        let body: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body.refusals[0].paths,
+            ["/harnesses/pi/bash/disclaim_privacy"]
+        );
     }
 }
 
@@ -646,20 +667,23 @@ async fn settings_two_routes_share_the_project_view_and_unknown_falls_back() {
         let (writer, mut written) = mpsc::channel(16);
         let replies = readiness::PendingControlReplies::default();
         let metrics = Arc::new(DispatchPathMetrics::new());
-        let control = readiness::DaemonControl::new(writer, metrics, PROTOCOL_VERSION, vec![], vec![], replies.clone(), 2);
+        let control = Arc::new(readiness::DaemonControl::new(writer.clone(), metrics.clone(), PROTOCOL_VERSION, vec![], vec![], replies.clone(), 2));
         let executor = Arc::new(Executor::new());
-        let user = ApprovedUser::new(validate_user(&json!({"format_on_edit":true})).unwrap());
-        let projects = projects::Projects::default();
+        let user_view = ConfigView::new(3, json!({"format_on_edit":true,"lsp":{"max_servers":6}}), Default::default(), vec![], ConfigStatus::Active);
+        let user = validate_user(&user_view.effective).unwrap();
         let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
-        let first_route = projects.slot("registered", &user, &schema);
-        let second_route = projects.slot("registered", &user, &schema);
-        let missing = projects.slot("unregistered", &user, &schema);
+        let session = Arc::new(Session::new(schema.clone(), user, user_view));
+        session.mark_ready();
+        let projects = &session.projects;
+        let first_route = projects.slot("registered", session.user(), &schema);
+        let second_route = projects.slot("registered", session.user(), &schema);
+        let missing = projects.slot("unregistered", session.user(), &schema);
         let daemon = async {
             for _ in 0..2 {
                 let (corr, get) = next(&mut written).await;
                 let id = get["project_id"].as_str().unwrap();
                 if id == "registered" {
-                    let mut view = ConfigView::new(4, json!({"format_on_edit":false,"harnesses":{"pi":{"revision_reads":false}},"bash":{"env":{"A":"user-or-workspace","B":"project"}}}), Default::default(), vec![], ConfigStatus::Active);
+                    let mut view = ConfigView::new(4, json!({"format_on_edit":false,"harnesses":{"pi":{"revision_reads":false}},"lsp":{"max_servers":2},"bash":{"env":{"A":"user-or-workspace","B":"project"}}}), Default::default(), vec![], ConfigStatus::Active);
                     view.project_id = Some(id.into());
                     assert!(replies.resolve(frame(FrameType::Response, corr, json!(ConfigGetReply::new(Some(view), None)))));
                 } else {
@@ -678,7 +702,31 @@ async fn settings_two_routes_share_the_project_view_and_unknown_falls_back() {
         assert!(!resolved(&first_route.settings).resolved().format_on_edit);
         assert!(!resolved(&second_route.settings).resolved().revision_reads);
         assert_eq!(resolved(&second_route.settings).resolved().bash.env["B"], "project");
+        assert_eq!(resolved(&first_route.settings).resolved().lsp_max_servers, 2);
+        assert_eq!(resolved(&first_route.settings).resolved().lsp_user_max_servers, Some(6));
         assert!(resolved(&missing.settings).resolved().format_on_edit);
+        let watch = tokio::spawn({
+            let session = session.clone();
+            let control = control.clone();
+            async move { session.run(control, executor).await }
+        });
+        let mut change = ConfigChanged::new(5, vec![]);
+        change.project_id = Some("registered".into());
+        assert!(session.intercept(&frame(FrameType::Push, 0, json!(change)), &writer, &metrics).await.unwrap());
+        let (corr, get) = next(&mut written).await;
+        assert_eq!(get["project_id"], "registered");
+        let mut pending = ConfigView::new(5, json!({"format_on_edit":true,"bash":{"env":{"B":"updated"}}}), Default::default(), vec![], ConfigStatus::Pending);
+        pending.project_id = Some("registered".into());
+        pending.attempt = Some(11);
+        assert!(replies.resolve(frame(FrameType::Response, corr, json!(ConfigGetReply::new(None, Some(pending))))));
+        let (corr, applied) = next(&mut written).await;
+        assert_eq!(applied["project_id"], "registered");
+        assert_eq!(applied["result"], "ack");
+        assert_eq!(resolved(&second_route.settings).resolved().bash.env["B"], "updated");
+        assert!(!resolved(&missing.settings).resolved().bash.env.contains_key("B"));
+        assert!(replies.resolve(frame(FrameType::Response, corr, json!(ConfigAppliedReply::new()))));
+        watch.abort();
+        let _ = watch.await;
         drop(first_route);
         assert!(projects.existing("registered").is_some());
         drop(second_route);
