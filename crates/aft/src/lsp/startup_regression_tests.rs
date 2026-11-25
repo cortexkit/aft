@@ -297,6 +297,10 @@ fn closing_project_during_startup_reaps_child_and_never_installs_it() {
         let f = fixture();
         let (spawned_tx, spawned_rx) = unbounded();
         let (resume_tx, resume_rx) = unbounded();
+        let (finished_tx, finished_rx) = unbounded();
+        f.manager.lock().startup_finished_hook = Some(Arc::new(move || {
+            finished_tx.send(()).unwrap();
+        }));
         f.manager.lock().spawned_hook = Some(Arc::new(move |pid| {
             spawned_tx.send(pid).unwrap();
             resume_rx.recv_timeout(WAIT).unwrap();
@@ -313,15 +317,9 @@ fn closing_project_during_startup_reaps_child_and_never_installs_it() {
         }
         resume_tx.send(()).unwrap();
         assert!(signal.cancelled.load(Ordering::SeqCst));
-        assert!(signal.wait_until(Instant::now() + WAIT));
-        // waitpid blocks in the kernel, not a timing loop; the client's reaper
-        // may already have consumed the exit status, which also proves exit.
-        let waited = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
-        assert!(
-            waited == pid as i32
-                || (waited == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-        );
+        // Cancellation wakes callers before the worker has finished. Let the
+        // child owner reap the leader after it has signalled the group.
+        finished_rx.recv_timeout(WAIT).unwrap();
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
