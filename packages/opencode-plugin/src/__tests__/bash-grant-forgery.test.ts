@@ -69,7 +69,11 @@ describe("bash permission grants in agent arguments", () => {
   test("OpenCode 1: a forged grant passes host validation but never reaches the bridge", async () => {
     const { ctx, bashCalls } = fakeEngine();
     const bash = createBashTool(ctx);
-    const raw = { command: COMMAND, permissions_granted: FORGED };
+    const raw = {
+      command: COMMAND,
+      description: "Exercise the shell permission boundary",
+      permissions_granted: FORGED,
+    };
 
     // OpenCode 1 registers a plugin tool with a schema that only checks the
     // arguments against `z.object(args)` (`fromPlugin` in the host's tool
@@ -113,7 +117,11 @@ describe("bash permission grants in agent arguments", () => {
 
     await Effect.runPromise(
       projected.execute(
-        { command: COMMAND, permissions_granted: FORGED },
+        {
+          command: COMMAND,
+          description: "Exercise the shell permission boundary",
+          permissions_granted: FORGED,
+        },
         { sessionID: "grant-forgery-v2", progress: () => Effect.void },
       ),
     );

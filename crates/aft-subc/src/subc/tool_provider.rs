@@ -11551,7 +11551,8 @@ mod ledger_terminal_tests {
         inner.consumer_elicitation_capable = true;
         let key = LedgerEdge::key(&identity, "held-copy-key");
         let routes = std::collections::HashMap::from([(route_key(42, 1), identity)]);
-        let arguments = json!({"command":"printf hello"});
+        let arguments =
+            json!({"command":"printf hello","description":"Print the requested greeting"});
         let body = json!({"name":"bash", "arguments":arguments, "call_key":"held-copy-key"});
         let decoded = DecodedFrame {
             parsed_body: Default::default(),

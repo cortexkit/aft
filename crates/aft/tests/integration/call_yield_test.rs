@@ -539,7 +539,7 @@ fn assert_foreground_bash_handoff(test_name: &'static str, request: Vec<u8>) {
                 100,
                 "bash",
                 key,
-                json!({"command": held_command(&pid_path, &release), "timeout": 60_000, "wait": true}),
+                json!({"description":"Exercise the shell handoff path","command": held_command(&pid_path, &release), "timeout": 60_000, "wait": true}),
             )
             .await;
             let pid = read_pid(&pid_path).await;
@@ -662,7 +662,7 @@ fn assert_bash_watch_handoff(test_name: &'static str, reason: &'static str) {
                 100,
                 "bash",
                 &bash_key,
-                json!({"command": held_command(&pid_path, &release), "timeout": 60_000}),
+                json!({"description":"Exercise the shell handoff path","command": held_command(&pid_path, &release), "timeout": 60_000}),
             )
             .await;
             let pid = read_pid(&pid_path).await;
@@ -832,7 +832,7 @@ fn other_calls_are_not_yieldable_and_finished_calls_are_unknown() {
                 200,
                 "bash",
                 &plain_key,
-                json!({"command": held_command(&pid_path, &release), "timeout": 60_000}),
+                json!({"description":"Exercise the shell handoff path","command": held_command(&pid_path, &release), "timeout": 60_000}),
             )
             .await;
             let pid = read_pid(&pid_path).await;
@@ -876,7 +876,7 @@ fn other_calls_are_not_yieldable_and_finished_calls_are_unknown() {
                 300,
                 "bash",
                 &done_key,
-                json!({"command": "echo done"}),
+                json!({"description":"Exercise the shell handoff path","command": "echo done"}),
             )
             .await;
             let done = inbox
@@ -1002,7 +1002,7 @@ fn runner_restart_holds_worker_bash_and_watch_until_their_real_results() {
             let release = root.join("restart.release");
             let bash_key = unique("restart-bash");
             request(stream, 1, 100, json!({"name":"bash", "preset":"worker", "call_key":bash_key,
-                "arguments":{"command":held_command(&pid_path, &release), "wait":true, "timeout":60000}})).await;
+                "arguments":{"description":"Exercise the shell handoff path","command":held_command(&pid_path, &release), "wait":true, "timeout":60000}})).await;
             let pid = read_pid(&pid_path).await;
             let (_, sent) = yield_reason_until_accepted(
                 stream,

@@ -642,7 +642,7 @@ impl Daemon {
     }
 }
 fn shell(key: Option<&str>, background: bool, seconds: u64) -> Value {
-    let mut call = json!({"name":"bash","preset":"head","arguments":{"command":sleep_command(seconds),"background":background,"timeout":20000}});
+    let mut call = json!({"name":"bash","preset":"head","arguments":{"command":sleep_command(seconds),"description":"Start the scope lifetime probe","background":background,"timeout":20000}});
     if let Some(key) = key {
         call["call_key"] = json!(key);
     }
@@ -912,7 +912,7 @@ async fn first_party_worker_bash_runs_with_default_relaxed_and_reports_unenforce
     daemon.bind(1, 1, "broca", Some(scope), false).await;
     for command in ["echo relaxed-worker-ran", "cat worker-proof.txt"] {
         let reply = daemon
-            .call(1, json!({"name":"bash","preset":"worker","arguments":{"command":command,"compressed":false,"timeout":10000}}))
+            .call(1, json!({"name":"bash","preset":"worker","arguments":{"command":command,"description":"Check the worker shell policy","compressed":false,"timeout":10000}}))
             .await;
         assert_eq!(reply.header.ty, FrameType::Response, "{}", body(&reply));
         let output = body(&reply).to_string();

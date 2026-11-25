@@ -745,7 +745,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         run_owner: None,
     }));
     let mut call = json!({"name":"bash","arguments":{
-        "command":"sleep 30; printf completed", "wait":true, "timeout":120_000
+        "command":"sleep 30; printf completed", "description":"Check the shell wait limit", "wait":true, "timeout":120_000
     }});
     call["preset"] = json!(if worker { "worker" } else { "head" });
     let frame = Frame::build(

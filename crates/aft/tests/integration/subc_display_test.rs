@@ -20,7 +20,7 @@ use super::subc_detach_test::{
 };
 
 const BASH_PIN: &str =
-    "tp1:bash:019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f:3";
+    "tp2:bash:b1b9c46c6f578a6ac0c77a012009ac52df08218edf3bb96814a661a08f185629:2";
 
 async fn respond(stream: &mut TcpStream, request: &Frame, value: Value) {
     send_frame(
@@ -309,7 +309,7 @@ async fn run_display_case(switch: Option<&str>) {
         wait_for_ready_root(&mut stream, project.path()).await;
         let call_key = format!("display-lineage:{index}");
         let response = request(&mut stream, channel, 20 + index as u64, json!({
-            "op":"tool.call", "name":"bash", "arguments":{"command":"printf display-ok","compressed":false},
+            "op":"tool.call", "name":"bash", "arguments":{"command":"printf display-ok","description":"Print the display completion marker","compressed":false},
             "call_key":call_key, "schema_pin":BASH_PIN,
         })).await;
         let body: Value = serde_json::from_slice(&response.body).unwrap();

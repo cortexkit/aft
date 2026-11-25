@@ -360,7 +360,7 @@ async fn scope_watch_daemon_case(binary_env: &str, expect_watch: bool) {
     .unwrap();
     // PTY launches hand back a task id even to a direct consumer, leaving a
     // running task to monitor after the consumer closes its route.
-    let reply = request(&consumer, &route, json!({"name":"bash", "arguments":{"command":"sleep 120", "background":true, "pty":true, "timeout":150000}})).await
+    let reply = request(&consumer, &route, json!({"name":"bash", "arguments":{"command":"sleep 120", "description":"Keep the scoped terminal active", "background":true, "pty":true, "timeout":150000}})).await
         .unwrap_or_else(|error| panic!("background bash request: {error}; fixture logs:\n{}", fixture_logs(&home)));
     let reply: Value = serde_json::from_slice(&reply).unwrap();
     assert_ne!(reply["isError"], true, "bash launch refused: {reply}");

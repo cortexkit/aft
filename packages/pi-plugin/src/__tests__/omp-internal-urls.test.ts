@@ -131,7 +131,12 @@ describe("OMP internal URL hand-back", () => {
   test("bash delegates native cwd and AFT workdir URLs", async () => {
     const s = setup();
     for (const key of ["cwd", "workdir"]) {
-      const params = { command: "pwd", [key]: "skill://sample", timeout: 0.5 };
+      const params = {
+        command: "pwd",
+        description: "Print the current working directory",
+        [key]: "skill://sample",
+        timeout: 0.5,
+      };
       expect(Value.Check(s.tools.get("bash")!.parameters as TSchema, params)).toBe(true);
       await executeTool(s.tools.get("bash")!, params, s.extCtx);
       expect(s.invocations.at(-1)).toBe(params);
@@ -171,9 +176,9 @@ describe("OMP internal URL hand-back", () => {
       ["write", { path: "src/index.ts", content: "text" }],
       ["edit", { path: "src/index.ts", appendContent: "text" }],
       ["grep", { path: "src", pattern: "text" }],
-      ["bash", { command: "curl https://example.com" }],
-      ["bash", { command: "curl http://example.com" }],
-      ["bash", { command: "cat file:///tmp/x" }],
+      ["bash", { command: "curl https://example.com", description: "Read the example HTTPS page" }],
+      ["bash", { command: "curl http://example.com", description: "Read the example HTTP page" }],
+      ["bash", { command: "cat file:///tmp/x", description: "Read the example file URI" }],
     ] as const)
       await executeTool(s.tools.get(name)!, params, s.extCtx);
     expect(s.invocations).toHaveLength(0);
@@ -234,6 +239,7 @@ describe("OMP internal URL hand-back", () => {
     expect(
       Value.Check(s.tools.get("bash")!.parameters as TSchema, {
         command: "pwd",
+        description: "Start the example shell service",
         cwd: "local://",
         timeout: 0.5,
         pty: true,
@@ -268,8 +274,15 @@ describe("OMP internal URL hand-back", () => {
       executeTool(s.tools.get("edit")!, { path: "x", edits: [] }, s.extCtx),
     ).rejects.toThrow();
     await expect(
-      executeTool(s.tools.get("bash")!, { command: "true", timeout: 0.5 }, s.extCtx),
+      executeTool(
+        s.tools.get("bash")!,
+        { command: "true", description: "Check shell timeout argument validation", timeout: 0.5 },
+        s.extCtx,
+      ),
     ).rejects.toThrow();
+    await expect(executeTool(s.tools.get("bash")!, { command: "true" }, s.extCtx)).rejects.toThrow(
+      /invalid AFT filesystem arguments: description/,
+    );
     expect(s.calls).toHaveLength(0);
   });
 
@@ -343,14 +356,29 @@ describe("OMP internal URL hand-back", () => {
     await expect(
       executeTool(
         s.tools.get("bash")!,
-        { command: "pwd", cwd: "src", async: true, name: "service", ready: { port: 3000 } },
+        {
+          command: "pwd",
+          description: "Print the current working directory",
+          cwd: "src",
+          async: true,
+          name: "service",
+          ready: { port: 3000 },
+        },
         s.extCtx,
       ),
     ).rejects.toThrow(/cwd.*async.*name.*ready.*workdir/);
     await expect(
-      executeTool(s.tools.get("bash")!, { command: "pwd", timeout: "0.5" }, s.extCtx),
+      executeTool(
+        s.tools.get("bash")!,
+        { command: "pwd", description: "Print the current working directory", timeout: "0.5" },
+        s.extCtx,
+      ),
     ).rejects.toThrow(/timeout.*integer milliseconds/);
-    await executeTool(s.tools.get("bash")!, { command: "pwd", timeout: "500" }, s.extCtx);
+    await executeTool(
+      s.tools.get("bash")!,
+      { command: "pwd", description: "Print the current working directory", timeout: "500" },
+      s.extCtx,
+    );
     expect(s.calls).toHaveLength(1);
   });
 

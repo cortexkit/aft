@@ -2341,7 +2341,7 @@ async fn exercise_catalog_remote_bash(
         1,
         8,
         serde_json::to_vec(
-            &json!({"name":"bash","preset":"worker","arguments":{"command":command,"runon":"linux"}}),
+            &json!({"name":"bash","preset":"worker","arguments":{"command":command,"description":"Check the remote shell route","runon":"linux"}}),
         )
         .unwrap(),
     )

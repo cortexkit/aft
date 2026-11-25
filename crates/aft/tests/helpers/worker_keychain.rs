@@ -135,7 +135,11 @@ async fn head_shell_throwaway_keychain_remains_readable() {
     let mut jail = Jail::start().await;
     jail.bind_grant_head().await;
     let reply = jail
-        .tool_reply_on_channel(2, "bash", json!({"command":fixture.query()}))
+        .tool_reply_on_channel(
+            2,
+            "bash",
+            json!({"description":"Exercise the shell keychain fixture","command":fixture.query()}),
+        )
         .await;
     assert!(
         reply.to_string().contains(SECRET),

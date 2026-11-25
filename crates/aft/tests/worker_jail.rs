@@ -976,7 +976,12 @@ impl Jail {
     }
 
     async fn submit_held_bash(&mut self, arguments: Value) -> u64 {
-        let warm = self.tool_reply("bash", json!({"command":"true"})).await;
+        let warm = self
+            .tool_reply(
+                "bash",
+                json!({"description":"Exercise the worker shell fixture","command":"true"}),
+            )
+            .await;
         self.assert_bash_completed("worker-session", &warm);
         self.submit_tool("bash", arguments).await
     }
@@ -1060,7 +1065,7 @@ impl Jail {
         self.tool_reply_on_channel(
             2,
             "bash",
-            json!({"command":format!("printf 'HEAD_SHELL_READ\\n'; cat {}", quote(path))}),
+            json!({"description":"Exercise the worker shell fixture","command":format!("printf 'HEAD_SHELL_READ\\n'; cat {}", quote(path))}),
         )
         .await
     }
@@ -1132,7 +1137,7 @@ impl Jail {
 
     /// Run one shell command as the worker and return the reply as text.
     async fn bash(&mut self, command: &str) -> String {
-        self.tool("bash", json!({"command": command, "timeout": 300_000}))
+        self.tool("bash", json!({"description":"Exercise the worker shell fixture","command": command, "timeout": 300_000}))
             .await
     }
 }
@@ -1818,7 +1823,7 @@ for label, extra in [('NO_HOME', {}), ('WRONG_HOME', {'HOME': '/nonexistent'})]:
     print(f'{label}_EXIT={code}', flush=True)
 "#;
     let reply = jail.tool("bash", json!({
-        "command": format!("python3 -B -c {} {}", quote(Path::new(script)), quote(&upstream)),
+        "description":"Exercise the worker shell fixture","command": format!("python3 -B -c {} {}", quote(Path::new(script)), quote(&upstream)),
         "timeout": 20_000,
         "wait": true,
     })).await;
@@ -1964,7 +1969,7 @@ async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_w
                 "{\"value\":\"edited\"}\n"
             );
             let shell = jail.tool_reply_on_channel(channel, "bash", json!({
-                "command": format!("printf '{{\"value\":\"shell\"}}\\n' > {} && printf SETTINGS_WRITTEN", quote(&path)),
+                "description":"Exercise the worker shell fixture","command": format!("printf '{{\"value\":\"shell\"}}\\n' > {} && printf SETTINGS_WRITTEN", quote(&path)),
                 "timeout": 300_000,
             })).await;
             jail.assert_bash_completed(session, &shell);
@@ -2511,7 +2516,7 @@ async fn worker_jail_commits_and_deletes_packed_ref_preserving_config() {
         .tool_reply(
             "bash",
             json!({
-                "command": format!(
+                "description":"Exercise the worker shell fixture","command": format!(
                     "cd {} && git branch -D packed-delete && echo PACKED_DELETE_$((1+1))",
                     quote(&jail.worktree),
                 ),
@@ -2986,7 +2991,7 @@ async fn worker_jail_private_hook_chain_executes_read_only() {
                 quote(&jail.worktree),
             );
             let reply = jail
-                .tool_reply("bash", json!({"command": command, "timeout": 300_000}))
+                .tool_reply("bash", json!({"description":"Exercise the worker shell fixture","command": command, "timeout": 300_000}))
                 .await;
             let result = jail.task_record("worker-session", &reply);
             let output = model_text(&reply);
@@ -3304,7 +3309,7 @@ async fn worker_jail_temp_denies_other_task_directory() {
     // when its scratch is retained for its own session.
     let ready = jail.bash("true").await;
     let first_corr = jail.submit_tool("bash", json!({
-        "command": format!("printf original > \"$TMPDIR/sentinel\" && printf '%s' \"$TMPDIR\" > {}; {}", quote(&recorded), test_gate::gate(&quote(&release), "sleep 0.05")),
+        "description":"Exercise the worker shell fixture","command": format!("printf original > \"$TMPDIR/sentinel\" && printf '%s' \"$TMPDIR\" > {}; {}", quote(&recorded), test_gate::gate(&quote(&release), "sleep 0.05")),
         "timeout": 30_000,
     })).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -3441,7 +3446,12 @@ mod session_output;
 
 async fn session_output_jail() -> (Jail, session_output::SessionOutput) {
     let mut jail = Jail::start().await;
-    let ready = jail.tool_reply("bash", json!({"command": "true"})).await;
+    let ready = jail
+        .tool_reply(
+            "bash",
+            json!({"description":"Exercise the worker shell fixture","command": "true"}),
+        )
+        .await;
     jail.assert_bash_completed("worker-session", &ready);
     let capture = jail
         .task_paths("worker-session", &bash_task_id(&ready))
@@ -3738,7 +3748,7 @@ async fn worker_jail_teardown_kills_sandboxed_shell_groups_during_unwind() {
     let ready = jail.worktree.join("teardown-ready");
     let release = jail.worktree.join("teardown-release");
     jail.submit_held_bash(json!({
-        "command": format!(
+        "description":"Exercise the worker shell fixture","command": format!(
             "printf '%s\\n' \"$TMPDIR\" > {}; {}",
             quote(&ready),
             test_gate::gate(&quote(&release), "sleep .02"),
@@ -3840,7 +3850,7 @@ echo TWO_READS_OK
         metadata_check
     );
     let response = jail
-        .tool_reply("bash", json!({"command":command,"timeout":300_000}))
+        .tool_reply("bash", json!({"description":"Exercise the worker shell fixture","command":command,"timeout":300_000}))
         .await;
     let reply = response.to_string();
     jail.assert_bash_completed("worker-session", &response);
@@ -3895,7 +3905,7 @@ async fn worker_gh_read_log_failed_whole_job_fallback_through_sandboxed_gh() {
         .tool_reply(
             "bash",
             json!({
-                "command":"gh run view 40083893167 --repo cortexkit/aft --log-failed > gh-log-failed.txt",
+                "description":"Exercise the worker shell fixture","command":"gh run view 40083893167 --repo cortexkit/aft --log-failed > gh-log-failed.txt",
                 "timeout":300_000
             }),
         )
@@ -3940,7 +3950,7 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
         quote(&outcome)
     );
     let corr = jail
-        .submit_held_bash(json!({"command":command,"background":true,"timeout":30_000}))
+        .submit_held_bash(json!({"description":"Exercise the worker shell fixture","command":command,"background":true,"timeout":30_000}))
         .await;
     wait_test_file(&ready).await;
     let mut scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
@@ -4090,7 +4100,7 @@ async fn cross_command_broker_isolation(profile: &str) {
     let mut jail = gh_read_jail_with_profile(profile).await;
     let paths = jail.worktree.join("broker-a-paths");
     let finish = jail.worktree.join("broker-a-finish");
-    let corr = jail.submit_held_bash(json!({"command":format!(
+    let corr = jail.submit_held_bash(json!({"description":"Exercise the worker shell fixture","command":format!(
         "printf '%s\\n%s\\n%s\\n' \"$AFT_GH_READ_SOCKET\" \"$AFT_GH_READ_CAPABILITY_FILE\" \"$$\" > {}.tmp && mv {}.tmp {}; {}",
         quote(&paths), quote(&paths), quote(&paths), test_gate::gate(&quote(&finish), "sleep 0.02")),"background":true,"timeout":30_000})).await;
     // The file is renamed into place whole: the test polls for it and must
@@ -4191,7 +4201,7 @@ printf 'ISOLATION_OK\n'
         quote(&alias)
     );
     let output = jail
-        .tool_reply_on_channel(2, "bash", json!({"command":probe,"timeout":30_000}))
+        .tool_reply_on_channel(2, "bash", json!({"description":"Exercise the worker shell fixture","command":probe,"timeout":30_000}))
         .await
         .to_string();
     assert!(output.contains("ISOLATION_OK"), "{output}");
@@ -4216,7 +4226,7 @@ printf 'ISOLATION_OK\n'
     // The launch environment contains only capability-file/socket paths, never
     // the bearer. Cross-command file denial is the Linux isolation boundary.
     let capability = std::fs::read_to_string(parts[1]).unwrap();
-    let inspected = jail.tool_reply_on_channel(2, "bash", json!({"command":format!("ps eww -p {} 2>/dev/null || true; echo ENV_INSPECTION_DONE", parts[2]),"timeout":30_000})).await.to_string();
+    let inspected = jail.tool_reply_on_channel(2, "bash", json!({"description":"Exercise the worker shell fixture","command":format!("ps eww -p {} 2>/dev/null || true; echo ENV_INSPECTION_DONE", parts[2]),"timeout":30_000})).await.to_string();
     assert!(inspected.contains("ENV_INSPECTION_DONE"));
     assert!(
         !inspected.contains(&capability),
@@ -4446,7 +4456,7 @@ PY
             ));
         }
 
-        let corr = jail.submit_held_bash(json!({"command":command,"background":true,"timeout":if mode == "timeout" {5000} else {30_000}})).await;
+        let corr = jail.submit_held_bash(json!({"description":"Exercise the worker shell fixture","command":command,"background":true,"timeout":if mode == "timeout" {5000} else {30_000}})).await;
         let witness = wait_test_file(&ready).await;
         let mut paths = witness.lines();
         let socket = paths.next().expect("published broker socket");
@@ -4545,7 +4555,7 @@ async fn worker_gh_read_t10_cancel_midflight_terminates_reader_without_output() 
     jail.read_holder.lock().unwrap().hold_reads = Some(hold.clone());
     let output = jail.worktree.join("inflight-read-output");
     let ready = jail.worktree.join("inflight-read-ready");
-    let corr = jail.submit_held_bash(json!({"command":format!("printf '%s' \"$TMPDIR\" > {}; gh api repos/cortexkit/aft > {}", quote(&ready), quote(&output)),"background":true,"timeout":30_000})).await;
+    let corr = jail.submit_held_bash(json!({"description":"Exercise the worker shell fixture","command":format!("printf '%s' \"$TMPDIR\" > {}; gh api repos/cortexkit/aft > {}", quote(&ready), quote(&output)),"background":true,"timeout":30_000})).await;
     let temp = wait_test_file(&ready).await;
     let (task, _) = worker_gh_read::observe_task(Path::new(&temp));
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -4589,10 +4599,14 @@ async fn gh_shim_router_host_v1_background_reply_is_terminal_and_model_only() {
     let ready = jail.base.join("v1-ready");
     let release = jail.base.join("v1-release");
     let warm = jail
-        .tool_reply_on_channel(2, "bash", json!({"command":"true"}))
+        .tool_reply_on_channel(
+            2,
+            "bash",
+            json!({"description":"Exercise the worker shell fixture","command":"true"}),
+        )
         .await;
     jail.assert_bash_completed("head-session", &warm);
-    let corr = jail.submit_tool_on_channel(2, "bash", json!({"command":format!("echo ready > {}; {}", quote(&ready), test_gate::gate(&quote(&release), "sleep .02")),"background":true,"timeout":10_000})).await;
+    let corr = jail.submit_tool_on_channel(2, "bash", json!({"description":"Exercise the worker shell fixture","command":format!("echo ready > {}; {}", quote(&ready), test_gate::gate(&quote(&release), "sleep .02")),"background":true,"timeout":10_000})).await;
     wait_test_file(&ready).await;
     let frame = {
         let pending = jail.reply_frame(2, corr);
@@ -4640,7 +4654,7 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     let ready = jail.worktree.join("promotion-ready");
     let release = jail.worktree.join("promotion-release");
     let output = jail.worktree.join("promotion-read");
-    jail.submit_held_bash(json!({"command":format!("gh api repos/cortexkit/aft >/dev/null; printf '%s' \"$TMPDIR\" > {}; {}; gh api repos/cortexkit/aft > {}", quote(&ready), test_gate::gate(&quote(&release), "sleep .02"), quote(&output)),"background":false,"timeout":30_000})).await;
+    jail.submit_held_bash(json!({"description":"Exercise the worker shell fixture","command":format!("gh api repos/cortexkit/aft >/dev/null; printf '%s' \"$TMPDIR\" > {}; {}; gh api repos/cortexkit/aft > {}", quote(&ready), test_gate::gate(&quote(&release), "sleep .02"), quote(&output)),"background":false,"timeout":30_000})).await;
     let temp = wait_test_file(&ready).await;
     let (task, metadata) = worker_gh_read::observe_task(Path::new(&temp));
     assert!(
@@ -4865,7 +4879,7 @@ async fn worker_gh_read_revocation_suppresses_reply_to_surviving_observer() {
     jail.read_holder.lock().unwrap().hold_reads = Some(hold.clone());
     let ready = jail.worktree.join("observer-ready");
     let finish = jail.worktree.join("observer-finish");
-    let corr=jail.submit_held_bash(json!({"command":format!("printf '%s' \"$TMPDIR\" > {}; {}",quote(&ready),test_gate::gate(&quote(&finish), "sleep .02")),"timeout":30_000})).await;
+    let corr=jail.submit_held_bash(json!({"description":"Exercise the worker shell fixture","command":format!("printf '%s' \"$TMPDIR\" > {}; {}",quote(&ready),test_gate::gate(&quote(&finish), "sleep .02")),"timeout":30_000})).await;
     let temp = wait_test_file(&ready).await;
     let socket = Path::new(&temp).with_file_name(format!(
         "{}.gh-read.sock",
