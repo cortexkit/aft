@@ -245,6 +245,7 @@ impl AstGrepLang {
 fn nix_pattern_without_comments(pattern: &str) -> String {
     let bytes = pattern.as_bytes();
     let states = crate::ast_grep_hints::nix_lex_code_states(bytes);
+    let mut guard = crate::ast_grep_hints::NixApostropheGuard::new(bytes);
     let mut out = String::with_capacity(pattern.len());
     let mut i = 0;
     let mut strings: Vec<crate::ast_grep_hints::NixStrFrame> = Vec::new();
@@ -256,7 +257,13 @@ fn nix_pattern_without_comments(pattern: &str) -> String {
             // opening quote and ends after a closing quote or at EOF.
             let start = i;
             while i < bytes.len() && !strings.is_empty() {
-                i += crate::ast_grep_hints::nix_string_step(bytes, i, &mut strings, &states);
+                i += crate::ast_grep_hints::nix_string_step(
+                    bytes,
+                    i,
+                    &mut strings,
+                    &states,
+                    &mut guard,
+                );
             }
             out.push_str(&pattern[start..i]);
             continue;
@@ -280,7 +287,7 @@ fn nix_pattern_without_comments(pattern: &str) -> String {
             continue;
         }
         if b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
-            if crate::ast_grep_hints::nix_apostrophe_continues_identifier(bytes, i, &states) {
+            if guard.continues(bytes, i, &states) {
                 // Apostrophes inside identifiers (`foo''`) are content;
                 // opening a string region here would copy the trailing
                 // comment verbatim and hide the wrapper's closing brace.

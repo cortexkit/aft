@@ -298,6 +298,9 @@ Omit an optional setting instead of using `null`.
   // "nix" has no auto-detection and formats only when set explicitly to "nixfmt")
   // Keys: "typescript", "python", "rust", "go", "nix"
   // Values: "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" | "nixfmt" | "none"
+  // "nixfmt" is accepted only under the "nix" key: it formats Nix files only, so
+  // pairing it with another language is refused at config read (with a warning)
+  // instead of disabling that language's formatter detection.
   "formatter": {
     "typescript": "biome",
     "rust": "rustfmt"
