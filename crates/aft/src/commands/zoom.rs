@@ -135,6 +135,7 @@ struct ZoomEnrichment {
     source: String,
     tree: tree_sitter::Tree,
     calls: Vec<RawCall>,
+    calls_by_name: HashMap<String, Vec<usize>>,
     line_starts: Vec<usize>,
 }
 
@@ -144,6 +145,17 @@ struct RawCall {
     line: u32,
     start_byte: usize,
     end_byte: usize,
+}
+
+fn index_calls_by_name(calls: &[RawCall]) -> HashMap<String, Vec<usize>> {
+    // The preorder walk visits each call before its children and visits siblings
+    // in source order. Equal byte starts therefore keep their original order.
+    debug_assert!(calls.is_sorted_by_key(|call| call.start_byte));
+    let mut by_name = HashMap::<String, Vec<usize>>::new();
+    for (index, call) in calls.iter().enumerate() {
+        by_name.entry(call.name.clone()).or_default().push(index);
+    }
+    by_name
 }
 
 fn zoom_parse_source(
@@ -1762,6 +1774,7 @@ fn zoom_one_symbol_inner(
                 }
             };
             let calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
+            let calls_by_name = index_calls_by_name(&calls);
             let line_starts = zoom_line_starts(&resolved_source);
             let local_names = symbols.iter().map(|symbol| symbol.name.clone()).collect();
             let imported_bindings = imported_call_bindings(&resolved_source, &tree, lang);
@@ -1774,12 +1787,12 @@ fn zoom_one_symbol_inner(
                     source: resolved_source,
                     tree,
                     calls,
+                    calls_by_name,
                     line_starts,
                 },
             );
         }
         let enrichment = &enrichments[resolved_file_path];
-        let all_symbols = &enrichment.symbols;
         let resolved_source = &enrichment.source;
         let line_starts = &enrichment.line_starts;
         let all_file_calls = &enrichment.calls;
@@ -1823,46 +1836,7 @@ fn zoom_one_symbol_inner(
         }
         let calls_out = dedupe_call_refs_by_name(calls_out);
 
-        // Preserve file-call order for each name when attributing nested symbols.
-        let matching_calls: Vec<&RawCall> = all_file_calls
-            .iter()
-            .filter(|call| {
-                #[cfg(test)]
-                ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
-                call.name == target.name
-            })
-            .collect();
-        let mut called_by: Vec<CallRef> = Vec::new();
-        for sym in all_symbols.iter() {
-            if sym.name == target.name && sym.range.start_line == target.range.start_line {
-                continue; // skip self
-            }
-            let sym_byte_start = zoom_line_col_to_byte(
-                &resolved_source,
-                &line_starts,
-                sym.range.start_line,
-                sym.range.start_col,
-            );
-            let sym_byte_end = zoom_line_col_to_byte(
-                &resolved_source,
-                &line_starts,
-                sym.range.end_line,
-                sym.range.end_col,
-            );
-            for call in &matching_calls {
-                #[cfg(test)]
-                ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
-                if call.start_byte >= sym_byte_start && call.end_byte <= sym_byte_end {
-                    called_by.push(CallRef {
-                        name: sym.name.clone(),
-                        line: call.line,
-                        extra_count: 0,
-                    });
-                }
-            }
-        }
-
-        let called_by = dedupe_call_refs_by_name(called_by);
+        let called_by = zoom_called_by(enrichment, target);
 
         (calls_out, called_by, other_calls)
     } else {
@@ -1898,6 +1872,45 @@ fn zoom_one_symbol_inner(
             format!("zoom: failed to serialize response: {err}"),
         ),
     }
+}
+
+fn zoom_called_by(enrichment: &ZoomEnrichment, target: &Symbol) -> Vec<CallRef> {
+    let Some(matching_calls) = enrichment.calls_by_name.get(&target.name) else {
+        return Vec::new();
+    };
+    let byte =
+        |line, col| zoom_line_col_to_byte(&enrichment.source, &enrichment.line_starts, line, col);
+    let call_of = |index: &usize| &enrichment.calls[*index];
+    let mut called_by = Vec::new();
+    for sym in enrichment.symbols.iter() {
+        if sym.name == target.name && sym.range.start_line == target.range.start_line {
+            continue; // skip self
+        }
+        let start = byte(sym.range.start_line, sym.range.start_col);
+        let end = byte(sym.range.end_line, sym.range.end_col);
+        let first = matching_calls.partition_point(|index| {
+            #[cfg(test)]
+            ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
+            call_of(index).start_byte < start
+        });
+        // Each enclosing symbol can own a nested call. Keep symbol order and
+        // visit only that symbol's byte window, in the original call order.
+        for call in matching_calls[first..].iter().map(call_of) {
+            #[cfg(test)]
+            ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
+            if call.start_byte > end {
+                break;
+            }
+            if call.end_byte <= end {
+                called_by.push(CallRef {
+                    name: sym.name.clone(),
+                    line: call.line,
+                    extra_count: 0,
+                });
+            }
+        }
+    }
+    dedupe_call_refs_by_name(called_by)
 }
 
 /// The `callgraph` field of a `callgraph:true` zoom when the callgraph index
@@ -3980,6 +3993,85 @@ import { before, acquireRefreshFileLock, after } from './ops';
             assert_eq!(json["success"], true, "{json}");
             assert_eq!(json["annotations"]["calls_out"], expected, "{name}");
         }
+    }
+
+    #[test]
+    fn zoom_incoming_call_range_index_matches_nested_legacy_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fan_in.ts");
+        let source = format!(
+            "{}{}",
+            "function target(arg?: unknown) { target(); }\n\
+             function outer() {\n\
+               function inner() {\n\
+                 target(target());\n\
+                 target();\n\
+               }\n\
+               target();\n\
+             }\n",
+            (0..512)
+                .map(|i| format!("function fan{i}() {{ target(); }}\n"))
+                .collect::<String>()
+        );
+        std::fs::write(&path, &source).unwrap();
+        let file = path.to_str().unwrap();
+        let req = make_zoom_request_cg("range-index", file, "target");
+        let ctx = make_ctx();
+        let mut enrichments = HashMap::new();
+        ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(0));
+        let actual = zoom_one_symbol(
+            &req,
+            &ctx,
+            &path,
+            file,
+            &source,
+            &source.lines().collect::<Vec<_>>(),
+            "target",
+            0,
+            true,
+            &mut enrichments,
+        );
+        assert!(actual.success, "{:?}", actual.data);
+        let enrichment = &enrichments[&path];
+        let target = enrichment
+            .symbols
+            .iter()
+            .find(|s| s.name == "target")
+            .unwrap();
+        let matching: Vec<_> = enrichment
+            .calls
+            .iter()
+            .filter(|c| c.name == "target")
+            .collect();
+        let mut reference = Vec::new();
+        for sym in enrichment.symbols.iter() {
+            if sym.name == target.name && sym.range.start_line == target.range.start_line {
+                continue;
+            }
+            let start = line_col_to_byte(&source, sym.range.start_line, sym.range.start_col);
+            let end = line_col_to_byte(&source, sym.range.end_line, sym.range.end_col);
+            for call in &matching {
+                if call.start_byte >= start && call.end_byte <= end {
+                    reference.push(CallRef {
+                        name: sym.name.clone(),
+                        line: call.line,
+                        extra_count: 0,
+                    });
+                }
+            }
+        }
+        let reference = dedupe_call_refs_by_name(reference);
+        let nested = |name| reference.iter().find(|call| call.name == name).unwrap();
+        assert_eq!((nested("outer").line, nested("outer").extra_count), (4, 3));
+        assert_eq!((nested("inner").line, nested("inner").extra_count), (4, 2));
+        assert_eq!(reference.len(), 514);
+        assert_eq!(
+            serde_json::to_vec(&actual.data["annotations"]["called_by"]).unwrap(),
+            serde_json::to_vec(&serde_json::to_value(&reference).unwrap()).unwrap(),
+        );
+        let old_work = (enrichment.symbols.len() - 1) * matching.len();
+        let indexed_work = ZOOM_CALL_NAME_COMPARISONS.with(|count| count.get());
+        assert!(indexed_work * 20 < old_work, "{indexed_work} vs {old_work}");
     }
 
     #[test]
