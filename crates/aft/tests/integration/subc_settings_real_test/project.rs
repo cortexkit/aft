@@ -139,7 +139,7 @@ fn configure_fixture(fixture: &Path) {
     let daemon_config = fixture.join("config/cortexkit/subc.jsonc");
     let mut config: Value = serde_json::from_slice(&fs::read(&daemon_config).unwrap()).unwrap();
     config["modules"]["entorhinal"] = json!({
-        "program":registry_bin,"args":["--ignored","--exact",REGISTRY_TEST,"--nocapture"],"enabled":true,
+        "program":registry_bin,"args":["--ignored","--exact","--nocapture",REGISTRY_TEST,"--"],"enabled":true,
         "registration_channel":true,"env":{"AFT_SETTINGS_PROJECT_FIXTURE":fixture}
     });
     fs::write(daemon_config, config.to_string()).unwrap();
