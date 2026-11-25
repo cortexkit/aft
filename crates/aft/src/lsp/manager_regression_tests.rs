@@ -1469,6 +1469,83 @@ fn per_file_pulls_close_temporary_documents_at_each_open_version() {
 }
 
 #[test]
+fn unversioned_closed_push_masks_status_until_a_certified_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(dir.path()).unwrap();
+    let file = root.join("broken.go");
+    std::fs::write(&file, "package main\nvar n int = \"error\"\n").unwrap();
+    let key = ServerKey {
+        kind: ServerKind::Go,
+        root: root.clone(),
+    };
+    let ctx = crate::context::AppContext::new(
+        crate::context::default_language_provider_factory(),
+        Config::default(),
+    );
+    ctx.set_canonical_cache_root(root);
+    ctx.lsp().store_project_applicability(Default::default());
+    let pull = || {
+        let mut manager = ctx.lsp();
+        let version = manager
+            .documents
+            .entry(key.clone())
+            .or_default()
+            .open(file.clone());
+        let report = decode_document_diagnostic_report(json!({"kind":"full", "items":[{
+            "range": {"start":{"line":1,"character":12},"end":{"line":1,"character":19}},
+            "severity": 1, "message": "type error"
+        }]}))
+        .unwrap();
+        assert!(matches!(
+            manager.ingest_document_report(&key, &file, Some(version), None, report),
+            PullFileOutcome::Full {
+                diagnostic_count: 1
+            }
+        ));
+        manager
+            .close_inspect_documents(&file, std::slice::from_ref(&key))
+            .unwrap();
+        assert!(!manager.documents[&key].is_open(&file));
+    };
+    let status = || {
+        let values = ctx.status_bar_count_values();
+        (values.errors, values.warnings, values.diagnostics_reason)
+    };
+    pull();
+    assert_eq!(status(), (Some(1), Some(0), None));
+
+    for message in ["first unverified error", "new unverified error"] {
+        let mut manager = ctx.lsp();
+        manager.handle_publish_diagnostics(
+            key.kind.clone(),
+            key.root.clone(),
+            &json!({
+                "uri": uri_for_path(&file).unwrap(), "diagnostics": [{
+                    "range": {"start":{"line":1,"character":12},"end":{"line":1,"character":19}},
+                    "severity": 1, "message": message
+                }]
+            }),
+        );
+        let entry = manager
+            .diagnostics
+            .report_for_server_file(&key, &file)
+            .unwrap();
+        assert!(entry.stale && entry.version.is_none());
+        assert_eq!(entry.diagnostics[0].message, message);
+        drop(manager);
+        assert_eq!(status(), (None, None, Some("producer_reports_pending")));
+        assert_eq!(
+            status(),
+            (None, None, Some("producer_reports_pending")),
+            "cached counts"
+        );
+    }
+
+    pull();
+    assert_eq!(status(), (Some(1), Some(0), None));
+}
+
+#[test]
 fn owned_pull_ingestion_reuses_diagnostic_and_result_id_allocations() {
     let tmp = tempfile::tempdir().unwrap();
     let key = key(tmp.path());

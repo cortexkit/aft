@@ -8,6 +8,9 @@ use crate::bounded_io::open_content_file;
 // Start above zero so gopls can echo the version without omitting it.
 pub(super) const FIRST_VERSION: i32 = 1;
 
+#[cfg(feature = "test-hooks")]
+pub const FIRST_VERSION_FOR_TEST: i32 = FIRST_VERSION;
+
 /// Per-document state tracked for LSP synchronization.
 ///
 /// We track `mtime`, `size`, and a content hash so we can

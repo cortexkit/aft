@@ -514,8 +514,8 @@ pub struct StatusBarCountValues {
     /// the background walk that decides which language servers apply to the
     /// project has not finished, `applicability_unknown` when no such walk has
     /// recorded a result (it failed or never ran), and
-    /// `producer_reports_pending` when an applicable server has not started,
-    /// is still warming up, or has not reported yet. `None` otherwise.
+    /// `producer_reports_pending` when an applicable server has not provided a
+    /// current report needed for the counts. `None` otherwise.
     pub diagnostics_reason: Option<&'static str>,
     pub diagnostics_gaps: Vec<serde_json::Value>,
 }
@@ -3627,6 +3627,7 @@ impl AppContext {
         &self,
         wait_for_manager: bool,
     ) -> Option<StatusBarCountValues> {
+        use crate::lsp::diagnostics::CountReadiness;
         #[cfg(test)]
         STATUS_COUNT_PROBES.with(|count| count.set(count.get() + 1));
         let todos = self
@@ -3650,13 +3651,13 @@ impl AppContext {
             "applicability_unknown"
         };
         let mask_failed = |mut counts: StatusBarCountValues| {
-            if !authoritative {
-                counts.errors = None;
-                counts.warnings = None;
+            let pending = !authoritative || counts.diagnostics == Some("pending");
+            if pending {
+                (counts.errors, counts.warnings) = (None, None);
             }
             (counts.diagnostics, counts.diagnostics_reason) = if !producer_gaps.is_empty() {
                 (Some("producer_missing"), None)
-            } else if !authoritative {
+            } else if pending {
                 (Some("pending"), Some(pending_reason))
             } else {
                 (None, None)
@@ -3695,21 +3696,22 @@ impl AppContext {
             .counts
             .as_ref()
             .map(|counts| (counts.errors, counts.warnings));
-        let ((current_errors, current_warnings), provisional) =
-            match self.canonical_cache_root_opt() {
-                Some(root) => {
-                    // The cache root is identity-domain (bare-canonical, verbatim on
-                    // Windows) while diagnostics store keys are normalized; normalize a
-                    // comparison-local copy or the starts_with filter drops every diagnostic.
-                    let root = crate::path_identity::normalize_path(&root);
-                    let mut membership = self.tsconfig_membership.lock();
-                    lsp.filtered_error_warning_counts_with_provisional(|file| {
-                        file.starts_with(&root) && !membership.should_skip_diagnostics(file)
-                    })
-                }
-                None => lsp.warm_error_warning_counts_with_provisional(),
-            };
-        let provisional = provisional || lsp.project_analysis_progress_pending();
+        let ((current_errors, current_warnings), readiness) = match self.canonical_cache_root_opt()
+        {
+            Some(root) => {
+                // The cache root is verbatim on Windows, while diagnostic keys
+                // are normalized. Compare against a normalized copy of the root
+                // so the prefix test can find matching diagnostic keys.
+                let root = crate::path_identity::normalize_path(&root);
+                let mut membership = self.tsconfig_membership.lock();
+                lsp.filtered_error_warning_counts_with_readiness(|file| {
+                    file.starts_with(&root) && !membership.should_skip_diagnostics(file)
+                })
+            }
+            None => lsp.warm_error_warning_counts_with_readiness(),
+        };
+        let provisional =
+            readiness == CountReadiness::Provisional || lsp.project_analysis_progress_pending();
         let (errors, warnings) = if provisional {
             // A warming producer or report cannot prove current E/W values. Preserve a prior
             // authoritative pair when available; otherwise omit both categories.
@@ -3725,10 +3727,8 @@ impl AppContext {
             errors,
             warnings,
             todos: todos.todos,
-            disabled_categories: Vec::new(),
-            diagnostics: None,
-            diagnostics_reason: None,
-            diagnostics_gaps: Vec::new(),
+            diagnostics: (readiness == CountReadiness::UncertifiedReplacement).then_some("pending"),
+            ..StatusBarCountValues::default()
         });
 
         *self

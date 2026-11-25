@@ -4292,8 +4292,10 @@ impl LspManager {
         self.diagnostics.error_warning_counts()
     }
 
-    pub fn warm_error_warning_counts_with_provisional(&self) -> ((usize, usize), bool) {
-        self.diagnostics.error_warning_counts_with_provisional()
+    pub fn warm_error_warning_counts_with_readiness(
+        &self,
+    ) -> ((usize, usize), super::diagnostics::CountReadiness) {
+        self.diagnostics.error_warning_counts_with_readiness()
     }
 
     pub fn diagnostics_generation(&self) -> u64 {
@@ -4311,15 +4313,13 @@ impl LspManager {
         self.diagnostics.filtered_error_warning_counts(keep)
     }
 
-    /// Status-bar counts plus whether any kept diagnostics came from a server
-    /// that is still warming. The readiness flag is needed to retain the last
-    /// authoritative E/W values while provisional reports replace old entries.
-    pub fn filtered_error_warning_counts_with_provisional(
+    /// Status-bar counts and readiness for the same set of files.
+    pub fn filtered_error_warning_counts_with_readiness(
         &self,
         keep: impl FnMut(&std::path::Path) -> bool,
-    ) -> ((usize, usize), bool) {
+    ) -> ((usize, usize), super::diagnostics::CountReadiness) {
         self.diagnostics
-            .filtered_error_warning_counts_with_provisional(keep)
+            .filtered_error_warning_counts_with_readiness(keep)
     }
 
     /// Active rust-analyzer instances that have not yet reported quiescence.

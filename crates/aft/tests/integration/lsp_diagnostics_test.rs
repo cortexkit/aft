@@ -3947,6 +3947,8 @@ fn workspace_unchanged_reply_does_not_relabel_an_interleaved_report() {
 
 #[test]
 fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
+    use aft::lsp::document::FIRST_VERSION_FOR_TEST as FIRST_VERSION;
+
     let (_temp, root, files) = rust_workspace_with_files(&["main.rs", "probe.rs"]);
     fs::write(root.join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();
     let python = root.join("main.py");
@@ -3991,7 +3993,7 @@ fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
                 .get(&versions[0].0)
                 .expect("owning store must be captured")
                 .document_version_at_capture,
-            Some(0)
+            Some(FIRST_VERSION)
         );
         before.push(snapshot);
     }
@@ -4026,7 +4028,7 @@ fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
             .next()
             .expect("probe must remain open")
             .document_version_at_capture,
-        Some(1),
+        Some(FIRST_VERSION + 1),
         "the unqueued disk change must prove an overflow resync ran"
     );
     for ((file, _, _), previous) in documents.iter().zip(&before) {
