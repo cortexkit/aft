@@ -40,7 +40,9 @@ import {
   renderDiff,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Spacer } from "@earendil-works/pi-tui/dist/components/spacer.js";
+import { Text } from "@earendil-works/pi-tui/dist/components/text.js";
+import { type Component, Container } from "@earendil-works/pi-tui/dist/tui.js";
 import { type Static, type TObject, Type } from "typebox";
 import { resolveBashConfig, resolveGithubConfig, toolEnabled } from "../config.js";
 import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";

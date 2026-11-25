@@ -16,15 +16,13 @@
 
 import { compressionSavingsPercent } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import { matchesKey, setKittyProtocolActive } from "@earendil-works/pi-tui/dist/keys.js";
+import type { Component, TUI } from "@earendil-works/pi-tui/dist/tui.js";
 import {
-  type Component,
-  matchesKey,
-  setKittyProtocolActive,
-  type TUI,
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
-} from "@earendil-works/pi-tui";
+} from "@earendil-works/pi-tui/dist/utils.js";
 
 import packageJson from "../../package.json";
 import { detectPiHarness } from "../harness.js";

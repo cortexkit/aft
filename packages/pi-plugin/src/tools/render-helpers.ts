@@ -7,7 +7,9 @@ import { shortenHomePath as shortenPath } from "@cortexkit/aft-bridge";
 export { shortenPath };
 
 import { type AgentToolResult, renderDiff, type Theme } from "@earendil-works/pi-coding-agent";
-import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Spacer } from "@earendil-works/pi-tui/dist/components/spacer.js";
+import { Text } from "@earendil-works/pi-tui/dist/components/text.js";
+import { type Component, Container } from "@earendil-works/pi-tui/dist/tui.js";
 
 export interface RenderContextLike<TArgs = unknown> {
   args?: TArgs;
