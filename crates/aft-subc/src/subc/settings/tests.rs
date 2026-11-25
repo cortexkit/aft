@@ -611,7 +611,7 @@ async fn settings_review_refuses_the_entire_workspace_or_project_snapshot() {
         };
         let mut cases = vec![
             (
-                json!({"format_on_edit":false, "search":{"rerank":{"backend":"local"}}}),
+                json!({"format_on_edit":false, "search":{"rerank":{"backend":"onnx"}}}),
                 "/search/rerank/backend".to_string(),
             ),
             (
