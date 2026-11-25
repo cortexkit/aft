@@ -2445,19 +2445,31 @@ fn write_restored_file(
                     message: format!("failed to replace symlink with regular file: {error}"),
                 })?;
             }
-            let write = crate::edit::atomic_write_source(path, bytes).map_err(|error| {
-                AftError::IoError {
-                    path: path.display().to_string(),
-                    message: format!("failed to restore checkpoint file contents: {error}"),
-                }
-            })?;
+            let mode = snapshot
+                .metadata
+                .as_ref()
+                .and_then(checkpoint_mode)
+                .or(snapshot.mode);
+            let write =
+                crate::edit::atomic_write_source_with_mode(path, bytes, mode).map_err(|error| {
+                    AftError::IoError {
+                        path: path.display().to_string(),
+                        message: format!("failed to restore checkpoint file: {error}"),
+                    }
+                })?;
             for warning in write.warnings {
                 crate::slog_warn!("checkpoint restore {}: {warning}", path.display());
             }
-            restore_checkpoint_permissions(path, snapshot).map_err(|error| AftError::IoError {
-                path: path.display().to_string(),
-                message: format!("failed to restore checkpoint file permissions: {error}"),
-            })
+            #[cfg(not(unix))]
+            if let Some(metadata) = &snapshot.metadata {
+                fs::set_permissions(path, metadata.permissions()).map_err(|error| {
+                    AftError::IoError {
+                        path: path.display().to_string(),
+                        message: format!("failed to restore checkpoint file permissions: {error}"),
+                    }
+                })?;
+            }
+            Ok(())
         }
         CheckpointFileKind::Symlink {
             target,
@@ -2473,27 +2485,6 @@ fn write_restored_file(
             })
         }
     }
-}
-
-fn restore_checkpoint_permissions(path: &Path, snapshot: &CheckpointFile) -> io::Result<()> {
-    if let Some(metadata) = &snapshot.metadata {
-        return fs::set_permissions(path, metadata.permissions());
-    }
-    restore_checkpoint_mode(path, snapshot.mode)
-}
-
-#[cfg(unix)]
-fn restore_checkpoint_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(mode) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restore_checkpoint_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
-    Ok(())
 }
 
 fn create_parent_dirs(path: &Path, created_dirs: &mut Vec<PathBuf>) -> Result<(), AftError> {

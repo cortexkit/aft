@@ -56,7 +56,7 @@
     "reason": "Split dead-code analysis by language pending; AFT crate split lane."
   },
   "crates/aft/src/backup.rs": {
-    "lines": 7119,
+    "lines": 7118,
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
   "crates/aft/src/data_layer/checkout.rs": {

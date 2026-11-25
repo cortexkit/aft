@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -31,6 +32,7 @@ use serde_json::{json, Value};
 use super::helpers::{user_config, AftProcess};
 
 const SESSION: &str = "durability-census";
+const EDITED_FILE: &str = "edited.txt";
 const INTERPOSER_SOURCE: &str = include_str!("durability_census_interposer.c");
 /// How long to keep tracing after a response so background threads (database
 /// mirrors, watchdogs, lock release) finish the operation's I/O.
@@ -89,6 +91,7 @@ struct Event {
     kind: String,
     duration_ns: u64,
     bytes: u64,
+    result: i64,
     path: String,
     path2: String,
 }
@@ -106,6 +109,7 @@ fn parse_trace(text: &str) -> Vec<Event> {
                 kind: fields[4].to_string(),
                 duration_ns: fields[5].parse().ok()?,
                 bytes: fields[6].parse().unwrap_or(0),
+                result: fields[7].parse().ok()?,
                 path: fields[8].to_string(),
                 path2: fields[9].to_string(),
             })
@@ -268,21 +272,44 @@ impl Census {
                 self.assert_full_flushes(&events, &roots, label, 2);
                 ("storage: opencode/backups", 4)
             } else if label.starts_with("undo ") {
-                // Include the user-file sync, not just stack metadata. In
-                // full-sync mode, the restored file and meta.json flush the
-                // drive; the undo index and its folder use ordinary fsync.
+                // Atomic restore syncs the replacement file (bytes and mode)
+                // before rename, then its parent directory. Undo also syncs
+                // the backup metadata temp file, its parent, and meta.json.
+                // Full-sync mode flushes the first two and meta.json to the
+                // drive; the other two always use fsync.
                 let in_scope = |event: &Event| {
                     let store = store_of(&event.path, &roots, &self.project);
                     store == "storage: opencode/backups" || store == "project (user files)"
                 };
                 let count = count_syncs(&events, in_scope);
-                assert_eq!(count, 4, "{label}: undo syncs including restored file");
+                assert_eq!(count, 5, "{label}: undo syncs including restored file");
                 let full = events
                     .iter()
                     .filter(|event| in_scope(event) && event.op == "F_FULLFSYNC")
                     .count();
-                let expected_full = if self.macos_full_sync { 2 } else { 0 };
+                let expected_full = if self.macos_full_sync { 3 } else { 0 };
                 assert_eq!(full, expected_full, "{label}: undo full drive flushes");
+                if self.macos_full_sync {
+                    let restored = format!("{}/{EDITED_FILE}", self.project);
+                    let replaced_at = events
+                        .iter()
+                        .position(|event| {
+                            event.op == "rename"
+                                && event.path2.strip_prefix("/private").unwrap_or(&event.path2)
+                                    == restored
+                        })
+                        .expect("undo should rename a temporary file over the target");
+                    let temporary = &events[replaced_at].path;
+                    assert!(
+                        events[..replaced_at].iter().any(|event| {
+                            event.op == "F_FULLFSYNC"
+                                && event.kind == "file"
+                                && event.result == 0
+                                && &event.path == temporary
+                        }),
+                        "{label}: restored bytes should reach the drive before rename"
+                    );
+                }
                 return;
             } else if label.starts_with("checkpoint create") {
                 ("storage: opencode/checkpoints", 8)
@@ -489,8 +516,9 @@ fn run_scenario(trace: bool, verify_counts: bool, macos_full_sync: bool) -> Stri
         )
         .unwrap();
     }
-    let target = project.join("edited.txt");
+    let target = project.join(EDITED_FILE);
     std::fs::write(&target, "original content\n").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let trace_path = scratch.path().join("trace.tsv");
     let library = build_interposer(scratch.path());
@@ -645,12 +673,17 @@ fn run_scenario(trace: bool, verify_counts: bool, macos_full_sync: bool) -> Stri
         );
     }
 
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
     census.mark();
     let (undo, elapsed) = send(
         &mut aft,
         json!({ "id": "census-undo", "session_id": SESSION, "command": "undo", "file": target }),
     );
     assert_eq!(undo["success"], true, "{undo:?}");
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     std::thread::sleep(SETTLE);
     census.record("undo (one step)", elapsed);
 

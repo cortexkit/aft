@@ -112,8 +112,18 @@ pub(crate) fn atomic_write_source(
     path: &Path,
     bytes: &[u8],
 ) -> std::io::Result<SourceWriteOutcome> {
+    atomic_write_source_with_mode(path, bytes, None)
+}
+
+/// Like [`atomic_write_source`], but publish the supplied Unix mode with the
+/// restored bytes. With no mode, keep the ordinary source-write permissions.
+pub(crate) fn atomic_write_source_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    restore_mode: Option<u32>,
+) -> std::io::Result<SourceWriteOutcome> {
     let started = std::time::Instant::now();
-    let result = atomic_write_source_with(path, bytes, |file, bytes| {
+    let result = atomic_write_source_with(path, bytes, restore_mode, |file, bytes| {
         use std::io::Write;
         file.write_all(bytes)
     });
@@ -131,7 +141,7 @@ pub(crate) fn atomic_write_source(
 /// [`crate::backup::latency::take`] afterwards. Not for production callers.
 #[doc(hidden)]
 pub fn write_source_for_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    atomic_write_source_with(path, bytes, |file, bytes| {
+    atomic_write_source_with(path, bytes, None, |file, bytes| {
         use std::io::Write;
         file.write_all(bytes)
     })
@@ -141,6 +151,7 @@ pub fn write_source_for_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> 
 fn atomic_write_source_with(
     path: &Path,
     bytes: &[u8],
+    restore_mode: Option<u32>,
     mut writer: impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<SourceWriteOutcome> {
     use std::fs::{self, OpenOptions};
@@ -167,7 +178,14 @@ fn atomic_write_source_with(
         drop(file);
         warnings.extend(source_recovery::leftover_copy_warnings(&destination));
         if !source_replacement::may_keep_access(&destination, metadata) {
-            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+            return write_source_in_place(
+                &destination,
+                metadata,
+                bytes,
+                &mut writer,
+                warnings,
+                restore_mode,
+            );
         }
     }
     let parent = destination
@@ -191,7 +209,14 @@ fn atomic_write_source_with(
             let Some(metadata) = original.as_ref() else {
                 return Err(error);
             };
-            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+            return write_source_in_place(
+                &destination,
+                metadata,
+                bytes,
+                &mut writer,
+                warnings,
+                restore_mode,
+            );
         }
         Err(error) => return Err(error),
     };
@@ -215,14 +240,34 @@ fn atomic_write_source_with(
         // replacement that cannot match the original costs nothing to abandon.
         if !source_replacement::copy_access(&destination, &temporary, file, metadata) {
             drop(cleanup);
-            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+            return write_source_in_place(
+                &destination,
+                metadata,
+                bytes,
+                &mut writer,
+                warnings,
+                restore_mode,
+            );
         }
     }
     remote_links::check_open(file, &temporary)?;
+    #[cfg(unix)]
+    if let Some(mode) = restore_mode {
+        use std::os::unix::fs::PermissionsExt;
+        // Start with only the permission bits allowed by both modes, so a
+        // more restrictive saved mode also protects the bytes while writing.
+        let current = file.metadata()?.permissions().mode();
+        if current & 0o777 & !mode != 0 {
+            set_source_mode(file, current & mode & 0o7777)?;
+        }
+    }
     writer(file, bytes)?;
-    if let Some(metadata) = original.as_ref() {
-        // Writing can clear set-id bits; restore the exact original mode.
-        file.set_permissions(metadata.permissions())?;
+    // Writing can clear set-id bits; set the mode before syncing.
+    match (restore_mode, original.as_ref()) {
+        #[cfg(unix)]
+        (Some(mode), _) => set_source_mode(file, mode)?,
+        (_, Some(metadata)) => file.set_permissions(metadata.permissions())?,
+        _ => {}
     }
     drop(write_temp);
     let write_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteSync);
@@ -241,7 +286,14 @@ fn atomic_write_source_with(
         }
         drop(cleanup);
         warnings.push("non_atomic_windows_write: atomic replacement is unavailable for this file; saved in place without removing its name. Concurrent readers may see incomplete contents.".to_owned());
-        return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+        return write_source_in_place(
+            &destination,
+            metadata,
+            bytes,
+            &mut writer,
+            warnings,
+            restore_mode,
+        );
     }
     {
         let _rename = crate::backup::latency::time(crate::backup::latency::Part::WriteRename);
@@ -257,6 +309,22 @@ fn atomic_write_source_with(
         mode: SourceWriteMode::Replaced,
         warnings,
     })
+}
+
+#[cfg(unix)]
+fn set_source_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let wanted = mode & 0o7777;
+    if file.metadata()?.permissions().mode() & 0o7777 != wanted {
+        file.set_permissions(std::fs::Permissions::from_mode(wanted))?;
+        if file.metadata()?.permissions().mode() & 0o7777 != wanted {
+            return Err(std::io::Error::other(format!(
+                "restored mode {wanted:o} did not read back"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 32 random hex digits for sibling temporary and recovery file names.
@@ -281,6 +349,7 @@ fn write_source_in_place(
     bytes: &[u8],
     writer: &mut impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
     mut warnings: Vec<String>,
+    restore_mode: Option<u32>,
 ) -> std::io::Result<SourceWriteOutcome> {
     use std::io::{self, Read, Seek, SeekFrom, Write};
     #[cfg(windows)]
@@ -330,21 +399,39 @@ fn write_source_in_place(
         destination: &Path,
         content: &[u8],
         writer: &mut dyn FnMut(&mut std::fs::File, &[u8]) -> io::Result<()>,
+        restore_mode: Option<u32>,
     ) -> io::Result<()> {
         remote_links::check_open(file, destination)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         writer(file, content)?;
+        #[cfg(unix)]
+        if let Some(mode) = restore_mode {
+            set_source_mode(file, mode)?;
+        }
+        #[cfg(not(unix))]
+        let _ = restore_mode;
         aft_store::sync::sync_all(file, destination)
             .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))
     }
-    if let Err(error) = rewrite(&mut file, destination, bytes, writer) {
+    if let Err(error) = rewrite(&mut file, destination, bytes, writer, restore_mode) {
         let Some(saved) = saved.as_deref() else {
             return Err(error);
         };
-        let restored = rewrite(&mut file, destination, saved, &mut |file, content| {
-            file.write_all(content)
+        #[cfg(unix)]
+        let rollback_mode = restore_mode.map(|_| {
+            use std::os::unix::fs::PermissionsExt;
+            original.permissions().mode()
         });
+        #[cfg(not(unix))]
+        let rollback_mode = None;
+        let restored = rewrite(
+            &mut file,
+            destination,
+            saved,
+            &mut |file, content| file.write_all(content),
+            rollback_mode,
+        );
         return match (restored, copy) {
             (Ok(()), copy) => {
                 if let Some(copy) = copy {
@@ -370,7 +457,7 @@ fn write_source_in_place(
         };
     }
     #[cfg(unix)]
-    {
+    if restore_mode.is_none() {
         use std::os::unix::fs::PermissionsExt;
         let wanted = original.permissions().mode() & 0o7777;
         let now = file.metadata()?.permissions().mode() & 0o7777;
@@ -3783,7 +3870,7 @@ mod audit11_regressions {
         let path = dir.path().join("file.txt");
         let original = b"\xef\xbb\xbfexisting\r\n\xfflast";
         std::fs::write(&path, original).unwrap();
-        let result = atomic_write_source_with(&path, b"new\r\n", |file, _| {
+        let result = atomic_write_source_with(&path, b"new\r\n", None, |file, _| {
             use std::io::Write;
             file.write_all(b"partial")?;
             Err(std::io::Error::other("injected write failure"))
@@ -4241,7 +4328,7 @@ mod in_place_write_tests {
         let original = b"\xef\xbb\xbforiginal\r\n\xfflast";
         std::fs::write(&path, original).unwrap();
         std::fs::hard_link(&path, &other_name).unwrap();
-        let result = atomic_write_source_with(&path, b"replacement\n", |file, _| {
+        let result = atomic_write_source_with(&path, b"replacement\n", None, |file, _| {
             use std::io::Write;
             file.write_all(b"partial")?;
             Err(std::io::Error::other("injected write failure"))
@@ -4269,6 +4356,31 @@ mod in_place_write_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"new\r\n");
         assert_eq!(std::fs::read(&other_name).unwrap(), b"new\r\n");
         assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_restore_applies_saved_mode_without_replacing_either_name() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked.txt");
+        let other_name = dir.path().join("other.txt");
+        fs::write(&path, b"changed\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&path, &other_name).unwrap();
+
+        let outcome = atomic_write_source_with_mode(&path, b"original\n", Some(0o400)).unwrap();
+        assert_eq!(outcome.mode, SourceWriteMode::InPlace);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        for name in [path, other_name] {
+            assert_eq!(fs::read(&name).unwrap(), b"original\n");
+            assert_eq!(
+                fs::metadata(&name).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+        }
     }
 
     #[test]
@@ -4509,7 +4621,7 @@ mod in_place_write_tests {
         );
         std::fs::remove_file(&sibling).unwrap();
         let mut seen = None;
-        let outcome = atomic_write_source_with(&path, b"new\n", |file, bytes| {
+        let outcome = atomic_write_source_with(&path, b"new\n", None, |file, bytes| {
             use std::io::Write;
             let temporaries: Vec<String> = recovery_entries(dir.path())
                 .into_iter()
@@ -4554,7 +4666,7 @@ mod in_place_write_tests {
         let before = icacls(&path);
         let mut copy_acl = None;
         let mut copy_path = None;
-        let outcome = atomic_write_source_with(&path, b"new\n", |file, bytes| {
+        let outcome = atomic_write_source_with(&path, b"new\n", None, |file, bytes| {
             use std::io::Write;
             let copies = recovery_entries(dir.path());
             assert_eq!(copies.len(), 1, "{copies:?}");

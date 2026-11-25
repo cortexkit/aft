@@ -6272,10 +6272,8 @@ fn restore_regular_file(
     mode: Option<u32>,
 ) -> std::io::Result<()> {
     refuse_storage_path(path).map_err(std::io::Error::other)?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
     }
     if std::fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
@@ -6283,12 +6281,13 @@ fn restore_regular_file(
     {
         std::fs::remove_file(path)?;
     }
-    for warning in crate::edit::atomic_write_source(path, content_bytes)?.warnings {
+    let write = crate::edit::atomic_write_source_with_mode(path, content_bytes, mode)?;
+    for warning in write.warnings {
         crate::slog_warn!("undo restore {}: {warning}", path.display());
     }
+    #[cfg(not(unix))]
     if mode.is_some() {
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
-        set_file_mode(path, mode)?;
         crate::durability::sync_file(&file, path)?;
     }
     Ok(())

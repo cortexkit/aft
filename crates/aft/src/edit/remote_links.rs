@@ -175,6 +175,7 @@ mod tests {
                 b"blocked",
                 &mut |_, _| panic!("multi-link descriptor reached the source writer"),
                 Vec::new(),
+                None,
             )
         })
         .unwrap_err();
