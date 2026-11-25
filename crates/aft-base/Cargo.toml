@@ -1,6 +1,6 @@
 [package]
 name = "aft-base"
-version = "0.67.0"
+version = "0.68.0"
 edition = "2021"
 rust-version.workspace = true
 license = "MIT"
@@ -19,8 +19,8 @@ test-timing-hooks = []
 secret-test-fake = []
 
 [dependencies]
-aft-store = { path = "../aft-store", version = "0.67.0" }
-secret-rules = { path = "../secret-rules", version = "0.67.0", package = "aft-secret-rules" }
+aft-store = { path = "../aft-store", version = "0.68.0" }
+secret-rules = { path = "../secret-rules", version = "0.68.0", package = "aft-secret-rules" }
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
