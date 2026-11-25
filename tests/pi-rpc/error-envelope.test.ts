@@ -154,10 +154,11 @@ describe("tool error envelopes (real Pi RPC)", () => {
         message: "Read the CortexKit data file.",
         setup: async (env) => {
           // Pi runs with HOME set to the environment's config folder, so
-          // this is `~/.local/share/cortexkit` for the session.
+          // this is `~/.local/share/cortexkit` for the session. File tools may
+          // read ordinary files there, but never a module's database file.
           const store = join(env.configDir, ".local", "share", "cortexkit");
           await mkdir(store, { recursive: true });
-          protectedFile = join(store, "probe.txt");
+          protectedFile = join(store, "probe.db");
           await writeFile(protectedFile, "protected body 9d1a\n");
         },
         toolArguments: () => ({ path: protectedFile }),
