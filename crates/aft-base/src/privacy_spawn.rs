@@ -425,13 +425,22 @@ mod tests {
             assert_eq!(output.status.code(), Some(23));
         });
     }
+    /// Every test that launches this binary as its own responsible process
+    /// must launch this copy instead. Run from a removable volume (a build
+    /// folder on an external disk), such a process makes macOS stop and ask
+    /// the person for access, and the test hangs until someone answers.
+    fn copy_of_test_binary(dir: &std::path::Path) -> std::path::PathBuf {
+        let exe = dir.join("responsible-child");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        exe
+    }
     #[test]
     fn native_pipe_spawn_applies_privacy_before_exec() {
         hook(Some(capture), || {
             let dir = tempfile::tempdir().unwrap();
             let output = std::fs::File::create(dir.path().join("output")).unwrap();
             use std::os::fd::AsRawFd;
-            let mut command = Command::new(std::env::current_exe().unwrap());
+            let mut command = Command::new(copy_of_test_binary(dir.path()));
             command
                 .env_clear()
                 .env("AFT_RESPONSIBILITY_CHILD", "1")
@@ -545,13 +554,8 @@ mod tests {
     }
     #[test]
     fn real_spawn_is_its_own_responsible_process() {
-        // Run a copy from the temp folder: a self-responsible process launched
-        // from a removable volume (a build folder on an external disk) makes
-        // macOS stop and ask the person for access, which hangs the test.
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("responsible-child");
-        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-        let mut command = Command::new(&exe);
+        let mut command = Command::new(copy_of_test_binary(dir.path()));
         command.args([
             "--exact",
             "privacy_spawn::tests::responsible_child",
