@@ -70,6 +70,7 @@ mod durability_census_test;
 // kill primitive and the parked-child protocol are POSIX-only.
 #[cfg(unix)]
 mod edit_append_test;
+mod edit_line_endings_test;
 mod edit_match_test;
 mod edit_test;
 mod effective_path_cache_test;
