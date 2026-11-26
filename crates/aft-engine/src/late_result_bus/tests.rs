@@ -284,6 +284,71 @@ async fn late_result_bus_committed_entry_is_sent_once_with_only_public_fields() 
 }
 
 #[tokio::test]
+async fn late_result_bus_inline_result_is_pullable_but_never_wakes() {
+    let (_dir, conn) = database();
+    let mut live = DeliveryState::default();
+    let mut live_publisher = RecordingPublisher::default();
+    drain(&conn, &mut live, &mut live_publisher).await;
+
+    let inline = key("inline");
+    let settled_at = ledger::now_ms();
+    admit(&conn, &inline, "reserved:broca");
+    ledger::settle(&conn, &inline, &frame(), "ok", None, settled_at).unwrap();
+    live.hint();
+    drain(&conn, &mut live, &mut live_publisher).await;
+
+    // Settle a later row far enough ahead that the live scan's overlap window
+    // cannot see the inline row. Only startup replay can find it.
+    let boundary = key("unscoped-boundary");
+    ledger::admit(
+        &conn,
+        &boundary,
+        "digest",
+        None,
+        ledger::State::DispatchStarted,
+    )
+    .unwrap();
+    ledger::settle(
+        &conn,
+        &boundary,
+        &frame(),
+        "ok",
+        None,
+        settled_at + OVERLAP_MS + 1,
+    )
+    .unwrap();
+    let mut replay_publisher = RecordingPublisher::default();
+    drain(&conn, &mut DeliveryState::default(), &mut replay_publisher).await;
+
+    let page = ledger::late_results(
+        &conn,
+        "reserved:broca",
+        ledger::provider_incarnation(),
+        None,
+        None,
+        settled_at,
+        1024 * 1024,
+    )
+    .unwrap()
+    .unwrap();
+    let feed: Value = serde_json::from_slice(&page).unwrap();
+    assert_eq!(feed["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(feed["entries"][0]["call_key"], "inline");
+    assert_eq!(
+        feed["entries"][0]["result"],
+        serde_json::from_slice::<Value>(&frame().body).unwrap()
+    );
+    assert_eq!(
+        (
+            live_publisher.attempts.len(),
+            replay_publisher.attempts.len()
+        ),
+        (0, 0),
+        "inline settlement must not wake in either live scan or startup replay"
+    );
+}
+
+#[tokio::test]
 async fn late_result_bus_never_reads_uncommitted_or_failed_settlement() {
     let (dir, writer) = database();
     let reader = crate::db::open_readonly(&dir.path().join("aft.db")).unwrap();
