@@ -2598,6 +2598,7 @@ pub fn outside_macros() {}
             [
                 "domain_ingress",
                 "domain_record",
+                "DOMAIN_LIMIT",
                 "DomainTerminal",
                 "domain_limit",
                 "outside_macros"

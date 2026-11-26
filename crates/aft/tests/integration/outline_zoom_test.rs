@@ -153,11 +153,13 @@ fn outline_zoom_rust_item_symbols() {
         assert_eq!(sym.kind, kind, "{qualified}");
         let zoom = send(
             &mut aft,
-            json!({"id":"rust-item-zoom", "command":"zoom", "file":file, "symbol":qualified}),
+            json!({"id":"rust-item-zoom", "command":"zoom", "file":file, "symbols":[qualified]}),
         );
         assert_eq!(zoom["success"], true, "{qualified}: {zoom}");
         assert!(
-            zoom["content"].as_str().unwrap().contains(declaration),
+            zoom["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(declaration)),
             "{qualified}: {zoom}"
         );
     }
