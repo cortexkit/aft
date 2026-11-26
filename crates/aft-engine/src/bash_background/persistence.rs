@@ -3211,6 +3211,41 @@ pub(crate) fn metadata_open_attempts_for_test() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rollback_birth_fields_task_decoders_read_json_and_sqlite_metadata() {
+        let storage = tempfile::tempdir().unwrap();
+        let (resolved, mut task) = counted_task(storage.path());
+        task.child_pid = Some(42);
+        task.child_start_time_ms = Some(12345);
+        let identity = serde_json::json!({
+            "pid": 42, "started_at_ms": 12345, "boot_id": "boot", "start_ticks": 27,
+        });
+        let mut value = serde_json::to_value(&task).unwrap();
+        value["boot_id"] = "boot".into();
+        value["start_ticks"] = 27.into();
+        value["child_boot_id"] = "boot".into();
+        value["child_start_ticks"] = 27.into();
+        value["launch_owner"] = identity.clone();
+        value["group_member_identities"] = serde_json::json!([identity]);
+        let metadata = value.to_string();
+        std::fs::write(&resolved.paths.json, &metadata).unwrap();
+
+        let mut row = task.to_bash_task_row("runner", &resolved.paths).unwrap();
+        row.metadata = metadata;
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&mut conn).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(&conn, &row).unwrap();
+        let saved =
+            crate::db::bash_tasks::get_bash_task(&conn, "runner", &task.session_id, &task.task_id)
+                .unwrap()
+                .unwrap();
+        for decoded in [read_task_at(&resolved).unwrap(), PersistedTask::from(saved)] {
+            assert_eq!(decoded.child_start_time_ms, task.child_start_time_ms);
+            assert_eq!(decoded.launch_owner.unwrap().started_at_ms, 12345);
+            assert_eq!(decoded.group_member_identities[0].started_at_ms, 12345);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn refused_task_layout_creation_leaves_storage_root_untouched() {

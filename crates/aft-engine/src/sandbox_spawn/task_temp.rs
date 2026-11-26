@@ -357,6 +357,14 @@ fn sweep_stale(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rollback_birth_fields_provider_owner_decoder_reads_json() {
+        use crate::bash_background::process::ProcessIdentity;
+        let json = br#"{"pid":42,"started_at_ms":12345,"boot_id":"boot","start_ticks":27}"#;
+        let decoded: ProcessIdentity = serde_json::from_reader(&json[..]).unwrap();
+        assert_eq!((decoded.pid, decoded.started_at_ms), (42, 12345));
+    }
+
+    #[test]
     fn shell_env_provider_sweep_reclaims_dead_and_reused_owners_only() {
         use crate::bash_background::process::ProcessIdentity;
         let fixture = tempfile::tempdir().unwrap();
