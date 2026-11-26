@@ -624,6 +624,13 @@ pub(crate) fn main() -> io::Result<()> {
     let mut analysis_opens = 0usize;
     let dynamic_pull = std::env::var_os("AFT_FAKE_LSP_DYNAMIC_PULL").is_some();
     let mut hover_burst_sent = false;
+    // Hold the first batch of didOpen publishes until a hover releases them.
+    // The hover reply follows the last publish on the same stdout stream.
+    let mut open_burst = std::env::var_os("AFT_FAKE_LSP_OPEN_BURST_READY")
+        .map(|path| (path, Vec::new()));
+    let open_burst_count = std::env::var("AFT_FAKE_LSP_OPEN_BURST_COUNT")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap());
     let mut held_hover = None;
     let mut client_dynamic_pull = false;
     let mut client_disables_pull = false;
@@ -1052,6 +1059,15 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/hover" => {
+                    if let Some((_, publishes)) = open_burst.take() {
+                        for (uri, version) in publishes {
+                            write_publish_diagnostics_versioned(
+                                &mut writer, uri, opened_diagnostics(), version,
+                            )?;
+                        }
+                        write_response(&mut writer, id, Value::Null)?;
+                        continue;
+                    }
                     if std::env::var_os("AFT_FAKE_LSP_HOLD_HOVER").is_some() {
                         held_hover = Some(id);
                         write_notification(&mut writer, &Notification::new("custom/hoverHeld", None))?;
@@ -1602,6 +1618,13 @@ pub(crate) fn main() -> io::Result<()> {
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if let Some((ready, publishes)) = &mut open_burst {
+                        publishes.push((uri, version));
+                        if Some(publishes.len()) == open_burst_count {
+                            std::fs::write(ready, b"ready")?;
+                        }
+                        continue;
+                    }
                     if let (Some(uri), Some(text)) = (
                         uri.as_str(),
                         params

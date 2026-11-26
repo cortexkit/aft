@@ -4228,52 +4228,8 @@ fn scoped_blocking_inspect_waits_to_pull_native_rust_diagnostics_until_current_c
     assert_eq!(response["inspect_terminal"], "fresh", "{response:#}");
 }
 
-/// A scope with more files than one inspect opens reports how many it
-/// examined, and names the rest with that cause instead of opening them.
-#[test]
-fn scoped_blocking_inspect_caps_the_files_it_opens() {
-    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cap");
-    for index in 0..1000 {
-        write_file(&root, &format!("src/m{index:04}.rs"), "pub fn g() {}\n");
-    }
-    let ctx = configured_context(&root);
-    configure_fake_rust_lsp(&ctx);
-
-    let mut response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap", "src");
-    // The cap intentionally leaves diagnostics partial. Retry only a separate
-    // freshness-budget gap, and keep the exact coverage and header assertions.
-    if response["complete"] == false
-        && response["gaps"].as_array().is_some_and(|gaps| {
-            gaps.iter().any(|gap| {
-                gap["kind"] == "stat_verification_incomplete"
-                && gap["reason"]
-                    == "file freshness verification exceeded the request budget; retry aft_inspect"
-            })
-        })
-    {
-        response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap-retry", "src");
-    }
-
-    assert_eq!(
-        response["summary"]["diagnostics"]["coverage"],
-        json!({"files": 1001, "examined": 1000, "authoritative": 1000, "not_examined": 1, "file_cap": 1000}),
-        "response: {response:#}"
-    );
-    let uncovered = uncovered_files(&response);
-    assert_eq!(uncovered.len(), 1, "response: {response:#}");
-    assert!(
-        uncovered[0].1.starts_with("not examined:"),
-        "response: {response:#}"
-    );
-    let text = response["text"].as_str().expect("rendered text");
-    // The cap's unknown file is explained once in the header; exact coverage
-    // remains structured rather than repeating incompleteness in a body line.
-    assert!(
-        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: not examined:")
-            && text.contains("(1 file); retry aft_inspect."),
-        "{text}"
-    );
-}
+#[path = "inspect_command_test/sweep_cap.rs"]
+mod sweep_cap;
 
 /// When `cargo check` is still running at the end of the budget, the Rust
 /// files are named as incomplete with that cause instead of being certified
