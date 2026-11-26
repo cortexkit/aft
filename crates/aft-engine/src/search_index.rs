@@ -32,7 +32,8 @@ use crate::search_state::request_files::{Fetched, FileStat, RequestFile, Request
 pub mod exact_lane;
 mod indexed_glob;
 pub use crate::search_state::memo;
-pub(crate) use indexed_glob::IndexedGlobMatcher;
+#[doc(hidden)]
+pub use indexed_glob::IndexedGlobMatcher;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactPassMatch {
@@ -3938,7 +3939,8 @@ pub(crate) fn path_missing_on_disk(path: &Path) -> bool {
 /// index is badly out of date.
 pub(crate) const MISSING_ON_DISK_REFILL_BUDGET: usize = 256;
 
-pub(crate) fn presence_stat_budget(limit: usize) -> usize {
+#[doc(hidden)]
+pub fn presence_stat_budget(limit: usize) -> usize {
     limit.saturating_add(MISSING_ON_DISK_REFILL_BUDGET)
 }
 
@@ -4705,7 +4707,8 @@ fn path_modified_time(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
-pub(crate) fn normalized_display_sort_key(project_root: Option<&Path>, path: &Path) -> String {
+#[doc(hidden)]
+pub fn normalized_display_sort_key(project_root: Option<&Path>, path: &Path) -> String {
     let display_path = project_root
         .and_then(|root| path.strip_prefix(root).ok())
         .unwrap_or(path);

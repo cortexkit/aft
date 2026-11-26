@@ -181,7 +181,7 @@ fn audit_resolution_invalid_utf8_caller_is_a_named_gap() {
     let ctx = context(&root, &dir.path().join("storage"));
     let ready = ctx.data_checkout().unwrap();
     let view = match ready.fresh_view(Duration::from_secs(60)) {
-        super::runtime::Fresh::Ready(view) => view,
+        crate::data_layer::runtime::Fresh::Ready(view) => view,
         _ => panic!("call graph did not become ready"),
     };
     assert!(view.callgraph_has_file("caller.py"));
@@ -254,7 +254,7 @@ fn audit_resolution_macro_mention_overflow_discloses_file_gap() {
     let checkout = ctx.data_checkout().unwrap();
     assert!(matches!(
         checkout.fresh_view(Duration::from_secs(60)),
-        super::runtime::Fresh::Ready(_)
+        crate::data_layer::runtime::Fresh::Ready(_)
     ));
     let reply = ask(
         &ctx,

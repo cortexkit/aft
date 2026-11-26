@@ -257,8 +257,11 @@ mod tests {
     #[test]
     fn review_search_unpublished_corpus_stops_at_the_fallback_file_limit() {
         let (_dir, root) = project(&[("a.rs", "needle"), ("b.rs", "needle"), ("c.rs", "needle")]);
-        let run =
-            |limit| crate::grep_executor::with_walk_limit(limit, || collect_bounded_corpus(&root));
+        let run = |limit| {
+            aft_engine::test_bridge::search_misc::grep_executor::with_walk_limit(limit, || {
+                collect_bounded_corpus(&root)
+            })
+        };
         let capped = run(2);
         assert_eq!(capped.check.files_examined, 2);
         assert_eq!(capped.check.reread, 2);

@@ -36,7 +36,8 @@ pub(crate) fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(crate) fn read_regular_text(path: &Path) -> std::io::Result<String> {
+#[doc(hidden)]
+pub fn read_regular_text(path: &Path) -> std::io::Result<String> {
     std::io::read_to_string(open_regular(path)?)
 }
 use std::sync::LazyLock;

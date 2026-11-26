@@ -33,7 +33,9 @@ pub fn is_read_only_request(request: &RawRequest) -> bool {
     } else {
         &request.command
     };
-    crate::subc::manifest::is_read_only_command(command.strip_prefix("aft_").unwrap_or(command))
+    crate::command_lane_policy::is_read_only_command(
+        command.strip_prefix("aft_").unwrap_or(command),
+    )
 }
 
 /// Finalizes a formatted tool result. It receives the agent-visible text so the finalizer can
@@ -1233,7 +1235,7 @@ mod tests {
 
     #[test]
     fn refusal_delivers_pending_notice_without_rewording() {
-        use crate::subc::runner_notices::notice_templates::{Notice, Target};
+        use aft_base::pending_notices::{Notice, Target};
 
         let mut response = Response::error_with_data(
             "refused",

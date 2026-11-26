@@ -4,6 +4,7 @@ The daemon may call the tools; the tools do not depend on the daemon. This inven
 
 | Item path | Kind | Classification | Reason |
 | --- | --- | --- | --- |
+| `command_lane_policy::command_lane_explicit` | function | Public API | Tools own the table so the standalone loop can decide whether to record backups and the daemon can schedule work without a tools-to-daemon dependency. |
 | `commands::bash_orchestrate::blocking_wait_cap_ms` | function | Public API | Standalone and daemon foreground waits use the same cap. |
 | `commands::bash_orchestrate::decide_bash_step` | function | Public API | Both shell paths make the same poll, promotion and completion decisions. |
 | `commands::bash_orchestrate::BashStep` | enum (variants exposed) | Public API | Both shell paths match on the decision returned by `decide_bash_step`. |

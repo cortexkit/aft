@@ -488,6 +488,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-rust",
  "url",
+ "vt100",
  "which",
  "windows-sys 0.61.2",
 ]

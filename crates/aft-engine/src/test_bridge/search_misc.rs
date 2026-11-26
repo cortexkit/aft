@@ -272,7 +272,62 @@ pub fn keep_request_file(
 
 pub mod output;
 pub mod search;
+
+#[cfg(unix)]
+pub fn capture_probe_command_for_test(
+    command: std::process::Command,
+    label: &str,
+    deadline: std::time::Instant,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    crate::format::capture_probe_command(command, label, deadline, || false)
+        .map(|result| (result.status, result.stdout, result.stderr))
+        .map_err(|error| error.to_string())
+}
+
 pub mod edit {
+    use std::cell::RefCell;
+    use std::thread::LocalKey;
+    use std::time::Duration;
+
+    fn with_slot<T: 'static, R>(
+        key: &'static LocalKey<RefCell<Option<T>>>,
+        value: T,
+        run: impl FnOnce() -> R,
+    ) -> (R, Option<T>) {
+        struct Restore<'a, T>(&'a RefCell<Option<T>>, Option<T>);
+
+        impl<T> Drop for Restore<'_, T> {
+            fn drop(&mut self) {
+                self.0.replace(self.1.take());
+            }
+        }
+
+        key.with(|slot| {
+            let _restore = Restore(slot, slot.replace(Some(value)));
+            let result = run();
+            (result, slot.take())
+        })
+    }
+
+    pub fn capture_reported_files_for_test<R>(
+        run: impl FnOnce() -> R,
+    ) -> (R, Vec<(String, &'static str)>) {
+        let (result, files) = with_slot(&crate::edit::REPORTED_FILES, Vec::new(), run);
+        (result, files.unwrap())
+    }
+
+    pub fn measure_batch_syntax_hold_for_test<R>(run: impl FnOnce() -> R) -> (R, Vec<Duration>) {
+        let (result, times) = with_slot(&crate::edit::BATCH_SYNTAX_HOLD_TIMES, Vec::new(), run);
+        (result, times.unwrap())
+    }
+
+    pub fn with_before_syntax_rollback_for_test<R>(
+        hook: impl FnOnce() + 'static,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        with_slot(&crate::edit::BEFORE_SYNTAX_ROLLBACK, Box::new(hook), run).0
+    }
+
     pub fn file_reporter_registered() -> bool {
         crate::edit::file_reporter_registered()
     }

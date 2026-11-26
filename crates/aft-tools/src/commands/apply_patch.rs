@@ -1551,9 +1551,10 @@ mod tests {
             lsp_hints: None,
             session_id: None,
         };
-        edit::BATCH_SYNTAX_HOLD_TIMES.with(|times| *times.borrow_mut() = Some(Vec::new()));
-        let response = handle_apply_patch(&req, &ctx);
-        let times = edit::BATCH_SYNTAX_HOLD_TIMES.with(|times| times.borrow_mut().take().unwrap());
+        let (response, times) =
+            aft_engine::test_bridge::search_misc::edit::measure_batch_syntax_hold_for_test(|| {
+                handle_apply_patch(&req, &ctx)
+            });
         assert!(response.success, "{response:?}");
         for index in 0..64 {
             let content = fs::read_to_string(temp.path().join(format!("file{index}.rs"))).unwrap();
@@ -1606,13 +1607,14 @@ mod tests {
                 session_id: None,
             };
             let hook_target = target.clone();
-            edit::BEFORE_SYNTAX_ROLLBACK.with(|slot| {
-                *slot.borrow_mut() = Some(Box::new(move || {
-                    assert_eq!(fs::read_to_string(&hook_target).unwrap(), invalid);
-                    fs::write(&hook_target, later).unwrap();
-                }));
-            });
-            let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
+            let response =
+                aft_engine::test_bridge::search_misc::edit::with_before_syntax_rollback_for_test(
+                    move || {
+                        assert_eq!(fs::read_to_string(&hook_target).unwrap(), invalid);
+                        fs::write(&hook_target, later).unwrap();
+                    },
+                    || serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap(),
+                );
             assert_eq!(fs::read_to_string(target).unwrap(), later);
             if with_move {
                 assert_eq!(fs::read_to_string(&source).unwrap(), original);

@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How long one agent write waits for the program to read its input.
-pub(crate) const INPUT_DEADLINE: Duration = Duration::from_secs(5);
+pub const INPUT_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Longest single wait for room in the terminal, so a task that stops during
 /// a write is noticed promptly.
@@ -35,7 +35,7 @@ pub(crate) type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// Why `bash_write` could not send its whole input to a task's terminal.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PtyWriteError {
+pub enum PtyWriteError {
     TaskNotFound,
     TaskNotPty,
     /// The task was not running, or stopped during the write.

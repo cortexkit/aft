@@ -67,14 +67,13 @@ fn fifo_mutations_refuse_without_a_writer() {
                 "--nocapture",
             ])
             .env(CHILD, action);
-        match crate::format::capture_probe_command(
+        match aft_engine::test_bridge::search_misc::capture_probe_command_for_test(
             child,
             action,
             Instant::now() + Duration::from_secs(5),
-            || false,
         ) {
-            Ok(result) if result.status.success() && result.stdout.contains("1 passed") => {}
-            Ok(result) => failures.push(format!("{action}: {}\n{}", result.stdout, result.stderr)),
+            Ok((status, stdout, _)) if status.success() && stdout.contains("1 passed") => {}
+            Ok((_, stdout, stderr)) => failures.push(format!("{action}: {stdout}\n{stderr}")),
             Err(error) => failures.push(format!("{action}: {error}")),
         }
     }

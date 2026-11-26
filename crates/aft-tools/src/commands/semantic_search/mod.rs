@@ -11777,7 +11777,7 @@ mod tests {
     #[test]
     fn query_retries_after_a_cached_embedding_with_the_wrong_dimension() {
         struct WrongDimensionOnce(Arc<AtomicUsize>);
-        impl crate::semantic_index::LocalEmbeddingProvider for WrongDimensionOnce {
+        impl aft_engine::test_bridge::search_misc::semantic::LocalEmbeddingProvider for WrongDimensionOnce {
             fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
                 let call = self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(vec![if call == 0 {
@@ -11790,11 +11790,12 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let ctx = test_context(project.path());
         let calls = Arc::new(AtomicUsize::new(0));
-        *ctx.semantic_embedding_model().lock() =
-            Some(SemanticEmbeddingModel::from_local_provider_for_test(
+        *ctx.semantic_embedding_model().lock() = Some(
+            aft_engine::test_bridge::search_misc::semantic::from_local_provider_for_test(
                 Box::new(WrongDimensionOnce(calls.clone())),
                 project.path().to_path_buf(),
-            ));
+            ),
+        );
 
         let query = || embed_query_for_dimension("same query", &ctx, Some(2));
         assert!(query().unwrap_err().contains("returned 3, index expects 2"));
@@ -12443,7 +12444,10 @@ mod tests {
         .unwrap();
         let (root, ctx) = data_layer_context(project.path(), storage.path());
         ctx.update_config(|config| config.semantic.max_files = 1);
-        let _fill = crate::data_layer::meaning::fill_with_constant_vectors_for_test(&root, 2);
+        let _fill =
+            aft_engine::test_bridge::display_data::meaning::fill_with_constant_vectors_for_test(
+                &root, 2,
+            );
         wait_for_data_semantic(&ctx, |data| {
             data.serving().is_some_and(|meaning| {
                 meaning.coverage().pending.is_empty() && meaning.coverage().past_cap == 1

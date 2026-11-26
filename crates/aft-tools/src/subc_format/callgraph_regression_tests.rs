@@ -663,7 +663,7 @@ fn rust_memory_graph(
     files: &[(String, String)],
 ) -> (
     tempfile::TempDir,
-    crate::data_layer::query::SliceReader<crate::data_layer::query::MemorySlices>,
+    crate::data_layer::query::SliceReader<impl crate::data_layer::query::SliceSource>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -676,7 +676,7 @@ fn rust_memory_graph(
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, source).unwrap();
     }
-    let reader = crate::data_layer::trace_measure::memory_reader(dir.path());
+    let reader = aft_engine::test_bridge::display_data::callgraph_roots::memory_reader(dir.path());
     (dir, reader)
 }
 
@@ -698,31 +698,31 @@ fn template_callers(invocations: usize) -> serde_json::Value {
     serde_json::to_value(result).unwrap()
 }
 
-/// Macro-template callers stop at `MACRO_VIA_ENTRY_LIMIT`. When more exist,
+/// Macro-template callers stop at the entry limit. When more exist,
 /// the answer must say its total is a lower bound, not give the listed
 /// count as the exact total.
 #[test]
 fn callgraph_macro_template_callers_past_the_limit_report_a_lower_bound() {
-    let value = template_callers(MACRO_VIA_ENTRY_LIMIT + 10);
+    let (via_limit, _) =
+        aft_engine::test_bridge::display_data::callgraph_roots::macro_limits_for_test();
+    let value = template_callers(via_limit + 10);
     let envelope = &value["callers_list_envelope"];
-    assert_eq!(envelope["shown"], MACRO_VIA_ENTRY_LIMIT, "{value}");
+    assert_eq!(envelope["shown"], via_limit, "{value}");
     assert_eq!(envelope["total"]["kind"], "at_least", "{value}");
     assert_eq!(envelope["reason"], "budget", "{value}");
     let text = crate::subc_format::format_callgraph("callers", &value, false);
     assert!(
-        text.contains(&format!(
-            "shown {MACRO_VIA_ENTRY_LIMIT} of ≥{MACRO_VIA_ENTRY_LIMIT} items (budget)"
-        )),
+        text.contains(&format!("shown {via_limit} of ≥{via_limit} items (budget)")),
         "{text}"
     );
 
     // One invocation fewer than fills the limit with the template call is
     // listed in full, and its total stays exact.
-    let value = template_callers(MACRO_VIA_ENTRY_LIMIT - 1);
+    let value = template_callers(via_limit - 1);
     let envelope = &value["callers_list_envelope"];
     assert_eq!(envelope["total"]["kind"], "exact", "{value}");
-    assert_eq!(envelope["total"]["value"], MACRO_VIA_ENTRY_LIMIT, "{value}");
-    assert_eq!(value["total_callers"], MACRO_VIA_ENTRY_LIMIT, "{value}");
+    assert_eq!(envelope["total"]["value"], via_limit, "{value}");
+    assert_eq!(value["total_callers"], via_limit, "{value}");
 }
 
 /// The unanalyzed-macro note counts mentions exactly only when the lookup
@@ -730,6 +730,8 @@ fn callgraph_macro_template_callers_past_the_limit_report_a_lower_bound() {
 /// not turn a cut count into an exact one.
 #[test]
 fn callgraph_unanalyzed_macro_mentions_past_the_limit_report_a_lower_bound() {
+    let (_, mention_limit) =
+        aft_engine::test_bridge::display_data::callgraph_roots::macro_limits_for_test();
     let mention = "pub fn f() {\n    my_dsl! { when ready then dsl_target @ 3 }\n}\n";
     let mut files = vec![
         (
@@ -739,7 +741,7 @@ fn callgraph_unanalyzed_macro_mentions_past_the_limit_report_a_lower_bound() {
         // Sorts before every other mention, so the lookup's window holds it.
         ("src/a_test.rs".to_string(), mention.to_string()),
     ];
-    for index in 0..=MACRO_MENTION_COUNT_LIMIT {
+    for index in 0..=mention_limit {
         files.push((format!("src/dsl/m{index:03}.rs"), mention.to_string()));
     }
     let (_dir, reader) = rust_memory_graph(&files);
@@ -749,9 +751,8 @@ fn callgraph_unanalyzed_macro_mentions_past_the_limit_report_a_lower_bound() {
         .expect("mentions inside macros are noted");
     assert!(note.mentions_is_lower_bound, "{note:?}");
     assert!(
-        note.message.starts_with(&format!(
-            "{MACRO_MENTION_COUNT_LIMIT}+ mentions of `dsl_target`"
-        )),
+        note.message
+            .starts_with(&format!("{mention_limit}+ mentions of `dsl_target`")),
         "{note:?}"
     );
 

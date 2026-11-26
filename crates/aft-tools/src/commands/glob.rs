@@ -1224,7 +1224,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap().join("checkout");
         std::fs::create_dir(&root).unwrap();
-        let window = DEFAULT_MAX_RESULTS + crate::search_index::MISSING_ON_DISK_REFILL_BUDGET;
+        let window = DEFAULT_MAX_RESULTS + crate::search_index::presence_stat_budget(0);
         let count = window * 2;
         for index in 0..count {
             let path = root.join(format!("file-{index:04}.txt"));
@@ -1274,7 +1274,7 @@ mod tests {
             assert_eq!(selected.budget_exhausted, reference.budget_exhausted);
         };
         compare_refill(12, false);
-        let exhausted = crate::search_index::MISSING_ON_DISK_REFILL_BUDGET + 1;
+        let exhausted = crate::search_index::presence_stat_budget(0) + 1;
         for path in &expected.files[12..exhausted] {
             std::fs::remove_file(path).unwrap();
         }

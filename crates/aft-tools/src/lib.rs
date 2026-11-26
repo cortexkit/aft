@@ -93,6 +93,8 @@ pub(crate) use aft_engine::callgraph;
 pub(crate) use aft_engine::callgraph_store;
 pub(crate) use aft_engine::calls;
 pub(crate) use aft_engine::checkpoint;
+#[doc(hidden)]
+pub mod command_lane_policy;
 pub mod commands;
 pub(crate) use aft_base::compress;
 pub(crate) use aft_base::config;

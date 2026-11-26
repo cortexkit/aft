@@ -8,7 +8,7 @@
 pub(crate) type FileReporter =
     fn(&str, Option<&str>, Option<&str>, Option<&str>, &'static str, Option<(&str, Option<&str>)>);
 static FILE_REPORTER: std::sync::OnceLock<FileReporter> = std::sync::OnceLock::new();
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     pub(crate) static REPORTED_FILES: std::cell::RefCell<Option<Vec<(String, &'static str)>>> =
         const { std::cell::RefCell::new(None) };
@@ -32,7 +32,8 @@ pub fn report_file(
     report_file_with_input_paths(file, old_path, before, after, change, None);
 }
 
-pub(crate) fn report_file_with_input_paths(
+#[doc(hidden)]
+pub fn report_file_with_input_paths(
     file: &str,
     old_path: Option<&str>,
     before: Option<&str>,
@@ -40,7 +41,7 @@ pub(crate) fn report_file_with_input_paths(
     change: &'static str,
     input_paths: Option<(&str, Option<&str>)>,
 ) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     REPORTED_FILES.with(|capture| {
         if let Some(files) = capture.borrow_mut().as_mut() {
             files.push((file.to_string(), change));
@@ -1879,7 +1880,8 @@ pub fn attach_edit_diff(
     render_edit_diff(result, params, file, before, after);
 }
 
-pub(crate) fn render_edit_diff(
+#[doc(hidden)]
+pub fn render_edit_diff(
     result: &mut serde_json::Value,
     params: &serde_json::Value,
     file: &str,
@@ -2376,10 +2378,10 @@ pub fn created_file_syntax_error_notice(first_error_line: u64) -> String {
 thread_local! {
     static FULL_VALIDATION_START_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) static BEFORE_SYNTAX_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) static BATCH_SYNTAX_HOLD_TIMES: std::cell::RefCell<Option<Vec<std::time::Duration>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -2659,7 +2661,7 @@ fn write_format_validate_impl(
     let mut rollback_skipped_reason = None;
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 let hook = BEFORE_SYNTAX_ROLLBACK.with(|slot| slot.replace(None));
                 if let Some(hook) = hook {
@@ -2703,7 +2705,7 @@ fn write_format_validate_impl(
         false
     };
     if let Some(after_syntax) = after_syntax {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         BATCH_SYNTAX_HOLD_TIMES.with(|times| {
             if let Some(times) = times.borrow_mut().as_mut() {
                 times.push(admission_extended.unwrap().elapsed());

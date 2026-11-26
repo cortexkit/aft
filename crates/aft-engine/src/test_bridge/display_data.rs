@@ -435,6 +435,14 @@ pub mod callgraph_roots {
     pub fn memory_reader(root: &Path) -> query::SliceReader<impl query::SliceSource> {
         trace_measure::memory_reader(root)
     }
+
+    pub fn macro_limits_for_test() -> (usize, usize) {
+        use crate::data_layer::callgraph_store_adapter;
+        (
+            callgraph_store_adapter::MACRO_VIA_ENTRY_LIMIT,
+            callgraph_store_adapter::MACRO_MENTION_COUNT_LIMIT,
+        )
+    }
 }
 
 pub mod trace_budget {

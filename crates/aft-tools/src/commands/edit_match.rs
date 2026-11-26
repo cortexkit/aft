@@ -1329,7 +1329,7 @@ mod tests {
     fn edit_review_opus_1_undo_skips_failed_append_open() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("a.txt");
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         ctx.backup()
             .lock()
             .set_storage_dir(root.path().join("backup"), 72);

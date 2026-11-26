@@ -20,7 +20,8 @@ impl BgTaskRegistry {
     /// Send `input` to the terminal of PTY task `task_id`. Waits at most
     /// [`INPUT_DEADLINE`] for the program to read it, and stops once the task
     /// stops (a kill, say).
-    pub(crate) fn write_pty_input(
+    #[doc(hidden)]
+    pub fn write_pty_input(
         &self,
         task_id: &str,
         session_id: &str,

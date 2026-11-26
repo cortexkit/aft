@@ -2399,3 +2399,5 @@ pub(crate) use registry::push_projection_fixture;
 pub mod progress;
 #[doc(hidden)]
 pub mod secrets;
+#[doc(hidden)]
+pub use pty_input::{PtyWriteError, INPUT_DEADLINE};

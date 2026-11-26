@@ -66,8 +66,7 @@ pub mod extract_function;
 mod feature_status_tests;
 #[cfg(all(test, unix))]
 mod fifo_mutation_tests;
-pub mod policy_environment;
-pub(crate) use crate::file_read_exact;
+pub(crate) use aft_engine::file_read_exact;
 pub(crate) mod github_comments;
 pub mod glob;
 #[cfg(all(

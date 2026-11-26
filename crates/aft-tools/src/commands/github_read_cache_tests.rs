@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use crate::config::GithubConfig;
-use crate::db::github_read_cache::{GithubReadCacheEntry, GithubReadCacheKey};
+use crate::db::github_read_cache::{
+    GithubReadCacheEntry, GithubReadCacheKey, GithubReadResourceKind,
+};
 use crate::github_read::{DownloadedGithubImage, GithubImageDownloader};
 use crate::github_read::{
     GithubDiff, GithubFetchRequest, GithubFetcher, GithubReadCacheStore, GithubReadClock,

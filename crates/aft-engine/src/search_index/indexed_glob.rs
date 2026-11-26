@@ -9,7 +9,7 @@ use super::{
     project_walk_builder_pruned, PathFilters,
 };
 
-pub(crate) struct IndexedGlobMatcher {
+pub struct IndexedGlobMatcher {
     filters: PathFilters,
     raw_root: PathBuf,
     canonical_root: PathBuf,
@@ -17,7 +17,7 @@ pub(crate) struct IndexedGlobMatcher {
 }
 
 impl IndexedGlobMatcher {
-    pub(crate) fn new(pattern: &str, search_root: &Path) -> Option<Self> {
+    pub fn new(pattern: &str, search_root: &Path) -> Option<Self> {
         Some(Self {
             filters: build_path_filters(&[pattern.to_owned()], &[]).ok()?,
             raw_root: search_root.to_path_buf(),
@@ -26,7 +26,7 @@ impl IndexedGlobMatcher {
         })
     }
 
-    pub(crate) fn matches(&self, path: &Path) -> bool {
+    pub fn matches(&self, path: &Path) -> bool {
         if path.as_os_str().is_empty() {
             return false;
         }

@@ -300,13 +300,14 @@ mod audit_regressions {
         }))
         .unwrap();
         let hook_path = path.clone();
-        edit::BEFORE_SYNTAX_ROLLBACK.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move || {
-                assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), invalid);
-                std::fs::write(&hook_path, later).unwrap();
-            }));
-        });
-        let response = handle_write(&failed, &ctx);
+        let response =
+            aft_engine::test_bridge::search_misc::edit::with_before_syntax_rollback_for_test(
+                move || {
+                    assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), invalid);
+                    std::fs::write(&hook_path, later).unwrap();
+                },
+                || handle_write(&failed, &ctx),
+            );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), later);
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["syntax_valid"], false);
@@ -334,9 +335,10 @@ mod audit_regressions {
                 "id": "display", "command": "write", "file": "example.ts", "content": content,
             }))
             .unwrap();
-            edit::REPORTED_FILES.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
-            let reply = handle_write(&req, &ctx);
-            let files = edit::REPORTED_FILES.with(|capture| capture.borrow_mut().take().unwrap());
+            let (reply, files) =
+                aft_engine::test_bridge::search_misc::edit::capture_reported_files_for_test(|| {
+                    handle_write(&req, &ctx)
+                });
             assert!(reply.success, "{reply:?}");
             assert!(reply.data["metadata"]["diff"].is_string(), "{reply:?}");
             files

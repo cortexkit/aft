@@ -913,7 +913,7 @@ mod tests {
             std::fs::write(root.path().join(name), IDENTIFIER).unwrap();
         }
         let run = |limit| {
-            crate::grep_executor::with_walk_limit(limit, || {
+            aft_engine::test_bridge::search_misc::grep_executor::with_walk_limit(limit, || {
                 sweep(root.path(), &terms(), None, true, far_deadline())
             })
         };

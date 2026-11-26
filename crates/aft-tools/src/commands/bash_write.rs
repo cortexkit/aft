@@ -83,7 +83,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    use crate::bash_background::pty_input::{PtyWriteError, INPUT_DEADLINE};
+    use crate::bash_background::{PtyWriteError, INPUT_DEADLINE};
     match ctx
         .bash_background()
         .write_pty_input(&params.task_id, req.session(), &bytes)

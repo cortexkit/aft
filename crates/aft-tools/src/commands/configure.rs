@@ -7386,7 +7386,7 @@ mod tests {
         let (probe_released, wait_probe_released) = mpsc::channel();
         let probe_thread = std::thread::spawn(move || {
             {
-                let _probe = git_root_commit_probe_override_lock_for_test();
+                let _probe = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
                 if probe_held.send(()).is_err()
                     || wait_env_checked.recv_timeout(hang_guard).is_err()
                 {

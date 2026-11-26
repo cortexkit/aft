@@ -33,6 +33,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
+vt100 = "0.16"
 parking_lot = "0.12"
 libc = "0.2"
 tree-sitter = "=0.26.7"

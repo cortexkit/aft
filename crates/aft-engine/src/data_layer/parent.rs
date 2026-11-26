@@ -355,3 +355,6 @@ impl ChildCheckouts {
         self.bound()
     }
 }
+
+#[cfg(test)]
+mod watcher_path_tests;
