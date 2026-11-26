@@ -5,10 +5,12 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RotatingLogSink, resolveAftLogPath, resolveAftStorageRoot } from "../durable-log.js";
@@ -194,6 +196,32 @@ describe("durable plugin logging", () => {
     // B's next line must not rotate again over the backup A just made.
     expect(readFileSync(`${path}.1`, "utf8").startsWith(line("A0"))).toBe(true);
     expect(readFileSync(path, "utf8")).toBe(line("A9") + line("A10") + line("B1"));
+  });
+
+  test("a stale rotation keeps late appends from an already-open writer", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
+    cleanup.push(root);
+    const path = join(root, "aft-plugin.log");
+    const sink = new RotatingLogSink(path);
+    writeFileSync(path, "full log\n");
+    const measured = statSync(path, { bigint: true });
+
+    // The first writer rotates and opens a fresh live file before the stale rotation.
+    renameSync(path, `${path}.1`);
+    const writer = await open(path, "a");
+    try {
+      await writer.appendFile("fresh line\n");
+      // biome-ignore lint/complexity/useLiteralKeys: Call the private method with the earlier stat to control rotation order.
+      await sink["rotate"](measured);
+      // Copying the fresh log back would leave this handle pointing at the unlinked original.
+      await writer.appendFile("late line\n");
+    } finally {
+      await writer.close();
+    }
+
+    expect(readFileSync(path, "utf8")).toBe("fresh line\nlate line\n");
+    expect(readFileSync(`${path}.1`, "utf8")).toBe("full log\n");
+    expect(readdirSync(root).sort()).toEqual(["aft-plugin.log", "aft-plugin.log.1"]);
   });
 
   test("writers that rotate at the same moment keep the backup and every new line", async () => {

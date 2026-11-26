@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { type BigIntStats, constants } from "node:fs";
-import { appendFile, lstat, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { appendFile, link, lstat, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
   openPrivateStorageDir,
@@ -236,8 +236,16 @@ export class RotatingLogSink {
     }
     const claimed = await stat(claim, { bigint: true });
     if (claimed.ino !== measured.ino || claimed.dev !== measured.dev) {
-      const fresh = await readFile(claim);
-      await appendFile(this.path, fresh, { mode: LOG_FILE_MODE });
+      try {
+        // Keep the same inode so writes through already-open handles still
+        // reach the live log. Linking won't replace a live file recreated by
+        // another writer.
+        await link(claim, this.path);
+      } catch (error: unknown) {
+        if (!canCopyClaim(error)) throw error;
+        const fresh = await readFile(claim);
+        await appendFile(this.path, fresh, { mode: LOG_FILE_MODE });
+      }
       await removeIfPresent(claim);
       return;
     }
@@ -259,6 +267,15 @@ function isMissing(error: unknown): boolean {
 
 function hasCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function canCopyClaim(error: unknown): boolean {
+  // Unsupported links can look like EPERM on Linux or EISDIR on Windows
+  // (libuv's mapping of ERROR_INVALID_FUNCTION).
+  return (
+    ["EEXIST", "EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"].some((code) => hasCode(error, code)) ||
+    (process.platform === "win32" && hasCode(error, "EISDIR"))
+  );
 }
 
 /**
