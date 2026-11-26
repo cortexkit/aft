@@ -1,4 +1,4 @@
-//! Optional wakes for terminal entries in the durable `late_results` feed.
+//! Wakes for settled calls whose first reply was held.
 //!
 //! The ledger remains authoritative. Bus acknowledgements live only in memory:
 //! restart replays retained entries with the same message id. A duplicate after
@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, LazyLock, OnceLock,
+        Arc, LazyLock, Mutex, MutexGuard, OnceLock, TryLockError,
     },
     time::Duration,
 };
@@ -25,6 +25,7 @@ use tokio::sync::{oneshot, Notify};
 
 use crate::context::App;
 use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
+use crate::db::lifecycle::TrackedConnection;
 
 #[doc(hidden)]
 pub mod display;
@@ -64,7 +65,7 @@ const SCAN_BATCH: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OVERLAP_MS: i64 = 10_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const LIVE_SCAN_SQL: &str = "SELECT rowid,settled_at,seq,CASE WHEN late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0) THEN custodian END,carrier,call_key,event_id,outcome FROM call_ledger WHERE state='Settled' AND (settled_at,rowid)>(?1,?2) ORDER BY settled_at,rowid LIMIT ?3";
+const LIVE_SCAN_SQL: &str = "SELECT rowid,settled_at,seq,CASE WHEN first_reply_held=1 AND acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0) THEN custodian END,carrier,call_key,event_id,outcome FROM call_ledger WHERE state='Settled' AND (settled_at,rowid)>(?1,?2) ORDER BY settled_at,rowid LIMIT ?3";
 use crate::db::call_ledger::SETTLED;
 static DISPLAY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static HEALTH: LazyLock<parking_lot::Mutex<BusHealth>> = LazyLock::new(Default::default);
@@ -75,6 +76,7 @@ struct BusHealth {
     connects: u64,
     published: u64,
     publish_failures: u64,
+    scan_deferrals: u64,
     last_error: Option<&'static str>,
     display_published: u64,
     display_publish_failures: u64,
@@ -93,15 +95,23 @@ pub fn health() -> serde_json::Value {
     serde_json::to_value(&*HEALTH.lock()).expect("bus health is JSON")
 }
 
-fn failure(code: &'static str) {
-    let mut health = HEALTH.lock();
-    if health.warned.insert(code) {
-        log::warn!("bus failure: {code}");
+impl BusHealth {
+    fn record_failure(&mut self, code: &'static str) {
+        if code == "bus_ledger_busy" {
+            self.scan_deferrals = self.scan_deferrals.saturating_add(1);
+            return;
+        }
+        if self.warned.insert(code) {
+            log::warn!("bus failure: {code}");
+        }
+        self.connected = false;
+        self.publish_failures = self.publish_failures.saturating_add(1);
+        self.last_error = Some(code);
     }
-    health.connected = false;
-    health.publish_failures = health.publish_failures.saturating_add(1);
-    health.last_error = Some(code);
-    drop(health);
+}
+
+fn failure(code: &'static str) {
+    HEALTH.lock().record_failure(code);
     if matches!(
         code,
         "bus_runtime"
@@ -117,6 +127,15 @@ fn failure(code: &'static str) {
     ) {
         readers::unavailable(code);
     }
+}
+
+fn try_ledger(
+    db: &Mutex<TrackedConnection>,
+) -> Result<MutexGuard<'_, TrackedConnection>, &'static str> {
+    db.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => "bus_ledger_busy",
+        TryLockError::Poisoned(_) => "bus_ledger_read",
+    })
 }
 
 #[doc(hidden)]
@@ -313,7 +332,7 @@ async fn drive(
             let database = database.clone();
             let retained = tokio::task::spawn_blocking(move || {
                 let db = app.open_db(&database).map_err(|_| "bus_ledger_open")?;
-                let conn = db.try_lock().map_err(|_| "bus_ledger_busy")?;
+                let conn = try_ledger(&db)?;
                 due.into_iter()
                     .map(|notice| {
                         let retained =
@@ -348,7 +367,7 @@ async fn drive(
             let position = state.position.clone();
             let batch = tokio::task::spawn_blocking(move || {
                 let db = app.open_db(&database).map_err(|_| "bus_ledger_open")?;
-                let conn = db.try_lock().map_err(|_| "bus_ledger_busy")?;
+                let conn = try_ledger(&db)?;
                 read_batch(&conn, &position, capacity).map_err(|_| "bus_ledger_read")
             })
             .await;
@@ -559,7 +578,7 @@ fn replay(
     let limit = SCAN_BATCH.min(LATE_RESULTS_PAGE_MAX as usize).min(capacity);
     // This is the terminal half of late_results' custodian/seq seek, without
     // loading result bodies or the separate non-terminal held-update entries.
-    let mut stmt = conn.prepare("SELECT rowid,settled_at,seq,custodian,carrier,call_key,event_id,outcome FROM call_ledger WHERE custodian=?1 AND seq>?2 AND late_entry IS NOT NULL AND (settled_at,rowid)<=(?3,?4) ORDER BY seq LIMIT ?5")?;
+    let mut stmt = conn.prepare("SELECT rowid,settled_at,seq,custodian,carrier,call_key,event_id,outcome FROM call_ledger WHERE custodian=?1 AND seq>?2 AND first_reply_held=1 AND late_entry IS NOT NULL AND acked=0 AND (settled_at,rowid)<=(?3,?4) ORDER BY seq LIMIT ?5")?;
     let mut rows = stmt.query(params![
         reader,
         seq,
@@ -584,7 +603,7 @@ fn replay(
 }
 
 fn is_retained(conn: &Connection, notice: &Notice) -> rusqlite::Result<bool> {
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND event_id=?3 AND state='Settled' AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0))", params![notice.key.carrier, notice.key.call_key, notice.event_id], |row| row.get(0))
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND event_id=?3 AND state='Settled' AND first_reply_held=1 AND acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0))", params![notice.key.carrier, notice.key.call_key, notice.event_id], |row| row.get(0))
 }
 
 trait Publisher {

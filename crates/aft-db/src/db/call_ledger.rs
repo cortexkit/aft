@@ -149,6 +149,28 @@ pub(super) fn migrate_result_source(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Add wake provenance outside the versioned migrations. Older builds can
+/// ignore the column, and their rows keep NULL rather than guessing from a
+/// terminal result whether the caller received a held reply.
+pub(super) fn ensure_first_reply_held(conn: &Connection) -> rusqlite::Result<()> {
+    fn present(conn: &Connection) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('call_ledger') WHERE name='first_reply_held')",
+            [],
+            |row| row.get(0),
+        )
+    }
+    if present(conn)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Another opener may have added the column while we waited for the lock.
+    if !present(&tx)? {
+        tx.execute_batch("ALTER TABLE call_ledger ADD COLUMN first_reply_held INTEGER")?;
+    }
+    tx.commit()
+}
+
 /// One process-wide cursor identity, deliberately never persisted in aft.db.
 /// Reconnecting or binding another project must not look like a restart.
 pub fn provider_incarnation() -> &'static str {
@@ -454,7 +476,7 @@ pub fn hold_permission(
     let mut retained: Value = serde_json::from_slice(body)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     retained["_aft_include_structured"] = json!(include_structured);
-    Ok(conn.execute("UPDATE call_ledger SET state='Prepared',frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state IN ('Prepared','DispatchStarted') AND task_id IS NULL", params![key.carrier,key.call_key,retained.to_string().as_bytes()])? == 1)
+    Ok(conn.execute("UPDATE call_ledger SET state='Prepared',frame_type='Response',frame_body=?3,first_reply_held=1 WHERE carrier=?1 AND call_key=?2 AND state IN ('Prepared','DispatchStarted') AND task_id IS NULL", params![key.carrier,key.call_key,retained.to_string().as_bytes()])? == 1)
 }
 
 /// DispatchStarted is the irrevocable start boundary, not native handler entry.
@@ -518,7 +540,7 @@ pub fn hold_running(
     // this caller may receive the response's structured data.
     retained["_aft_include_structured"] = json!(include_structured);
     let retained = retained.to_string().into_bytes();
-    tx.execute("UPDATE call_ledger SET recovered=1,frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key, if consent { &row.frame.as_ref().unwrap().body } else { &retained }])?;
+    tx.execute("UPDATE call_ledger SET recovered=1,frame_type='Response',frame_body=?3,first_reply_held=CASE WHEN ?4 THEN first_reply_held ELSE 1 END WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key, if consent { &row.frame.as_ref().unwrap().body } else { &retained }, consent])?;
     tx.commit()?;
     Ok(!consent)
 }
@@ -530,7 +552,21 @@ fn has_held_reply(row: &Row) -> bool {
 }
 
 pub fn hold_watch(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite::Result<()> {
-    let changed = conn.execute("UPDATE call_ledger SET recovered=1,frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state='DispatchStarted'", params![key.carrier, key.call_key, body])?;
+    write_watch_hold(conn, key, body, true)
+}
+
+/// Recovery refreshes the persisted watch hold without sending another first reply.
+pub fn refresh_watch_hold(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite::Result<()> {
+    write_watch_hold(conn, key, body, false)
+}
+
+fn write_watch_hold(
+    conn: &Connection,
+    key: &Key,
+    body: &[u8],
+    first_reply: bool,
+) -> rusqlite::Result<()> {
+    let changed = conn.execute("UPDATE call_ledger SET recovered=1,frame_type='Response',frame_body=?3,first_reply_held=CASE WHEN ?4 THEN 1 ELSE first_reply_held END WHERE carrier=?1 AND call_key=?2 AND state='DispatchStarted'", params![key.carrier, key.call_key, body, first_reply])?;
     if changed != 1 {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
@@ -815,6 +851,8 @@ fn settle_row(
         entry = Some(value.to_string());
     }
     let never_ran_answer = reason.map(|reason| answer_bytes(&never_ran_answer(reason)));
+    // Replacing the interim frame must not change whether the first reply was
+    // held. Only the original hold write records that fact.
     tx.execute("UPDATE call_ledger SET state='Settled',frame_type=?3,frame_body=?4,outcome=?5,settled_at=?6,seq=?7,late_entry=?8,withdraw_answer=COALESCE(withdraw_answer,?10),tool_result_source=?11 WHERE carrier=?1 AND call_key=?2 AND state=?9",
         params![key.carrier,key.call_key,frame.type_name(),frame.body,outcome,now,seq,entry,row.state.as_str(),never_ran_answer,tool_result_source])?;
     if let Some(custodian) = &row.custodian {
@@ -1878,6 +1916,84 @@ pub mod tests {
     }
     #[cfg(test)]
     #[test]
+    fn first_reply_held_column_is_additive_in_both_open_modes() {
+        use super::*;
+        use crate::db::{self, OpenMode};
+
+        for mode in [OpenMode::Deferred, OpenMode::SingleAttempt] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("aft.db");
+            let call = key("reserved:broca");
+            let (version, entry) = {
+                let mut conn = Connection::open(&path).unwrap();
+                let version = db::run_migrations(&mut conn).unwrap();
+                admit(
+                    &conn,
+                    &call,
+                    "digest",
+                    Some(&scope("reserved:prefrontal")),
+                    State::DispatchStarted,
+                )
+                .unwrap();
+                settle(&conn, &call, &success(), "ok", None, 100).unwrap();
+                let row = get(&conn, &call).unwrap().unwrap();
+                (version, row.late_entry.unwrap())
+            };
+            for _ in 0..2 {
+                let conn = db::open_with_mode(&path, mode).unwrap();
+                assert_eq!(db::current_schema_version(&conn).unwrap(), version);
+                let (held, stored): (Option<i64>, String) = conn
+                    .query_row(
+                        "SELECT first_reply_held,late_entry FROM call_ledger",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(held, None);
+                assert_eq!(stored, entry);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn recovery_refresh_preserves_first_reply_held_through_settlement() {
+        use super::*;
+
+        let conn = database();
+        let initial_hold = br#"{"held":{"reason":"running"},"_aft_watch_incarnation":"old"}"#;
+        let refreshed_hold = br#"{"held":{"reason":"running"},"_aft_watch_incarnation":"new"}"#;
+        for (carrier, marker) in [("reserved:broca", Some(1_i64)), ("reserved:old", None)] {
+            let call = key(carrier);
+            admit(&conn, &call, "digest", None, State::DispatchStarted).unwrap();
+            if marker.is_some() {
+                hold_watch(&conn, &call, initial_hold).unwrap();
+            } else {
+                conn.execute(
+                    "UPDATE call_ledger SET frame_type='Response',frame_body=?1 WHERE carrier=?2",
+                    params![initial_hold, carrier],
+                )
+                .unwrap();
+            }
+            refresh_watch_hold(&conn, &call, refreshed_hold).unwrap();
+            assert_eq!(
+                get(&conn, &call).unwrap().unwrap().frame.unwrap().body,
+                refreshed_hold,
+            );
+            settle(&conn, &call, &success(), "ok", None, 100).unwrap();
+            let stored: Option<i64> = conn
+                .query_row(
+                    "SELECT first_reply_held FROM call_ledger WHERE carrier=?1",
+                    [carrier],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, marker);
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
     fn schema_29_preserves_schema_28_rows_and_indexes_but_allows_carrier_custody() {
         use super::*;
         let mut conn = Connection::open_in_memory().unwrap();
@@ -2278,6 +2394,7 @@ pub mod tests {
     pub fn database() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::db::run_migrations(&mut conn).unwrap();
+        ensure_first_reply_held(&conn).unwrap();
         conn
     }
     pub fn key(carrier: &str) -> Key {

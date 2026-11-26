@@ -389,7 +389,7 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
                 continue;
             }
             body["_aft_watch_incarnation"] = serde_json::json!(ledger::provider_incarnation());
-            ledger::hold_watch(&conn, &key, &body.to_string().into_bytes())?;
+            ledger::refresh_watch_hold(&conn, &key, &body.to_string().into_bytes())?;
             waits.push((key, body));
         }
         drop(stmt);
