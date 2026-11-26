@@ -8182,9 +8182,9 @@ async fn consent_worker_dotdot_and_symlink_escapes_are_not_suggested() {
         );
         symlink(&outside, checkout.join(&link_name)).unwrap();
         let symlink_reply = f.read(&f.worker, &Path::new("/").join(link_name), 8).await;
-        assert_eq!(code(&symlink_reply), "access_pending", "{symlink_reply}");
+        assert_eq!(code(&symlink_reply), "not_found", "{symlink_reply}");
         assert!(!text(&symlink_reply).contains("did you mean"));
-        assert_eq!(f.fake.calls("consent.request").len(), 1);
+        assert!(f.fake.calls("consent.request").is_empty());
     }
 }
 

@@ -11851,6 +11851,7 @@ mod force_restrict_tests {
         assert!(ctx.validate_read_path("read", "session", &target).is_ok());
         let write = ctx.validate_path("write", &target).unwrap_err();
         assert_eq!(write.data["code"], "permission_required");
+        std::fs::write(outside.path().join("sibling"), "unapproved").unwrap();
         assert_eq!(
             ctx.validate_read_path("other", "session", &outside.path().join("sibling"))
                 .unwrap_err()

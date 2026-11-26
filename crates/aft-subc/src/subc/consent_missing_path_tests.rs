@@ -124,18 +124,36 @@ async fn consent_head_reader_missing_outside_paths_do_not_hold() {
         let reply: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(code(&reply), expected_code, "{name}: {reply}");
         assert_eq!(
-            text(&reply),
+            reply["structuredContent"]["message"],
             format!("{message}: {}", missing.display()),
             "{reply}"
         );
     }
     assert!(f.fake.calls("consent.request").is_empty());
-    let db = f.ctx.db().unwrap();
-    assert!(
-        asks::for_scope(&db.lock().unwrap(), &access_grants::scope_key(&f.head))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(asks::for_scope(
+        &f.ctx.db().unwrap().lock().unwrap(),
+        &access_grants::scope_key(&f.head)
+    )
+    .unwrap()
+    .is_empty());
+    let (_, mut replies) = f
+        .send_tool_options(
+            &f.head,
+            "read",
+            json!({"filePath": f.dir.path().join("elsewhere.txt")}),
+            20,
+            read_dispatch,
+            false,
+            Some("reader"),
+        )
+        .await;
+    let frame = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    assert_eq!(f.fake.calls("consent.request").len(), 1);
 }
 
 #[cfg(unix)]

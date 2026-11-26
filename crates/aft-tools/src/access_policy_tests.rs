@@ -1610,11 +1610,20 @@ fn scratch_read_after_command_exit_is_not_found_without_ask() {
             gone.data
         );
         let foreign = read("foreign-session", command);
+        let expected = if command == "read" {
+            "not_found"
+        } else {
+            "file_not_found"
+        };
         assert_eq!(
-            foreign.data["code"], "access_ask_required",
+            foreign.data["code"], expected,
             "{command}: {:?}",
             foreign.data
         );
+        assert!(!foreign.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("task scratch"));
     }
     // Workers often spell the scratch through the /tmp alias on macOS.
     #[cfg(target_os = "macos")]

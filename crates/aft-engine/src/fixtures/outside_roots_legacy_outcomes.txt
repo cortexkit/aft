@@ -299,8 +299,8 @@ root=set route=plugin forced=false outside-existing write-location
   false: ask permission_required
   true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
 root=set route=plugin forced=false outside-missing read
-  absent: ask permission_required
-  false: ask permission_required
+  absent: err path_not_found: path does not exist: <dir>/outside/missing.txt
+  false: err path_not_found: path does not exist: <dir>/outside/missing.txt
   true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
 root=set route=plugin forced=false outside-missing mutate
   absent: ask permission_required
@@ -383,8 +383,8 @@ root=set route=plugin forced=false symlink-file-escape write-location
   false: ok <dir>/root/link.txt
   true: ok <dir>/root/link.txt
 root=set route=plugin forced=false symlink-dir-escape read
-  absent: ask permission_required
-  false: ask permission_required
+  absent: err path_not_found: path does not exist: <dir>/root/link-dir/missing.txt
+  false: err path_not_found: path does not exist: <dir>/root/link-dir/missing.txt
   true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
 root=set route=plugin forced=false symlink-dir-escape mutate
   absent: ask permission_required
@@ -563,8 +563,8 @@ root=set route=elicitation forced=false outside-existing write-location
   false: ask access_ask_required
   true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
 root=set route=elicitation forced=false outside-missing read
-  absent: ask access_ask_required
-  false: ask access_ask_required
+  absent: err path_not_found: path does not exist: <dir>/outside/missing.txt
+  false: err path_not_found: path does not exist: <dir>/outside/missing.txt
   true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
 root=set route=elicitation forced=false outside-missing mutate
   absent: ask access_ask_required
@@ -647,8 +647,8 @@ root=set route=elicitation forced=false symlink-file-escape write-location
   false: ok <dir>/root/link.txt
   true: ok <dir>/root/link.txt
 root=set route=elicitation forced=false symlink-dir-escape read
-  absent: ask access_ask_required
-  false: ask access_ask_required
+  absent: err path_not_found: path does not exist: <dir>/root/link-dir/missing.txt
+  false: err path_not_found: path does not exist: <dir>/root/link-dir/missing.txt
   true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
 root=set route=elicitation forced=false symlink-dir-escape mutate
   absent: ask access_ask_required
@@ -695,8 +695,8 @@ root=set route=elicitation forced=true outside-existing write-location
   false: ask access_ask_required
   true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
 root=set route=elicitation forced=true outside-missing read
-  absent: ask access_ask_required
-  false: ask access_ask_required
+  absent: err path_not_found: path does not exist: <dir>/outside/missing.txt
+  false: err path_not_found: path does not exist: <dir>/outside/missing.txt
   true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
 root=set route=elicitation forced=true outside-missing mutate
   absent: ask access_ask_required
@@ -1235,9 +1235,9 @@ root=none route=plugin forced=false outside-existing write-location
   false: ask permission_required
   true: ask permission_required
 root=none route=plugin forced=false outside-missing read
-  absent: ask permission_required
-  false: ask permission_required
-  true: ask permission_required
+  absent: err path_not_found: path does not exist: <dir>/outside/missing.txt
+  false: err path_not_found: path does not exist: <dir>/outside/missing.txt
+  true: err path_not_found: path does not exist: <dir>/outside/missing.txt
 root=none route=plugin forced=false outside-missing mutate
   absent: ask permission_required
   false: ask permission_required
@@ -1379,9 +1379,9 @@ root=none route=elicitation forced=false outside-existing write-location
   false: ask access_ask_required
   true: ask access_ask_required
 root=none route=elicitation forced=false outside-missing read
-  absent: ask access_ask_required
-  false: ask access_ask_required
-  true: ask access_ask_required
+  absent: err path_not_found: path does not exist: <dir>/outside/missing.txt
+  false: err path_not_found: path does not exist: <dir>/outside/missing.txt
+  true: err path_not_found: path does not exist: <dir>/outside/missing.txt
 root=none route=elicitation forced=false outside-missing mutate
   absent: ask access_ask_required
   false: ask access_ask_required
@@ -1787,8 +1787,8 @@ root=linked route=elicitation forced=false main-checkout-file write-location
   false: ask access_ask_required
   true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
 root=linked route=elicitation forced=false main-checkout-missing read
-  absent: ask access_ask_required
-  false: ask access_ask_required
+  absent: err path_not_found: path does not exist: <dir>/main/new.txt
+  false: err path_not_found: path does not exist: <dir>/main/new.txt
   true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
 root=linked route=elicitation forced=false main-checkout-missing mutate
   absent: ask access_ask_required
@@ -1823,8 +1823,8 @@ root=linked route=elicitation forced=true main-checkout-file write-location
   false: ask access_ask_required
   true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
 root=linked route=elicitation forced=true main-checkout-missing read
-  absent: ask access_ask_required
-  false: ask access_ask_required
+  absent: err path_not_found: path does not exist: <dir>/main/new.txt
+  false: err path_not_found: path does not exist: <dir>/main/new.txt
   true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
 root=linked route=elicitation forced=true main-checkout-missing mutate
   absent: ask access_ask_required

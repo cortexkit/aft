@@ -10,8 +10,8 @@
 //!
 //! The expected outcomes live in `fixtures/outside_roots_legacy_outcomes.txt`.
 //! They were recorded from the engine as it decided before the setting was
-//! read through the policy rule, so a difference is a behaviour change for an
-//! existing configuration, not a fixture to refresh.
+//! read through the policy rule. Only the intentional switch from approval
+//! asks to not-found errors for missing read targets changes those outcomes.
 
 // The outcome table is Unix-only: it includes symlink probes and Unix path
 // spellings. On other targets only the rule test runs, so the table helpers
