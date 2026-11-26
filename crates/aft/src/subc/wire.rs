@@ -2726,13 +2726,9 @@ pub(super) mod tests {
 
     fn patch_diff_budget_fixture(large: bool) -> ToolCallResult {
         let dir = tempfile::tempdir().unwrap();
-        // macOS temp folders sit behind the /var -> /private/var link and the
-        // patch reports resolved paths, so build the fixture from the resolved
-        // folder. Elsewhere the temp path is used as is.
-        #[cfg(target_os = "macos")]
-        let root = dir.path().canonicalize().unwrap();
-        #[cfg(not(target_os = "macos"))]
-        let root = dir.path().to_path_buf();
+        // Patch headers use resolved paths, not macOS temp symlinks or the
+        // Windows 8.3 spelling sometimes returned by tempdir().
+        let root = crate::path_identity::canonicalize_normalized(dir.path());
         let deleted = root.join("deleted.txt");
         let source = root.join("source.txt");
         let moved = root.join("moved.txt");
