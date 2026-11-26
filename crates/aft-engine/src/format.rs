@@ -3514,6 +3514,47 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unsandboxed_formatter_strips_aft_credentials() {
+        const TEST: &str = "format::tests::unsandboxed_formatter_strips_aft_credentials";
+        const REENTRY: &str = "AFT_TEST_FORMATTER_ENV_REENTRY";
+
+        // Give the formatter's parent real inherited variables without changing
+        // the parallel test runner's environment.
+        if std::env::var(REENTRY).as_deref() != Ok(TEST) {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(REENTRY, TEST)
+                .env("SUBC_TEST_SECRET", "daemon-secret")
+                .env("SUBC_TEST_LABEL", "another-daemon-value")
+                .env("AFT_GH_SHIM_TICKET", "stale-ticket")
+                .env("AFT_FORMATTER_TEST_LABEL", "formatter-label")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "formatter environment test subprocess failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let result = run_external_tool(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            "/bin/sh",
+            &[
+                "-c",
+                r#"printf '%s|%s|%s|%s' "${SUBC_TEST_SECRET+set}" "${SUBC_TEST_LABEL+set}" "${AFT_GH_SHIM_TICKET+set}" "$AFT_FORMATTER_TEST_LABEL""#,
+            ],
+            None,
+            5,
+        )
+        .unwrap();
+        assert_eq!(result.stdout, "|||formatter-label");
+    }
+
     /// Formatters and checkers run on every edit. Their spawn must stay on
     /// std's posix_spawn path: a fork of the multi-GiB daemon on macOS takes
     /// every malloc zone lock. Any `pre_exec` closure in the builder (for
