@@ -8346,6 +8346,11 @@ mod v22_tests;
 #[cfg(test)]
 #[path = "gh_shim/v23_tests.rs"]
 mod v23_tests;
+
+#[cfg(test)]
+#[path = "gh_shim/workflow_approval_tests.rs"]
+mod workflow_approval_tests;
+
 // The review-thread rows are declared for Linux and macOS only, and the
 // signed fixtures verify only under the debug test key.
 #[cfg(test)]

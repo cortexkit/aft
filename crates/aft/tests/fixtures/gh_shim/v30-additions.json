@@ -1,0 +1,11 @@
+{
+  "manifest_version": 30,
+  "api_rules": [
+    {
+      "method": "POST",
+      "path_glob": "/repos/*/*/actions/runs/*/approve",
+      "tier": "admin",
+      "platform": ["macos", "linux"]
+    }
+  ]
+}
