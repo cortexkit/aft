@@ -341,7 +341,8 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
         | LangId::Json
         | LangId::Yaml
         | LangId::Toml
-        | LangId::Pascal => return None,
+        | LangId::Pascal
+        | LangId::Nix => return None,
     };
     Some(spec)
 }
@@ -794,6 +795,18 @@ fn push_children_with_state<'tree, T: Copy>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nix_is_skipped_by_complexity() {
+        let scan = fixture_scan(
+            "module.nix",
+            "{ lib, ... }: { services.demo.enable = true; f = x: if x then 1 else 0; }\n",
+        );
+        assert!(scan.functions.is_empty(), "{scan:?}");
+        assert!(scan.parse_error.is_none(), "{scan:?}");
+        assert_eq!(scan.language, None, "{scan:?}");
+        assert_eq!(scan.language_skipped.as_deref(), Some("nix"), "{scan:?}");
+    }
+
     #[test]
     fn h_header_complexity_uses_cpp_snapshot() {
         let root = tempfile::tempdir().unwrap();

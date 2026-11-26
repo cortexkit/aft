@@ -1449,6 +1449,192 @@ mod tests {
             .unwrap();
     }
 
+    /// The same 2 MiB-stack constraint as [`extract_on_a_small_stack`], but
+    /// returns the outline names so a Nix case can assert the binding nested
+    /// inside the nest was still found. A walk that abandoned descent under
+    /// stack pressure would return `Ok` with a truncated outline; asserting
+    /// the name catches that where `is_ok` alone would pass.
+    fn extract_names_on_a_small_stack(path: &'static str, source: String) -> Vec<String> {
+        extract_outline_on_a_small_stack(path, source)
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect()
+    }
+
+    /// [`extract_names_on_a_small_stack`] returning the stored outline
+    /// symbols, so a case can assert signature fields as the record holds
+    /// them, not just names.
+    fn extract_outline_on_a_small_stack(
+        path: &'static str,
+        source: String,
+    ) -> Vec<aft_store::content::OutlineSymbol> {
+        let language =
+            language_for(path, source.as_bytes()).unwrap_or_else(|| panic!("{path}: no language"));
+        std::thread::Builder::new()
+            .name(format!("deep-names-{path}"))
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let record = extract(source.as_bytes(), &language)
+                    .unwrap_or_else(|error| panic!("{path}: {error}"));
+                let RecordBody::Parsed { body, .. } = record.data else {
+                    panic!("{path}: a parsed language gives a parsed record");
+                };
+                body.outline.unwrap_or_else(|| panic!("{path}: no outline"))
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn nix_deeply_nested_parens_extracts_binding_on_a_small_stack() {
+        // nix_collect_entry descends the paren/let/apply wrapper chain once
+        // per level; a nest this deep had to be carried on the heap, and the
+        // binding wrapped inside it still has to be reported.
+        // Alternate the wrappers exactly as the wrappers come: parentheses
+        // and `let … in` layers interleaved, one binding wrapped inside.
+        let mut source = "{ deep = 1; }".to_string();
+        for level in 0..NESTING {
+            source = if level % 2 == 0 {
+                format!("({source})")
+            } else {
+                // The `let` layers bind a sibling flag and leave the wrapped
+                // expression as the body: entry discovery descends bodies
+                // syntactically and never resolves variable references (no
+                // evaluation), so the entry must stay an expression.
+                format!("let flag_{level} = true; in {source}")
+            };
+        }
+        let names = extract_names_on_a_small_stack("deep.nix", format!("{source}\n"));
+        assert!(names.iter().any(|name| name == "deep"), "{names:?}");
+    }
+
+    #[test]
+    fn nix_deeply_nested_formal_default_extracts_binding_on_a_small_stack() {
+        // nix_comment_ranges branches over every non-body child of a function
+        // header, including a formal's default value; a default nested this
+        // deep had to be carried on the heap, and the function binding inside
+        // it still has to be reported.
+        // A comment sits inside the innermost wrapper so the doc-comment
+        // walk traverses the full depth with real comments in range. That
+        // core comment sits at byte ~10,016 of the header, past the 1024-byte
+        // signature truncation every outline symbol passes through before
+        // storage (extract_symbols_from_tree_with, cloned into the outline
+        // at callgraph.rs:1784-1787), so it cannot answer whether comments
+        // are stripped at depth; a second comment sits right after the
+        // outermost paren, inside the retained prefix, where its presence
+        // would prove the splice failed — the same placement rule the
+        // attrset test above uses with `# early`. The `# c` assertion stays
+        // as a latent guard should the window ever widen; the deep region
+        // itself is oracled where no cap has run yet, in
+        // nix_deep_formal_comment_strips_below_the_window_in_the_parser.
+        let source = format!(
+            "{{ f = {{ x ? ( # outer\n{} ): x; }}\n",
+            nested("(", "# c\n1", ")")
+        );
+        let outline = extract_outline_on_a_small_stack("deep_formal.nix", source);
+        let binding = outline
+            .iter()
+            .find(|symbol| symbol.name == "f")
+            .expect("f must survive the nest");
+        assert!(
+            !binding
+                .signature
+                .as_deref()
+                .is_some_and(|s| s.contains("# c")),
+            "the reviewer's named comment must stay out of the signature: {:?}",
+            binding.signature
+        );
+        let signature = binding
+            .signature
+            .as_deref()
+            .expect("f is a function binding and carries a signature");
+        assert!(
+            !signature.contains('#'),
+            "header comments must be spliced out of f's signature: {signature}"
+        );
+    }
+
+    #[test]
+    fn nix_deeply_nested_attrset_and_list_values_complete_comments_on_a_small_stack() {
+        // The spec's literal shape: attrset and list values alternating ten
+        // thousand deep with comments inside. The nest hangs off a formal
+        // default so `nix_comment_ranges` — the walker hardened for exactly
+        // this traversal — carries it on the heap worklist, and the function
+        // binding's signature and doc-comment attachment still have to
+        // complete on the 2 MiB stack. Three oracles, each able to fail:
+        // the name proves entry descent completed (with the RED-transplant
+        // evidence pinning the overflow this fixture used to cause); the
+        // `# early` comment sits inside the header window that survives
+        // signature truncation, so a comment-free root signature fails if
+        // the splice walk skips header comments; the `# TODO deep` marker
+        // harvested from the core proves the marker walk reached the
+        // ten-thousand-deep level.
+        let mut nest = String::new();
+        let mut closes: Vec<&str> = Vec::with_capacity(NESTING);
+        for layer in 0..NESTING {
+            if layer % 2 == 0 {
+                // The outermost attrset carries `# early` inside the header
+                // byte range: retained by signature truncation, so a splice
+                // regression leaves `#` in the stored signature.
+                if layer == 0 {
+                    nest.push_str("{ # early\n wrap = ");
+                } else {
+                    nest.push_str("{ wrap = ");
+                }
+                closes.push("; }");
+            } else {
+                nest.push_str("[ ");
+                closes.push(" ]");
+            }
+        }
+        nest.push_str("{ # TODO deep\ndeep = 1; }");
+        for close in closes.iter().rev() {
+            nest.push_str(close);
+        }
+        // Formal default position: a non-body child of the function header,
+        // which the signature walk traverses for comment splicing.
+        let src = format!("{{ root = {{ x ? {nest} }}: x; }}\n");
+        let (names, todo_at_core, root_signature) = std::thread::Builder::new()
+            .name("deep-comments-deep_values.nix".to_string())
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let record = extract(src.as_bytes(), "nix")
+                    .unwrap_or_else(|error| panic!("deep_values.nix: {error}"));
+                let RecordBody::Parsed { body, .. } = record.data else {
+                    panic!("deep_values.nix: a parsed language gives a parsed record");
+                };
+                let outline = body.outline.unwrap_or_default();
+                let names: Vec<String> = outline.iter().map(|symbol| symbol.name.clone()).collect();
+                let root_signature = outline
+                    .iter()
+                    .find(|symbol| symbol.name == "root")
+                    .and_then(|symbol| symbol.signature.clone());
+                let todo = record
+                    .todos
+                    .as_ref()
+                    .and_then(|todos| todos.items.as_ref())
+                    .is_some_and(|items| items.iter().any(|marker| marker.marker == "TODO"));
+                (names, todo, root_signature)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            names.iter().any(|name| name == "root"),
+            "entry binding must survive the value nest: {names:?}"
+        );
+        assert!(
+            todo_at_core,
+            "the TODO comment at the ten-thousand-deep core must be harvested"
+        );
+        let root_signature = root_signature.expect("the formal-default header is the signature");
+        assert!(
+            !root_signature.contains('#'),
+            "header comments must be spliced out at depth: {root_signature}"
+        );
+    }
+
     /// One test per language, so a stack overflow names the language that
     /// caused it.
     macro_rules! deep_nesting_tests {

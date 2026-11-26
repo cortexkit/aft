@@ -10031,7 +10031,6 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
     if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
         return true;
     }
-
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
         Some(
@@ -10088,7 +10087,8 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "gradle"
                 | "m"
                 | "mm"
-                | "toml",
+                | "toml"
+                | "nix",
         )
     )
 }
@@ -13635,6 +13635,23 @@ Connection: close
             .find(|chunk| chunk.name == "dependencies.foo")
             .expect("dependency table chunk");
         assert_eq!((dependency.start_line, dependency.end_line), (4, 5));
+    }
+
+    #[test]
+    fn nix_semantic_chunk_indexes_fixture() {
+        let project_root = Path::new("/project");
+        let file = project_root.join("flake.nix");
+        let source = "{\n  outputs = inputs: {\n    devShells.default = inputs.nixpkgs.mkShell { };\n  };\n}\n";
+        let chunks = collect_file_chunks_from_source(
+            project_root,
+            &file,
+            crate::parser::LangId::Nix,
+            source,
+        )
+        .expect("collect Nix chunks");
+
+        assert!(chunks.iter().any(|chunk| chunk.name == "outputs"));
+        assert!(chunks.iter().any(|chunk| chunk.name == "devShells.default"));
     }
 
     #[test]

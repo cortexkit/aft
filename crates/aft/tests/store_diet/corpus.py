@@ -12,7 +12,7 @@ EXTENSIONS = dict(typescript='ts', tsx='tsx', javascript='js', python='py', rust
                   c='c', cpp='cpp', cuda='cu', metal='metal', zig='zig', csharp='cs', bash='sh',
                   html='html', markdown='md', solidity='sol', scss='scss', vue='vue', json='json',
                   scala='scala', java='java', ruby='rb', kotlin='kt', swift='swift', php='php',
-                  lua='lua', perl='pl', yaml='yaml', pascal='pas', r='r', groovy='groovy', objc='m', toml='toml')
+                  lua='lua', perl='pl', yaml='yaml', pascal='pas', r='r', groovy='groovy', objc='m', toml='toml', nix='nix')
 
 
 def function_table(source, function):

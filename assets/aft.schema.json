@@ -129,6 +129,7 @@
           "rustfmt",
           "goimports",
           "gofmt",
+          "nixfmt",
           "none"
         ]
       }
@@ -1004,6 +1005,7 @@
                 "rustfmt",
                 "goimports",
                 "gofmt",
+                "nixfmt",
                 "none"
               ]
             }

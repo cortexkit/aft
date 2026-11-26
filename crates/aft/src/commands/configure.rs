@@ -952,6 +952,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::Nix => "nix",
     }
 }
 
@@ -1015,13 +1016,17 @@ fn configure_tool_candidate(tool: &str, source: &str, required: bool) -> Configu
     }
 }
 
-fn explicit_formatter_candidate(name: &str) -> Vec<ConfigureToolCandidate> {
+fn explicit_formatter_candidate(name: &str, lang: LangId) -> Vec<ConfigureToolCandidate> {
     match name {
         "none" | "off" | "false" => Vec::new(),
-        "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports"
-        | "gofmt" => {
+        // nixfmt is a Nix-only formatter; under another language's key the
+        // value names a tool that cannot format that language, so it is not
+        // accepted (same as an unknown name).
+        "nixfmt" if lang == LangId::Nix => {
             vec![configure_tool_candidate(name, "formatter config", true)]
         }
+        "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports"
+        | "gofmt" => vec![configure_tool_candidate(name, "formatter config", true)],
         _ => Vec::new(),
     }
 }
@@ -1055,7 +1060,7 @@ fn formatter_candidates_with_pyproject(
 ) -> Vec<ConfigureToolCandidate> {
     let project_root = config.project_root.as_deref();
     if let Some(preferred) = config.formatter.get(lang_key(lang)) {
-        return explicit_formatter_candidate(preferred);
+        return explicit_formatter_candidate(preferred, lang);
     }
 
     match lang {
@@ -1146,7 +1151,8 @@ fn formatter_candidates_with_pyproject(
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => Vec::new(),
+        | LangId::Luau
+        | LangId::Nix => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -1225,7 +1231,8 @@ fn checker_candidates(
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => Vec::new(),
+        | LangId::Luau
+        | LangId::Nix => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -8031,6 +8038,38 @@ mod tests {
         assert_eq!(warning.kind, "formatter_not_installed");
         assert_eq!(warning.language, "typescript");
         assert_eq!(warning.tool, "oxfmt");
+    }
+
+    #[test]
+    fn configure_refuses_nixfmt_under_other_language_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        // With a Cargo.toml in the project root, auto-detection would offer
+        // rustfmt for Rust; the is_empty() assertion below then also pins
+        // that refusing nixfmt contributes nothing rather than falling back
+        // to the detected formatter.
+        std::fs::write(temp.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+        let mut config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+        config
+            .formatter
+            .insert("rust".to_string(), "nixfmt".to_string());
+        assert!(
+            super::formatter_candidates(crate::parser::LangId::Rust, &config).is_empty(),
+            "nixfmt under the rust key must contribute no candidate"
+        );
+
+        let mut nix_config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+        nix_config
+            .formatter
+            .insert("nix".to_string(), "nixfmt".to_string());
+        let candidates = super::formatter_candidates(crate::parser::LangId::Nix, &nix_config);
+        assert_eq!(candidates.len(), 1, "the nix key keeps nixfmt");
+        assert_eq!(candidates[0].tool, "nixfmt");
     }
 
     #[test]

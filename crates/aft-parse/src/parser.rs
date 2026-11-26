@@ -17,11 +17,16 @@ use crate::callgraph_store::join::syntax_index::{Direct, Nav};
 use crate::error::AftError;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
+use self::nix::extract_nix_symbols;
+
 mod file_language;
 pub use file_language::dynamic_language_for_extension;
 mod grammar_selection;
 pub use grammar_selection::grammar_for;
+mod data_langs;
 pub mod dead_code_facts;
+pub use data_langs::json_document_value;
+mod nix;
 pub mod outline_facts;
 pub mod todo_markers;
 
@@ -878,6 +883,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::ObjC => Some(OBJC_QUERY),
         LangId::Toml => None,
         LangId::Luau => None,
+        LangId::Nix => None,
     }
 }
 
@@ -977,7 +983,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         | LangId::Json
         | LangId::Yaml
         | LangId::Toml
-        | LangId::Luau => None,
+        | LangId::Luau
+        | LangId::Nix => None,
     };
 
     query
@@ -2749,13 +2756,16 @@ fn extract_symbols_from_tree_unbounded<'tree>(
         return extract_vue_symbols(source, &root);
     }
     if lang == LangId::Json {
-        return extract_json_symbols(source, &root);
+        return data_langs::extract_json_symbols(source, &root);
     }
     if lang == LangId::Yaml {
-        return extract_yaml_symbols(source, &root);
+        return data_langs::extract_yaml_symbols(source, &root);
     }
     if lang == LangId::Toml {
         return extract_toml_symbols(source, &root);
+    }
+    if lang == LangId::Nix {
+        return extract_nix_symbols(source, &root);
     }
     if lang == LangId::Luau {
         return Ok(crate::luau::declarations(source, root)
@@ -2803,7 +2813,8 @@ fn extract_symbols_from_tree_unbounded<'tree>(
         | LangId::Vue
         | LangId::Json
         | LangId::Yaml
-        | LangId::Toml => unreachable!("handled before query lookup"),
+        | LangId::Toml
+        | LangId::Nix => unreachable!("handled before query lookup"),
     }
 }
 
@@ -2940,7 +2951,8 @@ fn node_range_with_decorators_inner<'tree>(
             | LangId::Vue
             | LangId::Json
             | LangId::Yaml
-            | LangId::Toml => false,
+            | LangId::Toml
+            | LangId::Nix => false,
         };
 
         if should_include {
@@ -6947,405 +6959,6 @@ fn extract_toml_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
     Ok(symbols)
 }
 
-/// Return the first non-comment value in a JSON document.
-///
-/// JSONC permits comments before the document value. Tree-sitter exposes those
-/// comments as named children, so callers must not assume `named_child(0)` is the
-/// object or array that contains the document's data.
-pub fn json_document_value<'a>(root: &Node<'a>) -> Option<Node<'a>> {
-    let mut cursor = root.walk();
-    let value = root
-        .named_children(&mut cursor)
-        .find(|child| child.kind() != "comment");
-    value
-}
-
-fn extract_json_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
-    let Some(value) = json_document_value(root) else {
-        return Ok(Vec::new());
-    };
-
-    if value.kind() != "object" {
-        return Ok(Vec::new());
-    }
-
-    let mut symbols = Vec::new();
-    let mut cursor = value.walk();
-    for child in value.named_children(&mut cursor) {
-        if child.kind() != "pair" {
-            continue;
-        }
-        let Some(key_node) = child.child_by_field_name("key") else {
-            continue;
-        };
-        let name = node_text(source, &key_node).trim_matches('"').to_string();
-        if name.is_empty() {
-            continue;
-        }
-        symbols.push(Symbol {
-            name,
-            kind: SymbolKind::Variable,
-            range: node_range_with_decorators(&child, source, LangId::Json),
-            signature: None,
-            scope_chain: vec![],
-            exported: false,
-            parent: None,
-        });
-    }
-
-    Ok(symbols)
-}
-
-/// Read a YAML scalar/key node as trimmed text, stripping surrounding quotes.
-fn yaml_scalar_text(source: &str, node: &Node) -> String {
-    node_text(source, node)
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string()
-}
-
-/// Find the mapping that is the direct payload of `node`, descending only
-/// through wrapper nodes (`document`, `block_node`, `flow_node`) rather than
-/// arbitrary nested mappings. This keeps detection anchored to the document's
-/// top-level mapping instead of latching onto a mapping buried inside a
-/// sequence or nested value.
-fn yaml_find_mapping<'a>(node: &Node<'a>) -> Option<Node<'a>> {
-    let mut current = *node;
-    loop {
-        match current.kind() {
-            "block_mapping" | "flow_mapping" => return Some(current),
-            "document" | "block_node" | "flow_node" => {
-                let mut cursor = current.walk();
-                let next = current
-                    .named_children(&mut cursor)
-                    .find(|child| !matches!(child.kind(), "tag" | "anchor"));
-                match next {
-                    Some(inner) => current = inner,
-                    None => return None,
-                }
-            }
-            _ => return None,
-        }
-    }
-}
-
-/// Look up a top-level key in a YAML mapping and return its value node.
-fn yaml_get<'a>(mapping: &Node<'a>, source: &str, key: &str) -> Option<Node<'a>> {
-    let mut cursor = mapping.walk();
-    for pair in mapping.named_children(&mut cursor) {
-        if pair.kind() != "block_mapping_pair" && pair.kind() != "flow_pair" {
-            continue;
-        }
-        let Some(key_node) = pair.child_by_field_name("key") else {
-            continue;
-        };
-        if yaml_scalar_text(source, &key_node) == key {
-            return pair.child_by_field_name("value");
-        }
-    }
-    None
-}
-
-/// Flatten a YAML value node to clean text for embed_text. Scalars return their
-/// trimmed text; block/flow sequences are joined as comma-separated scalar items
-/// (so `verbs: [get, list, watch]` becomes `get,list,watch` instead of raw
-/// multi-line `- get\n- list` text). Nested mappings are ignored here.
-fn yaml_unwrap<'a>(node: &Node<'a>) -> Node<'a> {
-    let mut current = *node;
-    while current.kind() == "block_node" || current.kind() == "flow_node" {
-        let mut cursor = current.walk();
-        let next = current
-            .named_children(&mut cursor)
-            .find(|child| !matches!(child.kind(), "tag" | "anchor"));
-        match next {
-            Some(inner) => current = inner,
-            None => break,
-        }
-    }
-    current
-}
-
-fn yaml_flatten_value(source: &str, node: &Node) -> String {
-    let node = &yaml_unwrap(node);
-    match node.kind() {
-        "block_sequence" | "flow_sequence" => {
-            let mut items = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                // block_sequence_item wraps a value; flow_sequence holds nodes directly.
-                let value = if child.kind() == "block_sequence_item" {
-                    child.named_child(0)
-                } else {
-                    Some(child)
-                };
-                if let Some(v) = value {
-                    let v = yaml_unwrap(&v);
-                    // Only flatten scalar leaves; skip mappings (handled elsewhere).
-                    if v.kind() != "block_mapping" && v.kind() != "flow_mapping" {
-                        let text = yaml_scalar_text(source, &v);
-                        if !text.is_empty() {
-                            items.push(text);
-                        }
-                    }
-                }
-            }
-            items.join(",")
-        }
-        // Mapping values (e.g. container `resources:` block) are not flattened
-        // here — their high-signal leaves (cpu/memory) are collected separately.
-        // Returning empty avoids dumping raw multi-line YAML into embed_text.
-        "block_mapping" | "flow_mapping" => String::new(),
-        _ => yaml_scalar_text(source, node),
-    }
-}
-
-/// Collect `key=value` pairs for the given keys (e.g. image, cpu, memory,
-/// verbs) anywhere below `node`, in document order, to enrich embed_text for
-/// semantic search. Sequence values are flattened to comma-joined scalars.
-/// Capped to avoid runaway output. The walk keeps its pending nodes on the
-/// heap rather than recursing, so a deeply nested document cannot overflow
-/// the stack.
-fn yaml_collect_values(
-    source: &str,
-    node: &Node,
-    keys: &[&str],
-    out: &mut Vec<String>,
-    cap: usize,
-) {
-    // Children are pushed in reverse so they are popped in document order.
-    let mut pending: Vec<Node> = node.named_children(&mut node.walk()).collect();
-    pending.reverse();
-    while let Some(child) = pending.pop() {
-        if out.len() >= cap {
-            return;
-        }
-        if child.kind() == "block_mapping_pair" || child.kind() == "flow_pair" {
-            if let Some(key_node) = child.child_by_field_name("key") {
-                let key_text = yaml_scalar_text(source, &key_node);
-                if keys.contains(&key_text.as_str()) {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        let value_text = yaml_flatten_value(source, &value_node);
-                        if !value_text.is_empty() && out.len() < cap {
-                            out.push(format!("{}={}", key_text, value_text));
-                        }
-                    }
-                }
-            }
-        }
-        let start = pending.len();
-        pending.extend(child.named_children(&mut child.walk()));
-        pending[start..].reverse();
-    }
-}
-
-/// Collect the `name:` field from every item of a `<parent_key>:` sequence of
-/// mappings. The bare `name` key is too generic to match globally (it collides
-/// with metadata/container names), so these are gathered by parent key and
-/// emitted as `<label>=A,B,...`. Handles k8s `env: [{name,value}]` and Argo
-/// Workflow `templates: [{name, ...}]`. Capped. The walk keeps its pending
-/// nodes on the heap rather than recursing, so a deeply nested document
-/// cannot overflow the stack.
-fn yaml_collect_named_items(
-    source: &str,
-    node: &Node,
-    parent_key: &str,
-    label: &str,
-    out: &mut Vec<String>,
-    cap: usize,
-) {
-    // Children are pushed in reverse so they are popped in document order.
-    let mut pending: Vec<Node> = node.named_children(&mut node.walk()).collect();
-    pending.reverse();
-    while let Some(child) = pending.pop() {
-        if (child.kind() == "block_mapping_pair" || child.kind() == "flow_pair")
-            && child
-                .child_by_field_name("key")
-                .map(|k| yaml_scalar_text(source, &k))
-                .as_deref()
-                == Some(parent_key)
-        {
-            if let Some(seq) = child.child_by_field_name("value") {
-                let seq = yaml_unwrap(&seq);
-                let mut names = Vec::new();
-                let mut seq_cursor = seq.walk();
-                for item in seq.named_children(&mut seq_cursor) {
-                    let value = if item.kind() == "block_sequence_item" {
-                        item.named_child(0)
-                    } else {
-                        Some(item)
-                    };
-                    if let Some(v) = value {
-                        if let Some(map) = yaml_find_mapping(&v) {
-                            if let Some(name_node) = yaml_get(&map, source, "name") {
-                                let n = yaml_scalar_text(source, &name_node);
-                                if !n.is_empty() && names.len() < 16 {
-                                    names.push(n);
-                                }
-                            }
-                        }
-                    }
-                }
-                if !names.is_empty() && out.len() < cap {
-                    out.push(format!("{}={}", label, names.join(",")));
-                }
-            }
-        }
-        let start = pending.len();
-        pending.extend(child.named_children(&mut child.walk()));
-        pending[start..].reverse();
-    }
-}
-
-/// Tier 1: if a document is a Kubernetes resource (has both apiVersion + kind),
-/// emit one rich symbol named `<ns>/<Kind>/<name>` with enriched signature.
-/// Generalizes to arbitrary CRDs since apiVersion+kind is the CRD contract.
-fn yaml_k8s_resource_symbol(source: &str, doc: &Node, mapping: &Node) -> Option<Symbol> {
-    let api_version =
-        yaml_get(mapping, source, "apiVersion").map(|n| yaml_scalar_text(source, &n))?;
-    let kind = yaml_get(mapping, source, "kind").map(|n| yaml_scalar_text(source, &n))?;
-    if api_version.is_empty() || kind.is_empty() {
-        return None;
-    }
-
-    let (name, namespace) = match yaml_get(mapping, source, "metadata") {
-        Some(meta) => match yaml_find_mapping(&meta) {
-            Some(meta_map) => {
-                // Prefer `name`; fall back to `generateName` (common in Argo
-                // Workflows submitted without a fixed name) so the symbol still
-                // carries an identifier instead of collapsing to bare <Kind>.
-                let name = yaml_get(&meta_map, source, "name")
-                    .map(|n| yaml_scalar_text(source, &n))
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        yaml_get(&meta_map, source, "generateName")
-                            .map(|n| yaml_scalar_text(source, &n))
-                            .filter(|s| !s.is_empty())
-                    });
-                (
-                    name,
-                    yaml_get(&meta_map, source, "namespace").map(|n| yaml_scalar_text(source, &n)),
-                )
-            }
-            None => (None, None),
-        },
-        None => (None, None),
-    };
-
-    let res_name = name.clone().filter(|s| !s.is_empty());
-    let sym_name = match (&namespace, &res_name) {
-        (Some(ns), Some(n)) if !ns.is_empty() => format!("{}/{}/{}", ns, kind, n),
-        (_, Some(n)) => format!("{}/{}", kind, n),
-        _ => kind.clone(),
-    };
-
-    let mut sig = format!("apiVersion={} kind={}", api_version, kind);
-    if let Some(ns) = namespace.as_ref().filter(|s| !s.is_empty()) {
-        sig.push_str(&format!(" namespace={}", ns));
-    }
-    if let Some(n) = res_name.as_ref() {
-        sig.push_str(&format!(" name={}", n));
-    }
-    // Enrich with high-signal spec fields so intent queries match. Covers
-    // containers (image/ports), resource limits/requests (cpu/memory), RBAC
-    // rules (verbs/resources/apiGroups), and storage (volumeMounts mountPath).
-    let mut extras = Vec::new();
-    yaml_collect_values(
-        source,
-        mapping,
-        &[
-            "image",
-            "containerPort",
-            "port",
-            "targetPort",
-            "cpu",
-            "memory",
-            "storage",
-            "verbs",
-            "resources",
-            "apiGroups",
-            "mountPath",
-            "replicas",
-            // Argo Workflow high-signal scalars.
-            "entrypoint",
-            "command",
-            "args",
-            "schedule",
-        ],
-        &mut extras,
-        24,
-    );
-    // Sequence-of-mappings whose `name` key is ambiguous: collect by parent key.
-    // k8s env vars and Argo Workflow templates both use the `{name: ...}` shape.
-    yaml_collect_named_items(source, mapping, "env", "env", &mut extras, 24);
-    yaml_collect_named_items(source, mapping, "templates", "templates", &mut extras, 24);
-    if !extras.is_empty() {
-        sig.push(' ');
-        sig.push_str(&extras.join(" "));
-    }
-
-    Some(Symbol {
-        name: sym_name,
-        kind: SymbolKind::Class,
-        range: node_range(doc),
-        signature: Some(sig),
-        scope_chain: vec![],
-        exported: true,
-        parent: None,
-    })
-}
-
-/// Tier 2: generic YAML — emit top-level mapping keys as Variable symbols
-/// (docker-compose services, CI jobs, Helm values.yaml, etc.).
-fn yaml_generic_keys(source: &str, mapping: &Node, symbols: &mut Vec<Symbol>) {
-    let mut cursor = mapping.walk();
-    for pair in mapping.named_children(&mut cursor) {
-        if pair.kind() != "block_mapping_pair" && pair.kind() != "flow_pair" {
-            continue;
-        }
-        let Some(key_node) = pair.child_by_field_name("key") else {
-            continue;
-        };
-        let name = yaml_scalar_text(source, &key_node);
-        if name.is_empty() {
-            continue;
-        }
-        symbols.push(Symbol {
-            name,
-            kind: SymbolKind::Variable,
-            range: node_range(&pair),
-            signature: None,
-            scope_chain: vec![],
-            exported: false,
-            parent: None,
-        });
-    }
-}
-
-/// Extract symbols from a YAML stream. Handles multi-document (`---`) streams:
-/// each document becomes a Kubernetes resource symbol (Tier 1) when it carries
-/// apiVersion+kind, otherwise its top-level keys are emitted (Tier 2). Helm/Go
-/// templated YAML that yields no parseable mapping degrades gracefully (the
-/// document is skipped rather than failing the whole file).
-fn extract_yaml_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
-    let mut symbols = Vec::new();
-    let mut cursor = root.walk();
-    for doc in root.named_children(&mut cursor) {
-        if doc.kind() != "document" {
-            continue;
-        }
-        let Some(mapping) = yaml_find_mapping(&doc) else {
-            continue;
-        };
-        if let Some(symbol) = yaml_k8s_resource_symbol(source, &doc, &mapping) {
-            symbols.push(symbol);
-        } else {
-            yaml_generic_keys(source, &mapping, &mut symbols);
-        }
-    }
-    Ok(symbols)
-}
-
 fn scala_scope_chain(node: &Node, source: &str) -> Vec<String> {
     let mut chain = Vec::new();
     let mut current = node.parent();
@@ -9901,5 +9514,610 @@ pub mod work_counters {
 
     pub fn grammar_loads() -> usize {
         GRAMMAR_LOADS.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nix_symbols(source: &str) -> Vec<Symbol> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&grammar_for(LangId::Nix).unwrap())
+            .expect("nix grammar loads");
+        let tree = parser.parse(source, None).expect("parse nix source");
+        assert!(
+            !tree.root_node().has_error(),
+            "fixture must parse without errors: {source}"
+        );
+        extract_symbols_from_tree(source, &tree, LangId::Nix).expect("extract nix symbols")
+    }
+
+    fn nix_names(source: &str) -> Vec<String> {
+        nix_symbols(source)
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect()
+    }
+
+    #[test]
+    fn nix_detection_and_clean_parse() {
+        assert_eq!(detect_language(Path::new("flake.nix")), Some(LangId::Nix));
+        let symbols = nix_symbols("{\n  description = \"demo\";\n}\n");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "description");
+    }
+
+    #[test]
+    fn nix_entry_discovery_covers_every_wrapper_and_container() {
+        let cases: &[(&str, &str)] = &[
+            ("function body", "{ lib, ... }: {\n  a = 1;\n}\n"),
+            ("let", "let\n  version = \"1\";\nin\n{\n  a = 1;\n}\n"),
+            ("with", "with pkgs;\n{\n  a = 1;\n}\n"),
+            ("assert", "assert true;\n{\n  a = 1;\n}\n"),
+            ("parenthesized", "({\n  a = 1;\n})\n"),
+            ("attrset", "{\n  a = 1;\n}\n"),
+            ("rec attrset", "rec {\n  a = 1;\n}\n"),
+            ("let attrset", "let {\n  a = 1;\n}\n"),
+        ];
+        for (label, source) in cases {
+            assert!(
+                nix_names(source).contains(&"a".to_string()),
+                "{label} should outline `a`"
+            );
+        }
+
+        let let_names = nix_names("let\n  version = \"1\";\nin\n{\n  pname = \"demo\";\n}\n");
+        assert!(let_names.contains(&"version".to_string()));
+        assert!(let_names.contains(&"pname".to_string()));
+    }
+
+    #[test]
+    fn nix_module_outline_uses_dotted_attrpaths() {
+        let source = "{ config, lib, pkgs, ... }:\n{\n  options.services.demo.enable = lib.mkEnableOption \"demo\";\n  config.services.demo = { enable = true; port = 80; nested = { deep = 1; }; };\n}\n";
+        let symbols = nix_symbols(source);
+        let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
+        assert!(names.contains(&"options.services.demo.enable"));
+        assert!(names.contains(&"config.services.demo"));
+        assert!(names.contains(&"enable"));
+        assert!(names.contains(&"port"));
+        assert!(!names.contains(&"deep"), "depth stops after one level");
+
+        let enable = symbols
+            .iter()
+            .find(|symbol| symbol.name == "enable")
+            .unwrap();
+        assert_eq!(enable.scope_chain, vec!["config.services.demo"]);
+        assert_eq!(enable.parent.as_deref(), Some("config.services.demo"));
+        assert_eq!(
+            symbol_query_matches(enable, "config.services.demo.enable"),
+            true
+        );
+        assert_eq!(
+            symbol_query_matches(
+                &symbols
+                    .iter()
+                    .find(|symbol| symbol.name == "config.services.demo")
+                    .unwrap()
+                    .clone(),
+                "config.services.demo"
+            ),
+            true
+        );
+    }
+
+    #[test]
+    fn nix_applied_attrset_arguments_are_outlined() {
+        let derivation = "{\n  lib,\n  stdenv,\n}:\nstdenv.mkDerivation {\n  pname = \"demo\";\n  version = \"1.0\";\n  src = ./.;\n}\n";
+        let names = nix_names(derivation);
+        assert!(names.contains(&"pname".to_string()), "{names:?}");
+        assert!(names.contains(&"version".to_string()), "{names:?}");
+
+        assert!(
+            nix_names("stdenv.mkDerivation (finalAttrs: { pname = \"x\"; })\n")
+                .contains(&"pname".to_string())
+        );
+
+        let conditional =
+            nix_names("{ lib, ... }: lib.mkIf true { services.demo.enable = true; }\n");
+        assert!(
+            conditional.contains(&"services.demo.enable".to_string()),
+            "{conditional:?}"
+        );
+
+        let wrapped = nix_names("with pkgs; stdenv.mkDerivation { pname = \"x\"; }\n");
+        assert!(wrapped.contains(&"pname".to_string()), "{wrapped:?}");
+
+        // Deliberate limits: non-attrset shapes and non-final arguments.
+        for source in [
+            "lib.mkMerge [ { a = 1; } { b = 2; } ]\n",
+            "if true then { a = 1; } else { b = 2; }\n",
+            "{ a = 1; } // { b = 2; }\n",
+            "f { config = 1; } other\n",
+        ] {
+            assert!(
+                nix_names(source).is_empty(),
+                "expected no outline for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_nested_application_values_expand_one_level() {
+        let names = nix_names("{\n  config = lib.mkIf true { services.demo.enable = true; };\n}\n");
+        assert!(
+            names.contains(&"services.demo.enable".to_string()),
+            "an application-wrapped value must nest one level: {names:?}"
+        );
+
+        // The depth stop still applies: the nested binding's own child is not
+        // expanded even though its value is an attrset.
+        let deep = nix_names("{\n  config = f { a = { b = 1; }; };\n}\n");
+        assert!(deep.contains(&"a".to_string()), "{deep:?}");
+        assert!(!deep.contains(&"b".to_string()), "{deep:?}");
+
+        // Only an attribute-set argument is followed; lists and `//` splits
+        // nested in a binding still contribute nothing.
+        let shapes = nix_names(
+            "{\n  config = lib.mkMerge [ { a = 1; } { b = 2; } ];\n  other = { x = 1; } // { y = 2; };\n}\n",
+        );
+        assert_eq!(shapes, vec!["config".to_string(), "other".to_string()]);
+    }
+
+    #[test]
+    fn nix_applied_let_argument_keeps_file_level_bindings() {
+        let names = nix_names("stdenv.mkDerivation (let v = \"1\"; in { version = v; })\n");
+        assert!(names.contains(&"v".to_string()), "{names:?}");
+        assert!(names.contains(&"version".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn nix_wide_binding_file_stays_inside_the_outline_name_budget() {
+        // One long parent name over many small children: without the budget
+        // each child copies the parent name twice (`parent` plus its
+        // one-element `scope_chain`), so retained name bytes grow with the
+        // square of the file and a small source becomes quadratic work.
+        let parent = "p".repeat(3000);
+        let children = 2000;
+        let mut source = format!("{{ {parent} = {{\n");
+        for child in 0..children {
+            source.push_str(&format!("  c{child} = 1;\n"));
+        }
+        source.push_str("}; }\n");
+        assert!(
+            source.len() < 64 << 10,
+            "the input itself must stay small: {} bytes",
+            source.len()
+        );
+
+        let symbols = nix_symbols(&source);
+        let kept: usize = symbols
+            .iter()
+            .map(|symbol| {
+                symbol.name.len()
+                    + symbol.parent.as_deref().map_or(0, str::len)
+                    + symbol.scope_chain.iter().map(String::len).sum::<usize>()
+            })
+            .sum();
+        assert!(
+            kept <= nix::NIX_OUTLINE_NAME_BUDGET,
+            "the outline kept {kept} name bytes from a {}-byte file, over the bound",
+            source.len()
+        );
+
+        // The stop truncates the tail, not the head: the first children are
+        // emitted with exact names and parents, and the stop actually fired.
+        assert!(symbols.len() > 1, "the outline emitted nothing");
+        assert!(
+            symbols.len() < children + 1,
+            "the budget never fired: {} symbols for {children} children",
+            symbols.len()
+        );
+        let first = symbols
+            .iter()
+            .find(|symbol| symbol.name == "c0")
+            .expect("the first child is emitted");
+        assert_eq!(first.parent.as_deref(), Some(parent.as_str()));
+        assert_eq!(first.scope_chain, vec![parent.clone()]);
+    }
+
+    #[test]
+    fn nix_collisions_use_full_names_across_every_top_level_binding() {
+        let dotted = nix_symbols("let foo.bar = { x = 1; }; in { foo.baz = { y = 2; }; }\n");
+        let names: Vec<&str> = dotted.iter().map(|symbol| symbol.name.as_str()).collect();
+        assert!(names.contains(&"x"), "let binding expands: {names:?}");
+        assert!(names.contains(&"y"), "entry binding expands: {names:?}");
+
+        let same_name = nix_symbols("let x = { a = 1; }; in let x = { b = 2; }; in { y = 1; }\n");
+        let lines: Vec<u32> = same_name
+            .iter()
+            .filter(|symbol| symbol.name == "x")
+            .map(|symbol| symbol.range.start_line)
+            .collect();
+        assert_eq!(lines.len(), 2, "{same_name:?}");
+        assert!(
+            !same_name
+                .iter()
+                .any(|symbol| matches!(symbol.name.as_str(), "a" | "b")),
+            "identical names expand neither: {same_name:?}"
+        );
+    }
+
+    #[test]
+    fn nix_deep_formal_comment_strips_below_the_window_in_the_parser() {
+        // The record path truncates every outline signature to
+        // MAX_SIGNATURE_BYTES before storage, so a comment deeper than that
+        // window cannot be observed in a stored record. Call the extractor
+        // directly — splicing runs there, truncation has not run yet — and
+        // nest enough wrappers that the comment sits past 1024 bytes: the
+        // deep header region becomes a live oracle, and the retained
+        // signature must still come back comment-free at full length.
+        let depth = 1200usize;
+        let mut source = String::from("{ f = { x ? (");
+        for _ in 0..depth {
+            source.push_str(" (");
+        }
+        source.push_str(" # deep\n 1");
+        for _ in 0..depth {
+            source.push_str(" )");
+        }
+        source.push_str(" ) }: x; }\n");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&grammar_for(LangId::Nix).unwrap())
+            .expect("nix grammar loads");
+        let tree = parser.parse(&source, None).expect("parse nix source");
+        assert!(!tree.root_node().has_error(), "fixture must parse clean");
+        let symbols = extract_nix_symbols(&source, &tree.root_node()).expect("extract nix");
+        let binding = symbols
+            .iter()
+            .find(|symbol| symbol.name == "f")
+            .expect("f survives the nest");
+        let signature = binding
+            .signature
+            .as_deref()
+            .expect("f is a function binding");
+        assert!(
+            signature.len() > MAX_SIGNATURE_BYTES,
+            "the probe comment must sit past the stored window: {}",
+            signature.len()
+        );
+        assert!(
+            !signature.contains('#'),
+            "the deep comment must be spliced before any truncation: {signature}"
+        );
+    }
+
+    #[test]
+    fn nix_function_bindings_carry_signatures() {
+        let source = "{\n  config = { lib, pkgs, ... }: { a = 1; };\n  split =\n    { lib\n    , pkgs\n    }: { };\n  mkDefault = value: { b = value; };\n  run = (x: x);\n  enable = true;\n}\n";
+        let symbols = nix_symbols(source);
+        let find = |name: &str| symbols.iter().find(|symbol| symbol.name == name).unwrap();
+
+        assert_eq!(find("config").kind, SymbolKind::Function);
+        assert_eq!(
+            find("config").signature.as_deref(),
+            Some("config = { lib, pkgs, ... }:")
+        );
+        assert_eq!(
+            find("split").signature.as_deref(),
+            Some("split = { lib, pkgs }:"),
+            "multiline formals collapse to one line"
+        );
+
+        let commented = nix_symbols("{\n  foo = { lib\n  # note\n  , pkgs }: { a = 1; };\n}\n");
+        let foo = commented
+            .iter()
+            .find(|symbol| symbol.name == "foo")
+            .unwrap();
+        assert_eq!(
+            foo.signature.as_deref(),
+            Some("foo = { lib, pkgs }:"),
+            "comments inside the formals are stripped"
+        );
+        assert!(!foo.signature.as_deref().unwrap().contains('#'));
+        assert_eq!(find("mkDefault").kind, SymbolKind::Function);
+        assert_eq!(
+            find("mkDefault").signature.as_deref(),
+            Some("mkDefault = value:")
+        );
+        assert_eq!(find("run").kind, SymbolKind::Function);
+        assert_eq!(find("run").signature.as_deref(), Some("run = x:"));
+        assert_eq!(find("enable").kind, SymbolKind::Variable);
+        assert_eq!(find("enable").signature, None);
+    }
+
+    #[test]
+    fn nix_flake_outline_nests_outputs_one_level() {
+        let source = "{\n  outputs = inputs@{ self, nixpkgs }: {\n    devShells.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.mkShell { };\n  };\n}\n";
+        let symbols = nix_symbols(source);
+        let outputs = symbols
+            .iter()
+            .find(|symbol| symbol.name == "outputs")
+            .unwrap();
+        assert_eq!(outputs.kind, SymbolKind::Function);
+        assert!(
+            outputs
+                .signature
+                .as_deref()
+                .unwrap()
+                .starts_with("outputs = inputs@"),
+            "{:?}",
+            outputs.signature
+        );
+
+        let dev_shell = symbols
+            .iter()
+            .find(|symbol| symbol.name == "devShells.x86_64-linux.default")
+            .expect("nested flake output");
+        assert_eq!(dev_shell.scope_chain, vec!["outputs"]);
+        assert_eq!(dev_shell.parent.as_deref(), Some("outputs"));
+        assert!(symbol_query_matches(
+            dev_shell,
+            "outputs.devShells.x86_64-linux.default"
+        ));
+    }
+
+    #[test]
+    fn nix_signature_excludes_comments_and_shadowed_names_keep_entry_children() {
+        let commented = "{\n  foo = { lib }: # docs\n    { a = 1; };\n}\n";
+        let symbols = nix_symbols(commented);
+        let foo = symbols.iter().find(|symbol| symbol.name == "foo").unwrap();
+        assert_eq!(foo.signature.as_deref(), Some("foo = { lib }:"));
+
+        // Attributes and `let` variables are separate namespaces: both rows
+        // exist, and neither expands nested bindings while the parent name is
+        // ambiguous.
+        let shadowed =
+            nix_symbols("let\n  enable = { x = 1; };\nin\n{\n  enable = { y = 2; };\n}\n");
+        let names: Vec<&str> = shadowed.iter().map(|symbol| symbol.name.as_str()).collect();
+        assert_eq!(names, vec!["enable", "enable"]);
+        let lines: Vec<u32> = shadowed
+            .iter()
+            .map(|symbol| symbol.range.start_line)
+            .collect();
+        assert_eq!(lines, vec![1, 4], "outline follows source order");
+        assert_eq!(
+            shadowed
+                .iter()
+                .filter(|symbol| symbol.parent.is_some())
+                .count(),
+            0,
+            "ambiguous parents do not expand"
+        );
+    }
+
+    #[test]
+    fn nix_inherit_clauses_are_not_outlined() {
+        let names = nix_names("{\n  inherit (lib) mkIf;\n  inherit pkgs;\n}\n");
+        assert!(!names.contains(&"mkIf".to_string()));
+        assert!(!names.contains(&"pkgs".to_string()));
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn nix_indented_string_semicolons_neither_trigger_nor_suppress_the_hint() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        // The only top-level `;` shape here sits inside an indented string;
+        // the scanner must not read it as a second binding.
+        assert!(
+            detect_pattern_hint("$A = ''a; b'';", &lang).is_none(),
+            "a semicolon inside an indented string must not earn the hint"
+        );
+        // Two real bindings still earn it even when each value is an
+        // indented string.
+        let hint = detect_pattern_hint("$A = ''x''; $B = ''y'';", &lang)
+            .expect("two real bindings earn the nix hint");
+        assert!(
+            hint.contains("nix pattern must contain one binding or one inherit clause"),
+            "hint missing the exact wording: {hint}"
+        );
+    }
+
+    #[test]
+    fn nix_two_binding_pattern_error_carries_hint() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        let pattern = "$A = true; $B = false;";
+        assert!(
+            lang.compile_pattern(pattern).is_err(),
+            "an attrset body has no single node to bind"
+        );
+        let hint = detect_pattern_hint(pattern, &lang)
+            .expect("a multi-binding pattern earns the nix hint");
+        assert!(
+            hint.contains("nix pattern must contain one binding or one inherit clause"),
+            "hint missing the exact wording: {hint}"
+        );
+    }
+
+    #[test]
+    fn nix_binding_plus_inherit_pattern_error_carries_hint() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        let pattern = "$A = true; inherit $B;";
+        assert!(
+            lang.compile_pattern(pattern).is_err(),
+            "a binding plus an inherit clause is two members"
+        );
+        let hint = detect_pattern_hint(pattern, &lang)
+            .expect("a binding-plus-inherit pattern earns the nix hint");
+        assert!(
+            hint.contains("nix pattern must contain one binding or one inherit clause"),
+            "hint missing the exact wording: {hint}"
+        );
+    }
+
+    #[test]
+    fn nix_dynamic_attrpath_names_stay_as_written() {
+        let syms = nix_symbols("{ \"${x}\" = 1; a.\"${b}\".c = 2; plain = 3; }\n");
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["\"${x}\"", "a.\"${b}\".c", "plain"],
+            "interpolated and dynamic path segments keep the source-written name"
+        );
+    }
+
+    #[test]
+    fn nix_comment_or_quoted_member_after_semicolon_still_carries_hint() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        for pattern in ["$A = true; # c\n $B = false;", "$A = true; \"quoted\" = 2;"] {
+            let hint = detect_pattern_hint(pattern, &lang)
+                .expect("a member hidden by a comment or quote still earns the hint");
+            assert!(
+                hint.contains("nix pattern must contain one binding or one inherit clause"),
+                "hint missing the exact wording: {hint}"
+            );
+        }
+        assert!(
+            detect_pattern_hint("$A = true; # trailing comment only\n", &lang).is_none(),
+            "a single binding with a trailing comment earns no hint"
+        );
+        assert!(
+            detect_pattern_hint("$A = { b = 1; }; } ; $B = 2;", &lang).is_some(),
+            "a stray closer must not mask the second member"
+        );
+    }
+
+    #[test]
+    fn nix_indented_string_escapes_keep_the_hint_scanner_in_range() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        assert!(
+            detect_pattern_hint("$A = ''x''${y};'';", &lang).is_none(),
+            "a `;` inside an indented string (past a double-quote-dollar escape) is not a separator"
+        );
+        assert!(
+            detect_pattern_hint("$A = ''x'';''; $B = 2;", &lang).is_some(),
+            "the real separator after the closed indented string still earns the hint"
+        );
+        assert!(
+            detect_pattern_hint("$A = ''''; $B = 1;", &lang).is_some(),
+            "'''' is an empty indented string; the ; after it is top level"
+        );
+    }
+
+    #[test]
+    fn nix_quotes_nested_in_interpolation_keep_the_hint_scanner_in_range() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        // Interpolation bodies are full expressions and may nest strings; a
+        // `;` inside a nested string must not read as a member terminator.
+        for pattern in [
+            "$A = \"${ f \"x;y\" }\";",
+            "$A = ''${ f \"x;y\" }'';",
+            "$A = \"${ \"\" } x; y\";",
+            "$A = ''hi ${ \"don''t; do\" } x'';",
+            "$A = \"${ /* \" */ toString 1 }\"; # note",
+            "$A = ''${ /* ; */ f }'';",
+        ] {
+            assert!(
+                detect_pattern_hint(pattern, &lang).is_none(),
+                "nested string contents must not trigger the multi-binding hint: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_line_comment_hides_semicolons_from_the_hint_scanner() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        // One binding with a trailing comment: a `;` inside the comment must
+        // not read as a member terminator.
+        assert!(
+            detect_pattern_hint("a = 1; # TODO ; revisit later", &lang).is_none(),
+            "a `;` inside a line comment is not a member terminator"
+        );
+    }
+
+    #[test]
+    fn nix_block_comment_hides_semicolons_from_the_hint_scanner() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        // A single-binding pattern whose block comment contains `; x = 2;`
+        // must not read as multiple bindings.
+        assert!(
+            detect_pattern_hint("$A = /* ; x = 2; */ true;", &lang).is_none(),
+            "a `;` inside a block comment is not a member terminator"
+        );
+        // Positive control: a real second member behind a block comment is
+        // still two bindings and still gets the hint.
+        assert!(
+            detect_pattern_hint("$A = 1; /* why */ $B = 2;", &lang).is_some(),
+            "a member hidden behind a block comment is still a second binding"
+        );
+    }
+
+    #[test]
+    fn nix_let_in_terminator_after_semicolon_carries_no_hint() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        for pattern in ["let a = 1; in a", "let a = 1; in b", "let a = 1; in $B"] {
+            assert!(
+                detect_pattern_hint(pattern, &lang).is_none(),
+                "`{pattern}` is one let-expression member, not two bindings"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_apostrophe_in_identifier_does_not_open_a_string() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        // Nix identifiers may contain apostrophes: `foo''` is one
+        // identifier, not an indented-string opener. A `;` after it is a
+        // real member terminator, so the multi-binding hint must fire.
+        let hint = detect_pattern_hint("foo'' = true; bar = 1;", &lang)
+            .expect("apostrophe pair must not swallow the member terminator");
+        assert!(hint.contains("one binding or one inherit"), "{hint}");
+    }
+
+    #[test]
+    fn nix_single_binding_pattern_compiles_without_hint() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        let pattern = "$NAME = true;";
+        assert!(
+            lang.compile_pattern(pattern).is_ok(),
+            "a single binding compiles via the contextual fallback"
+        );
+        assert!(
+            detect_pattern_hint(pattern, &lang).is_none(),
+            "a valid single binding earns no hint"
+        );
+    }
+
+    #[test]
+    fn nix_composed_pattern_error_names_nix() {
+        use crate::ast_grep_hints::detect_pattern_hint;
+        use crate::ast_grep_lang::AstGrepLang;
+        let lang = AstGrepLang::Nix;
+        let pattern = "$A = true; $B = false;";
+        let err = lang
+            .compile_pattern(pattern)
+            .expect_err("two bindings cannot compile");
+        let hint = detect_pattern_hint(pattern, &lang).expect("the hint fires");
+        // Mirrors how the ast-search/replace commands compose the user-facing
+        // message: the generic pattern error plus the hint on a blank line.
+        let message = format!("invalid AST pattern: {err}\n\n{hint}");
+        assert!(
+            message.to_lowercase().contains("nix"),
+            "composed error must identify nix: {message}"
+        );
     }
 }

@@ -322,6 +322,7 @@ pub enum RawFormatter {
     Rustfmt,
     Goimports,
     Gofmt,
+    Nixfmt,
     None,
 }
 
@@ -337,6 +338,7 @@ impl RawFormatter {
             Self::Rustfmt => "rustfmt",
             Self::Goimports => "goimports",
             Self::Gofmt => "gofmt",
+            Self::Nixfmt => "nixfmt",
             Self::None => "none",
         }
     }
@@ -3167,10 +3169,27 @@ fn apply_resolved_config(
         config.validate_on_edit = Some(value.as_str().to_string());
     }
     if let Some(formatter) = &raw.formatter {
-        config.formatter = formatter
-            .iter()
-            .map(|(language, formatter)| (language.clone(), formatter.as_str().to_string()))
-            .collect();
+        let mut kept = HashMap::with_capacity(formatter.len());
+        for (language, tool) in formatter {
+            // nixfmt formats Nix files only: under any other language key it
+            // would silently disable that language's own formatter detection,
+            // so the pair is refused when the config is read. Removing it
+            // restores detection for that language.
+            if *tool == RawFormatter::Nixfmt && language != "nix" {
+                warnings.push(ConfigWarning {
+                    code: "nixfmt_wrong_language",
+                    key: "formatter",
+                    tier: "config".into(),
+                    value: format!("{language}=nixfmt"),
+                    message: format!(
+                        "nixfmt formats Nix files only; formatter.{language} = \"nixfmt\" is refused and does not disable {language} formatter detection"
+                    ),
+                });
+                continue;
+            }
+            kept.insert(language.clone(), tool.as_str().to_string());
+        }
+        config.formatter = kept;
     }
     if let Some(checker) = &raw.checker {
         config.checker = checker
@@ -4067,6 +4086,63 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nixfmt_is_a_recognized_formatter_and_reaches_the_resolved_map() {
+        let raw = serde_json::from_str::<super::RawAftConfig>(r#"{"formatter":{"nix":"nixfmt"}}"#);
+        assert!(raw.is_ok(), "formatter.nix must accept nixfmt: {raw:?}");
+
+        let result = super::resolve_config_for_harness(
+            &[tier("user", r#"{"formatter":{"nix":"nixfmt"}}"#)],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.formatter.get("nix").map(String::as_str),
+            Some("nixfmt")
+        );
+        assert!(
+            !result
+                .dropped
+                .iter()
+                .any(|dropped| dropped.key.starts_with("formatter")),
+            "formatter.nix must not be dropped: {:?}",
+            result.dropped
+        );
+    }
+
+    #[test]
+    fn nixfmt_under_a_foreign_language_key_is_refused_at_config_read() {
+        // A raw config pairing nixfmt with another language must not survive
+        // into the resolved map: keeping it would silently disable that
+        // language's own formatter detection (here: rustfmt).
+        let result = super::resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"formatter":{"rust":"nixfmt","nix":"nixfmt"}}"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.formatter.get("nix").map(String::as_str),
+            Some("nixfmt"),
+            "the nix key must keep nixfmt"
+        );
+        assert!(
+            !result.config.formatter.contains_key("rust"),
+            "formatter.rust = nixfmt must be refused, not kept: {:?}",
+            result.config.formatter
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("formatter.rust")),
+            "the refusal must be reported as a warning: {:?}",
+            result.warnings
+        );
+    }
+
     #[test]
     fn storage_cache_dir_is_a_recognized_user_setting() {
         let raw = serde_json::from_str::<super::RawAftConfig>(

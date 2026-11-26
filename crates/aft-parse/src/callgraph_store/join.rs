@@ -553,6 +553,7 @@ pub fn language_id(language: &str) -> Option<LangId> {
         "groovy" => LangId::Groovy,
         "objc" => LangId::ObjC,
         "toml" => LangId::Toml,
+        "nix" => LangId::Nix,
         _ => return crate::grammar::extractor_language(language),
     })
 }

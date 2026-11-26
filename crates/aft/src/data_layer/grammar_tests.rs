@@ -222,6 +222,7 @@ fn luau_s4_keyed_language_preserves_every_builtin_key() {
         "groovy",
         "objc",
         "toml",
+        "nix",
         "markers-lexical",
         "markers-markdown",
         "config",

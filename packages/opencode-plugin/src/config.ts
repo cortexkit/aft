@@ -103,6 +103,7 @@ const FormatterEnum = z.enum([
   "rustfmt",
   "goimports",
   "gofmt",
+  "nixfmt",
   "none",
 ]);
 
@@ -677,7 +678,26 @@ const AftConfigFieldsSchema = z.object({
   /** Auto-validate after edits: "syntax" (tree-sitter) or "full" (runs type checker). */
   validate_on_edit: z.enum(["syntax", "full"]).optional(),
   /** Per-language formatter overrides. Keys: "typescript", "python", "rust", "go". */
-  formatter: z.record(z.string(), FormatterEnum).optional(),
+  formatter: z
+    .record(z.string(), FormatterEnum)
+    .optional()
+    .superRefine((formatter, ctx) => {
+      // nixfmt only ever formats Nix files. Under another language key it
+      // would suppress that language's own formatter detection, so the pair
+      // is refused at the config boundary (same rule the Rust resolver
+      // applies); removing it restores detection for that language.
+      for (const [language, value] of Object.entries(formatter ?? {})) {
+        if (value === "nixfmt" && language !== "nix") {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            // Relative to the field: zod prefixes "formatter", so the
+            // rendered issue path stays `formatter.<language>`.
+            path: [language],
+            message: `nixfmt formats Nix files only; formatter.${language} = "nixfmt" is refused (remove it to restore ${language} formatter detection)`,
+          });
+        }
+      }
+    }),
   /** Per-language type checker overrides. Keys: "typescript", "python", "rust", "go". */
   checker: z.record(z.string(), CheckerEnum).optional(),
   /**

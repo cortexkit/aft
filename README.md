@@ -176,6 +176,7 @@ _Coming soon._
 | YAML (incl. Kubernetes) | ✓ | ✓ | | ✓ | | |
 | JSON | ✓ | ✓ | ✓ | | | |
 | TOML | ✓ | ✓ | | ✓ | | |
+| Nix | ✓ | ✓ | ✓ | ✓ | | |
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Pascal | ✓ | ✓ | ✓ | ✓ | | |
 | R | ✓ | ✓ | ✓ | ✓ | | |
@@ -187,7 +188,7 @@ Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`w
 
 Objective-C `.h` headers continue to use the C grammar in v1, so Objective-C interfaces declared only in headers may outline imperfectly compared with `.m`/`.mm` implementation files.
 
-Metal uses the C++ grammar because there is no maintained tree-sitter-metal grammar; covered shader qualifiers still produce ordinary function symbols. CUDA uses the dedicated tree-sitter-cuda grammar so kernel launches remain call expressions, and `__global__` definitions render as `kernel` symbols. TOML is structural for outline, zoom, and semantic chunking, but is intentionally absent from AST pattern tools because its key grammar does not accept ast-grep's identifier metavariable sentinels.
+Metal uses the C++ grammar because there is no maintained tree-sitter-metal grammar; covered shader qualifiers still produce ordinary function symbols. CUDA uses the dedicated tree-sitter-cuda grammar so kernel launches remain call expressions, and `__global__` definitions render as `kernel` symbols. TOML is structural for outline, zoom, and semantic chunking, but is intentionally absent from AST pattern tools because its key grammar does not accept ast-grep's identifier metavariable sentinels. Nix supports outline, zoom, AST search/replace, and semantic chunking, but its Imports and Refactor columns are intentionally blank and it contributes no call-graph edges: bindings are not declarations; standalone bindings and `inherit` clauses use contextual patterns, while complete Nix expressions use the normal AST pattern path. `$NAME` metavariables are rewritten to `_NAME`, so an identifier of `_` followed by an all-uppercase name (`_FOO`) is read as a metavariable, while `_module.args`, `_Foo`, and `__functor` stay literal.
 
 Indexes honor `.gitignore` and an optional `.aftignore` (same syntax) for paths git can't exclude, such as submodules. Naming a file explicitly in `grep` searches it even when ignored, matching ripgrep.
 

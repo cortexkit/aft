@@ -646,6 +646,64 @@ pub fn separator() -> char {
         (ctx, storage)
     }
 
+    /// Indexing a real `.nix` file through a checkout must publish a record
+    /// whose outline keeps each nested binding's exact parent: dotted zoom
+    /// and scope lookup key on `scope_chain`/`parent`, and the content-plane
+    /// substring checks would pass even if `enable` or `port` had landed
+    /// under the wrong parent.
+    #[test]
+    fn nix_stored_outline_reads_back_exact_parent_paths() {
+        let source = include_str!("../../tests/fixtures/nix_module.nix");
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        write(&root, "nix_module.nix", source);
+        let (ctx, _storage) = published_then_restarted(&root);
+        let view = ctx
+            .data_checkout()
+            .expect("the published checkout opens")
+            .view()
+            .expect("the published checkout has a view");
+        let stored = view
+            .outline_symbols(b"nix_module.nix")
+            .expect("read the stored outline")
+            .expect("the published Nix record carries an outline");
+        assert_eq!(
+            stored.content,
+            ContentKey::of(source.as_bytes()),
+            "the outline belongs to the file's published content"
+        );
+
+        let by_name = |name: &str| {
+            stored
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} missing from {:?}",
+                        stored.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    )
+                })
+        };
+        // The dotted module option stays one exact name at file level…
+        assert_eq!(by_name("options.services.demo.enable").parent, None);
+        // …and the attrset children keep their exact parent on both fields
+        // navigation keys on.
+        for nested in ["enable", "port"] {
+            let symbol = by_name(nested);
+            assert_eq!(
+                symbol.parent.as_deref(),
+                Some("config.services.demo"),
+                "{nested} must hang under its module attrpath"
+            );
+            assert_eq!(
+                symbol.scope_chain,
+                vec!["config.services.demo"],
+                "{nested} scope chain"
+            );
+        }
+    }
+
     fn fresh_cache() -> SharedSymbolCache {
         Arc::new(std::sync::RwLock::new(SymbolCache::new()))
     }
