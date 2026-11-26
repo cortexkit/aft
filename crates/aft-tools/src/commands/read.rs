@@ -4,7 +4,7 @@
 //! opencode's built-in read tool with a faster Rust implementation.
 //! For symbol-based reading and call-graph annotations, use `zoom` instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -203,13 +203,9 @@ impl PreparedPathRead {
             Self::Response(response) => return response,
             Self::Media { raw_bytes, media } => (raw_bytes, media),
         };
-        let byte_size = raw_bytes.len();
         match media {
             SniffedMedia::Pdf => handle_pdf_media(id, raw_bytes),
-            SniffedMedia::Image(kind) => match process_image_with_timeout(raw_bytes, kind) {
-                Ok(image) => image_attachment_response(id, image),
-                Err(reason) => media_omitted_response(id, byte_size, reason),
-            },
+            SniffedMedia::Image(kind) => handle_image_media(id, raw_bytes, kind),
         }
     }
 }
@@ -385,56 +381,140 @@ fn image_attachment_response_with_budget(
     )
 }
 
-static ACTIVE_IMAGE_DECODERS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 const MAX_IMAGE_DECODERS: usize = 2;
+const IMAGE_DECODER_WAIT: Duration = Duration::from_secs(10);
+const IMAGE_DECODER_CANCEL_POLL: Duration = Duration::from_millis(25);
+static IMAGE_DECODERS: LazyLock<ImageDecoderSlots> = LazyLock::new(ImageDecoderSlots::default);
+
+#[cfg(test)]
+type ImageDecoderTestHold = (
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<()>,
+);
 
 #[cfg(test)]
 thread_local! {
-    static HOLD_IMAGE_DECODER: std::cell::Cell<Option<(crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>)>> = const { std::cell::Cell::new(None) };
+    static HOLD_IMAGE_DECODER: std::cell::Cell<Option<ImageDecoderTestHold>> = const { std::cell::Cell::new(None) };
 }
 
-struct ImageDecoderPermit;
+#[derive(Default)]
+struct ImageDecoderSlots {
+    state: parking_lot::Mutex<ImageDecoderState>,
+    changed: parking_lot::Condvar,
+}
 
-impl Drop for ImageDecoderPermit {
-    fn drop(&mut self) {
-        ACTIVE_IMAGE_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+#[derive(Default)]
+struct ImageDecoderState {
+    active: usize,
+    next_ticket: u64,
+    waiters: VecDeque<u64>,
+}
+
+impl ImageDecoderSlots {
+    fn acquire(
+        &self,
+        decode_deadline: Option<Instant>,
+    ) -> Result<ImageDecoderPermit<'_>, ImageReadError> {
+        let wait_deadline = Instant::now() + IMAGE_DECODER_WAIT;
+        let wait_deadline =
+            decode_deadline.map_or(wait_deadline, |deadline| deadline.min(wait_deadline));
+        let cancellation = crate::executor::current_job_cancellation();
+        let mut state = self.state.lock();
+        let ticket = state.next_ticket;
+        state.next_ticket = ticket.wrapping_add(1);
+        state.waiters.push_back(ticket);
+
+        let result = loop {
+            // The executor signals route cancellation separately from decoder releases.
+            // Only read the signalled state here; checking whether the project root
+            // still exists could block everyone who needs the decoder lock.
+            if cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_already_requested())
+            {
+                break Err(ImageReadError::Cancelled);
+            }
+            let now = Instant::now();
+            if now >= wait_deadline {
+                break Err(ImageReadError::Omitted(format!(
+                    "image decoder capacity reached ({MAX_IMAGE_DECODERS}/{MAX_IMAGE_DECODERS} active); retry after existing image reads finish"
+                )));
+            }
+            if state.active < MAX_IMAGE_DECODERS && state.waiters.front() == Some(&ticket) {
+                state.active += 1;
+                break Ok(ImageDecoderPermit(self));
+            }
+            let wake_at = if cancellation.is_some() {
+                wait_deadline.min(now + IMAGE_DECODER_CANCEL_POLL)
+            } else {
+                wait_deadline
+            };
+            self.changed.wait_until(&mut state, wake_at);
+        };
+        state.waiters.retain(|waiting| *waiting != ticket);
+        if state.active < MAX_IMAGE_DECODERS {
+            self.changed.notify_all();
+        }
+        result
     }
 }
 
-#[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
+struct ImageDecoderPermit<'a>(&'a ImageDecoderSlots);
+
+impl Drop for ImageDecoderPermit<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().active -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
+#[derive(Debug)]
+enum ImageReadError {
+    Cancelled,
+    Omitted(String),
+}
+
+fn handle_image_media(id: &str, raw_bytes: Vec<u8>, kind: ImageKind) -> Response {
+    let byte_size = raw_bytes.len();
+    match process_image_with_timeout(raw_bytes, kind) {
+        Ok(image) => image_attachment_response(id, image),
+        Err(ImageReadError::Omitted(reason)) => media_omitted_response(id, byte_size, reason),
+        // A cancelled route discards the late completion rather than rendering an omission.
+        Err(ImageReadError::Cancelled) => {
+            Response::error(id, "request_cancelled", "request cancelled")
+        }
+    }
+}
+
 fn process_image_with_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
-) -> Result<ProcessedImage, String> {
+) -> Result<ProcessedImage, ImageReadError> {
     process_image_with_budget_timeout(
         raw_bytes,
         kind,
         crate::context::call_context::active().then_some(image_base64_budget()),
-        Instant::now() + IMAGE_PROCESS_TIMEOUT,
+        None,
     )
 }
 
-#[allow(deprecated)] // Keep decoder admission compatible with the minimum supported Rust version.
 fn process_image_with_budget_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
     budget: Option<usize>,
-    deadline: Instant,
-) -> Result<ProcessedImage, String> {
+    decode_deadline: Option<Instant>,
+) -> Result<ProcessedImage, ImageReadError> {
     #[cfg(test)]
     IMAGE_PROCESSING_DELAY.with(|delay| std::thread::sleep(delay.get()));
-    ACTIVE_IMAGE_DECODERS.fetch_update(
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-        |active| (active < MAX_IMAGE_DECODERS).then_some(active + 1),
-    ).map_err(|active| format!("image decoder capacity reached ({active}/{MAX_IMAGE_DECODERS} active); retry after existing image reads finish"))?;
-    let permit = ImageDecoderPermit;
+    let permit = IMAGE_DECODERS.acquire(decode_deadline)?;
+    // Local admission has its own window. A GitHub page shares an absolute
+    // deadline across all its images, leaving time to send the response.
+    let deadline = decode_deadline.unwrap_or_else(|| Instant::now() + IMAGE_PROCESS_TIMEOUT);
     let (tx, rx) = crossbeam_channel::bounded(1);
     #[cfg(test)]
     let hold = HOLD_IMAGE_DECODER.take();
     // The worker owns admission until decoding actually ends, including after a
-    // caller timeout. Reject overload rather than queueing retained image bytes.
+    // caller timeout.
     let spawned = std::thread::Builder::new()
         .name("aft-read-media".to_string())
         .stack_size(8 * 1024 * 1024)
@@ -452,7 +532,9 @@ fn process_image_with_budget_timeout(
             let _ = tx.send(result);
         });
     if let Err(error) = spawned {
-        return Err(format!("failed to start image processing: {error}"));
+        return Err(ImageReadError::Omitted(format!(
+            "failed to start image processing: {error}"
+        )));
     }
 
     let timeout = if budget.is_some() {
@@ -470,6 +552,7 @@ fn process_image_with_budget_timeout(
             Err("image processing worker stopped before returning a result".to_string())
         }
     }
+    .map_err(ImageReadError::Omitted)
 }
 
 fn image_is_opaque(image: &DynamicImage) -> bool {
@@ -947,10 +1030,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         }
         return match media {
             SniffedMedia::Pdf => handle_pdf_media(&req.id, bytes),
-            SniffedMedia::Image(kind) => match process_image_with_timeout(bytes, kind) {
-                Ok(image) => image_attachment_response(&req.id, image),
-                Err(reason) => media_omitted_response(&req.id, byte_size, reason),
-            },
+            SniffedMedia::Image(kind) => handle_image_media(&req.id, bytes, kind),
         };
     }
     if is_binary(&bytes) {
@@ -1347,9 +1427,12 @@ fn fit_github_images(
     for image in images {
         if !stopped && remaining > 0 && Instant::now() < deadline {
             if let Some(SniffedMedia::Image(kind)) = sniff_media(&image.bytes) {
-                if let Ok(processed) =
-                    process_image_with_budget_timeout(image.bytes, kind, Some(remaining), deadline)
-                {
+                if let Ok(processed) = process_image_with_budget_timeout(
+                    image.bytes,
+                    kind,
+                    Some(remaining),
+                    Some(deadline),
+                ) {
                     let encoded = base64_len(processed.bytes.len()).unwrap_or(usize::MAX);
                     if encoded <= remaining {
                         let mut response = image_attachment_response_with_budget(
@@ -3273,6 +3356,21 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn wait_for_image_decoder_queue(count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let queued = IMAGE_DECODERS.state.lock().waiters.len();
+            if queued == count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {count} waiters, got {queued}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn repeat_read_image_rewrite_with_same_summary_restarts_guidance_count() {
         use crate::run_tool_call::RepeatObservation;
@@ -3354,7 +3452,7 @@ mod tests {
         let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let png = encode_png(&rgba_image(192, 160, true)).unwrap();
+        let png = encode_png(&rgba_image(160, 144, true)).unwrap();
         let paths =
             std::array::from_fn::<_, 4, _>(|i| write_fixture(root, &format!("{i}.png"), &png));
 
@@ -3367,7 +3465,7 @@ mod tests {
                 scope.spawn(move || {
                     HOLD_IMAGE_DECODER.set(Some((entered, hold)));
                     let _body = crate::context::call_context::enter(true);
-                    done.send(read_response(root, path, json!({}))).unwrap();
+                    let _ = done.send(read_response(root, path, json!({})));
                 });
             }
             for _ in 0..2 {
@@ -3377,11 +3475,12 @@ mod tests {
                 let done = done.clone();
                 scope.spawn(move || {
                     let _body = crate::context::call_context::enter(true);
-                    done.send(read_response(root, path, json!({}))).unwrap();
+                    let _ = done.send(read_response(root, path, json!({})));
                 });
             }
-            // Keep both decoders occupied while the other reads try to acquire a slot.
-            if let Ok(response) = responses.recv_timeout(Duration::from_millis(250)) {
+            // Wait for both later reads to queue before freeing either decoder.
+            wait_for_image_decoder_queue(2);
+            if let Ok(response) = responses.try_recv() {
                 panic!(
                     "a saturated image read returned before a decoder was released: {}",
                     response.data
@@ -3396,6 +3495,97 @@ mod tests {
                     png
                 );
             }
+        });
+    }
+
+    #[test]
+    fn image_decoder_saturation_refuses_after_wait_limit() {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let png = encode_png(&rgba_image(32, 16, false)).unwrap();
+        let path = write_fixture(temp.path(), "image.png", &png);
+        let _first = IMAGE_DECODERS.acquire(None).unwrap();
+        let _second = IMAGE_DECODERS.acquire(None).unwrap();
+
+        let start = Instant::now();
+        let response = read_response(temp.path(), &path, json!({}));
+        let elapsed = start.elapsed();
+        assert!(
+            (Duration::from_secs(10)..Duration::from_secs(15)).contains(&elapsed),
+            "capacity refusal after {elapsed:?}, expected a 10s wait"
+        );
+        assert!(response.success);
+        assert_eq!(response.data["attachments"], json!([]));
+        assert_eq!(
+            response.data["content"],
+            "Attachment omitted: image decoder capacity reached (2/2 active); retry after existing image reads finish"
+        );
+        assert!(IMAGE_DECODERS.state.lock().waiters.is_empty());
+    }
+
+    #[test]
+    fn image_decoder_cancelled_waiter_leaves_remaining_reads_in_fifo_order() {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let png = encode_png(&rgba_image(32, 16, false)).unwrap();
+        let path = &write_fixture(root, "image.png", &png);
+        let first_slot = IMAGE_DECODERS.acquire(None).unwrap();
+        let _second_slot = IMAGE_DECODERS.acquire(None).unwrap();
+        let cancellation = crate::executor::JobCancellation::new();
+
+        std::thread::scope(|scope| {
+            let (done, responses) = crossbeam_channel::unbounded();
+            let (first_entered, first_decoding) = crossbeam_channel::bounded(1);
+            let (second_entered, second_decoding) = crossbeam_channel::bounded(1);
+            let (first_release, first_hold) = crossbeam_channel::bounded::<()>(0);
+            let (second_release, second_hold) = crossbeam_channel::bounded::<()>(0);
+            let timeout = Duration::from_secs(5);
+
+            for (i, hold) in [
+                None,
+                Some((first_entered, first_hold)),
+                Some((second_entered, second_hold)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let token = (i == 0).then(|| cancellation.clone());
+                let done = done.clone();
+                scope.spawn(move || {
+                    let _cancellation = token.map(crate::executor::install_job_cancellation);
+                    HOLD_IMAGE_DECODER.set(hold);
+                    let _ = done.send((i, read_response(root, path, json!({}))));
+                });
+                wait_for_image_decoder_queue(i + 1);
+            }
+
+            cancellation.request_cancel();
+            let (i, response) = responses.recv_timeout(timeout).unwrap();
+            assert_eq!(i, 0);
+            assert!(!response.success);
+            assert_eq!(response.data["code"], "request_cancelled");
+            assert_eq!(IMAGE_DECODERS.state.lock().waiters.len(), 2);
+
+            // Free only one slot so the order in which decoders start is the admission order.
+            drop(first_slot);
+            first_decoding.recv_timeout(timeout).unwrap();
+            assert!(matches!(
+                second_decoding.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ));
+            drop(first_release);
+            second_decoding.recv_timeout(timeout).unwrap();
+            drop(second_release);
+
+            for _ in 0..2 {
+                let (_, response) = responses.recv_timeout(timeout).unwrap();
+                assert_eq!(
+                    decoded_attachment_bytes(first_attachment(&response.data)),
+                    png
+                );
+            }
+            assert!(IMAGE_DECODERS.state.lock().waiters.is_empty());
         });
     }
 
@@ -3431,7 +3621,7 @@ mod tests {
             bytes.clone(),
             ImageKind::Png,
             None,
-            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+            Some(Instant::now() + IMAGE_PROCESS_TIMEOUT),
         )
         .unwrap();
         assert_eq!(legacy.bytes, bytes);
@@ -3464,7 +3654,7 @@ mod tests {
             noisy_fit_fixture(true),
             ImageKind::Png,
             Some(512 * 1024),
-            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+            Some(Instant::now() + IMAGE_PROCESS_TIMEOUT),
         )
         .unwrap();
         assert_eq!(image.mime, "image/png");
@@ -3495,7 +3685,7 @@ mod tests {
             noisy_fit_fixture(true),
             ImageKind::Png,
             Some(1),
-            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+            Some(Instant::now() + IMAGE_PROCESS_TIMEOUT),
         )
         .unwrap();
         assert_eq!(image.width.max(image.height), 256);
