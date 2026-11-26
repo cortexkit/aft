@@ -18,9 +18,8 @@
 //! made by foreign writers. An ordered deadline index also selects tasks at
 //! the end of the modification grace or the abandonment age without walking
 //! unrelated history. Conditions that can change without any file in the
-//! store changing are evaluated again on validation visits: the age and
-//! missing-worktree tests that retire an abandoned completion, whether a
-//! running task's recorded process is still alive, and whether a registry in
+//! store changing are evaluated again on validation visits: the age of an
+//! undelivered completion, whether a recorded process is still alive, and whether a registry in
 //! this process still owns a finished task whose scratch folder it is
 //! removing. None of those checks opens a file. A running task whose process
 //! the sweep found dead, and anything the sweep failed to read, are never
@@ -81,20 +80,12 @@ pub(crate) fn within_grace_at(modified: SystemTime, grace: Duration, now: System
         .unwrap_or(true)
 }
 
-/// Whether an undelivered, finished task's result is abandoned: it finished
-/// more than seven days ago and both its project root and its working
-/// directory are gone. The caller has already established that the task is
-/// terminal and its completion undelivered.
-pub(crate) fn abandonment_due(
-    finished_at: Option<u64>,
-    project_root: Option<&Path>,
-    workdir: &Path,
-    now_ms: u64,
-) -> bool {
-    const ABANDONMENT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-    finished_at.is_some_and(|finished| now_ms.saturating_sub(finished) > ABANDONMENT_MS)
-        && project_root.is_some_and(|root| matches!(root.try_exists(), Ok(false)))
-        && matches!(workdir.try_exists(), Ok(false))
+const UNDELIVERED_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Whether an undelivered, finished task has exceeded its retention period.
+/// A missing or future finish time does not establish its age.
+pub(crate) fn abandonment_due(finished_at: Option<u64>, now_ms: u64) -> bool {
+    finished_at.is_some_and(|finished| now_ms.saturating_sub(finished) >= UNDELIVERED_RETENTION_MS)
 }
 
 /// Why the sweep left a task in place, and what could make it deletable
@@ -105,11 +96,7 @@ pub(crate) enum Wait {
     Grace,
     /// It finished but its result was never delivered. Unless its metadata
     /// changes (a delivery rewrites it), only abandonment can retire it.
-    Abandonment {
-        finished_at: Option<u64>,
-        project_root: Option<Arc<Path>>,
-        workdir: Arc<Path>,
-    },
+    Abandonment { finished_at: Option<u64> },
     /// It is still running: a recorded process (the child or its group
     /// leader) was alive. Only that process exiting, or a metadata write,
     /// can change the verdict.
@@ -128,9 +115,8 @@ impl Wait {
                 .checked_add(super::registry::PERSISTED_GC_GRACE),
             Self::Abandonment {
                 finished_at: Some(finished),
-                ..
             } => finished
-                .checked_add(7 * 24 * 60 * 60 * 1000 + 1)
+                .checked_add(UNDELIVERED_RETENTION_MS)
                 .and_then(|ms| UNIX_EPOCH.checked_add(Duration::from_millis(ms))),
             _ => None,
         }
@@ -215,14 +201,8 @@ impl Verdict {
         }
         match &self.wait {
             Wait::Grace => within_grace_at(self.metadata.modified, grace, now),
-            Wait::Abandonment {
-                finished_at,
-                project_root,
-                workdir,
-            } => !abandonment_due(
+            Wait::Abandonment { finished_at } => !abandonment_due(
                 *finished_at,
-                project_root.as_deref(),
-                workdir,
                 now.duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis()
@@ -295,9 +275,6 @@ struct RootState {
     unreadable_sessions: HashSet<PathBuf>,
     /// Whether any root-directory entry could not be read during this store walk.
     root_directory_unreadable: bool,
-    /// Project roots and working directories are shared by many tasks; keep
-    /// one copy of each.
-    paths: HashSet<Arc<Path>>,
     health: PersistedGcHealth,
     /// Process-wide order of this root's last pass, to name the most recent
     /// failure across roots.
@@ -305,15 +282,6 @@ struct RootState {
 }
 
 impl RootState {
-    fn intern(&mut self, path: &Path) -> Arc<Path> {
-        if let Some(existing) = self.paths.get(path) {
-            return Arc::clone(existing);
-        }
-        let interned: Arc<Path> = Arc::from(path);
-        self.paths.insert(Arc::clone(&interned));
-        interned
-    }
-
     fn remembered_tasks(&self) -> usize {
         self.sessions.values().map(HashMap::len).sum()
     }
@@ -420,13 +388,6 @@ pub(crate) struct Evidence {
     pub task_dir: Option<Stamp>,
     pub metadata: Stamp,
     pub write_generation: u64,
-}
-
-/// Input for [`Wait::Abandonment`], borrowed from the task's metadata.
-pub(crate) struct AbandonmentInput<'a> {
-    pub finished_at: Option<u64>,
-    pub project_root: Option<&'a Path>,
-    pub workdir: &'a Path,
 }
 
 impl GcMemo {
@@ -578,12 +539,10 @@ impl GcMemo {
         session_dir: &Path,
         task_id: &str,
         evidence: Evidence,
-        input: AbandonmentInput<'_>,
+        finished_at: Option<u64>,
     ) {
-        self.remember(session_dir, task_id, evidence, |state| Wait::Abandonment {
-            finished_at: input.finished_at,
-            project_root: input.project_root.map(|root| state.intern(root)),
-            workdir: state.intern(input.workdir),
+        self.remember(session_dir, task_id, evidence, |_| Wait::Abandonment {
+            finished_at,
         });
     }
 
@@ -764,7 +723,6 @@ impl GcMemo {
                     }
                     !tasks.is_empty()
                 });
-                state.paths.retain(|path| Arc::strong_count(path) > 1);
                 state.lap = lap.saturating_add(1);
                 if pass.error.is_none() {
                     state.health.laps_completed = state.health.laps_completed.saturating_add(1);
@@ -941,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_abandonment_age_with_live_worktree_returns_to_validation() {
+    fn undelivered_retention_deadline_makes_memo_revisit_completion() {
         let storage = tempfile::tempdir().unwrap();
         let root = storage.path().join("bash-tasks");
         let session = root.join("session");
@@ -964,15 +922,12 @@ mod tests {
                 metadata: Stamp::of(&metadata).unwrap(),
                 write_generation: memo.write_generation(&session),
             },
-            AbandonmentInput {
-                finished_at: Some(finished),
-                project_root: Some(storage.path()),
-                workdir: storage.path(),
-            },
+            Some(finished),
         );
-        let due = UNIX_EPOCH + Duration::from_millis(finished + 7 * 24 * 60 * 60 * 1000 + 1);
+        let due = UNIX_EPOCH + Duration::from_millis(finished + 7 * 24 * 60 * 60 * 1000);
+        assert!(memo.due_batches(due - Duration::from_millis(1)).is_empty());
         assert_eq!(memo.due_batches(due).len(), 1);
-        assert!(memo.still_waiting(
+        assert!(!memo.still_waiting(
             &session,
             Some(&session_stamp),
             "bash-0000000000000001",

@@ -494,7 +494,19 @@ impl BgTaskRegistry {
                     super::super::persistence::persist_terminal_exit(paths, metadata);
                     return;
                 }
-                settle_killed_process_group(&metadata.task_id, metadata.pgid);
+                // A PTY signal targets the group named by its leader's PID.
+                let pgid = if metadata.mode == BgMode::Pty {
+                    metadata.pgid.filter(|&group| u32::try_from(group) == Ok(pid))
+                } else {
+                    metadata.pgid
+                };
+                let group_gone = settle_killed_process_group(&metadata.task_id, pgid);
+                if metadata.mode == BgMode::Pty && !group_gone {
+                    let reason = note.unwrap_or_else(|| restart_fate_unknown_reason(metadata, paths));
+                    metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(reason));
+                    super::super::persistence::persist_terminal_exit(paths, metadata);
+                    return;
+                }
                 note
             }
             ReplayKill::Unverified => {
@@ -835,9 +847,9 @@ fn kill_settlement_now() -> Instant {
 }
 
 #[cfg(unix)]
-pub(super) fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
-    let Some(pgid) = pgid else {
-        return;
+pub(super) fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) -> bool {
+    let Some(pgid) = pgid.filter(|pgid| *pgid > 0) else {
+        return false;
     };
     let started = kill_settlement_now();
     #[cfg(test)]
@@ -845,7 +857,7 @@ pub(super) fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
     loop {
         let exists = unsafe { libc::killpg(pgid, 0) } == 0;
         if !exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return;
+            return true;
         }
         // Zombies cannot run or retain output pipes. An unreaped orphan may
         // still make killpg(0) succeed, but is not a live descendant to report.
@@ -864,7 +876,7 @@ pub(super) fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
             }
         });
         if listing.is_ok_and(|listing| listing.is_clean()) {
-            return;
+            return true;
         }
         #[cfg(test)]
         if let Some(notice) = KILL_SETTLEMENT_NOTICES
@@ -875,14 +887,16 @@ pub(super) fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
         }
         let _ = task_id;
         if kill_settlement_now().saturating_duration_since(started) >= KILL_GROUP_SETTLEMENT_GRACE {
-            return;
+            return false;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 #[cfg(not(unix))]
-pub(super) fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
+pub(super) fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) -> bool {
+    false
+}
 
 /// Whether a finished task's process group, answering under its saved
 /// number, is still that task's group and may be signalled. The number is the
@@ -1029,6 +1043,45 @@ pub(crate) static KILL_PANICS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::ne
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_replay_unconfirmed_group_is_fate_unknown() {
+        use crate::bash_background::persistence::{allocate_task_layout, write_task_at};
+        use crate::bash_background::registry::root_reclaim_fixture::OwnedGroup;
+
+        let storage = tempfile::tempdir().unwrap();
+        let resolved = allocate_task_layout(storage.path(), "session").unwrap();
+        let paths = &resolved.paths;
+        let mut metadata = PersistedTask::starting(
+            paths.task_id.clone(),
+            "session".into(),
+            "sleep 60".into(),
+            storage.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.mode = BgMode::Pty;
+        let mut child = OwnedGroup::spawn();
+        let pid = child.0.id();
+        let pgid = i32::try_from(pid).unwrap();
+        metadata.mark_running(pid, pgid);
+        write_task_at(&resolved, &metadata).unwrap();
+        std::fs::write(&paths.exit, b"").unwrap();
+
+        let registry = BgTaskRegistry::default();
+        assert!(matches!(registry.replay_kill(&metadata), ReplayKill::Process(found) if found == pid));
+        // An unreaped child keeps the group visible even after it stops.
+        let _listing_fault = crate::bash_background::process::test_hooks::scoped_listing_failure(pgid);
+        settle_unattached_pty(&registry, &mut metadata, paths);
+        assert!(child.0.try_wait().unwrap().is_some());
+        assert_eq!(metadata.status, BgTaskStatus::FateUnknown);
+        assert_eq!(metadata.exit_code, None);
+        assert_eq!(metadata.exit_marker_unavailable, metadata.status_reason);
+        assert!(!paths.exit.exists());
+    }
 
     fn task_with_child(pid: u32, started_at_ms: Option<u64>) -> PersistedTask {
         let mut task = PersistedTask::starting(

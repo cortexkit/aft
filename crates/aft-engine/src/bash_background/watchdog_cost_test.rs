@@ -1170,30 +1170,31 @@ fn watchdog_cost_unreadable_session_prunes_stale_readable_memo() {
     assert!(crate::bash_background::persisted_gc_health().roots_failing >= 1);
 }
 
-/// Abandonment depends on the worktree existing, not on the task's files, so
-/// a remembered undelivered result is retired once its worktree is deleted.
 #[test]
-fn watchdog_cost_remembered_task_is_retired_when_its_worktree_goes() {
+fn watchdog_cost_undelivered_retention_retires_remembered_task_in_live_worktree() {
     let storage = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
     let worktree = storage.path().join("worktree");
     fs::create_dir_all(&worktree).unwrap();
-    let (_, paths) = fixture(storage.path(), "session", false, 8);
+    let (_, paths) = fixture(storage.path(), "session", false, 6);
     rewrite_fixture(&paths, |metadata| {
         metadata.project_root = Some(worktree.clone());
+        metadata.workdir = worktree.clone();
     });
     gc_until_lap(&registry, storage.path(), 1);
     assert!(
         paths.json.exists(),
-        "a result whose worktree exists was retired"
+        "an undelivered result was retired before seven days"
     );
     assert_eq!(gc_health(storage.path()).remembered_tasks, 1);
 
-    fs::remove_dir_all(&worktree).unwrap();
-    registry.maybe_gc_persisted(storage.path()).unwrap();
+    let after_retention = SystemTime::now() + Duration::from_secs(2 * 24 * 3600);
+    registry
+        .gc_persisted_with_clock(storage.path(), || after_retention, false)
+        .unwrap();
     assert!(
-        !paths.dir.exists(),
-        "a remembered result outlived its deleted worktree"
+        worktree.is_dir() && !paths.dir.exists(),
+        "the deadline did not collect a remembered result in an existing worktree"
     );
     assert_eq!(
         registry
@@ -1205,55 +1206,41 @@ fn watchdog_cost_remembered_task_is_retired_when_its_worktree_goes() {
 }
 
 #[test]
-fn watchdog_cost_abandonment_requires_both_paths_missing_and_seven_days() {
+fn watchdog_cost_undelivered_retention_collects_old_results_regardless_of_paths() {
     let storage = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
     let (_, abandoned) = fixture(storage.path(), "session", false, 8);
     let (_, recent) = fixture(storage.path(), "session", false, 6);
-    let (mut metadata, workdir_live) = fixture(storage.path(), "session", false, 8);
-    metadata.workdir = storage.path().to_path_buf();
-    write_task_at(
-        &resolve_task_layout(&workdir_live.session_dir, &workdir_live.task_id).unwrap(),
-        &metadata,
-    )
-    .unwrap();
-    filetime::set_file_mtime(
-        &workdir_live.json,
-        filetime::FileTime::from_unix_time((unix_millis() / 1000) as i64 - 25 * 3600, 0),
-    )
-    .unwrap();
-    let (mut metadata, root_live) = fixture(storage.path(), "session", false, 8);
-    metadata.project_root = Some(storage.path().to_path_buf());
-    write_task_at(
-        &resolve_task_layout(&root_live.session_dir, &root_live.task_id).unwrap(),
-        &metadata,
-    )
-    .unwrap();
-    filetime::set_file_mtime(
-        &root_live.json,
-        filetime::FileTime::from_unix_time((unix_millis() / 1000) as i64 - 25 * 3600, 0),
-    )
-    .unwrap();
+    let (_, workdir_live) = fixture(storage.path(), "session", false, 8);
+    rewrite_fixture(&workdir_live, |metadata| {
+        metadata.workdir = storage.path().to_path_buf();
+        metadata.project_root = None;
+    });
+    let (_, root_live) = fixture(storage.path(), "session", false, 8);
+    rewrite_fixture(&root_live, |metadata| {
+        metadata.project_root = Some(storage.path().to_path_buf());
+    });
     registry.maybe_gc_persisted(storage.path()).unwrap();
     assert!(
         !abandoned.json.exists(),
         "deleted-worktree completion retained forever"
     );
-    assert!(recent.json.exists() && workdir_live.json.exists() && root_live.json.exists());
+    assert!(recent.json.exists());
+    assert!(!workdir_live.json.exists() && !root_live.json.exists());
     assert_eq!(
         registry
             .try_health_counts()
             .unwrap()
             .retired_undelivered_completions,
-        1
+        3
     );
 }
 
 /// The collector runs every few seconds, so a pass that retires nothing must
 /// stay out of the log; a pass that retires something still reports it.
 #[test]
-fn watchdog_cost_retirement_is_logged_only_when_nonzero() {
-    const LINE: &str = "undelivered completions of deleted worktrees";
+fn watchdog_cost_undelivered_retention_is_logged_only_when_nonzero() {
+    const LINE: &str = "expired undelivered completions";
     let storage = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
     let (_, idle_lines) = crate::logging::capture_log_lines(|| {
@@ -1540,6 +1527,43 @@ fn watchdog_cost_gc_recovers_unobserved_exit_in_an_unloaded_worktree() {
         !paths.json.exists(),
         "a dead task with an exit marker stayed running forever"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_cost_gc_recovers_markerless_tasks_only_after_grace() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (_, old) = fixture(storage.path(), "session", false, 2);
+    let (_, recent) = fixture(storage.path(), "session", false, 2);
+    for (paths, status) in [
+        (&old, BgTaskStatus::Running),
+        (&recent, BgTaskStatus::Killing),
+    ] {
+        rewrite_fixture(paths, |metadata| {
+            metadata.mark_running(999_999_999, 999_999_999);
+            metadata.status = status;
+            metadata.exit_code = None;
+            metadata.finished_at = None;
+        });
+    }
+    fs::remove_file(&old.exit).unwrap();
+    filetime::set_file_mtime(&recent.json, filetime::FileTime::now()).unwrap();
+
+    registry.maybe_gc_persisted(storage.path()).unwrap();
+    let read = |paths: &TaskPaths| super::super::persistence::read_task(&paths.json).unwrap();
+    assert_eq!(read(&recent).status, BgTaskStatus::Killing);
+    let recovered = read(&old);
+    assert_eq!(recovered.status, BgTaskStatus::FateUnknown);
+    assert_eq!(recovered.exit_code, None);
+    assert!(recovered.finished_at.is_some());
+    assert!(!recovered.completion_delivered);
+
+    let after_grace = SystemTime::now() + Duration::from_secs(25 * 3600);
+    registry
+        .gc_persisted_with_clock(storage.path(), || after_grace, false)
+        .unwrap();
+    assert_eq!(read(&recent).status, BgTaskStatus::FateUnknown);
 }
 
 #[test]

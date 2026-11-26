@@ -17,6 +17,32 @@ pub(super) fn has_live_launch_owner(metadata: &PersistedTask) -> bool {
         })
 }
 
+/// Require affirmative evidence before inventing a terminal result in GC.
+pub(super) fn recorded_local_task_is_gone(metadata: &PersistedTask) -> bool {
+    use super::super::process::recorded_process_liveness;
+    use crate::process_identity::ProcessLiveness;
+
+    let pids = BgTaskRegistry::persisted_task_recorded_pids(metadata);
+    if metadata.remote.is_some()
+        || pids.is_empty()
+        || !pids.iter().all(|&pid| {
+            pid > 0 && recorded_process_liveness(pid, metadata.started_at) == ProcessLiveness::Gone
+        })
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    if let Some(pgid) = metadata.pgid.filter(|pgid| *pgid > 0) {
+        // The recorded leader can be gone while other group members still run.
+        let gone = unsafe { libc::killpg(pgid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        return gone
+            || super::super::process::live_process_group_members(pgid)
+                .is_ok_and(|group| group.is_clean());
+    }
+    true
+}
+
 impl BgTaskRegistry {
     pub(super) fn persisted_task_process_is_alive(metadata: &PersistedTask) -> bool {
         if metadata.remote.is_some() && !metadata.is_terminal() {

@@ -9971,17 +9971,12 @@ impl BgTaskRegistry {
                     });
                     #[cfg(test)]
                     super::persistence::work_counts::record_stat();
-                    if fs::metadata(&resolved.paths.json)
+                    let modified = fs::metadata(&resolved.paths.json)
                         .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .is_some_and(|modified| {
-                            super::gc_memo::within_grace_at(
-                                modified,
-                                PERSISTED_GC_GRACE,
-                                examined_at,
-                            )
-                        })
-                    {
+                        .ok();
+                    if modified.is_some_and(|at| {
+                        super::gc_memo::within_grace_at(at, PERSISTED_GC_GRACE, examined_at)
+                    }) {
                         if let Some(evidence) = evidence.take() {
                             memo.remember_grace(&session_dir, task_id, evidence);
                         }
@@ -10019,9 +10014,7 @@ impl BgTaskRegistry {
                             continue;
                         }
                     };
-                    // An unloaded project has no watchdog left to publish an
-                    // exit. Recover its durable marker only after both process
-                    // identity checks say it is dead; never poll live runners.
+                    // An unloaded project has no watchdog left to publish an exit.
                     if matches!(
                         metadata.status,
                         BgTaskStatus::Running | BgTaskStatus::Killing
@@ -10029,21 +10022,13 @@ impl BgTaskRegistry {
                         && !live_in_db(self, task_id)
                         && undisturbed(self)
                     {
-                        if let Ok(Some(marker)) = read_exit_marker(&resolved.paths) {
-                            let finished_at =
-                                open_task_artifact(&resolved.paths, TaskArtifact::Exit)
-                                    .and_then(|artifact| artifact.try_clone_file())
-                                    .and_then(|file| file.metadata()?.modified())
-                                    .ok()
-                                    .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-                                    .map(|age| age.as_millis().min(u128::from(u64::MAX)) as u64)
-                                    .unwrap_or_else(unix_millis)
-                                    .max(metadata.started_at)
-                                    .min(unix_millis());
-                            metadata = terminal_metadata_from_marker(metadata, marker, None);
-                            metadata.finished_at = Some(finished_at);
-                            metadata.duration_ms =
-                                Some(finished_at.saturating_sub(metadata.started_at));
+                        if let Some(recovered) = persisted_exit_recovery::recover(
+                            &metadata,
+                            &resolved.paths,
+                            modified.is_some(),
+                            now_ms,
+                        ) {
+                            metadata = recovered;
                             // This rewrite changes the metadata file, so the
                             // file stamps captured above no longer describe it;
                             // drop them so this visit remembers nothing.
@@ -10072,11 +10057,7 @@ impl BgTaskRegistry {
                                     &session_dir,
                                     task_id,
                                     evidence,
-                                    super::gc_memo::AbandonmentInput {
-                                        finished_at: metadata.finished_at,
-                                        project_root: metadata.project_root.as_deref(),
-                                        workdir: &metadata.workdir,
-                                    },
+                                    metadata.finished_at,
                                 );
                             }
                         } else if matches!(
@@ -10200,7 +10181,7 @@ impl BgTaskRegistry {
         // Minute housekeeping normally finds nothing to retire; a zero count is the normal
         // case and logging it would flood the daemon log.
         if retired > 0 {
-            crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
+            crate::slog_info!("retired {retired} expired undelivered completions");
         }
         memo.finish_pass(pass);
         gc_quarantine(self, storage_dir);
@@ -17014,12 +16995,7 @@ fn gc_harness_stores(base: &Path) -> Vec<PathBuf> {
 fn abandoned_completion(metadata: &PersistedTask, now_ms: u64) -> bool {
     metadata.status.is_terminal()
         && !metadata.completion_delivered
-        && super::gc_memo::abandonment_due(
-            metadata.finished_at,
-            metadata.project_root.as_deref(),
-            &metadata.workdir,
-            now_ms,
-        )
+        && super::gc_memo::abandonment_due(metadata.finished_at, now_ms)
 }
 
 fn read_for_token_count_from_disk(
@@ -17895,6 +17871,8 @@ use verified_kill::{
     close_pty_master, finished_group_is_still_the_tasks, record_group_check,
     settle_killed_process_group,
 };
+
+mod persisted_exit_recovery;
 
 #[path = "pty_input_write.rs"]
 mod pty_input_write;
