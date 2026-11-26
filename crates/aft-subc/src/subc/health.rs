@@ -34,6 +34,7 @@ use root_evidence::{health_failure_evidence, health_failure_field, health_nondef
 
 const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
     "executor scheduler state could not be snapshotted without contention";
+const SNAPSHOT_CONTENTION_DEGRADED_AFTER: Duration = demand::BACKGROUND_INTERVAL.saturating_mul(3);
 
 /// Why the idle reaper kept an existing, unbound root that is past its idle
 /// TTL. Deleted roots are counted separately in the census's `blockers`.
@@ -8631,7 +8632,7 @@ mod tests {
     }
 
     #[test]
-    fn health_contention_preserves_census_and_timestamp_with_age() {
+    fn health_contention_waits_for_three_refresh_intervals_and_recovers() {
         let (_dir, executor, cache, app) = contended_health_fixture();
         let good = cache.snapshot().0;
         assert_eq!(good.metrics["lsp_children"]["spawned"], 1);
@@ -8659,7 +8660,7 @@ mod tests {
             &DispatchPathMetrics::new(),
             &app,
         );
-        assert_eq!(report.status, HealthStatus::Degraded);
+        assert_eq!(report.status, HealthStatus::Ok);
         // Indexing that other tests run in this process can prefix the detail
         // ("<indexing>; <contention>"), so require the contention text, not
         // an exact detail.
@@ -8678,6 +8679,121 @@ mod tests {
         assert_eq!(metrics["age_ms"], 300);
         assert_eq!(metrics["snapshot_age_ms"], 300);
         assert_eq!(metrics["runtime"]["spawned_lsp_children"], 1);
+
+        let degraded_at_ms = 1_000 + SNAPSHOT_CONTENTION_DEGRADED_AFTER.as_millis() as u64;
+        cache.clock_ms.store(degraded_at_ms - 1, Ordering::Relaxed);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Ok);
+
+        cache.clock_ms.store(degraded_at_ms, Ordering::Relaxed);
+        executor.hold_state_lock_for_test(|| {
+            cache.refresh(&executor, &app);
+        });
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert!(report
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL)));
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["generated_at_ms"], 1_000);
+        assert_eq!(metrics["stale"], true);
+        assert_eq!(metrics["stale_reason"], "executor_contended");
+        assert_eq!(metrics["age_ms"], degraded_at_ms - 1_000);
+
+        let recovered_at_ms = degraded_at_ms + 1_000;
+        cache.clock_ms.store(recovered_at_ms, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Ok);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["generated_at_ms"], recovered_at_ms);
+        assert_eq!(metrics["stale"], false);
+        assert_eq!(metrics["stale_reason"], Value::Null);
+        assert_eq!(metrics["age_ms"], 0);
+    }
+
+    #[test]
+    fn root_actor_contention_waits_for_three_refresh_intervals_and_recovers() {
+        let (_dir, executor, cache, app) = contended_health_fixture();
+        let actors = executor.actor_entries();
+        let ctx = Arc::clone(&actors[0].1);
+        let dispatch = DispatchPathMetrics::new();
+        let interval_ms = demand::BACKGROUND_INTERVAL.as_millis() as u64;
+        let threshold_ms = SNAPSHOT_CONTENTION_DEGRADED_AFTER.as_millis() as u64;
+        assert_eq!(threshold_ms, 3 * interval_ms);
+        let contention_detail = "1 root actor(s) could not be snapshotted without contention";
+        let contended_report = |now_ms: u64| {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            ctx.hold_health_snapshot_lock_for_test(|| {
+                cache.refresh_for_test(&executor, &app);
+            });
+            build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
+        };
+
+        for now_ms in [1_000 + interval_ms, 1_000 + 2 * interval_ms] {
+            let report = contended_report(now_ms);
+            assert_eq!(report.status, HealthStatus::Ok, "{report:?}");
+            assert!(
+                report
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(contention_detail)),
+                "{:?}",
+                report.detail
+            );
+            let metrics = report.metrics.unwrap();
+            assert_eq!(metrics["generated_at_ms"], now_ms);
+            assert_eq!(metrics["stale"], false);
+            assert_eq!(metrics["stale_reason"], Value::Null);
+            assert_eq!(metrics["age_ms"], 0);
+        }
+
+        let degraded_at_ms = 1_000 + threshold_ms;
+        let report = contended_report(degraded_at_ms);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert!(report
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(contention_detail)));
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["stale"], false);
+        assert_eq!(metrics["stale_reason"], Value::Null);
+
+        let recovered_at_ms = degraded_at_ms + interval_ms;
+        cache.clock_ms.store(recovered_at_ms, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app);
+        assert_eq!(report.status, HealthStatus::Ok);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["generated_at_ms"], recovered_at_ms);
+        assert_eq!(metrics["stale"], false);
+        assert_eq!(metrics["stale_reason"], Value::Null);
+
+        let report = contended_report(recovered_at_ms + interval_ms);
+        assert_eq!(
+            report.status,
+            HealthStatus::Ok,
+            "a new miss after recovery starts a new grace period"
+        );
     }
 
     #[test]

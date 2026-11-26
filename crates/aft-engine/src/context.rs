@@ -11366,6 +11366,20 @@ pub(crate) use bind_effect_fixture::configure_bind_effects_for_test;
 use bind_effect_fixture::{record_configure_bind_effect_for_test, ConfigureBindEffect};
 
 #[cfg(test)]
+mod health_snapshot_test_support {
+    use super::AppContext;
+
+    impl AppContext {
+        /// Forces one root health summary to report contention without holding
+        /// the executor scheduler lock or blocking the health rollup.
+        pub(crate) fn hold_health_snapshot_lock_for_test(&self, while_held: impl FnOnce()) {
+            let _held = self.view_load_health.lock();
+            while_held();
+        }
+    }
+}
+
+#[cfg(test)]
 mod memory_estimate_tests {
     use super::*;
 
