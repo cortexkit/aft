@@ -66,6 +66,7 @@ mod bash_background {
         Refuse,
         Disconnect,
         LostReply,
+        LateCommit,
     }
 
     struct Fake {
@@ -76,6 +77,10 @@ mod bash_background {
         cancel_offline: AtomicBool,
         cancel_refusal: AtomicBool,
         finish_failure: AtomicBool,
+        warming: AtomicBool,
+        cancel_unknown: AtomicBool,
+        commit_on_sync: parking_lot::Mutex<Option<String>>,
+        lost: parking_lot::Mutex<Vec<String>>,
     }
 
     fn vector(name: &str) -> Value {
@@ -96,6 +101,9 @@ mod bash_background {
             let examples = vector("replies.json");
             let (key, label, index) = match req {
                 Request::List(_) => {
+                    if self.warming.load(Ordering::SeqCst) {
+                        return Err(Failure::Refused("module_warming".into()));
+                    }
                     let mut listing = examples["list"][0].clone();
                     let item = listing["items"][0].clone();
                     listing["items"] = json!(self
@@ -112,12 +120,18 @@ mod bash_background {
                 }
                 Request::Sync(params) => {
                     let mut reply = examples["sync"][0].clone();
-                    reply["lost"] = json!(self
-                        .listed
-                        .lock()
+                    let mut listed = self.listed.lock();
+                    if let Some(late) = self.commit_on_sync.lock().take() {
+                        listed.push(late);
+                    }
+                    let lost: Vec<_> = listed
                         .iter()
                         .filter(|key| !params.open.contains(key))
-                        .collect::<Vec<_>>());
+                        .cloned()
+                        .collect();
+                    listed.retain(|key| params.open.contains(key));
+                    self.lost.lock().extend(lost.iter().cloned());
+                    reply["lost"] = json!(lost);
                     reply["unknown"] = json!([]);
                     return Ok(serde_json::to_vec(&reply).unwrap());
                 }
@@ -145,6 +159,9 @@ mod bash_background {
                             ))
                             .into());
                         }
+                        Answer::LateCommit => {
+                            return Err(Failure::Unknown("open timed out before commit".into()))
+                        }
                     }
                 }
                 Request::Finish(_) if self.finish_failure.swap(false, Ordering::SeqCst) => {
@@ -162,7 +179,10 @@ mod bash_background {
                 Request::Cancel(_) if self.cancel_offline.load(Ordering::SeqCst) => {
                     return Err(Failure::Transport("cancel route down".into()))
                 }
-                Request::Cancel(_) if self.cancel_refusal.swap(false, Ordering::SeqCst) => {
+                Request::Cancel(_)
+                    if self.cancel_unknown.load(Ordering::SeqCst)
+                        || self.cancel_refusal.swap(false, Ordering::SeqCst) =>
+                {
                     return Err(Failure::Refused("unknown_key".into()));
                 }
                 Request::Cancel(cancel) => {
@@ -192,6 +212,10 @@ mod bash_background {
             cancel_offline: false.into(),
             cancel_refusal: false.into(),
             finish_failure: false.into(),
+            warming: false.into(),
+            cancel_unknown: false.into(),
+            commit_on_sync: None.into(),
+            lost: Vec::new().into(),
         });
         let service = Arc::new(Service::new("worker-provider-test"));
         *service.wire.write() = Some(fake.clone());
@@ -782,8 +806,9 @@ mod bash_background {
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
         registry.seed_awaited_fallback_for_test(&key);
         let (executor, _restarted) = restored(&f);
-        let (service, wire, mut calls) = fake(Answer::Open, vec![key.clone()]);
-        reconcile(&service, wire, &executor).await.unwrap();
+        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        *wire.commit_on_sync.lock() = Some(key.clone());
+        reconcile(&service, wire.clone(), &executor).await.unwrap();
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
         assert!(
             matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [key.clone()])
@@ -791,6 +816,7 @@ mod bash_background {
         assert!(
             matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
         );
+        assert!(wire.lost.lock().is_empty());
         no_more(&mut calls).await;
     }
 
@@ -809,10 +835,162 @@ mod bash_background {
         let (Request::Finish(first), _) = call(&mut calls).await else {
             panic!("missing finish")
         };
+        *service.wire.write() = None;
         f.ctx
             .bash_background()
             .drop_awaited_task_registration_for_test(&open.key);
+        fake.listed.lock().push(open.key.clone());
+        reconcile(&service, fake.clone(), &f.executor)
+            .await
+            .unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [open.key.clone()])
+        );
+        assert!(fake.lost.lock().is_empty());
         assert!(matches!(call(&mut calls).await, (Request::Finish(retry), None) if retry == first));
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn awaited_open_committing_between_list_and_sync_is_kept_for_cleanup() {
+        let f = Fixture::new();
+        let (service, fake, mut calls) = fake(Answer::LateCommit, Vec::new());
+        fake.cancel_unknown.store(true, Ordering::SeqCst);
+        let mut rx = f.start(Some(service.clone()), true);
+        let (Request::Open(open), _) = call(&mut calls).await else {
+            panic!("missing open")
+        };
+        fake.allow_open.notify_one();
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        );
+        *service.wire.write() = None;
+        assert!(fake.listed.lock().is_empty());
+        *fake.commit_on_sync.lock() = Some(open.key.clone());
+        reconcile(&service, fake.clone(), &f.executor)
+            .await
+            .unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [open.key.clone()])
+        );
+        assert!(fake.lost.lock().is_empty());
+        fake.cancel_unknown.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        );
+        f.release();
+        assert_eq!(
+            reply(&mut rx).await.response_for_test().data["status"],
+            "completed"
+        );
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn an_awaited_busy_list_is_retried_and_is_not_authoritative() {
+        let f = Fixture::new();
+        let key = f
+            .ctx
+            .bash_background()
+            .seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        let (executor, restarted) = restored(&f);
+        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        wire.warming.store(true, Ordering::SeqCst);
+        *service.wire.write() = None;
+        let failure = reconcile(&service, wire.clone(), &executor)
+            .await
+            .unwrap_err();
+        assert!(failure.retry_discovery());
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            !restarted
+                .bash_background()
+                .notice_metadata(&key)
+                .unwrap()
+                .completion_delivered
+        );
+        assert!(calls.try_recv().is_err());
+        wire.warming.store(false, Ordering::SeqCst);
+        reconcile(&service, wire, &executor).await.unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open.is_empty())
+        );
+        assert!(
+            restarted
+                .bash_background()
+                .notice_metadata(&key)
+                .unwrap()
+                .completion_delivered
+        );
+    }
+
+    async fn wait_for_cleanup_to_settle(registry: &BgTaskRegistry, key: &str) {
+        while registry
+            .notice_metadata(key)
+            .unwrap()
+            .has_pending_fallback_cancel()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn awaited_unknown_key_cleanup_expires_using_its_saved_age() {
+        let f = Fixture::new();
+        let registry = f.ctx.bash_background();
+        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        registry.seed_awaited_fallback_for_test(&key);
+        registry.set_awaited_cleanup_age_and_scope_for_test(
+            &key,
+            CLEANUP_LIFETIME - Duration::from_secs(2),
+            call_scope(true),
+        );
+        let (executor, restarted) = restored(&f);
+        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        wire.cancel_unknown.store(true, Ordering::SeqCst);
+        reconcile(&service, wire, &executor).await.unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [key.clone()])
+        );
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
+        );
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            wait_for_cleanup_to_settle(restarted.bash_background(), &key),
+        )
+        .await
+        .unwrap();
+        while calls.try_recv().is_ok() {}
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scope_end_settles_awaited_cleanup_without_waiting_for_retry() {
+        let f = Fixture::new();
+        let registry = f.ctx.bash_background();
+        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        registry.seed_awaited_fallback_for_test(&key);
+        registry.set_awaited_cleanup_age_and_scope_for_test(&key, Duration::ZERO, call_scope(true));
+        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        wire.cancel_unknown.store(true, Ordering::SeqCst);
+        reconcile(&service, wire, &f.executor).await.unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(matches!(call(&mut calls).await, (Request::Sync(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
+        );
+        registry.fence_scope_end(&call_scope(true));
+        tokio::time::timeout(
+            FIRST_RETRY_DELAY / 2,
+            wait_for_cleanup_to_settle(registry, &key),
+        )
+        .await
+        .unwrap();
         no_more(&mut calls).await;
     }
 }
@@ -827,4 +1005,22 @@ fn awaited_retry_failures_log_at_most_once_per_minute() {
     }
     assert!(log.due(start + Duration::from_secs(60)));
     assert!(!log.due(start + Duration::from_secs(61)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_awaited_finish_can_be_built_when_the_card_store_never_answers() {
+    let start = tokio::time::Instant::now();
+    let id = card_before_deadline(std::future::pending::<Option<String>>()).await;
+    assert!(start.elapsed() <= CARD_PREPARATION_LIMIT + Duration::from_millis(1));
+    let service = Service::new("instance");
+    let request = service.request_body(
+        "bash-test",
+        Event::Finish {
+            outcome: Outcome::Done,
+            summary: "done".into(),
+        },
+        id,
+    );
+    assert!(matches!(&request, Request::Finish(params) if params.notice_record.is_none()));
+    assert!(activate_linked_card(&request).is_none());
 }

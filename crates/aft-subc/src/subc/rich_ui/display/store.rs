@@ -51,20 +51,27 @@ impl Store {
             .await
     }
 
-    pub(super) async fn persist_awaited_notice(
+    pub(super) async fn prepare_awaited_notice(
         &self,
         id: String,
         bytes: Vec<u8>,
     ) -> Result<bool, &'static str> {
+        self.run(move |conn| {
+            display_records::prepare_awaited_notice(conn, &id, &bytes, display_records::now_ms())
+        })
+        .await
+    }
+
+    pub(super) async fn activate_awaited_notice(&self, id: String) -> Result<(), &'static str> {
         let pending = self.pending_awaited.clone();
         self.run(move |conn| {
             let now = display_records::now_ms();
-            let stored = display_records::persist_awaited_notice(conn, &id, &bytes, now)?;
+            display_records::activate_awaited_notice(conn, &id, now)?;
             pending.store(
                 display_records::count_pending_awaited_notices(conn, now)?,
                 Ordering::Release,
             );
-            Ok(stored)
+            Ok(())
         })
         .await
     }

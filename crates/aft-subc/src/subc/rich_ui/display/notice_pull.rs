@@ -23,40 +23,45 @@ pub(in crate::subc) async fn stage_notice(record: PullRecord) {
     }
 }
 
-pub(in crate::subc) async fn stage_awaited_notice(record: PullRecord) -> Option<String> {
-    let id = stage_for_display(SENDER.get()?, record, WRITE_BUDGET).await?;
-    crate::late_result_bus::display_committed();
-    Some(id)
+pub(in crate::subc) async fn prepare_awaited_notice(record: PullRecord) -> Option<String> {
+    prepare_for_display(SENDER.get()?, record).await
 }
 
+async fn prepare_for_display(writer: &Writer, record: PullRecord) -> Option<String> {
+    let PullRecord { id, bytes } = record;
+    let stored = writer
+        .store
+        .prepare_awaited_notice(id.clone(), bytes)
+        .await
+        .ok()?;
+    stored.then_some(id)
+}
+
+pub(in crate::subc) fn activate_awaited_notice(id: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(writer) = SENDER.get() else { return };
+        match writer.store.activate_awaited_notice(id.clone()).await {
+            Ok(()) => crate::late_result_bus::display_committed(),
+            Err(error) => log::warn!("could not activate awaited record {id}: {error}"),
+        }
+    })
+}
+
+#[cfg(test)]
 async fn stage_for_display(
     writer: &Writer,
     record: PullRecord,
     budget: Duration,
 ) -> Option<String> {
-    // The durable queue only announces that the card's data is ready to pull.
-    // The orchestrator owns delivery of the notice that links to it.
-    let PullRecord { id, bytes } = record;
-    let stored = confirm_linked_write(
-        writer.store.persist_awaited_notice(id.clone(), bytes),
-        budget,
-    )
-    .await
-    .ok()?;
-    stored.then_some(id)
-}
-
-async fn confirm_linked_write<T>(
-    write: impl std::future::Future<Output = T>,
-    budget: Duration,
-) -> T {
-    tokio::pin!(write);
-    match tokio::time::timeout(budget, &mut write).await {
-        Ok(result) => result,
-        // Dropping the future cannot cancel a blocking database write. Wait
-        // off the shell reply path so the request gets the eventual write result.
-        Err(_) => write.await,
-    }
+    let id = tokio::time::timeout(budget, prepare_for_display(writer, record))
+        .await
+        .ok()??;
+    writer
+        .store
+        .activate_awaited_notice(id.clone())
+        .await
+        .ok()?;
+    Some(id)
 }
 
 pub(super) async fn restore_awaited() {

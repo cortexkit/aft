@@ -106,19 +106,32 @@ async fn tool_provider_awaited_finish_announces_its_record_once_across_restart()
         .is_none());
 }
 
-#[tokio::test(start_paused = true)]
-async fn awaited_notice_record_waits_for_storage_after_the_initial_budget() {
-    let (commit, written) = tokio::sync::oneshot::channel();
-    let wait = confirm_linked_write(written, Duration::from_millis(50));
-    tokio::pin!(wait);
-    assert!(futures_util::poll!(&mut wait).is_pending());
-    tokio::time::advance(Duration::from_millis(51)).await;
-    assert!(
-        futures_util::poll!(&mut wait).is_pending(),
-        "do not freeze an absent pointer while the write can still commit"
+#[tokio::test]
+async fn a_late_awaited_notice_record_without_a_pointer_is_not_announced_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    let id = "notice:awaited:late";
+    // The blocking storage job finished, but the request's deadline left it
+    // without a pointer, so no caller authorizes publication.
+    let prepared = prepare_for_display(
+        &writer,
+        PullRecord {
+            id: id.into(),
+            bytes: b"{}".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(prepared.as_deref(), Some(id));
+    drop(writer);
+    let writer = test_writer(path);
+    assert_eq!(writer.store.restore_awaited_count().await.unwrap(), 0);
+    assert_eq!(
+        publish_awaited_with(&writer, |_| async { panic!("late draft was announced") })
+            .await
+            .unwrap(),
+        None
     );
-    commit.send(true).unwrap();
-    assert_eq!(wait.await, Ok(true));
 }
 
 #[tokio::test(start_paused = true)]

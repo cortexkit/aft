@@ -120,6 +120,15 @@ pub(crate) fn state_for_spawn() -> Option<State> {
 }
 
 impl BgTaskRegistry {
+    pub(crate) fn awaited_cleanup_age(&self, task: &BgTask) -> Duration {
+        task.lock_state().map_or(Duration::MAX, |state| {
+            Duration::from_millis(unix_millis().saturating_sub(state.metadata.started_at))
+        })
+    }
+
+    pub(crate) fn watch_awaited_scope_ends(&self) -> tokio::sync::watch::Receiver<()> {
+        self.inner.awaited_scope_ends.subscribe()
+    }
     pub(crate) fn kill_for_reply(
         &self,
         key: &str,
@@ -187,6 +196,15 @@ impl BgTaskRegistry {
                 *notice = Some(saved);
             }
         })?;
+        drop(state);
+        // The task's metadata file already holds the durable decision. Its
+        // SQLite mirror shares a pool with the card and must not delay finish.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if std::mem::take(&mut db.captured) {
+                let order = task.db_write_order.clone();
+                runtime.spawn_blocking(move || drop(order.flush_locked()));
+            }
+        }
         Ok(id)
     }
 
@@ -223,6 +241,19 @@ impl BgTaskRegistry {
             task.lock_state()
                 .is_ok_and(|state| !matches!(state.metadata.awaited_work, Some(State::Settled)))
         })
+    }
+
+    pub(crate) fn pending_awaited_open_cleanups(&self) -> Vec<String> {
+        self.task_arcs()
+            .into_iter()
+            .filter_map(|task| {
+                task.lock_state()
+                    .ok()?
+                    .metadata
+                    .has_pending_fallback_cancel()
+                    .then(|| task.task_id.clone())
+            })
+            .collect()
     }
 
     pub(crate) fn awaited_work_live(&self, task: &BgTask) -> bool {

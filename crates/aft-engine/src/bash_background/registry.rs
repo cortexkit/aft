@@ -1307,6 +1307,7 @@ pub(crate) struct RegistryInner {
     /// delete time, keyed by task id. See `scratch_retention`.
     retained_scratch: Mutex<HashMap<String, scratch_retention::RetainedScratch>>,
     revoked_scopes: Mutex<HashSet<(String, String, u64)>>,
+    awaited_scope_ends: tokio::sync::watch::Sender<()>,
     /// While `Some`, restored unfinished remote tasks are not handed to a
     /// remote worker; their ids are collected here instead. Used by
     /// `recover_saved_scope_tasks`, whose caller must record the owner's
@@ -1883,6 +1884,7 @@ impl BgTaskRegistry {
                 reclaim_kill_noop: AtomicBool::new(false),
                 retained_scratch: Mutex::new(HashMap::new()),
                 revoked_scopes: Mutex::new(HashSet::new()),
+                awaited_scope_ends: tokio::sync::watch::Sender::new(()),
                 held_remote_workers: Mutex::new(None),
                 saved_task_recovery: AtomicBool::new(false),
                 completions: Mutex::new(Default::default()),
@@ -12198,19 +12200,6 @@ impl BgTaskRegistry {
                     .clone()
             })
             .collect()
-    }
-
-    /// Fence approvals before asynchronous scope cleanup can block or fail.
-    pub fn fence_scope_end(&self, scope: &subc_protocol::scope::ScopeStamp) {
-        self.inner
-            .revoked_scopes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((
-                serde_json::to_string(&scope.owner).expect("principal is JSON"),
-                scope.scope_ref.clone(),
-                scope.scope_epoch,
-            ));
     }
 
     /// Serialize the final approval/dispatch check with confirmed scope ends.

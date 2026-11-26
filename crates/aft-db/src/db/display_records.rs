@@ -193,6 +193,34 @@ pub fn persist_awaited_notice(
     persist(conn, id, bytes, now_ms)
 }
 
+pub fn prepare_awaited_notice(
+    conn: &Connection,
+    id: &str,
+    bytes: &[u8],
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    if read(conn, id, now_ms)?.is_some() {
+        return Ok(true);
+    }
+    // A late database job may commit after the caller's card deadline. Store
+    // it under a draft ID so the publisher cannot announce it unless the
+    // orchestrator request links to the card.
+    persist_awaited_notice(conn, &format!("draft:{id}"), bytes, now_ms)
+}
+
+pub fn activate_awaited_notice(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<()> {
+    if available(conn)? {
+        conn.execute(
+            &format!(
+                "UPDATE display_records SET record_id=?1 WHERE record_id=?2 AND {EXPIRY} >= ?3
+             AND NOT EXISTS (SELECT 1 FROM display_records WHERE record_id=?1)"
+            ),
+            params![id, format!("draft:{id}"), now_ms],
+        )?;
+    }
+    Ok(())
+}
+
 /// Only linked notices use the persistent queue. Selecting one row by its key
 /// prefix avoids loading display bodies or replaying legacy announcements.
 pub fn pending_awaited_notice(

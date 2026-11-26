@@ -1,5 +1,52 @@
 use super::*;
 
+#[tokio::test]
+async fn an_awaited_finish_without_a_pointer_does_not_wait_for_sqlite() {
+    use crate::context::{App, AppContext};
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::default_shared();
+    let ctx = AppContext::from_app(
+        app.clone(),
+        crate::config::Config {
+            project_root: Some(dir.path().into()),
+            storage_dir: Some(dir.path().into()),
+            ..Default::default()
+        },
+    );
+    let registry = ctx.bash_background().clone();
+    let key = registry.seed_awaited_task_for_test(dir.path(), dir.path());
+    let task = registry.task(&key).unwrap();
+    {
+        let mut db = DeferredDbWrites::new(&registry, &task);
+        let mut state = task.lock_state().unwrap();
+        state.metadata.harness = Some("runner".into());
+        state.metadata.awaited_work = Some(State::Finish {
+            outcome: Outcome::Done,
+            summary: "done".into(),
+            notice: None,
+        });
+        registry
+            .persist_task_locked(&task, &state.metadata, &mut db)
+            .unwrap();
+    }
+    let pool = app.open_db(&dir.path().join("aft.db")).unwrap();
+    registry.set_db_pool(pool.clone());
+    let busy_store = pool.lock().unwrap();
+    let saved = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || registry.freeze_awaited_finish_notice(&task, None)),
+    )
+    .await;
+    drop(busy_store);
+    assert_eq!(
+        saved
+            .expect("card pool must not hold the finish")
+            .unwrap()
+            .unwrap(),
+        None
+    );
+}
+
 impl BgTaskRegistry {
     pub(crate) fn seed_awaited_opening_for_test(&self, key: &str) {
         self.set_awaited_marker_for_test(key, State::Opening);
@@ -7,6 +54,21 @@ impl BgTaskRegistry {
 
     pub(crate) fn seed_awaited_fallback_for_test(&self, key: &str) {
         self.set_awaited_marker_for_test(key, State::FallbackCancel);
+    }
+
+    pub(crate) fn set_awaited_cleanup_age_and_scope_for_test(
+        &self,
+        key: &str,
+        age: Duration,
+        scope: subc_protocol::scope::ScopeStamp,
+    ) {
+        let task = self.task(key).unwrap();
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task.lock_state().unwrap();
+        state.metadata.started_at = unix_millis().saturating_sub(age.as_millis() as u64);
+        state.metadata.scope = Some(scope);
+        self.persist_task_locked(&task, &state.metadata, &mut db)
+            .unwrap();
     }
 
     fn set_awaited_marker_for_test(&self, key: &str, marker: State) {

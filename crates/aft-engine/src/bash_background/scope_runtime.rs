@@ -1,5 +1,24 @@
 use super::*;
 
+impl BgTaskRegistry {
+    /// Fence approvals before asynchronous scope cleanup can block or fail.
+    pub fn fence_scope_end(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        let first = self
+            .inner
+            .revoked_scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((
+                serde_json::to_string(&scope.owner).expect("principal is JSON"),
+                scope.scope_ref.clone(),
+                scope.scope_epoch,
+            ));
+        if first {
+            self.inner.awaited_scope_ends.send_replace(());
+        }
+    }
+}
+
 pub(super) fn replay_terminal_metadata(
     metadata: PersistedTask,
     paths: &TaskPaths,

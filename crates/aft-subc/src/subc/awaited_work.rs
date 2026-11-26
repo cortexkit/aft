@@ -21,6 +21,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const FIRST_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+const CARD_PREPARATION_LIMIT: Duration = Duration::from_millis(50);
+const CLEANUP_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct RetryLog(Option<tokio::time::Instant>);
 
@@ -55,6 +57,17 @@ enum Failure {
     Refused(String),
     Transport(String),
     Unknown(String),
+}
+
+impl Failure {
+    fn retry_discovery(&self) -> bool {
+        match self {
+            Self::Refused(code) => {
+                matches!(code.as_str(), "module_warming" | "route_busy" | "busy")
+            }
+            Self::Transport(_) | Self::Unknown(_) => true,
+        }
+    }
 }
 
 impl From<CallError> for Failure {
@@ -202,6 +215,8 @@ impl Service {
         mut persisted: bool,
     ) {
         let terminal = !matches!(event, Event::Progress(_));
+        let cleanup = matches!(event, Event::CleanupOpen);
+        let scope_ends = cleanup.then(|| registry.watch_awaited_scope_ends());
         let token = CancellationToken::new();
         let mut pending_progress = None;
         if terminal {
@@ -227,8 +242,9 @@ impl Service {
             }
             let mut delay = FIRST_RETRY_DELAY;
             let mut retry_log = RetryLog::new(!persisted);
-            let cleanup = matches!(event, Event::CleanupOpen);
             let mut request = None;
+            let mut activation = None;
+            let sending = async {
             loop {
                 let guard = registry.clone();
                 let retained = task.clone();
@@ -260,7 +276,10 @@ impl Service {
                         .request_for(&registry, &task, &key, event.clone(), notice.clone())
                         .await
                     {
-                        Ok(prepared) => request = Some(prepared),
+                        Ok(prepared) => {
+                            activation = activate_linked_card(&prepared);
+                            request = Some(prepared);
+                        }
                         Err(error) => retry_log.failure(format_args!(
                             "could not freeze awaited-work result for {key}: {error}"
                         )),
@@ -299,8 +318,26 @@ impl Service {
                     _ = tokio::time::sleep(delay) => {},
                 }
                 delay = (delay * 2).min(MAX_RETRY_DELAY);
+            }};
+            if let Some(scope_ends) = scope_ends {
+                let (guard, retained) = (registry.clone(), task.clone());
+                let age = tokio::task::spawn_blocking(move || guard.awaited_cleanup_age(&retained))
+                    .await.unwrap_or(CLEANUP_LIFETIME);
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(CLEANUP_LIFETIME.saturating_sub(age)) => {
+                        log::warn!("abandoning uncertain awaited open cleanup for {key}: retry lifetime expired");
+                    }
+                    _ = wait_for_revocation(&registry, &task, scope_ends) => {},
+                    _ = sending => {},
+                }
+            } else {
+                sending.await;
             }
             if terminal {
+                // A confirmed link may be announced after finish. Its storage
+                // never delays the orchestrator's release of the worker.
+                if let Some(job) = activation { let _ = job.await; }
                 let _ =
                     tokio::task::spawn_blocking(move || registry.retire_awaited_work(&task)).await;
                 service.terminal.lock().remove(&key);
@@ -335,7 +372,7 @@ impl Service {
             id
         } else {
             let id = if let Some(frame) = notice {
-                stage_notice_record(registry.clone(), key.into(), frame).await
+                card_before_deadline(stage_notice_record(registry.clone(), key.into(), frame)).await
             } else {
                 None
             };
@@ -387,6 +424,42 @@ impl Service {
     }
 }
 
+async fn wait_for_revocation(
+    registry: &BgTaskRegistry,
+    task: &Arc<BgTask>,
+    mut changes: tokio::sync::watch::Receiver<()>,
+) {
+    while changes.changed().await.is_ok() {
+        let (registry, task) = (registry.clone(), task.clone());
+        if !tokio::task::spawn_blocking(move || registry.awaited_work_live(&task))
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+}
+
+async fn card_before_deadline<T>(
+    prepare: impl std::future::Future<Output = Option<T>>,
+) -> Option<T> {
+    tokio::time::timeout(CARD_PREPARATION_LIMIT, prepare)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn activate_linked_card(request: &Request) -> Option<tokio::task::JoinHandle<()>> {
+    let pointer = match request {
+        Request::Finish(params) => params.notice_record.as_ref(),
+        Request::Progress(params) => params.notice_record.as_ref(),
+        _ => None,
+    }?;
+    Some(super::rich_ui::display::activate_awaited_notice(
+        pointer.id.clone(),
+    ))
+}
+
 async fn stage_notice_record(
     registry: BgTaskRegistry,
     key: String,
@@ -403,7 +476,7 @@ async fn stage_notice_record(
     })
     .await
     .ok()??;
-    super::rich_ui::display::stage_awaited_notice(record).await
+    super::rich_ui::display::prepare_awaited_notice(record).await
 }
 
 #[derive(Clone)]
@@ -632,12 +705,13 @@ async fn discover(path: PathBuf, executor: Arc<super::Executor>, service: Weak<S
                             active = if supported { generation } else { None };
                             observed = Some(catalog);
                         }
-                        Err(Failure::Refused(code)) => {
-                            log::warn!("awaited-work discovery refused: {code}");
-                            observed = Some(catalog);
-                        }
-                        Err(Failure::Transport(error) | Failure::Unknown(error)) => {
-                            log::debug!("awaited-work discovery failed: {error}")
+                        Err(error) => {
+                            if error.retry_discovery() {
+                                log::debug!("awaited-work discovery will retry: {error:?}");
+                            } else {
+                                log::warn!("awaited-work discovery refused: {error:?}");
+                                observed = Some(catalog);
+                            }
                         }
                     }
                 }
@@ -702,7 +776,7 @@ async fn reconcile(
             .iter()
             .map(|actor| actor.bash_background().clone())
             .collect();
-        let known = listed
+        let mut known = listed
             .items
             .into_iter()
             .filter_map(|item| {
@@ -712,11 +786,23 @@ async fn reconcile(
                     .map(|registry| (item.key, registry.clone()))
             })
             .collect::<HashMap<_, _>>();
+        for registry in &registries {
+            known.extend(
+                registry
+                    .pending_awaited_open_cleanups()
+                    .into_iter()
+                    .map(|key| (key, registry.clone())),
+            );
+        }
         (known, registries)
     })
     .await
     .map_err(|error| Failure::Transport(error.to_string()))?;
-    let mut open: Vec<_> = known.keys().cloned().collect();
+    // Terminal retries own their decisions even after removal from the task
+    // index. Keep them, and keep uncertain opens that have not appeared in list.
+    let mut keep = service.terminal.lock().clone();
+    keep.extend(known.keys().cloned());
+    let mut open: Vec<_> = keep.iter().cloned().collect();
     open.sort_unstable();
     let reply: SyncReply = Service::call(
         wire.as_ref(),
@@ -728,18 +814,8 @@ async fn reconcile(
     )
     .await?;
     let unknown: HashSet<_> = reply.unknown.into_iter().collect();
-    let retained = Arc::new(
-        known
-            .keys()
-            .filter(|key| !unknown.contains(*key))
-            .cloned()
-            .collect::<HashSet<_>>(),
-    );
-    for registry in registries {
-        registry
-            .settle_missing_awaited(retained.clone(), service.clone())
-            .await;
-    }
+    keep.retain(|key| !unknown.contains(key));
+    settle_omitted_items(service, registries, Arc::new(keep)).await;
     let service_for_replay = service.clone();
     let _ = tokio::task::spawn_blocking(move || {
         for (key, registry) in known {
@@ -751,6 +827,22 @@ async fn reconcile(
     .await;
     *service.wire.write() = Some(wire);
     Ok(())
+}
+
+// A successful list is complete: Prefrontal commits each item before answering
+// open, and refuses as busy until its store is ready after restart. After both
+// list and sync have succeeded, an omitted item has already ended (or its open
+// never committed); settling locally must not send another notice.
+async fn settle_omitted_items(
+    service: &Arc<Service>,
+    registries: Vec<BgTaskRegistry>,
+    retained: Arc<HashSet<String>>,
+) {
+    for registry in registries {
+        registry
+            .settle_missing_awaited(retained.clone(), service.clone())
+            .await;
+    }
 }
 
 #[cfg(test)]
