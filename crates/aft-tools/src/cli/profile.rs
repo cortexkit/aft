@@ -50,6 +50,10 @@ const WAIT_MARKERS: &[&str] = &[
     "kevent",
     "__semwait_signal",
     "mach_msg2_trap",
+    "mach_msg_trap",
+    "epoll_wait",
+    "epoll_pwait",
+    "nanosleep",
     "__select",
     "__workq_kernreturn",
     "__ulock_wait",
@@ -2752,10 +2756,33 @@ fn node_path(thread: &SampleThread, mut index: usize) -> Vec<usize> {
 
 fn is_wait_frame(frame: &str) -> bool {
     let lower = frame.to_ascii_lowercase();
+    let symbol = lower
+        .split_whitespace()
+        .find(|part| !part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .unwrap_or("")
+        .trim_start_matches('`');
     WAIT_MARKERS.iter().any(|marker| lower.contains(marker))
-        || lower.starts_with("read ")
-        || lower.contains(" read ")
-        || lower.contains("`read")
+        || (symbol.contains("::condvar::") && symbol.contains("::wait"))
+        || symbol.contains("::thread::sleep")
+        || symbol.contains("thread::functions::park")
+        || symbol.contains("thread::park")
+        || symbol.contains("parking_lot_core::parking_lot::park")
+        || [
+            "read",
+            "__read",
+            "accept",
+            "__accept",
+            "sleep",
+            "mach_msg",
+            "mach_msg2",
+            "mach_msg_overwrite",
+        ]
+        .iter()
+        .any(|name| {
+            symbol
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['+', '$', '(']))
+        })
 }
 
 fn subsystem_for_paths(paths: &[HotPath]) -> String {
@@ -4001,6 +4028,56 @@ mod tests {
         assert_eq!(rendered.last().map(String::as_str), Some("frame-12"));
         assert!(rendered.iter().all(|frame| !is_runtime_prologue(frame)));
         assert_eq!(rendered.len(), 13);
+    }
+
+    #[test]
+    fn parked_and_busy_threads_are_counted_from_sample_leaves() {
+        let raw = "Call graph:\n    12 Thread_9: aft-fs-lock-heartbeat\n      12 thread_start\n        12 std::thread::functions::park_timeout (functions.rs:600)\n    7 Thread_10: busy-worker\n      7 thread_start\n        7 app::do_work (work.rs:42)\n";
+        let threads = parse_macos_sample(raw);
+        assert_eq!(threads.len(), 2);
+        let parked = thread_report(&threads[0]);
+        let busy = thread_report(&threads[1]);
+        assert!(!parked.parse_inconsistent);
+        assert!(!busy.parse_inconsistent);
+        assert_eq!((parked.running_samples, parked.waiting_samples), (0, 12));
+        assert!(parked.heaviest_paths.is_empty());
+        assert_eq!((busy.running_samples, busy.waiting_samples), (7, 0));
+        assert_eq!(busy.heaviest_paths[0].samples, 7);
+        let json = serde_json::to_value(&parked).unwrap();
+        assert_eq!(json["running_samples"], 0);
+        assert_eq!(json["waiting_samples"], 12);
+    }
+
+    #[test]
+    fn blocking_wait_symbols_are_idle_without_matching_similar_busy_names() {
+        for frame in [
+            "std::thread::park (in aft) + 8",
+            "std::thread::functions::park_timeout (functions.rs:600)",
+            "std::sys::sync::condvar::pthread::Condvar::wait_timeout (in aft)",
+            "parking_lot::condvar::Condvar::wait (in aft)",
+            "parking_lot_core::parking_lot::park (in aft)",
+            "std::thread::sleep (in aft)",
+            "nanosleep (in libc) + 8",
+            "__psynch_cvwait (in libsystem_kernel.dylib) + 8",
+            "__semwait_signal (in libsystem_kernel.dylib) + 8",
+            "mach_msg (in libsystem_kernel.dylib) + 8",
+            "mach_msg2_trap (in libsystem_kernel.dylib) + 8",
+            "kevent (in libsystem_kernel.dylib) + 8",
+            "7fff1234 epoll_wait+0x10 (/lib/libc.so)",
+            "7fff1234 read+0x10 (/lib/libc.so)",
+            "__read$NOCANCEL (in libsystem_kernel.dylib) + 8",
+            "accept (in libc) + 8",
+        ] {
+            assert!(is_wait_frame(frame), "expected idle: {frame}");
+        }
+        for frame in [
+            "app::read_file (in aft) + 8",
+            "app::accept_connection (in aft) + 8",
+            "app::sleepy_work (in aft) + 8",
+            "app::parking_meter (in aft) + 8",
+        ] {
+            assert!(!is_wait_frame(frame), "expected running: {frame}");
+        }
     }
 
     #[test]
