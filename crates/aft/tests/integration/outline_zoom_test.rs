@@ -881,6 +881,130 @@ export function plain(n: number) { return n; }
 }
 
 #[test]
+fn typescript_outline_does_not_export_locals() {
+    let dir = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let source = r#"export const factory = run(() => {
+  const bind = () => 1;
+  function register() { return bind(); }
+  return register;
+});
+export function outer() {
+  function inner() { return 1; }
+  return inner();
+}
+const shadow = () => 1;
+function unrelated() {
+  const shadow = () => 2;
+  return shadow();
+}
+const publicShadow = () => 3;
+export { shadow, shadow as publicShadow };
+const defaultEntry = () => 4;
+export default defaultEntry;
+"#;
+    for extension in ["ts", "tsx"] {
+        let file = write_file(dir.path(), &format!("locals.{extension}"), source);
+        let reply = send(
+            &mut aft,
+            json!({"id":"export-locals", "command":"outline", "file":file}),
+        );
+        assert_eq!(reply["success"], true, "{reply}");
+        let text = reply["text"].as_str().unwrap();
+        for local in [
+            "const bind",
+            "function register",
+            "function inner",
+            "const publicShadow",
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim_start().starts_with(local)),
+                "{extension}: missing unexported {local}: {text}"
+            );
+        }
+        for expected in [
+            "E const factory",
+            "E function outer",
+            "E const shadow = () => 1",
+            "const shadow = () => 2",
+            "E const defaultEntry",
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim_start().starts_with(expected)),
+                "{extension}: missing {expected}: {text}"
+            );
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn typescript_outline_and_zoom_find_exported_pattern_bindings() {
+    let dir = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let source = r#"export const {
+  use: useCommand, execute: executeCommand,
+  options: { shorthand, fallback = fallbackValue }, ...remaining
+} = makeCommands();
+export const [first, , [nested], ...tail] = makeItems();
+const { key: viaClause } = makeOther();
+export { viaClause as publicOther };
+"#;
+    for extension in ["ts", "tsx"] {
+        let file = write_file(dir.path(), &format!("patterns.{extension}"), source);
+        let reply = send(
+            &mut aft,
+            json!({"id":"export-patterns", "command":"outline", "file":file}),
+        );
+        assert_eq!(reply["success"], true, "{reply}");
+        let symbols = aft::parser::FileParser::new()
+            .extract_symbols(&file)
+            .unwrap();
+        let mut exported: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| symbol.exported)
+            .map(|symbol| {
+                assert_eq!(symbol.kind, aft::symbols::SymbolKind::Variable);
+                symbol.name.as_str()
+            })
+            .collect();
+        exported.sort_unstable();
+        assert_eq!(
+            exported,
+            [
+                "executeCommand",
+                "fallback",
+                "first",
+                "nested",
+                "remaining",
+                "shorthand",
+                "tail",
+                "useCommand",
+                "viaClause",
+            ],
+            "{extension}: {reply}"
+        );
+        let reply = send(
+            &mut aft,
+            json!({"id":"zoom-pattern", "command":"zoom", "file":file, "symbol":"useCommand"}),
+        );
+        assert_eq!(reply["success"], true, "{extension}: {reply}");
+        assert!(
+            reply["content"]
+                .as_str()
+                .unwrap()
+                .contains("use: useCommand"),
+            "{reply}"
+        );
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn outline_existing_large_interface_is_a_nested_member_menu() {
     let file = crate::test_helpers::manifest_dir()
         .join("../..")
