@@ -1627,18 +1627,24 @@ if ! python3 "$REPO/scripts/check-path-deps.py"; then
   refuse "dependency path resolves outside the repository"
 fi
 
-# .cortexkit/ is private CortexKit working space: Git may track only the paths
-# the ignore rules re-include there. CI's Landing policy job runs
-# scripts/check-cortexkit-tracking.sh; this block repeats its Git query inline
-# (so train-push.sh needs no extra file) because this checkout's
-# .git/info/exclude can ignore files that a fresh CI clone does not.
-# The tree is clean at this point, so the index is exactly what gets pushed.
-if ! cortexkit_tracked="$(git -C "$REPO" ls-files -ci --exclude-standard -- .cortexkit)"; then
+# .cortexkit/ is private CortexKit working space: Git may track only the shared
+# allowlist, regardless of what the ignore rules re-include. CI's Landing policy
+# job runs scripts/check-cortexkit-tracking.sh; this block repeats the same
+# allowlist inline so train-push.sh needs no extra file. The tree is clean at
+# this point, so the index is exactly what gets pushed.
+if ! cortexkit_tracked="$(git -C "$REPO" ls-files -- .cortexkit)"; then
   refuse "could not list tracked files under .cortexkit/"
 fi
-if [ -n "$cortexkit_tracked" ]; then
-  printf '%s\n' "$cortexkit_tracked" | sed 's/^/  /' >&2
-  refuse "ignored files are tracked under .cortexkit/ (stop tracking them with git rm --cached <path>, which keeps the working copy)"
+cortexkit_forbidden=""
+while IFS= read -r path; do
+  if [[ "$path" =~ ^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$|[a-z0-9-]+\.jsonc$) ]]; then
+    continue
+  fi
+  cortexkit_forbidden+="$path"$'\n'
+done <<< "$cortexkit_tracked"
+if [ -n "$cortexkit_forbidden" ]; then
+  printf '%s' "$cortexkit_forbidden" | sed 's/^/  /' >&2
+  refuse "files outside the allowlist are tracked under .cortexkit/ (only release-notes/, skills/, rules/, WORKER.md and top-level [a-z0-9-]+.jsonc project settings are allowed; stop tracking the rest with git rm --cached <path>, which keeps the working copy)"
 fi
 
 # A local main behind origin/main means an unstacked train was built on a stale

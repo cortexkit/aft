@@ -1790,21 +1790,20 @@ expect_rc 2 "a missing path-dependency checker refuses"
 expect_out "scripts/check-path-deps.py not found" "the refusal names the missing checker"
 expect_no_out "dependency path resolves outside" "a missing checker is not reported as a path verdict"
 
-# --- refusal: an ignored file is tracked under .cortexkit/ -----------------
+# --- refusal: a non-allowlisted file is tracked under .cortexkit/ -----------
 dir="$(new_fixture cortexkit-tracked)"
-printf '/.cortexkit/*\n!/.cortexkit/WORKER.md\n' > "$dir/work/.gitignore"
-mkdir -p "$dir/work/.cortexkit/alfonso/drafts"
+printf '/.cortexkit/*\n!/.cortexkit/WORKER.md\n!/.cortexkit/private.txt\n' > "$dir/work/.gitignore"
+mkdir -p "$dir/work/.cortexkit"
 echo "worker guide" > "$dir/work/.cortexkit/WORKER.md"
-echo "private draft" > "$dir/work/.cortexkit/alfonso/drafts/plan.md"
-git -C "$dir/work" add .gitignore .cortexkit/WORKER.md
-git -C "$dir/work" add -f .cortexkit/alfonso/drafts/plan.md
-git -C "$dir/work" commit -qm "track a private draft"
+echo "private draft" > "$dir/work/.cortexkit/private.txt"
+git -C "$dir/work" add .gitignore .cortexkit/WORKER.md .cortexkit/private.txt
+git -C "$dir/work" commit -qm "track a re-included private file"
 add_train_commit "$dir/work" "cortexkit-tracked"
 main_before="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
 run_train "$dir" cortexkit-tracked
-expect_rc 2 "a tracked ignored file under .cortexkit refuses"
-expect_out ".cortexkit/alfonso/drafts/plan.md" "the refusal lists the tracked ignored file"
-expect_out "ignored files are tracked under .cortexkit/" "the refusal names the reason"
+expect_rc 2 "a tracked non-allowlisted file under .cortexkit refuses"
+expect_out ".cortexkit/private.txt" "the refusal lists the tracked non-allowlisted file"
+expect_out "files outside the allowlist are tracked under .cortexkit/" "the refusal names the reason"
 expect_no_out ".cortexkit/WORKER.md" "a re-included tracked file is not listed"
 # A train that got through would push train/cortexkit-tracked and then land it
 # on main (deleting the train ref), so check both refs.

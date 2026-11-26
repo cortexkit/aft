@@ -2319,7 +2319,7 @@ while [[ "$1" != --output ]]; do shift; done
 
 
 class CortexkitTrackingGateTests(unittest.TestCase):
-    """Private .cortexkit/ files must never be tracked, and CI must say so."""
+    """Only allowlisted .cortexkit/ files may be tracked, and CI must say so."""
 
     ROOT = Path(__file__).resolve().parents[2]
     SCRIPT = ROOT / "scripts/check-cortexkit-tracking.sh"
@@ -2383,6 +2383,7 @@ class CortexkitTrackingGateTests(unittest.TestCase):
                 ".cortexkit/rules/example.md",
                 ".cortexkit/WORKER.md",
                 ".cortexkit/aft.jsonc",
+                ".cortexkit/prefrontal.jsonc",
             ):
                 with self.subTest(shared=path):
                     self.assertFalse(ignored(path))
@@ -2406,6 +2407,63 @@ class CortexkitTrackingGateTests(unittest.TestCase):
             green = self._check(repo)
             self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
             self.assertTrue(draft.exists(), "git rm --cached must keep the working copy")
+
+    def test_check_rejects_tracked_file_reincluded_by_ignore_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+            private = repo / ".cortexkit/notes.md"
+            private.parent.mkdir(parents=True)
+            private.write_text("private\n")
+            with (repo / ".gitignore").open("a") as ignore_rules:
+                ignore_rules.write("\n!/.cortexkit/notes.md\n")
+            self._git(repo, "add", ".gitignore", ".cortexkit/notes.md")
+
+            red = self._check(repo)
+            self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+            self.assertIn(".cortexkit/notes.md", red.stderr)
+            self.assertIn("outside the .cortexkit/ allowlist", red.stderr)
+
+    def test_check_rejects_jsonc_settings_in_subfolders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+            nested = repo / ".cortexkit/sub/x.jsonc"
+            nested.parent.mkdir(parents=True)
+            nested.write_text("private\n")
+            self._git(repo, "add", "-f", ".cortexkit/sub/x.jsonc")
+
+            red = self._check(repo)
+            self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+            self.assertIn(".cortexkit/sub/x.jsonc", red.stderr)
+            self.assertIn("outside the .cortexkit/ allowlist", red.stderr)
+
+    def test_check_allows_every_shared_cortexkit_path(self) -> None:
+        for path in (
+            ".cortexkit/release-notes/v1.0.0.md",
+            ".cortexkit/skills/example/SKILL.md",
+            ".cortexkit/rules/example.md",
+            ".cortexkit/WORKER.md",
+            ".cortexkit/aft.jsonc",
+            ".cortexkit/prefrontal.jsonc",
+            ".cortexkit/other-tool.jsonc",
+        ):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp:
+                repo = self._fixture(Path(tmp))
+                shared = repo / path
+                shared.parent.mkdir(parents=True, exist_ok=True)
+                shared.write_text("shared\n")
+                self._git(repo, "add", "-f", path)
+
+                green = self._check(repo)
+                self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
+
+    def test_check_returns_2_when_git_ls_files_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_repo = Path(tmp) / "not-a-repo"
+            not_a_repo.mkdir()
+
+            red = self._check(not_a_repo)
+            self.assertEqual(red.returncode, 2, red.stdout + red.stderr)
+            self.assertIn("git ls-files failed", red.stderr)
 
     def test_check_rejects_tracked_aft_ci_staging_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
