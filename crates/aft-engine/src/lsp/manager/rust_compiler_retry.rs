@@ -34,11 +34,8 @@ impl LspManager {
     /// compiler diagnostics that could not be matched to known file content
     /// (see `unproven_rust_compiler_reports`). A pulled report for the file
     /// then lacks those rows and cannot stand for its compiler result.
-    pub(crate) fn rust_compiler_report_unproven(
-        &self,
-        server_key: &ServerKey,
-        file_path: &Path,
-    ) -> bool {
+    #[doc(hidden)]
+    pub fn rust_compiler_report_unproven(&self, server_key: &ServerKey, file_path: &Path) -> bool {
         self.unproven_rust_compiler_reports
             .contains_key(&(server_key.clone(), normalize_lookup_path(file_path)))
     }

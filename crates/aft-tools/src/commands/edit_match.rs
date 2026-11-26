@@ -2273,7 +2273,7 @@ fn handle_single_file_edit_match(
     // The match was satisfied (replacements > 0) but no net change landed.
     // Pi/OpenCode UIs use this to render "matched but no change" instead of
     // a bare `+0/-0` that looks like a tool failure (see GitHub #45).
-    let rollback_skipped = write_result.rollback_skipped_reason.is_some();
+    let rollback_skipped = write_result.rollback_skipped_reason().is_some();
     let final_content = write_result.final_content(&path).unwrap_or(&new_source);
     if !rollback_skipped && source == final_content {
         result["no_op"] = serde_json::json!(true);

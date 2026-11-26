@@ -2217,6 +2217,11 @@ impl WriteResult {
         }
     }
 
+    #[doc(hidden)]
+    pub fn rollback_skipped_reason(&self) -> Option<&'static str> {
+        self.rollback_skipped_reason
+    }
+
     /// Return the validated final text only while the live path still has the
     /// same identity. LSP notifications may wait, so response rendering checks
     /// again rather than assuming the file stayed unchanged during that wait.
@@ -2303,7 +2308,8 @@ impl WriteResult {
 
     /// Add file-write warnings to the reply's `warnings` array, keeping any
     /// warnings the handler already put there.
-    pub(crate) fn append_write_warnings_to(&self, result: &mut serde_json::Value) {
+    #[doc(hidden)]
+    pub fn append_write_warnings_to(&self, result: &mut serde_json::Value) {
         if self.write_warnings.is_empty() {
             return;
         }

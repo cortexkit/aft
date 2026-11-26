@@ -24,7 +24,7 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 
 pub(crate) use crate::host_tool_names::{is_native_plumbing_call, is_subc_native_plumbing_tool};
 
-use aft_tools::command_lane_policy::command_lane_explicit;
+pub(super) use aft_tools::command_lane_policy::command_lane_explicit;
 pub(super) fn command_lane(command: &str) -> Lane {
     command_lane_explicit(command).unwrap_or(Lane::Mutating)
 }

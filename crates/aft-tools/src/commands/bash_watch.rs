@@ -1283,7 +1283,7 @@ mod tests {
         let now = tokio::time::Instant::now().into_std();
         let job = WatchJob {
             registry,
-            task_id: task.task_id.clone(),
+            task_id: task.task_id().to_owned(),
             session: SESSION.into(),
             pattern: None,
             limit_ms: 1000,

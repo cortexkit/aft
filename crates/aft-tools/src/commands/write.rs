@@ -252,7 +252,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // "wrote, but no net change" instead of a bare "File updated". See
     // GitHub #45.
     let rolled_back = write_result.rolled_back;
-    let rollback_skipped = write_result.rollback_skipped_reason.is_some();
+    let rollback_skipped = write_result.rollback_skipped_reason().is_some();
     let final_content = write_result
         .final_content(path.as_path())
         .unwrap_or(content);

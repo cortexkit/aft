@@ -30,7 +30,8 @@ pub struct RepeatObservation {
 }
 
 impl RepeatObservation {
-    pub(crate) fn is_reset_only(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_reset_only(&self) -> bool {
         self.mutating && !matches!(self.tool.as_str(), "bash" | "powershell")
     }
 }

@@ -35,13 +35,12 @@ fn runon_read_only_note_scans_stderr_once_within_its_budget() {
     let dir = tempfile::tempdir().unwrap();
     let (registry, task_id, _) =
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
-    let task = registry.task(&task_id).unwrap();
-    task.state.lock().unwrap().metadata.workdir = dir.path().join("package");
+    let task = registry.test_task(&task_id).unwrap();
+    task.test_lock_state().unwrap().metadata_mut().workdir = dir.path().join("package");
     let stderr = task
-        .state
-        .lock()
+        .test_lock_state()
         .unwrap()
-        .buffer
+        .buffer()
         .stderr_path()
         .unwrap()
         .to_path_buf();

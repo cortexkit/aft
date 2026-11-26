@@ -498,7 +498,7 @@ fn write_patched_file(
     Ok(PatchedFile {
         final_content,
         snapshot_taken,
-        rollback_skipped_reason: write_result.rollback_skipped_reason,
+        rollback_skipped_reason: write_result.rollback_skipped_reason(),
     })
 }
 

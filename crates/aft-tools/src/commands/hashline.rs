@@ -220,7 +220,7 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
                 transport: transport_kind(ctx),
             });
             if let (Some(object), Some(reason)) =
-                (payload.as_object_mut(), envelope.backup_skipped_reason)
+                (payload.as_object_mut(), envelope.backup_skipped_reason())
             {
                 object.insert(
                     "backup_skipped_reason".to_string(),

@@ -1,6 +1,6 @@
 //! Shared command lanes for standalone bookkeeping and daemon scheduling.
 
-use subc_protocol::manifest::Lane;
+use crate::executor::Lane;
 
 pub(crate) fn is_read_only_command(command: &str) -> bool {
     matches!(

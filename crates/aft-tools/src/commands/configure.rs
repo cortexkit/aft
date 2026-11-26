@@ -7377,8 +7377,8 @@ mod tests {
 
     #[test]
     fn configure_git_probe_fixture_does_not_invert_process_env_lock() {
-        use crate::root_identity::key::git_root_commit_probe_override_lock_for_test;
         use crate::test_env::{process_env_lock, process_env_lock_is_available};
+        use aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test;
 
         let hang_guard = Duration::from_secs(5);
         let (probe_held, wait_probe_held) = mpsc::channel();

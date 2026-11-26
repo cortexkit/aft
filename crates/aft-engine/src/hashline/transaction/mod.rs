@@ -132,6 +132,11 @@ pub struct TransactionEnvelope {
 }
 
 impl TransactionEnvelope {
+    #[doc(hidden)]
+    pub fn backup_skipped_reason(&self) -> Option<crate::backup::BackupSkippedReason> {
+        self.backup_skipped_reason
+    }
+
     /// Convert to the apply-layer envelope shape (without `op_id` / roles).
     pub fn to_apply_envelope(&self) -> crate::hashline::apply::ApplyResultEnvelope {
         crate::hashline::apply::ApplyResultEnvelope {
