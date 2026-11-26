@@ -494,9 +494,11 @@ impl GithubReadCacheStore for MemoryCache {
         _key: &GithubReadCacheKey,
         canonical_text: &str,
         fetched_at_ms: i64,
+        document_gap: bool,
     ) -> Result<(), String> {
         *self.0.lock() = Some(GithubReadCacheEntry {
             canonical_text: canonical_text.to_string(),
+            document_gap: Some(document_gap),
             fetched_at_ms,
             updated_at_ms: fetched_at_ms,
         });

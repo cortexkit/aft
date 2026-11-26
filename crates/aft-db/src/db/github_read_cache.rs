@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS github_read_cache (
     canonical_text           TEXT NOT NULL,
     fetched_at_ms            INTEGER NOT NULL,
     updated_at_ms            INTEGER NOT NULL,
+    document_gap_with_text_hash BLOB,
     PRIMARY KEY (resource_kind, repository, resource_number, authentication_identity_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_github_read_cache_hard_ttl
@@ -69,24 +70,57 @@ impl GithubReadCacheKey {
     }
 }
 
-/// Cached canonical text and the timestamps used for cache freshness decisions.
+/// Cached canonical text, fetch-gap metadata, and freshness timestamps.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GithubReadCacheEntry {
     pub canonical_text: String,
+    /// None means the cache has no reliable gap metadata for this exact text.
+    pub document_gap: Option<bool>,
     /// Milliseconds since the Unix epoch when GitHub supplied the cached content.
     pub fetched_at_ms: i64,
     /// Milliseconds since the Unix epoch when this durable row was last written.
     pub updated_at_ms: i64,
 }
 
-/// Create the GitHub-read cache table and index in the already-open AFT database.
+/// Prepare the GitHub-read cache table and index in the already-open AFT database.
 ///
-/// This stays separate from AFT's historical schema migrations so the cache
-/// module can be registered without coupling unrelated database consumers to its
-/// rollout. Every public cache operation calls this function before accessing the
-/// table.
+/// The nullable metadata column keeps the cache compatible with older builds:
+/// their queries name columns explicitly and can ignore the new column.
 pub fn ensure_github_read_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(CREATE_GITHUB_READ_CACHE_SCHEMA)
+    conn.execute_batch(CREATE_GITHUB_READ_CACHE_SCHEMA)?;
+    if !has_document_gap_column(conn)? {
+        let result = conn.execute_batch(
+            "ALTER TABLE github_read_cache ADD COLUMN document_gap_with_text_hash BLOB",
+        );
+        // Another connection may have added the column since our check.
+        if result.is_err() && !has_document_gap_column(conn)? {
+            return result;
+        }
+    }
+    Ok(())
+}
+
+fn has_document_gap_column(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('github_read_cache')
+                       WHERE name = 'document_gap_with_text_hash')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+// A rolled-back build can overwrite the text without updating this column.
+// Trust the flag only if the hash still describes the exact cached render.
+fn decode_document_gap(canonical_text: &str, metadata: &[u8]) -> Option<bool> {
+    let (flag, hash) = metadata.split_first()?;
+    if hash != blake3::hash(canonical_text.as_bytes()).as_bytes() {
+        return None;
+    }
+    match flag {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
 }
 
 /// Look up one cache row using the full resource and authentication-identity key.
@@ -106,7 +140,7 @@ pub fn lookup_github_read_cache_entry_after_schema(
     key: &GithubReadCacheKey,
 ) -> rusqlite::Result<Option<GithubReadCacheEntry>> {
     conn.query_row(
-        "SELECT canonical_text, fetched_at_ms, updated_at_ms
+        "SELECT canonical_text, fetched_at_ms, updated_at_ms, document_gap_with_text_hash
          FROM github_read_cache
          WHERE resource_kind = ?1
            AND repository = ?2
@@ -119,8 +153,14 @@ pub fn lookup_github_read_cache_entry_after_schema(
             key.authentication_identity_hash.as_slice(),
         ],
         |row| {
+            let canonical_text: String = row.get(0)?;
+            let metadata: Option<Vec<u8>> = row.get(3)?;
+            let document_gap = metadata
+                .as_deref()
+                .and_then(|metadata| decode_document_gap(&canonical_text, metadata));
             Ok(GithubReadCacheEntry {
-                canonical_text: row.get(0)?,
+                canonical_text,
+                document_gap,
                 fetched_at_ms: row.get(1)?,
                 updated_at_ms: row.get(2)?,
             })
@@ -138,9 +178,16 @@ pub fn upsert_github_read_cache_entry(
     key: &GithubReadCacheKey,
     canonical_text: &str,
     fetched_at_ms: i64,
+    document_gap: bool,
 ) -> rusqlite::Result<()> {
     ensure_github_read_cache_schema(conn)?;
-    upsert_github_read_cache_entry_after_schema(conn, key, canonical_text, fetched_at_ms)
+    upsert_github_read_cache_entry_after_schema(
+        conn,
+        key,
+        canonical_text,
+        fetched_at_ms,
+        document_gap,
+    )
 }
 
 /// [`upsert_github_read_cache_entry`] for a caller that already ran
@@ -150,7 +197,11 @@ pub fn upsert_github_read_cache_entry_after_schema(
     key: &GithubReadCacheKey,
     canonical_text: &str,
     fetched_at_ms: i64,
+    document_gap: bool,
 ) -> rusqlite::Result<()> {
+    let mut metadata = [0; 1 + blake3::OUT_LEN];
+    metadata[0] = u8::from(document_gap);
+    metadata[1..].copy_from_slice(blake3::hash(canonical_text.as_bytes()).as_bytes());
     conn.execute(
         "INSERT INTO github_read_cache (
             resource_kind,
@@ -159,13 +210,15 @@ pub fn upsert_github_read_cache_entry_after_schema(
             authentication_identity_hash,
             canonical_text,
             fetched_at_ms,
-            updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            updated_at_ms,
+            document_gap_with_text_hash
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(resource_kind, repository, resource_number, authentication_identity_hash)
          DO UPDATE SET
             canonical_text = excluded.canonical_text,
             fetched_at_ms = excluded.fetched_at_ms,
-            updated_at_ms = excluded.updated_at_ms",
+            updated_at_ms = excluded.updated_at_ms,
+            document_gap_with_text_hash = excluded.document_gap_with_text_hash",
         params![
             key.resource_kind.as_str(),
             &key.normalized_repository,
@@ -174,6 +227,7 @@ pub fn upsert_github_read_cache_entry_after_schema(
             canonical_text,
             fetched_at_ms,
             fetched_at_ms,
+            metadata.as_slice(),
         ],
     )?;
     Ok(())
@@ -328,7 +382,7 @@ mod tests {
             number,
             session,
         );
-        upsert_github_read_cache_entry(conn, &key, "# PR\n", fetched_at_ms).unwrap();
+        upsert_github_read_cache_entry(conn, &key, "# PR\n", fetched_at_ms, false).unwrap();
     }
 
     fn rows(conn: &Connection) -> i64 {
@@ -336,6 +390,39 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn github_read_cache_legacy_rows_remain_readable_with_unknown_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let version = crate::db::current_schema_version(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE github_read_cache (
+                resource_kind TEXT NOT NULL CHECK (resource_kind IN ('issue', 'pr')),
+                repository TEXT NOT NULL,
+                resource_number INTEGER NOT NULL CHECK (resource_number > 0),
+                authentication_identity_hash BLOB NOT NULL,
+                canonical_text TEXT NOT NULL,
+                fetched_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (resource_kind, repository, resource_number, authentication_identity_hash)
+            );",
+        )
+        .unwrap();
+        let key = GithubReadCacheKey::new(GithubReadResourceKind::Issue, "owner/repo", 7, "id");
+        conn.execute(
+            "INSERT INTO github_read_cache VALUES ('issue', 'owner/repo', 7, ?1, '# Legacy', 1, 1)",
+            [key.authentication_identity_hash.as_slice()],
+        )
+        .unwrap();
+
+        let entry = lookup_github_read_cache_entry(&conn, &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.canonical_text, "# Legacy");
+        assert_eq!(entry.document_gap, None);
+        assert_eq!(crate::db::current_schema_version(&conn).unwrap(), version);
     }
 
     #[test]

@@ -16808,6 +16808,7 @@ mod github_read_mutation_tests {
             &cache_key(repository, resource_number, identity),
             "# Cached issue\n",
             1_000,
+            false,
         )
         .expect("write cached issue");
     }

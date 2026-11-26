@@ -3963,7 +3963,7 @@ mod github_deferred_deadline_tests {
     use crate::github_read::{
         DownloadedGithubImage, GithubDocument, GithubFetchRequest, GithubFetcher,
         GithubImageDownloader, GithubReadCacheStore, GithubReadClock, GithubReadError,
-        GithubResourceKind,
+        GithubReadFreshness, GithubReadRequest, GithubResourceKind,
     };
 
     /// A cache that always holds a copy of the requested resource.
@@ -3976,12 +3976,19 @@ mod github_deferred_deadline_tests {
         ) -> Result<Option<GithubReadCacheEntry>, String> {
             Ok(Some(GithubReadCacheEntry {
                 canonical_text: "# Cached issue\n".to_string(),
+                document_gap: Some(false),
                 fetched_at_ms: 1_234,
                 updated_at_ms: 1_234,
             }))
         }
 
-        fn upsert(&self, _key: &GithubReadCacheKey, _text: &str, _at: i64) -> Result<(), String> {
+        fn upsert(
+            &self,
+            _key: &GithubReadCacheKey,
+            _text: &str,
+            _at: i64,
+            _document_gap: bool,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -4031,6 +4038,139 @@ mod github_deferred_deadline_tests {
         fn now_ms(&self) -> i64 {
             2_000
         }
+    }
+
+    struct FixtureFetch(Result<GithubDocument, GithubReadError>);
+
+    impl GithubFetcher for FixtureFetch {
+        fn fetch(&self, _request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+            self.0.clone()
+        }
+    }
+
+    fn assert_cached_read_completeness(
+        document: GithubDocument,
+        live_complete: bool,
+        legacy_rewrite: Option<&str>,
+        cached_complete: bool,
+    ) {
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("aft.db");
+        let config = crate::config::GithubConfig {
+            read: true,
+            ..Default::default()
+        };
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "cached-read",
+            "command": "read",
+            "file": "pr://owner/repo/1",
+        }))
+        .unwrap();
+        let start = |result| {
+            let engine = GithubReadEngine::new(
+                sqlite_cache_store(&database),
+                Arc::new(FixtureFetch(result)),
+                Arc::new(NoImages),
+                Arc::new(FixedClock),
+            );
+            let request =
+                GithubReadRequest::parse("pr://owner/repo/1", "/fixture", "identity", None)
+                    .unwrap();
+            let GithubReadStart::Deferred(deferred) = engine
+                .start(&config, request, GithubReadSelector::default())
+                .unwrap()
+            else {
+                panic!("read must attempt a live fetch");
+            };
+            deferred
+        };
+        let assert_response = |completion: GithubReadCompletion, freshness, expected_complete| {
+            assert_eq!(completion.freshness, freshness);
+            let response = github_read_response(&req, completion, 1);
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["truncated"], false);
+            assert_eq!(response.data["complete"], expected_complete);
+            response
+        };
+
+        let live = start(Ok(document))
+            .wait_until(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_response(live, GithubReadFreshness::Fetched, live_complete);
+
+        if let Some(text) = legacy_rewrite {
+            // The older upsert updates canonical_text without refreshing its gap metadata.
+            let conn = crate::db::open(&database).unwrap();
+            assert_eq!(
+                conn.execute("UPDATE github_read_cache SET canonical_text = ?1", [text])
+                    .unwrap(),
+                1,
+            );
+        }
+
+        let (receiver, late) =
+            start(Err(GithubReadError::FetchFailed("offline".into()))).into_parts();
+        for cached in [
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            late.answer(Duration::from_secs(1)).unwrap(),
+        ] {
+            let response =
+                assert_response(cached, GithubReadFreshness::CachedFallback, cached_complete);
+            if let Some(text) = legacy_rewrite {
+                assert!(response.data["content"].as_str().unwrap().ends_with(text));
+            }
+        }
+    }
+
+    fn fixture_pull_request() -> GithubDocument {
+        GithubDocument {
+            repository: "owner/repo".into(),
+            kind: crate::github_read::GithubDocumentKind::PullRequest,
+            number: 1,
+            title: "Fixture pull request".into(),
+            state: "OPEN".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn github_read_cached_fallback_keeps_fetch_gaps_incomplete() {
+        assert_cached_read_completeness(
+            GithubDocument {
+                timeline_cut_at_bytes: Some(100),
+                ..fixture_pull_request()
+            },
+            false,
+            None,
+            false,
+        );
+        assert_cached_read_completeness(
+            GithubDocument {
+                review_pages_cut_after: Some(1),
+                ..fixture_pull_request()
+            },
+            false,
+            None,
+            false,
+        );
+    }
+
+    #[test]
+    fn github_read_cached_fallback_keeps_whole_documents_complete() {
+        assert_cached_read_completeness(fixture_pull_request(), true, None, true);
+    }
+
+    #[test]
+    fn github_read_cached_fallback_rejects_metadata_after_an_older_write() {
+        assert_cached_read_completeness(
+            fixture_pull_request(),
+            true,
+            Some("# Pull request cached by an older build\n"),
+            false,
+        );
     }
 
     #[test]

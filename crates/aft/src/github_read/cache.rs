@@ -17,6 +17,7 @@ use super::attachments::{
     GithubImageDownloader,
 };
 use super::fetch::{GithubFetchRequest, GithubFetcher, GithubReadError};
+use super::model::GithubDocument;
 use super::render::{render_document_for_resource, render_outline_for_resource};
 use super::resource::{parse_resource, GithubResource, GithubResourceKind, InvalidGithubResource};
 
@@ -49,6 +50,7 @@ pub trait GithubReadCacheStore: Send + Sync {
         key: &GithubReadCacheKey,
         canonical_text: &str,
         fetched_at_ms: i64,
+        document_gap: bool,
     ) -> Result<(), String>;
     fn invalidate(
         &self,
@@ -141,6 +143,7 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
         key: &GithubReadCacheKey,
         canonical_text: &str,
         fetched_at_ms: i64,
+        document_gap: bool,
     ) -> Result<(), String> {
         self.run("update", |connection| {
             upsert_github_read_cache_entry_after_schema(
@@ -148,6 +151,7 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
                 key,
                 canonical_text,
                 fetched_at_ms,
+                document_gap,
             )
         })
     }
@@ -256,13 +260,13 @@ pub struct GithubReadCompletion {
     pub freshness: GithubReadFreshness,
     pub attachments: Vec<GithubImageAttachment>,
     /// Live structured data retained for mutation flows that must reuse read ordinals.
-    pub document: Option<super::model::GithubDocument>,
+    pub document: Option<GithubDocument>,
     pub diff_page: Option<super::diff::GithubDiffPage>,
     /// The page stopped at [`MAX_PAGE_BYTES`]; its last line is the
     /// truncation notice, not document text.
     pub page_cut_by_size: bool,
-    /// The live fetch left part of the resource out (the rendered text names
-    /// what), so no page of it is complete.
+    /// The fetch left part of the resource out, or the cache cannot establish
+    /// that the fetch was complete.
     pub document_gap: bool,
 }
 
@@ -298,9 +302,8 @@ impl GithubReadLateAnswer {
             Some((entry, selector, kind)) => Ok(complete(
                 cached_fallback_text(entry, &GithubReadError::FetchFailed(still_running), *kind),
                 selector.clone(),
-                GithubReadFreshness::CachedFallback,
                 Vec::new(),
-                None,
+                DocumentSource::Cached(entry),
             )),
             None => Err(GithubReadError::Pending(format!(
                 "{still_running} and its result will be cached; retry this call shortly"
@@ -670,10 +673,9 @@ impl GithubReadEngine {
                                         &waiter.request,
                                         waiter.selector,
                                         canonical_text,
-                                        GithubReadFreshness::Fetched,
                                         &downloads,
                                         waiter.view,
-                                        Some(document.clone()),
+                                        DocumentSource::Fetched(document),
                                     )
                                 })
                         }
@@ -682,10 +684,9 @@ impl GithubReadEngine {
                                 &waiter.request,
                                 waiter.selector,
                                 cached_fallback_text(&entry, error, waiter.request.resource.kind),
-                                GithubReadFreshness::CachedFallback,
                                 &downloads,
                                 waiter.view,
-                                None,
+                                DocumentSource::Cached(&entry),
                             ),
                             None => Err(error.clone()),
                         },
@@ -709,7 +710,7 @@ fn fetch_store(
     fetcher: &dyn GithubFetcher,
     clock: &dyn GithubReadClock,
     state: &Mutex<GithubReadEngineState>,
-) -> Result<super::model::GithubDocument, GithubReadError> {
+) -> Result<GithubDocument, GithubReadError> {
     let document = fetcher.fetch(&GithubFetchRequest {
         resource: request.resource.clone(),
         working_directory: request.working_directory.clone(),
@@ -732,7 +733,12 @@ fn fetch_store(
     // A cache outage or an unrepresentable cache key must not convert a live
     // GitHub document into a failed read. The next request will fetch live again.
     if let Some(key) = github_cache_key(&slot, &request.effective_authentication_identity) {
-        if let Err(error) = cache.upsert(&key, &canonical_text, clock.now_ms()) {
+        if let Err(error) = cache.upsert(
+            &key,
+            &canonical_text,
+            clock.now_ms(),
+            document.has_fetch_gap(),
+        ) {
             log::warn!("GitHub read cache write failed: {error}");
         }
     }
@@ -746,7 +752,7 @@ fn fetch_store(
 }
 
 fn render_for_view(
-    document: &super::model::GithubDocument,
+    document: &GithubDocument,
     resource: &GithubResource,
     view: GithubReadView,
 ) -> Result<String, GithubReadError> {
@@ -756,14 +762,18 @@ fn render_for_view(
     }
 }
 
+enum DocumentSource<'a> {
+    Fetched(&'a GithubDocument),
+    Cached(&'a GithubReadCacheEntry),
+}
+
 fn complete_with_optional_attachments(
     request: &GithubReadRequest,
     selector: GithubReadSelector,
     canonical_text: String,
-    freshness: GithubReadFreshness,
     downloader: &dyn GithubImageDownloader,
     view: GithubReadView,
-    document: Option<super::model::GithubDocument>,
+    source: DocumentSource<'_>,
 ) -> Result<GithubReadCompletion, GithubReadError> {
     let attachments = if view == GithubReadView::Document && request.vision_capability == Some(true)
     {
@@ -771,27 +781,29 @@ fn complete_with_optional_attachments(
     } else {
         Vec::new()
     };
-    Ok(complete(
-        canonical_text,
-        selector,
-        freshness,
-        attachments,
-        document,
-    ))
+    Ok(complete(canonical_text, selector, attachments, source))
 }
 
 fn complete(
     canonical_text: String,
     selector: GithubReadSelector,
-    freshness: GithubReadFreshness,
     attachments: Vec<GithubImageAttachment>,
-    document: Option<super::model::GithubDocument>,
+    source: DocumentSource<'_>,
 ) -> GithubReadCompletion {
     let total_lines = canonical_text.lines().count();
     let (content, page_cut_by_size) = select(&canonical_text, selector);
-    let document_gap = document
-        .as_ref()
-        .is_some_and(super::model::GithubDocument::has_fetch_gap);
+    let (freshness, document, document_gap) = match source {
+        DocumentSource::Fetched(document) => (
+            GithubReadFreshness::Fetched,
+            Some(document.clone()),
+            document.has_fetch_gap(),
+        ),
+        DocumentSource::Cached(entry) => (
+            GithubReadFreshness::CachedFallback,
+            None,
+            entry.document_gap.unwrap_or(true),
+        ),
+    };
     GithubReadCompletion {
         content,
         total_lines,
@@ -996,7 +1008,7 @@ mod tests {
 
     use super::*;
     use crate::github_read::attachments::{DownloadedGithubImage, GithubImageDownloader};
-    use crate::github_read::model::{GithubDocument, GithubDocumentKind};
+    use crate::github_read::model::GithubDocumentKind;
 
     #[test]
     fn a_line_page_stops_at_the_file_read_byte_and_line_bounds() {
@@ -1017,9 +1029,8 @@ mod tests {
         let completion = complete(
             canonical,
             page.clone(),
-            GithubReadFreshness::Fetched,
             Vec::new(),
-            None,
+            DocumentSource::Fetched(&GithubDocument::default()),
         );
         assert!(completion.page_cut_by_size);
         assert_eq!(completion.total_lines, 100);
@@ -1060,7 +1071,7 @@ mod tests {
         // peek, PRAGMAs and the migration check, on the request thread.
         let peeks = crate::db::schema_peek_count_for_test();
         assert_eq!(store.lookup(&key).unwrap(), None);
-        store.upsert(&key, "# Issue\n", 1_000).unwrap();
+        store.upsert(&key, "# Issue\n", 1_000, false).unwrap();
         assert_eq!(
             store.lookup(&key).unwrap().unwrap().canonical_text,
             "# Issue\n"
@@ -1097,6 +1108,7 @@ mod tests {
         fn with_entry(canonical_text: &str, fetched_at_ms: i64) -> Self {
             Self(Mutex::new(Some(GithubReadCacheEntry {
                 canonical_text: canonical_text.to_string(),
+                document_gap: Some(false),
                 fetched_at_ms,
                 updated_at_ms: fetched_at_ms,
             })))
@@ -1116,9 +1128,11 @@ mod tests {
             _key: &GithubReadCacheKey,
             canonical_text: &str,
             fetched_at_ms: i64,
+            document_gap: bool,
         ) -> Result<(), String> {
             *self.0.lock() = Some(GithubReadCacheEntry {
                 canonical_text: canonical_text.to_string(),
+                document_gap: Some(document_gap),
                 fetched_at_ms,
                 updated_at_ms: fetched_at_ms,
             });
