@@ -777,15 +777,15 @@ impl RepeatObservation {
         text: &mut String,
         now: Instant,
     ) {
-        let output_hash = if self.call.is_reset_only() {
-            0
+        let output = if self.call.is_reset_only() {
+            Default::default()
         } else {
-            crate::response_finalize::repeat_breaker::output_hash(text)
+            crate::response_finalize::repeat_breaker::output_fingerprint(text, &response.data)
         };
         if let Some(intervention) =
             app_ctx
                 .repeat_breaker()
-                .observe_at(&self.session_id, &self.call, output_hash, now)
+                .observe_output_at(&self.session_id, &self.call, output, now)
         {
             let mut standalone = String::new();
             crate::response_finalize::append_repeat_breaker_reminder(

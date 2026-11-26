@@ -45,8 +45,14 @@ struct RepeatKey {
 #[derive(Debug)]
 struct RecentCall {
     key: RepeatKey,
-    output_hash: u64,
+    output: RepeatOutput,
     observed_at: Instant,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RepeatOutput {
+    pub(crate) text_hash: u64,
+    pub(crate) attachment_hash: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -126,6 +132,24 @@ impl RepeatBreaker {
         output_hash: u64,
         now: Instant,
     ) -> Option<RepeatIntervention> {
+        self.observe_output_at(
+            session_id,
+            call,
+            RepeatOutput {
+                text_hash: output_hash,
+                attachment_hash: None,
+            },
+            now,
+        )
+    }
+
+    pub(crate) fn observe_output_at(
+        &self,
+        session_id: &str,
+        call: &RepeatObservation,
+        output: RepeatOutput,
+        now: Instant,
+    ) -> Option<RepeatIntervention> {
         let key = (!call.is_reset_only()).then(|| RepeatKey {
             tool: call.tool.clone(),
             input_hash: hash_value(&call.semantic_key),
@@ -155,10 +179,22 @@ impl RepeatBreaker {
         }
         let session = sessions.entry(session_id.to_string()).or_default();
         session.expire_idle_keys(now);
+        // A changed attachment is new material to read, even if the rendered
+        // summary is unchanged. Restart just this read's repetition count.
+        if call.tool == "read"
+            && session
+                .calls
+                .iter()
+                .rev()
+                .find(|previous| previous.key == key)
+                .is_some_and(|previous| previous.output.attachment_hash != output.attachment_hash)
+        {
+            session.calls.retain(|previous| previous.key != key);
+        }
         session.make_room_for_key(&key);
         session.push_call(RecentCall {
             key: key.clone(),
-            output_hash,
+            output,
             observed_at: now,
         });
 
@@ -167,12 +203,12 @@ impl RepeatBreaker {
             .next()
             .expect("the call inserted above must remain in the bounded ring");
         let first_seen = first.observed_at;
-        let first_output_hash = first.output_hash;
+        let first_output = first.output;
         let mut count = 1_u64;
         let mut outputs_identical = true;
         for call in matching {
             count = count.saturating_add(1);
-            outputs_identical &= call.output_hash == first_output_hash;
+            outputs_identical &= call.output == first_output;
         }
 
         let span = now.saturating_duration_since(first_seen);
