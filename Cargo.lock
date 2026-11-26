@@ -131,6 +131,7 @@ dependencies = [
  "cortexkit-paths",
  "cortexkit-project-identity",
  "cortexkit-role-agent-data",
+ "cortexkit-role-agent-orchestrator",
  "cortexkit-role-harness",
  "cortexkit-role-llm-runner",
  "cortexkit-role-tool-display",
@@ -371,6 +372,7 @@ dependencies = [
  "cortexkit-persona",
  "cortexkit-project-identity",
  "cortexkit-role-agent-data",
+ "cortexkit-role-agent-orchestrator",
  "cortexkit-role-llm-runner",
  "cortexkit-role-tool-display",
  "cortexkit-role-tool-provider",
@@ -1538,6 +1540,16 @@ name = "cortexkit-role-agent-data"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4269ece1b76adc8aef3424b522bd288f44506c20de0ef11b0c14a060c6bddce"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-agent-orchestrator"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8bd669df6fea92dbd8d9756f72c9bde9fa066703833bd57f832b364ac914cb5"
 dependencies = [
  "serde",
  "serde_json",

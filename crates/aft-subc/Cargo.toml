@@ -67,6 +67,7 @@ cortexkit-role-tool-provider = "=0.15.18"
 cortexkit-role-llm-runner = "=0.8.53"
 cortexkit-role-tool-display = "=0.1.14"
 cortexkit-role-agent-data = "=0.3.3"
+cortexkit-role-agent-orchestrator = "=0.1.0"
 cortexkit-role-user-commands = "=0.1.4"
 cortexkit-project-identity = "=0.1.5"
 jsonschema = { version = "0.33", default-features = false }
@@ -111,6 +112,7 @@ aft-db = { path = "../aft-db", version = "0.68.1", features = ["test-support"] }
 cortexkit-test-support = "=0.1.14"
 cortexkit-role-tool-provider = { version = "=0.15.18", features = ["test-vectors"] }
 cortexkit-role-agent-data = { version = "=0.3.3", features = ["test-vectors"] }
+cortexkit-role-agent-orchestrator = { version = "=0.1.0", features = ["test-vectors"] }
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"
