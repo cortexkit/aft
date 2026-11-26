@@ -107,23 +107,8 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let discovery = discover_outline_files(&dir_path);
         let project_root = ctx.config().project_root.clone();
         let include_tests = include_tests_param(req);
-        let files = if include_tests {
-            discovery.files.clone()
-        } else {
-            discovery
-                .files
-                .iter()
-                .filter(|file| {
-                    let path = Path::new(file);
-                    let relative = project_root
-                        .as_deref()
-                        .and_then(|root| relative_path_from_root(path, root))
-                        .unwrap_or_else(|| path_to_slash(path));
-                    !is_test_file(&relative)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
+        let files =
+            outline_files_from_discovery(&discovery.files, project_root.as_deref(), include_tests);
         let walk_incomplete = discovery.walk_truncated
             || discovery.collection_truncated
             || discovery.skipped_foreign_mounts > 0;
@@ -168,7 +153,8 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::success(&req.id, body);
     }
 
-    // Multi-file mode: if "files" array is present, outline each file
+    // Multi-file mode: arrays accept files and directories; URL entries keep
+    // their single-target fetching and rendering.
     if let Some(files_arr) = req.params.get("files").and_then(|v| v.as_array()) {
         let project_root = ctx.config().project_root.clone();
         let (files, files_capped) = requested_outline_files(files_arr);
@@ -191,13 +177,16 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(resp) => return resp,
         };
 
+        let directory_discovery = rendered.directory_discovery;
+        let has_directories = directory_discovery.targets > 0;
+        let walk_incomplete = directory_discovery.incomplete();
         // Honest reporting: complete only when no requested file was skipped
         // and every requested file was examined. skipped_files names the gaps
         // (missing/unreadable/unparseable inputs); the footer counts files
         // left unexamined by the file cap, output budget or deadline.
         let mut body = serde_json::json!({
             "text": rendered.text,
-            "complete": skipped_files.is_empty() && !rendered.truncated && !rendered.cut_short && !rendered.content_incomplete,
+            "complete": skipped_files.is_empty() && !walk_incomplete && !rendered.truncated && !rendered.cut_short && !rendered.content_incomplete,
             "output_truncated": rendered.truncated,
             "files_shown": rendered.shown,
             "structure_footer": rendered.footer,
@@ -209,6 +198,16 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         if rendered.deadline_reached {
             body["deadline_reached"] = serde_json::json!(true);
+        }
+        if has_directories {
+            body["discovered"] = serde_json::json!(true);
+            body["walk_truncated"] = serde_json::json!(directory_discovery.walk_truncated);
+            body["entries_examined"] = serde_json::json!(directory_discovery.entries_examined);
+            body["collection_truncated"] =
+                serde_json::json!(directory_discovery.collection_truncated);
+            body["skipped_foreign_mounts"] =
+                serde_json::json!(directory_discovery.skipped_foreign_mounts);
+            crate::context::confinement::disclose_denied(&mut body);
         }
         return Response::success(&req.id, body);
     }
@@ -491,6 +490,27 @@ fn include_tests_param(req: &RawRequest) -> bool {
         .or_else(|| req.params.get("include_tests"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+fn outline_files_from_discovery(
+    files: &[String],
+    project_root: Option<&Path>,
+    include_tests: bool,
+) -> Vec<String> {
+    if include_tests {
+        return files.to_vec();
+    }
+    files
+        .iter()
+        .filter(|file| {
+            let path = Path::new(file);
+            let relative = project_root
+                .and_then(|root| relative_path_from_root(path, root))
+                .unwrap_or_else(|| path_to_slash(path));
+            !is_test_file(&relative)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Build a nested outline tree from a flat symbol list.
@@ -2571,6 +2591,33 @@ struct MultiFileBudget {
     files_capped: bool,
 }
 
+/// Directory walks expanded into a mixed file-and-directory request.
+#[derive(Clone, Copy, Default)]
+struct OutlineDirectoryDiscovery {
+    targets: usize,
+    entries_examined: usize,
+    walk_truncated: bool,
+    collection_truncated: bool,
+    skipped_foreign_mounts: usize,
+}
+
+impl OutlineDirectoryDiscovery {
+    fn incomplete(&self) -> bool {
+        self.walk_truncated || self.collection_truncated || self.skipped_foreign_mounts > 0
+    }
+}
+
+/// One file to render. The index orders skipped files by the original target
+/// and then by its position within an expanded directory. A new group starts
+/// at each requested entry in a mixed request, keeping directory roots apart.
+struct OutlineWorkItem {
+    index: (usize, usize),
+    file: String,
+    path: Option<PathBuf>,
+    rel_path: String,
+    group: usize,
+}
+
 /// Time kept back from the request deadline, so that a batch stopped between
 /// files still has time to render and return its partial result before the
 /// deadline fails the whole call.
@@ -2644,8 +2691,10 @@ pub(crate) fn outline_examined_files(req: &RawRequest) -> Vec<&str> {
 
 /// Outline `files` and render their structure map within `max_bytes`.
 ///
-/// Files are outlined in the order the map shows them (by display path), and
-/// outlining stops as soon as the rendered output budget is spent: the first
+/// Files-only arrays render in display-path order. Once an array contains a
+/// directory, its top-level entries retain request order and each directory
+/// renders from the same root as a lone directory target.
+/// Outlining stops as soon as the rendered output budget is spent: the first
 /// file that does not fit has been read and parsed, but later files are not.
 /// The files not shown still count in `total_requested`, so the footer
 /// reports them as not shown. Outlining
@@ -2658,12 +2707,12 @@ fn outline_many_files(
     req: &RawRequest,
     project_root: Option<&Path>,
     excluded: &HashSet<PathBuf>,
-    budget: MultiFileBudget,
+    mut budget: MultiFileBudget,
 ) -> Result<(RenderedOutline, Vec<SkippedFile>), Response> {
     let mut paths = Vec::new();
     let mut admitted_files = Vec::new();
     // Keep request indices so denied leaves and parse failures share one list.
-    let mut skipped_files: Vec<(usize, SkippedFile)> = Vec::new();
+    let mut skipped_files: Vec<((usize, usize), SkippedFile)> = Vec::new();
     for (index, file) in files.iter().enumerate() {
         if is_http_url(file) {
             admitted_files.push((index, file, None));
@@ -2675,29 +2724,131 @@ fn outline_many_files(
                 admitted_files.push((index, file, Some(path)));
             }
             Err(response) if response.data["code"] == "denied_floor" => {
-                skipped_files.push((index, SkippedFile::new(file, "denied_floor")));
+                skipped_files.push(((index, 0), SkippedFile::new(file, "denied_floor")));
             }
             Err(response) => return Err(response),
         }
     }
-    let display_root = project_root
-        .filter(|root| paths.iter().all(|path| path.starts_with(root)))
-        .map(Path::to_path_buf)
-        .or_else(|| common_outline_path_ancestor(&paths));
-
-    // Visit files in rendering order (stable, so equal display paths keep
-    // their request order) so that the budget check below can stop early.
-    let mut ordered = admitted_files
-        .into_iter()
-        .map(|(index, file, path)| {
-            let rel_path = path
-                .as_deref()
-                .map(|path| display_path(path, file, display_root.as_deref()))
-                .unwrap_or_else(|| file.to_string());
-            (index, file, path, rel_path)
+    let directories = admitted_files
+        .iter()
+        .filter_map(|(index, _, path)| {
+            let path = path.as_ref()?;
+            crate::bounded_io::metadata(path)
+                .is_ok_and(|metadata| metadata.is_dir())
+                .then_some(*index)
         })
-        .collect::<Vec<_>>();
-    ordered.sort_by(|a, b| a.3.cmp(&b.3));
+        .collect::<HashSet<_>>();
+    let mixed = !directories.is_empty();
+    let mut directory_discovery = OutlineDirectoryDiscovery::default();
+    let mut ordered = Vec::new();
+
+    if mixed {
+        // A directory entry is a separate structure map rooted exactly as it
+        // would be when requested alone. Top-level entries retain their request
+        // order; only the files discovered within each directory are sorted.
+        let capped_targets = budget.total_requested.saturating_sub(files.len());
+        let mut total_requested = capped_targets + skipped_files.len();
+        for (index, file, path) in admitted_files {
+            match path {
+                Some(path) if directories.contains(&index) => {
+                    if let Err(refusal) =
+                        crate::context::confinement::check_walk_root(&req.id, &path)
+                    {
+                        return Err(refusal);
+                    }
+                    let discovery = discover_outline_files(&path);
+                    directory_discovery.targets += 1;
+                    directory_discovery.entries_examined += discovery.entries_examined;
+                    directory_discovery.walk_truncated |= discovery.walk_truncated;
+                    directory_discovery.collection_truncated |= discovery.collection_truncated;
+                    directory_discovery.skipped_foreign_mounts += discovery.skipped_foreign_mounts;
+                    let discovered = outline_files_from_discovery(
+                        &discovery.files,
+                        project_root,
+                        include_tests_param(req),
+                    );
+                    total_requested += discovered.len();
+                    let mut admitted = Vec::new();
+                    for (file_index, discovered) in discovered.into_iter().enumerate() {
+                        match ctx.validate_read_path(&req.id, req.session(), Path::new(&discovered))
+                        {
+                            Ok(path) => admitted.push((file_index, discovered, path)),
+                            Err(response) if response.data["code"] == "denied_floor" => {
+                                skipped_files.push((
+                                    (index, file_index),
+                                    SkippedFile::new(discovered, "denied_floor"),
+                                ));
+                            }
+                            Err(response) => return Err(response),
+                        }
+                    }
+                    let discovered_paths = admitted
+                        .iter()
+                        .map(|(_, _, path)| path.clone())
+                        .collect::<Vec<_>>();
+                    let display_root = outline_display_root(project_root, &discovered_paths);
+                    let mut group = admitted
+                        .into_iter()
+                        .map(|(file_index, discovered, path)| OutlineWorkItem {
+                            index: (index, file_index),
+                            rel_path: display_path(&path, &discovered, display_root.as_deref()),
+                            file: discovered,
+                            path: Some(path),
+                            group: index,
+                        })
+                        .collect::<Vec<_>>();
+                    group.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+                    ordered.extend(group);
+                }
+                Some(path) => {
+                    total_requested += 1;
+                    let display_root =
+                        outline_display_root(project_root, std::slice::from_ref(&path));
+                    let rel_path = display_path(&path, file, display_root.as_deref());
+                    ordered.push(OutlineWorkItem {
+                        index: (index, 0),
+                        file: file.to_string(),
+                        path: Some(path),
+                        rel_path,
+                        group: index,
+                    });
+                }
+                None => {
+                    total_requested += 1;
+                    ordered.push(OutlineWorkItem {
+                        index: (index, 0),
+                        file: file.to_string(),
+                        path: None,
+                        rel_path: file.to_string(),
+                        group: index,
+                    });
+                }
+            }
+        }
+        budget.total_requested = total_requested;
+        budget.walk_incomplete |= directory_discovery.incomplete();
+    } else {
+        let display_root = outline_display_root(project_root, &paths);
+        // A files-only array retains its display-path ordering. Equal paths are
+        // stable, so duplicate entries keep their request order.
+        ordered = admitted_files
+            .into_iter()
+            .map(|(index, file, path)| {
+                let rel_path = path
+                    .as_deref()
+                    .map(|path| display_path(path, file, display_root.as_deref()))
+                    .unwrap_or_else(|| file.to_string());
+                OutlineWorkItem {
+                    index: (index, 0),
+                    file: file.to_string(),
+                    path,
+                    rel_path,
+                    group: 0,
+                }
+            })
+            .collect();
+        ordered.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    }
 
     let mut writer = MultiFileTreeWriter::new(&budget);
     // Skipped files are reported in request order, keyed by request index.
@@ -2717,7 +2868,19 @@ fn outline_many_files(
     let mut fallback_parser =
         FileParser::new().with_dynamic_languages(cfg!(feature = "wasm-grammars"));
 
-    for (examined, (index, file, path, rel_path)) in ordered.into_iter().enumerate() {
+    let mut current_group = None;
+    for (examined, item) in ordered.into_iter().enumerate() {
+        let OutlineWorkItem {
+            index,
+            file,
+            path,
+            rel_path,
+            group,
+        } = item;
+        if current_group != Some(group) {
+            writer.start_group();
+            current_group = Some(group);
+        }
         if path
             .as_deref()
             .is_some_and(|path| is_read_excluded(excluded, path))
@@ -2729,7 +2892,7 @@ fn outline_many_files(
             break;
         }
         let Some(path) = path else {
-            let response = outline_single_target(req, ctx, file);
+            let response = outline_single_target(req, ctx, &file);
             if !response.success {
                 let code = response.data["code"].as_str().unwrap_or("error");
                 let reason = response.data["message"]
@@ -2861,8 +3024,10 @@ fn outline_many_files(
     }
 
     skipped_files.sort_by_key(|(index, _)| *index);
+    let mut rendered = writer.finish();
+    rendered.directory_discovery = directory_discovery;
     Ok((
-        writer.finish(),
+        rendered,
         skipped_files
             .into_iter()
             .map(|(_, skipped)| skipped)
@@ -2968,6 +3133,13 @@ fn common_outline_path_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
         }
     }
     Some(common)
+}
+
+fn outline_display_root(project_root: Option<&Path>, paths: &[PathBuf]) -> Option<PathBuf> {
+    project_root
+        .filter(|root| paths.iter().all(|path| path.starts_with(root)))
+        .map(Path::to_path_buf)
+        .or_else(|| common_outline_path_ancestor(paths))
 }
 
 fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
@@ -3826,6 +3998,7 @@ fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
 /// The rendered structure map for a batch of files, built incrementally by
 /// [`MultiFileTreeWriter`] in path order.
 struct RenderedOutline {
+    directory_discovery: OutlineDirectoryDiscovery,
     gaps: Vec<serde_json::Value>,
     text: String,
     /// The output byte budget cut the map.
@@ -3927,6 +4100,13 @@ impl MultiFileTreeWriter {
     /// footer always follows the last file.
     fn cut_short(&self) -> bool {
         self.files_capped || self.deadline_reached
+    }
+
+    /// Requested entries in a mixed batch have independent display roots.
+    /// Clearing the previous path keeps one entry's directory prefix from
+    /// changing the next entry's indentation or suppressing its root row.
+    fn start_group(&mut self) {
+        self.prev_parts.clear();
     }
 
     /// Record that outlining stopped at the request deadline with files
@@ -4075,6 +4255,7 @@ impl MultiFileTreeWriter {
             output.push_str(&footer);
         }
         RenderedOutline {
+            directory_discovery: OutlineDirectoryDiscovery::default(),
             gaps: self.gaps,
             text: output,
             truncated: self.truncated,
@@ -5131,6 +5312,111 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
                 expected
             );
         }
+    }
+
+    #[test]
+    fn mixed_outline_array_matches_single_directory_rendering_in_request_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = root.join("z_last.ts");
+        let directory = root.join("a_directory");
+        let nested = directory.join("nested");
+        let missing = root.join("missing.ts");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&file, "export function explicitFile() {}\n").unwrap();
+        std::fs::write(
+            directory.join("first.ts"),
+            "export function directoryFirst() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join("second.ts"),
+            "export function directorySecond() {}\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root),
+                ..crate::config::Config::default()
+            },
+        );
+        let request = |params: serde_json::Value| {
+            let mut params = params;
+            params["id"] = serde_json::json!("mixed-directory");
+            params["command"] = serde_json::json!("outline");
+            serde_json::from_value(params).unwrap()
+        };
+        let file_response = handle_outline(&request(serde_json::json!({"files": [file]})), &ctx);
+        let directory_response =
+            handle_outline(&request(serde_json::json!({"directory": directory})), &ctx);
+        let mixed = handle_outline(
+            &request(serde_json::json!({"files": [file, directory, missing]})),
+            &ctx,
+        );
+        assert!(file_response.success && directory_response.success && mixed.success);
+        let file_text = file_response.data["text"].as_str().unwrap();
+        let directory_text = directory_response.data["text"].as_str().unwrap();
+        assert!(file_text.contains("explicitFile"), "{file_text}");
+        assert!(
+            directory_text.contains("directoryFirst"),
+            "{directory_text}"
+        );
+        assert!(
+            directory_text.contains("directorySecond"),
+            "{directory_text}"
+        );
+        assert_eq!(
+            mixed.data["text"].as_str().unwrap(),
+            format!("{file_text}{directory_text}")
+        );
+        assert_eq!(mixed.data["discovered"], true);
+        assert_eq!(mixed.data["complete"], false);
+        assert_eq!(mixed.data["files_shown"], 3);
+        assert_eq!(
+            mixed.data["skipped_files"],
+            serde_json::json!([{"file": missing, "reason": "file_not_found"}])
+        );
+    }
+
+    #[test]
+    fn mixed_outline_array_uses_the_existing_shared_structure_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let source = (0..700)
+            .map(|index| format!("export function symbol_{index:04}() {{}}\n"))
+            .collect::<String>();
+        let explicit = root.join("explicit.ts");
+        std::fs::write(&explicit, &source).unwrap();
+        for name in ["a.ts", "b.ts"] {
+            std::fs::write(directory.join(name), &source).unwrap();
+        }
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root),
+                ..crate::config::Config::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "mixed-budget", "command": "outline", "files": [explicit, directory],
+        }))
+        .unwrap();
+        let response = handle_outline(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["files_shown"], 1);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["output_truncated"], true);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains("explicit.ts"), "{text}");
+        assert!(!text.contains("directory/"), "{text}");
+        assert!(
+            text.contains("shown 1 of 3 files (budget) · narrow: path"),
+            "{text}"
+        );
+        assert_eq!(text.matches("shown 1 of").count(), 1, "{text}");
     }
 
     /// `content_files` names the files that were read, in the spelling the

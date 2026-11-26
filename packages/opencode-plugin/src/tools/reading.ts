@@ -107,14 +107,14 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     "  • file path → outline that file (with signatures)\n" +
     "  • directory path → outline source files under it\n" +
     "  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n" +
-    "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory" +
+    "  • array of paths → outline files and directories in one call; with files:true, every path must be a directory" +
     (githubOutlineDescription ? `\n\n${githubOutlineDescription}` : "") +
     "\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.";
   const outlineArgs = {
     target: z
       .union([z.string(), z.array(z.string())])
       .describe(
-        "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+        "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
       ),
     files: z
       .boolean()
