@@ -118,6 +118,66 @@ async fn saved_grant_sweep_rechecks_coverage_before_each_describe() {
 }
 
 #[tokio::test]
+async fn saved_grant_sweep_defers_end_after_watch_takes_over() {
+    use super::super::super::scope_watch::Coverage;
+    use crate::db::call_ledger as ledger;
+
+    let (dir, db) = fixture();
+    let key = save(&db, dir.path(), "handoff", 1);
+    let call = ledger::Key {
+        carrier: "direct".into(),
+        call_key: "queued-before-watch-end".into(),
+    };
+    ledger::admit(
+        &db.lock().unwrap(),
+        &call,
+        "digest",
+        ledger::ledger_scope(&key).as_ref(),
+        ledger::State::Prepared,
+    )
+    .unwrap();
+    let (watch, covered) = tokio::sync::watch::channel(Coverage::default());
+    let (describes, mut requests) = tokio::sync::mpsc::channel(1);
+    let describe = |stamp| {
+        let describes = describes.clone();
+        async move {
+            let (reply, answered) = tokio::sync::oneshot::channel();
+            describes.send((stamp, reply)).await.unwrap();
+            Ok(answered.await.unwrap())
+        }
+    };
+    let mut cursor = None;
+    let (stats, ()) = tokio::join!(
+        tick_unwatched(db.clone(), &mut cursor, describe, |stamp| covered
+            .borrow()
+            .covers_reference(stamp)),
+        async {
+            let (request, answer) = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .expect("the uncovered scope sent a describe")
+                .unwrap();
+            let expected = scope_describe::stamp_key(&stamp(&key).unwrap());
+            assert_eq!(scope_describe::stamp_key(&request), expected);
+            // The scope wasn't covered when its describe left, but the watch
+            // owns cleanup by the time the daemon's reply arrives.
+            watch.send_replace(Coverage {
+                keys: [expected].into_iter().collect(),
+                all: true,
+            });
+            answer.send(reply(ScopeStatus::Ended, true)).unwrap();
+        },
+    );
+    assert_eq!(stats.described, 1);
+    let conn = db.lock().unwrap();
+    assert_eq!(
+        ledger::get(&conn, &call).unwrap().unwrap().state,
+        ledger::State::Prepared
+    );
+    assert!(!store::scope_ended(&conn, &key).unwrap());
+    assert_eq!(store::list(&conn, &key).unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn saved_grant_sweep_older_epoch_is_covered_and_watch_loss_restores_polling() {
     use super::super::super::scope_watch::Coverage;
     let (dir, db) = fixture();
