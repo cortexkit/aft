@@ -20,9 +20,11 @@ pub(super) const NOTHING_SENT_NOTE: &str = "AFT could not confirm the kill: the 
 
 /// Reply note when SIGTERM was sent but nothing proved the group was still
 /// the command's by the time SIGKILL was due.
+#[cfg(unix)]
 pub(super) const KILL_WITHHELD_NOTE: &str = "AFT could not confirm the kill: the command's processes could no longer be identified after SIGTERM, so SIGKILL was not sent.";
 
 /// Reply note naming recorded processes that a group signal did not reach.
+#[cfg(unix)]
 pub(super) fn outside_group_note(count: usize) -> String {
     let processes = if count == 1 {
         "1 process".to_string()
@@ -89,6 +91,7 @@ impl GroupEvidence {
     }
 
     /// Recorded processes still running but no longer in the group.
+    #[cfg(unix)]
     pub(super) fn outside_group_note(&self) -> Option<String> {
         let count = super::super::process::running_outside_group(&self.identities, self.pgid);
         (count > 0).then(|| outside_group_note(count))
@@ -424,7 +427,7 @@ impl BgTaskRegistry {
         pgid: Option<i32>,
         child_pid: Option<u32>,
         reason: &str,
-        mut child: Option<&mut Child>,
+        #[allow(unused_mut)] mut child: Option<&mut Child>,
     ) -> (Result<(), String>, Option<String>) {
         let metadata = match task.lock_state() {
             Ok(state) => state.metadata.clone(),
@@ -516,6 +519,7 @@ mod tests {
         assert!(matches!(plan, ReplayKill::Unverified), "{plan:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn kill_coverage_notes_name_the_outside_count() {
         assert_eq!(

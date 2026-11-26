@@ -1074,6 +1074,7 @@ pub(crate) fn child_unreaped(pid: u32) -> bool {
 /// How many of `identities` are still the same running processes but no
 /// longer in process group `pgid`: processes recorded for a task that a
 /// signal to that group did not reach.
+#[cfg(unix)]
 pub(crate) fn running_outside_group(identities: &[ProcessIdentity], pgid: i32) -> usize {
     let mut seen = std::collections::HashSet::new();
     identities
