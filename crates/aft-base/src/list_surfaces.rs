@@ -384,7 +384,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "OutlineFileDiscovery, OutlineDirectoryDiscovery, directory_walk_incomplete, outline_many_files, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
             },
         ],
     },

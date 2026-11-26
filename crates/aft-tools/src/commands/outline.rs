@@ -179,7 +179,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 
         let directory_discovery = rendered.directory_discovery;
         let has_directories = directory_discovery.targets > 0;
-        let walk_incomplete = directory_discovery.incomplete();
+        let walk_incomplete = directory_discovery.directory_walk_incomplete();
         // Honest reporting: complete only when no requested file was skipped
         // and every requested file was examined. skipped_files names the gaps
         // (missing/unreadable/unparseable inputs); the footer counts files
@@ -2602,7 +2602,7 @@ struct OutlineDirectoryDiscovery {
 }
 
 impl OutlineDirectoryDiscovery {
-    fn incomplete(&self) -> bool {
+    fn directory_walk_incomplete(&self) -> bool {
         self.walk_truncated || self.collection_truncated || self.skipped_foreign_mounts > 0
     }
 }
@@ -2826,7 +2826,7 @@ fn outline_many_files(
             }
         }
         budget.total_requested = total_requested;
-        budget.walk_incomplete |= directory_discovery.incomplete();
+        budget.walk_incomplete |= directory_discovery.directory_walk_incomplete();
     } else {
         let display_root = outline_display_root(project_root, &paths);
         // A files-only array retains its display-path ordering. Equal paths are
