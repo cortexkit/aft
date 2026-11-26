@@ -112,7 +112,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
     let a0 = A0Egress::new(writer.clone(), done.clone());
     let metrics = Arc::new(DispatchPathMetrics::new());
     let (lossy_tx, _lossy) = mpsc::channel(8);
-    let (reliable_tx, _reliable) = mpsc::unbounded_channel();
+    let (reliable_tx, _reliable) = push::ReliableIngress::channel(Arc::default());
     let senders = PushSenders {
         lossy_tx,
         reliable_tx,

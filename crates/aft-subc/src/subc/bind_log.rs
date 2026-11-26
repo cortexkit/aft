@@ -34,7 +34,7 @@ mod tests {
             let (writer, mut replies) = mpsc::channel(8);
             let (completion, mut completed) = mpsc::channel(8);
             let (lossy_tx, _lossy_rx) = mpsc::channel(8);
-            let (reliable_tx, _reliable_rx) = mpsc::unbounded_channel();
+            let (reliable_tx, _reliable_rx) = push::ReliableIngress::channel(Arc::default());
             let a0 = A0Egress::new(writer.clone(), completion.clone());
             let senders = PushSenders {
                 lossy_tx,

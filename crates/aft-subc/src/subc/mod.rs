@@ -939,7 +939,7 @@ impl PendingSubcResponses {
 #[derive(Clone)]
 struct PushSenders {
     lossy_tx: mpsc::Sender<LossyPushEnvelope>,
-    reliable_tx: mpsc::UnboundedSender<PushEnvelope>,
+    reliable_tx: push::ReliableIngress,
     lossy_overflow: Arc<push::LossyOverflow>,
     lossy_seq: Arc<AtomicU64>,
     fleet_status_client: FleetStatusClient,
@@ -1759,27 +1759,7 @@ struct BgSub {
     session: String,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BgWakeState {
-    next_nudge_at: Instant,
-    nudges_sent: u32,
-}
-
-impl BgWakeState {
-    fn armed(now: Instant) -> Self {
-        Self {
-            next_nudge_at: now,
-            nudges_sent: 0,
-        }
-    }
-}
-
-type BgWakePending = HashMap<RouteChannel, BgWakeState>;
-
-// A session can be observed by multiple long-lived consumer records. Retain
-// every route so each wake uses the correlation captured by that route's BgSub.
-type BgSubsBySession =
-    HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), HashSet<RouteChannel>>;
+use push::{BgSubsBySession, BgWakePending, BgWakeState};
 
 struct MaintenanceCompletion {
     root_id: ProjectRootId,
@@ -4819,7 +4799,8 @@ where
     let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1024);
     let lossy_overflow = Arc::new(push::LossyOverflow::default());
     let lossy_seq = Arc::new(AtomicU64::new(0));
-    let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
+    let (reliable_tx, mut reliable_rx) =
+        push::ReliableIngress::channel(dispatch_path_metrics.completion_delivery.ingress.clone());
     let (fleet_status_client, fleet_status_task) =
         spawn_fleet_status_dial(connection_file_path, 64);
     // Serves the gh shim's bot-write relay on management routes; it dials
@@ -5022,6 +5003,21 @@ where
                 .map(|pending| pending.bind_root_id.clone()),
         );
         if tokio::time::Instant::now() >= next_drain_at {
+            push::recover_reliable_ingress(
+                &writer_tx,
+                &dispatch_path_metrics,
+                &executor,
+                &routes,
+                &root_channels,
+                &session_identity,
+                &mut retry_buffer,
+                &mut push_buffer,
+                &mut completed_tasks,
+                &bg_sub_by_session,
+                &mut bg_wake_pending,
+                &mut bg_wake_epoch,
+                lifecycle_probe.as_ref(),
+            );
             dispatch_path_metrics.mark_frame_loop_step("push::emit_bg_event_wakes", "", 0);
             push::emit_bg_event_wakes(
                 &writer_tx,
@@ -6072,9 +6068,7 @@ where
             }
             Some((root_id, frame)) = reliable_rx.recv() => {
                 dispatch_path_metrics.mark_frame_loop_step("push::drain_reliable_push_turn", "", 0);
-                // Reliable Push frames are FIFO and must-deliver, but draining an
-                // unbounded burst in one current-thread turn can starve RouteBind
-                // completions. The budget defers excess frames, never drops them.
+                // Even a bounded FIFO burst must yield to RouteBind completions.
                 let (processed, deferred) = push::drain_reliable_push_turn(
                     &writer_tx,
                     &dispatch_path_metrics,
@@ -14411,6 +14405,7 @@ pub(crate) mod test_support {
 
     pub(super) fn completion_frame_with_session(task_id: &str, session_id: &str) -> PushFrame {
         PushFrame::BashCompleted(BashCompletedFrame {
+            ingress_missed: None,
             launching_identity: None,
             changed_files: None,
             frame_type: "bash_completed",
@@ -14456,6 +14451,7 @@ pub(crate) mod test_support {
 
     pub(super) fn pattern_match_frame(session_id: &str) -> PushFrame {
         PushFrame::BashPatternMatch(BashPatternMatchFrame {
+            durable_pending: false,
             launching_identity: None,
             batch: None,
             frame_type: "bash_pattern_match",

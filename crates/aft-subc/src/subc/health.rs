@@ -1288,8 +1288,6 @@ impl DispatchPathMetrics {
             .map(|bind| duration_millis_u64(now.saturating_duration_since(bind.started_at)))
             .max();
         let last_tick_age_ms = duration_millis_u64(self.frame_loop_progress_age());
-        let mut reliable_push = self.watch_delivery.health();
-        reliable_push["completions"] = self.completion_delivery.health();
         json!({
             "frame_loop": {
                 "last_tick_age_ms": last_tick_age_ms,
@@ -1306,7 +1304,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
-            "reliable_push": reliable_push,
+            "reliable_push": self.completion_delivery.push_health(&self.watch_delivery),
             "tool_call_presets": self.tool_call_preset_snapshot(),
             "scope_background_tasks": self.scope_background_tasks.snapshot(),
             "completion_channels": {

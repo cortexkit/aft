@@ -199,6 +199,7 @@ impl BgTaskRegistry {
         self.emit_bash_pattern_match(
             &task.session_id,
             PatternMatch {
+                durable_pending: false,
                 watch_id: "match-watch".into(),
                 task_id: key.into(),
                 match_text: "matched".into(),

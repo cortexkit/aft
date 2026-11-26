@@ -16,6 +16,7 @@ pub(super) enum Stage {
     RouteOpen,
     Request,
     ModuleError,
+    Busy,
     Worker,
     Deadline,
 }
@@ -31,6 +32,7 @@ impl Stage {
             Self::RouteOpen => "route_open",
             Self::Request => "request",
             Self::ModuleError => "module_error",
+            Self::Busy => "busy",
             Self::Worker => "worker",
             Self::Deadline => "deadline",
         }

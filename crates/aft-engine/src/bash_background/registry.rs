@@ -569,97 +569,6 @@ fn wait_on_finished_delete_gate_for_test(task_id: &str) {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct BgCompletion {
-    #[serde(
-        rename = "_bash_changed_files",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub changed_files: Option<crate::protocol::Report>,
-    pub task_id: String,
-    /// Intentionally omitted from serialized completion payloads: push frames
-    /// carry `session_id` at the BashCompletedFrame envelope level for routing.
-    #[serde(skip_serializing)]
-    pub session_id: String,
-    #[serde(skip_serializing)]
-    pub launching_identity: Option<super::TaskIdentity>,
-    pub status: BgTaskStatus,
-    pub exit_code: Option<i64>,
-    pub command: String,
-    /// Small head+tail preview of the cached terminal render at completion time,
-    /// cached so push-frame consumers and `bash_drain_completions` callers see
-    /// the same preview without racing against later output rotation. Empty
-    /// when not captured (e.g., persisted task seen on startup before buffer
-    /// reattachment).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub output_preview: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bash_output_list_envelope: Option<ListEnvelope>,
-    /// True when the captured tail is shorter than the actual output (because
-    /// rotation occurred or the output exceeds the preview cap). Plugins use
-    /// this to render a `…` prefix and signal that `bash_status` would return
-    /// more.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub output_truncated: bool,
-    /// Token count for the capped raw stdout+stderr payload before compression.
-    /// Omitted when capture or tokenization fails, or the exact count will not fit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub original_tokens: Option<u32>,
-    /// Token count for the compressed output generated from the same capped
-    /// raw payload. Omitted when either token count is unavailable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compressed_tokens: Option<u32>,
-    /// True when exact token counts are unavailable, including capture/read
-    /// failures, pre-tokenizer errors and counts that cannot be represented.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub tokens_skipped: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_reason: Option<String>,
-    /// The build server's memory-kill cause and measurements, when reported.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_oom_kill: Option<remote::RemoteOomKill>,
-    /// Output capture was incomplete, without changing the command's outcome.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub output_incomplete: bool,
-    pub live_descendants: Option<Vec<LiveDescendant>>,
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
-    pub live_descendants_omitted: usize,
-    /// For a finished task, why `live_descendants` is null, or, with
-    /// `listing_incomplete`, why the list may be only part of the group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_descendants_summary: Option<String>,
-}
-
-impl BgCompletion {
-    pub fn into_push_frame(self) -> PushFrame {
-        let mut frame = BashCompletedFrame::new(
-            self.task_id,
-            self.session_id,
-            self.status,
-            self.exit_code,
-            self.command,
-            self.output_preview,
-            self.output_truncated,
-            self.original_tokens,
-            self.compressed_tokens,
-            self.tokens_skipped,
-        );
-        frame.bash_output_list_envelope = self.bash_output_list_envelope;
-        frame.launching_identity = self.launching_identity;
-        frame.changed_files = self.changed_files;
-        frame.status_reason = self.status_reason;
-        frame.remote_oom_kill = self.remote_oom_kill;
-        frame.output_incomplete = self.output_incomplete;
-        frame.live_descendants = self.live_descendants;
-        frame.live_descendants_omitted = self.live_descendants_omitted;
-        frame.live_descendants_unavailable = self.live_descendants_unavailable;
-        frame.live_descendants_summary = self.live_descendants_summary;
-        PushFrame::BashCompleted(frame)
-    }
-}
-
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
@@ -1101,6 +1010,7 @@ pub struct ScopeKillReport {
 
 mod cancelled_notices;
 mod completion_listener;
+pub use completion_listener::BgCompletion;
 #[path = "scratch_retention.rs"]
 mod scratch_retention;
 #[path = "shell_registry.rs"]
@@ -4173,6 +4083,7 @@ impl BgTaskRegistry {
                     )
                 };
                 frame.launching_identity = launching_identity;
+                frame.durable_pending = true;
                 frame.batch = row
                     .match_batch
                     .as_deref()
@@ -4665,6 +4576,7 @@ impl BgTaskRegistry {
                 row.once && !row.scanning && batch.has_matches(),
             );
             notice.batch = Some(batch);
+            notice.durable_pending = true;
             sender(PushFrame::BashPatternMatch(notice));
         }
         Ok(())
@@ -4684,6 +4596,7 @@ impl BgTaskRegistry {
     ) -> bool {
         // The scanner masks the intact capture before constructing this match.
         // Save that presentation verbatim so replay does not need task secrets.
+        pattern_match.durable_pending = false;
         let cursors = cursors.map(|cursors| self.watch_replay_cursors(task_id, cursors));
         let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
         else {
@@ -4782,6 +4695,7 @@ impl BgTaskRegistry {
             );
             return false;
         }
+        pattern_match.durable_pending = true;
         true
     }
 
@@ -11634,6 +11548,7 @@ impl BgTaskRegistry {
                 )
             };
         Some(BgCompletion {
+            ingress_missed: Default::default(),
             changed_files: self.changed_files_report(&metadata.task_id),
             task_id: snapshot.info.task_id,
             session_id: task.session_id.clone(),
@@ -13389,6 +13304,7 @@ impl BgTaskRegistry {
                             serde_json::from_str::<super::watch_lines::LineBatch>(batch).ok()
                         });
                         pending_to_emit.push(PatternMatch {
+                            durable_pending: true,
                             watch_id: row.watch_id.clone(),
                             task_id: row.task_id.clone(),
                             match_text,
@@ -14532,20 +14448,20 @@ impl BgTaskRegistry {
             context,
         );
         frame.launching_identity = completion.launching_identity.clone();
-        self.persist_bash_watch_exit(&frame);
+        frame.durable_pending = self.persist_bash_watch_exit(&frame);
         if emit_frame {
             self.emit_bash_watch_exit(frame);
         }
     }
 
-    fn persist_bash_watch_exit(&self, frame: &BashPatternMatchFrame) {
+    fn persist_bash_watch_exit(&self, frame: &BashPatternMatchFrame) -> bool {
         let Some((harness, pool)) =
             self.db_harness_and_pool_for_task_id(&frame.session_id, &frame.task_id)
         else {
-            return;
+            return false;
         };
         let Ok(conn) = pool.lock() else {
-            return;
+            return false;
         };
         let Ok(mut rows) = crate::db::bash_watches::list_bash_pattern_watches_for_task(
             &conn,
@@ -14553,7 +14469,7 @@ impl BgTaskRegistry {
             &frame.session_id,
             &frame.task_id,
         ) else {
-            return;
+            return false;
         };
         let Some(mut row) = rows
             .iter()
@@ -14561,7 +14477,7 @@ impl BgTaskRegistry {
             .map(|index| rows.swap_remove(index))
             .or_else(|| rows.into_iter().next())
         else {
-            return;
+            return false;
         };
         row.scanning = false;
         row.pending_match = true;
@@ -14574,7 +14490,9 @@ impl BgTaskRegistry {
                 frame.task_id,
                 row.watch_id
             );
+            return false;
         }
+        true
     }
 
     fn emit_bash_watch_exit(&self, frame: BashPatternMatchFrame) {
@@ -17474,6 +17392,7 @@ mod tests {
         );
 
         let mut matched = PatternMatch {
+            durable_pending: false,
             watch_id: "watch-00000001".into(),
             task_id: task_id.into(),
             match_text: "ERROR".into(),
@@ -17967,6 +17886,7 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(BgCompletion {
+                ingress_missed: Default::default(),
                 changed_files: None,
                 task_id: "bash-memory".to_string(),
                 session_id: "session-memory".to_string(),
@@ -29992,6 +29912,7 @@ mod tests {
         registry.emit_bash_pattern_match(
             "session-v2",
             PatternMatch {
+                durable_pending: false,
                 watch_id: "watch-ready".into(),
                 task_id: "bash-running".into(),
                 match_text: "READY".into(),
@@ -30030,6 +29951,7 @@ mod tests {
         registry.emit_bash_pattern_match(
             "session-v2",
             PatternMatch {
+                durable_pending: false,
                 watch_id: "watch-ready".into(),
                 task_id: "bash-running".into(),
                 match_text: "matching lines".into(),

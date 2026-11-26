@@ -773,29 +773,20 @@ fn emit_test_status_burst(ctx: &AppContext, marker: &str, count: u64) {
 }
 
 fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
-    PushFrame::BashCompleted(BashCompletedFrame {
-        launching_identity: None,
-        changed_files: None,
-        frame_type: "bash_completed",
-        task_id: task_id.to_string(),
-        session_id: session_id.to_string(),
-        status: BgTaskStatus::Completed,
-        exit_code: Some(0),
-        command: format!("echo {task_id}"),
-        output_preview: String::new(),
-        bash_output_list_envelope: None,
-        output_truncated: false,
-        original_tokens: None,
-        compressed_tokens: None,
-        tokens_skipped: false,
-        status_reason: None,
-        remote_oom_kill: None,
-        output_incomplete: false,
-        live_descendants: Some(Vec::new()),
-        live_descendants_omitted: 0,
-        live_descendants_unavailable: None,
-        live_descendants_summary: None,
-    })
+    let mut frame = BashCompletedFrame::new(
+        task_id,
+        session_id,
+        BgTaskStatus::Completed,
+        Some(0),
+        format!("echo {task_id}"),
+        "",
+        false,
+        None,
+        None,
+        false,
+    );
+    frame.live_descendants = Some(Vec::new());
+    PushFrame::BashCompleted(frame)
 }
 
 fn bash_long_running_push(task_id: &str, session_id: &str) -> PushFrame {

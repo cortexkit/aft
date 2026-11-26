@@ -249,6 +249,7 @@ impl BgTaskRegistry {
             token_policy,
         );
         let completion = BgCompletion {
+            ingress_missed: Default::default(),
             changed_files: self.changed_files_report(&metadata.task_id),
             task_id: metadata.task_id.clone(),
             session_id: metadata.session_id.clone(),
@@ -431,6 +432,7 @@ fn pattern_notice_frame(session_id: &str, mut pattern: PatternMatch) -> BashPatt
         )
     };
     frame.batch = pattern.batch;
+    frame.durable_pending = pattern.durable_pending;
     frame
 }
 

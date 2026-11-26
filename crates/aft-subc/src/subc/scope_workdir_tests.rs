@@ -98,7 +98,7 @@ fn bind_observed(
             let (completion_tx, mut completion_rx) = mpsc::channel(8);
             let a0 = A0Egress::new(writer_tx.clone(), completion_tx.clone());
             let (lossy_tx, _lossy_rx) = mpsc::channel(8);
-            let (reliable_tx, _reliable_rx) = mpsc::unbounded_channel();
+            let (reliable_tx, _reliable_rx) = push::ReliableIngress::channel(Arc::default());
             let senders = PushSenders {
                 lossy_tx,
                 reliable_tx,

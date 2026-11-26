@@ -526,7 +526,7 @@ pub(crate) mod tests {
     fn senders() -> PushSenders {
         PushSenders {
             lossy_tx: mpsc::channel(16).0,
-            reliable_tx: mpsc::unbounded_channel().0,
+            reliable_tx: push::ReliableIngress::channel(Arc::default()).0,
             lossy_overflow: Arc::new(push::LossyOverflow::default()),
             lossy_seq: Arc::new(AtomicU64::new(0)),
             fleet_status_client: FleetStatusClient::channel(1).0,

@@ -168,9 +168,13 @@ fn fabricated_ticket_with_a_typed_head_session_is_refused_before_any_call() {
     params["session"] = json!("ses-head");
     params["session_id"] = json!("ses-head");
     params["request"]["metadata"]["session"] = json!("ses-head");
-    let (reply, _) = run(&transport, BOT_REQUEST_OPERATION, params);
+    let (reply, lines) = run(&transport, BOT_REQUEST_OPERATION, params);
     assert!(!reply.ok);
     assert_eq!(reply.data["refusal_code"], "ticket_unknown");
+    assert_eq!(
+        lines,
+        ["gh_shim relay: op=gh_shim.bot_request outcome=ticket_unknown"]
+    );
     assert!(transport.calls().is_empty(), "no mint and no plexus call");
 
     let mut absent = bot_params("", "nonce-absent");
@@ -226,14 +230,16 @@ fn untrusted_binds_are_refused_even_with_a_live_ticket() {
 }
 
 #[test]
-fn relay_log_escapes_untrusted_fields_into_one_record() {
+fn relay_log_omits_untrusted_fields_before_ticket_redemption() {
     let transport = FakeTransport::default();
     let mut params = bot_params("", "nonce\nforged record");
     params["request"]["action"] = json!("action\rforged");
     params["request"]["repository"] = json!("owner/repo\u{001b}[31m");
     let (_, lines) = run(&transport, BOT_REQUEST_OPERATION, params);
-    assert_eq!(lines.len(), 1);
-    assert!(!lines[0].chars().any(char::is_control), "{:?}", lines[0]);
+    assert_eq!(
+        lines,
+        ["gh_shim relay: op=gh_shim.bot_request outcome=ticket_absent"]
+    );
     assert!(transport.calls().is_empty());
 }
 
@@ -486,7 +492,7 @@ fn agent_bindings_request_matches_the_real_plexus_contract() {
 }
 
 #[test]
-fn relay_log_line_carries_session_task_and_nonce_but_no_ticket_or_scope() {
+fn relay_log_line_carries_session_task_and_nonce_digest_but_no_ticket_or_scope() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-log", "call-log-7", "/p");
     let ticket = live.value().unwrap().to_string();
     let transport = FakeTransport::scoped();
@@ -501,10 +507,32 @@ fn relay_log_line_carries_session_task_and_nonce_but_no_ticket_or_scope() {
     let line = &lines[0];
     assert_eq!(
         line,
-        "gh_shim relay: op=gh_shim.bot_request session=ses-log task=call-log-7 nonce=nonce-log-42 action=issue reaction repository=org/repo path=stamp outcome=completed"
+        &format!("gh_shim relay: op=gh_shim.bot_request session=ses-log task=call-log-7 nonce_digest={} action=issue reaction repository=org/repo path=stamp outcome=completed", blake3::hash(b"nonce-log-42").to_hex())
     );
+    assert!(!line.contains("nonce-log-42"));
     assert!(!line.contains(&ticket));
     assert!(!line.contains("head-ref-1"));
+}
+
+#[test]
+fn admitted_relay_log_bounds_and_escapes_fields_and_omits_unknown_actions() {
+    let session = format!("ses-limit-{}", "é".repeat(100));
+    let task = format!("call-limit\n{}", "x".repeat(100));
+    let live = crate::gh_shim_ticket::ScopedTicket::issue(&session, &task, "/p");
+    let mut params = bot_params(live.value().unwrap(), "nonce-too-sensitive-for-log");
+    params["request"]["repository"] = json!(format!("org/\r{}", "r".repeat(100)));
+    params["request"]["action"] = json!("unknown-action-not-for-log");
+    let (_, lines) = run(&FakeTransport::default(), BOT_REQUEST_OPERATION, params);
+    assert_eq!(lines.len(), 1);
+    let line = &lines[0];
+    assert!(!line.chars().any(char::is_control));
+    assert!(line.contains(" action=- repository=org/\\r"));
+    assert!(!line.contains("unknown-action-not-for-log"));
+    for field in ["session", "task", "repository"] {
+        let (_, tail) = line.split_once(&format!(" {field}=")).unwrap();
+        let (value, _) = tail.split_once(' ').unwrap();
+        assert_eq!(value.len(), 96, "{field}");
+    }
 }
 
 #[test]
