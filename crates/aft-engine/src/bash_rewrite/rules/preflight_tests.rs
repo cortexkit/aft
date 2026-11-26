@@ -1,4 +1,6 @@
 use super::*;
+use crate::bash_rewrite::RewriteDecision;
+use crate::config::Config;
 use crate::context::default_language_provider_factory;
 use crate::hashline::integration::RegistrationRequest;
 use crate::protocol::DEFAULT_SESSION_ID;

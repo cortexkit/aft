@@ -13,6 +13,11 @@ pub mod completion_queue {
 pub use crate::pinned_dir::with_openat_file_hook;
 pub use crate::pinned_dir::work_counts;
 
+#[cfg(unix)]
+pub fn watch_pty_write_start_for_test(task_id: &str) -> crossbeam_channel::Receiver<()> {
+    background::pty_process::watch_pty_write_start_for_test(task_id)
+}
+
 pub fn canonical_root_path(path: &Path) -> std::io::Result<PathBuf> {
     persistence::canonical_root_path(path)
 }

@@ -116,10 +116,7 @@ pub struct SourceWriteOutcome {
 /// reports it. Every source write path, including syntax rollback and
 /// hashline transactions, goes through this one decision.
 #[doc(hidden)]
-pub fn atomic_write_source(
-    path: &Path,
-    bytes: &[u8],
-) -> std::io::Result<SourceWriteOutcome> {
+pub fn atomic_write_source(path: &Path, bytes: &[u8]) -> std::io::Result<SourceWriteOutcome> {
     atomic_write_source_with_mode(path, bytes, None)
 }
 

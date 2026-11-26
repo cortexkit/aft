@@ -16,9 +16,8 @@ fn a_line_page_stops_at_the_file_read_byte_and_line_bounds() {
     let (content, cut) = select(&canonical, page.clone());
     assert!(cut);
     assert!(content.len() <= MAX_PAGE_BYTES + 100, "{}", content.len());
-    assert!(content.ends_with(
-        "... (output truncated at 50KB, use start_line/end_line to read sections)\n"
-    ));
+    assert!(content
+        .ends_with("... (output truncated at 50KB, use start_line/end_line to read sections)\n"));
     let completion = complete(
         canonical,
         page.clone(),
@@ -53,12 +52,8 @@ fn a_line_page_under_the_bounds_is_unchanged() {
 #[derive(Default)]
 struct MemoryCache(Mutex<Option<GithubReadCacheEntry>>);
 
-
 impl GithubReadCacheStore for MemoryCache {
-    fn lookup(
-        &self,
-        _key: &GithubReadCacheKey,
-    ) -> Result<Option<GithubReadCacheEntry>, String> {
+    fn lookup(&self, _key: &GithubReadCacheKey) -> Result<Option<GithubReadCacheEntry>, String> {
         Ok(self.0.lock().clone())
     }
 
@@ -146,7 +141,6 @@ fn enabled_gh_read() -> GithubConfig {
     }
 }
 
-
 fn wait_for(deferred: GithubReadDeferred) -> Result<GithubReadCompletion, GithubReadError> {
     for _ in 0..1000 {
         if let Some(result) = deferred.try_complete() {
@@ -194,7 +188,6 @@ impl GithubFetcher for RepositoryFetcher {
     }
 }
 
-
 #[test]
 fn a_stale_shorthand_alias_does_not_join_another_repositorys_live_fetch() {
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(8);
@@ -212,8 +205,7 @@ fn a_stale_shorthand_alias_does_not_join_another_repositorys_live_fetch() {
     );
     // An earlier shorthand read here resolved to team/old; the checkout's
     // default repository has since changed to team/new.
-    let shorthand =
-        GithubReadRequest::parse("issue://42", "/fixture", "identity", None).unwrap();
+    let shorthand = GithubReadRequest::parse("issue://42", "/fixture", "identity", None).unwrap();
     engine
         .state
         .lock()
@@ -223,8 +215,7 @@ fn a_stale_shorthand_alias_does_not_join_another_repositorys_live_fetch() {
     let explicit = engine
         .start(
             &enabled_gh_read(),
-            GithubReadRequest::parse("issue://team/old/42", "/fixture", "identity", None)
-                .unwrap(),
+            GithubReadRequest::parse("issue://team/old/42", "/fixture", "identity", None).unwrap(),
             GithubReadSelector::default(),
         )
         .unwrap();
@@ -250,13 +241,9 @@ fn shorthand_aliases_do_not_grow_with_sessions() {
         Arc::new(FixtureClock::new(2_000)),
     );
     for session in 0..100 {
-        let request = GithubReadRequest::parse(
-            "issue://1",
-            "/fixture",
-            format!("session:{session}"),
-            None,
-        )
-        .unwrap();
+        let request =
+            GithubReadRequest::parse("issue://1", "/fixture", format!("session:{session}"), None)
+                .unwrap();
         let start = engine
             .start(&enabled_gh_read(), request, GithubReadSelector::default())
             .unwrap();

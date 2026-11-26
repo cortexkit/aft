@@ -134,7 +134,9 @@ impl Fixture {
         task.state.lock().unwrap().runtime = TaskRuntime::Pty(Some(PtyRuntime {
             bootstrap_release: None,
             master: Some(pair.master),
-            input: Arc::new(crate::bash_background::pty_input::PtyInput::blocking(Box::new(io::sink()))),
+            input: Arc::new(crate::bash_background::pty_input::PtyInput::blocking(
+                Box::new(io::sink()),
+            )),
             killer: Box::new(NoopKiller),
             child_pid: None,
             reader_done,

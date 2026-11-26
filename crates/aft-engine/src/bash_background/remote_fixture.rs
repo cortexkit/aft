@@ -1547,11 +1547,8 @@ pub fn accepted_task_past_runner_timeout_for_test(
     session: &str,
 ) -> (tempfile::TempDir, Arc<BgTask>) {
     let dir = tempfile::tempdir().unwrap();
-    let (source, id, paths) = persist_accepted_with_snapshot(
-        dir.path(),
-        dir.path().join("unused"),
-        "printf unused",
-    );
+    let (source, id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
     let mut metadata = source
         .task(&id)
         .unwrap()

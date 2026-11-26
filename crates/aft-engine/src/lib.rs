@@ -77,8 +77,8 @@ pub mod bash_permissions;
 pub mod bash_rewrite;
 #[doc(hidden)]
 pub mod blocking_wait;
-pub(crate) use aft_base::bounded_io;
 pub use aft_base::atomic_replace;
+pub(crate) use aft_base::bounded_io;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod callgraph;
@@ -236,6 +236,8 @@ pub mod provisional_identity_retry;
 pub use aft_base::pty_render;
 pub use aft_base::query_shape;
 pub use aft_base::read_policy;
+#[doc(hidden)]
+pub mod read_trace;
 pub mod reader_floor;
 pub mod repeat_state;
 #[doc(hidden)]

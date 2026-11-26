@@ -120,7 +120,6 @@ pub(crate) use aft_engine::bash_permissions;
 pub(crate) use aft_engine::bash_rewrite;
 pub(crate) use aft_engine::blocking_wait;
 #[cfg(test)]
-pub(crate) use aft_engine::build_breaker;
 #[cfg(test)]
 pub(crate) use aft_engine::cache_location;
 pub(crate) use aft_engine::config_live;

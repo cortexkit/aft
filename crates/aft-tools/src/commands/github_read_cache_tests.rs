@@ -17,8 +17,7 @@ use std::sync::{mpsc, Arc};
 fn sqlite_store_reuses_the_resident_connection_and_creates_its_table_once() {
     let storage = tempfile::tempdir().unwrap();
     let database = storage.path().join("aft.db");
-    let resident =
-        Arc::new(std::sync::Mutex::new(crate::db::open(&database).unwrap()));
+    let resident = Arc::new(std::sync::Mutex::new(crate::db::open(&database).unwrap()));
     let store = SqliteGithubReadCacheStore::new(&database);
     store.attach_resident_connection(Some(&resident));
     let key = GithubReadCacheKey::new(GithubReadResourceKind::Issue, "owner/repo", 7, "id");
@@ -120,10 +119,7 @@ impl MemoryCache {
 }
 
 impl GithubReadCacheStore for MemoryCache {
-    fn lookup(
-        &self,
-        _key: &GithubReadCacheKey,
-    ) -> Result<Option<GithubReadCacheEntry>, String> {
+    fn lookup(&self, _key: &GithubReadCacheKey) -> Result<Option<GithubReadCacheEntry>, String> {
         Ok(self.0.lock().clone())
     }
 
@@ -267,10 +263,7 @@ fn diff_reads_fetch_live_without_cache_or_attachments() {
         fn fetch(&self, _: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
             panic!("diff must not fetch a document");
         }
-        fn fetch_diff(
-            &self,
-            _: &GithubFetchRequest,
-        ) -> Result<GithubDiff, GithubReadError> {
+        fn fetch_diff(&self, _: &GithubFetchRequest) -> Result<GithubDiff, GithubReadError> {
             let revision = self.0.fetch_add(1, Ordering::SeqCst);
             if revision >= 2 {
                 return Err(GithubReadError::FetchFailed(
@@ -476,8 +469,7 @@ fn failed_live_fetch_returns_a_loudly_disclosed_cached_fallback() {
     let completion = match engine
         .start(
             &enabled_gh_read(),
-            GithubReadRequest::parse("issue://owner/repo/1", "/fixture", "identity", None)
-                .unwrap(),
+            GithubReadRequest::parse("issue://owner/repo/1", "/fixture", "identity", None).unwrap(),
             GithubReadSelector::default(),
         )
         .unwrap()
@@ -506,8 +498,7 @@ fn github_read_pr_fallback_discloses_stale_threads_without_changing_cache() {
     let deferred = match engine
         .start(
             &enabled_gh_read(),
-            GithubReadRequest::parse("pr://owner/repo/1", "/fixture", "identity", None)
-                .unwrap(),
+            GithubReadRequest::parse("pr://owner/repo/1", "/fixture", "identity", None).unwrap(),
             GithubReadSelector::default(),
         )
         .unwrap()
@@ -657,10 +648,7 @@ fn panicking_fetch_completes_all_waiters_and_allows_a_new_flight() {
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
     impl GithubFetcher for PanicOnceFetcher {
-        fn fetch(
-            &self,
-            request: &GithubFetchRequest,
-        ) -> Result<GithubDocument, GithubReadError> {
+        fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.started.send(()).unwrap();
                 self.release.lock().recv().unwrap();
@@ -764,7 +752,6 @@ fn concurrent_same_resource_reads_share_one_live_fetch() {
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
 }
 
-
 fn fetched_text(start: GithubReadStart) -> String {
     match start {
         GithubReadStart::Deferred(deferred) => wait_for(deferred).unwrap().content,
@@ -833,7 +820,6 @@ fn coalesced_vision_readers_download_each_image_once() {
     assert_eq!(downloader.0.load(Ordering::SeqCst), 2);
 }
 
-
 /// A gated fetcher whose live fetch stays running until the test lets it
 /// finish, the sender that does so, and the receiver of its start reports
 /// (kept alive so the fetcher can report).
@@ -864,8 +850,7 @@ fn a_read_still_running_at_the_deadline_answers_with_the_labelled_cached_copy() 
     let GithubReadStart::Deferred(pending) = engine
         .start(
             &enabled_gh_read(),
-            GithubReadRequest::parse("issue://owner/repo/1", "/fixture", "identity", None)
-                .unwrap(),
+            GithubReadRequest::parse("issue://owner/repo/1", "/fixture", "identity", None).unwrap(),
             GithubReadSelector::default(),
         )
         .unwrap()

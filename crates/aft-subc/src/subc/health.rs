@@ -12032,7 +12032,6 @@ mod tests {
     #[cfg(test)]
     use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
     #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::BuildDeathBreakerTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::InspectCacheTestExt as _;
     #[cfg(test)]

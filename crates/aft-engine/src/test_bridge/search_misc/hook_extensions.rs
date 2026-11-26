@@ -161,7 +161,8 @@ pub mod lsp {
 
         pub mod regression_tests {
             pub use crate::lsp::manager::idle_fixture::{
-                enqueue_maintenance_backlog_for_test, IdleLspFixture,
+                enqueue_maintenance_backlog_for_test, publish_after_document_sync_for_test,
+                IdleLspFixture,
             };
         }
 

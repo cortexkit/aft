@@ -18013,10 +18013,6 @@ mod pty_lifecycle_tests;
 #[path = "watch_scan_tests.rs"]
 mod watch_scan_tests;
 
-#[cfg(test)]
-#[path = "pty_status_tests.rs"]
-mod pty_status_tests;
-
 #[cfg(any(test, feature = "test-support"))]
 fn random_slug() -> String {
     // 8 bytes = 64-bit entropy → `bash-{16hex}`, matching the documented contract

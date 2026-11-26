@@ -360,7 +360,7 @@ impl RevisionSession {
                 ),
             ));
         }
-        crate::run_tool_call::read_trace::note_file(entry.size);
+        crate::read_trace::note_file(entry.size);
         self.materialized
             .borrow_mut()
             .insert(relative, target.clone());

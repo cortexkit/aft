@@ -815,14 +815,14 @@ fn pty_fault_injected_for_test(task_id: &str, fault: PtyFaultForTest) -> bool {
 
 /// Senders told when `bash_write` starts writing to a task's terminal, keyed
 /// by task id.
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 static PTY_WRITE_STARTS: std::sync::OnceLock<
     Mutex<HashMap<String, crossbeam_channel::Sender<()>>>,
 > = std::sync::OnceLock::new();
 
 /// Returns a receiver that gets one message when a write to `task_id`'s
 /// terminal starts.
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn watch_pty_write_start_for_test(task_id: &str) -> crossbeam_channel::Receiver<()> {
     let (started_tx, started_rx) = crossbeam_channel::bounded(1);
@@ -834,7 +834,7 @@ pub(crate) fn watch_pty_write_start_for_test(task_id: &str) -> crossbeam_channel
     started_rx
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 pub(crate) fn note_pty_write_started_for_test(task_id: &str) {
     let started = PTY_WRITE_STARTS
         .get()

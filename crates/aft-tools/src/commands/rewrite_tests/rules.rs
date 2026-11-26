@@ -26,9 +26,18 @@ mod tests {
             },
         );
         for command in ["ls -R", "ls -AR", "ls -RA ."] {
-            assert!(aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request(command, &ctx).is_none(), "{command}");
+            assert!(
+                aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request(
+                    command, &ctx
+                )
+                .is_none(),
+                "{command}"
+            );
         }
-        assert!(aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request("ls -A", &ctx).is_some());
+        assert!(
+            aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request("ls -A", &ctx)
+                .is_some()
+        );
     }
 
     /// A directory read never lists `.` and `..`, which is the `ls -A`
@@ -43,10 +52,18 @@ mod tests {
                 ..Config::default()
             },
         );
-        let request = aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request("ls -A", &ctx).expect("ls -A is rewritten");
+        let request =
+            aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request("ls -A", &ctx)
+                .expect("ls -A is rewritten");
         assert_eq!(request["include_hidden"], json!(true));
         for command in ["ls -a", "ls -la", "ls -aA", "ls -Aa ."] {
-            assert!(aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request(command, &ctx).is_none(), "{command}");
+            assert!(
+                aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request(
+                    command, &ctx
+                )
+                .is_none(),
+                "{command}"
+            );
         }
     }
 
@@ -87,8 +104,8 @@ mod tests {
                 output.status.success(),
                 "bash failed: {command}: {output:?}"
             );
-            let RewriteDecision::Accept(request) =
-                crate::bash_rewrite::rules::CatAppendRule.decide(command, "literal-oracle", None, &ctx)
+            let RewriteDecision::Accept(request) = crate::bash_rewrite::rules::CatAppendRule
+                .decide(command, "literal-oracle", None, &ctx)
             else {
                 panic!("must rewrite: {command}");
             };
@@ -217,7 +234,9 @@ mod tests {
                 ..Config::default()
             },
         );
-        let decide = |command: &str| crate::bash_rewrite::rules::GrepRule.decide(command, "grep-shape", None, &ctx);
+        let decide = |command: &str| {
+            crate::bash_rewrite::rules::GrepRule.decide(command, "grep-shape", None, &ctx)
+        };
         for command in [
             "grep needle",
             "grep -n needle",
@@ -331,5 +350,4 @@ mod tests {
         assert!(content.starts_with("[src/app.ts#"), "{content}");
         assert!(content.contains("3:three\n4:four\n"), "{content}");
     }
-
 }

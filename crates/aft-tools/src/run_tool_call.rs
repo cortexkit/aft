@@ -112,7 +112,7 @@ struct PhaseCpuTrace {
     execute_suspended: bool,
 }
 
-pub(crate) mod read_trace;
+pub(crate) use aft_engine::read_trace;
 
 pub use crate::tool_progress::{ToolCallPhaseCpu, ToolCallPhaseDurations, WaitingOn};
 

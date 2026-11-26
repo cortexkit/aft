@@ -52,7 +52,7 @@ impl BgTaskRegistry {
                         if !runtime.was_killed.load(Ordering::SeqCst))
             })
         };
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "test-support")))]
         crate::bash_background::pty_process::note_pty_write_started_for_test(task_id);
         let result = terminal.write(input, Instant::now() + INPUT_DEADLINE, &stopped);
         // Record how much typed input reached the terminal, so a task that

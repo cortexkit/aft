@@ -1608,10 +1608,7 @@ impl WalkCoverage {
 /// glob and their scope probes use [`fallback_target_walk_builder`], which
 /// does.
 #[doc(hidden)]
-pub fn fallback_project_walk_builder(
-    search_root: &Path,
-    coverage: WalkCoverage,
-) -> WalkBuilder {
+pub fn fallback_project_walk_builder(search_root: &Path, coverage: WalkCoverage) -> WalkBuilder {
     target_walk_builder(search_root, coverage, false, false, Some(search_root), None)
 }
 

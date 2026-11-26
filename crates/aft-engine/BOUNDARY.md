@@ -11,3 +11,5 @@ The engine display retry hands a due record to the existing announce hook.
 reader before persisting or publishing a notice. The engine still owns retry
 completion and backoff. The engine depends on neither the daemon nor the tool
 handlers.
+
+The read trace lives in the engine so revision reads and tool handlers record bytes in the same per-call scope.

@@ -112,10 +112,12 @@ pub fn enqueue_maintenance_backlog_for_test(manager: &mut LspManager, root: &Pat
     // leave a final exit in its priority slot when ingress is full.
     for _ in 0..EVENT_CAP {
         manager.enqueue_event_for_test(event.clone());
-        manager.ready_startup_events.push_back(StartupEventDelivery {
-            event: event.clone().into(),
-            published: None,
-        });
+        manager
+            .ready_startup_events
+            .push_back(StartupEventDelivery {
+                event: event.clone().into(),
+                published: None,
+            });
     }
     let instance = ServerInstanceId::next();
     let root = root.to_path_buf();
@@ -124,7 +126,8 @@ pub fn enqueue_maintenance_backlog_for_test(manager: &mut LspManager, root: &Pat
         root: root.clone(),
     };
     let lease = manager.event_tx.register(instance, key);
-    manager.event_tx
+    manager
+        .event_tx
         .send(ReceivedLspEvent {
             event: LspEvent::ServerExited {
                 server_kind: ServerKind::Rust,
@@ -138,4 +141,23 @@ pub fn enqueue_maintenance_backlog_for_test(manager: &mut LspManager, root: &Pat
         .unwrap();
     assert!(manager.event_tx.exit_pending_for_test(instance));
     lease
+}
+/// Inject an unversioned push received after the file's last document sync.
+/// Return the open document's version for comparison with the diagnostic report.
+pub fn publish_after_document_sync_for_test(
+    manager: &mut LspManager,
+    key: &ServerKey,
+    path: &Path,
+    params: &serde_json::Value,
+) -> Option<i32> {
+    let document = manager.documents.get(key)?.entry(path)?;
+    let version = document.version;
+    let received_after_sync = document.sync_order? + 1;
+    manager.handle_publish_diagnostics_ordered(
+        key.kind.clone(),
+        key.root.clone(),
+        params,
+        Some(received_after_sync),
+    );
+    Some(version)
 }

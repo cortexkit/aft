@@ -16,13 +16,13 @@ thread_local! {
     static CURRENT: Cell<Option<ReadShape>> = const { Cell::new(None) };
 }
 
-pub(crate) struct Scope {
+pub struct Scope {
     previous: Option<ReadShape>,
     batch_kinds: Option<String>,
 }
 
 impl Scope {
-    pub(super) fn begin(request: &RawRequest) -> Option<Self> {
+    pub fn begin(request: &RawRequest) -> Option<Self> {
         if !matches!(request.command.as_str(), "read" | "outline" | "zoom") {
             return None;
         }
@@ -39,7 +39,7 @@ impl Scope {
         })
     }
 
-    pub(super) fn append(self, summary: &mut String) {
+    pub fn append(self, summary: &mut String) {
         if let Some(shape) = CURRENT.get() {
             if let Some(kinds) = self.batch_kinds.as_deref() {
                 let _ = write!(summary, " target_kinds={kinds}");
@@ -93,14 +93,14 @@ fn batch_kinds(params: &Value) -> Option<String> {
 
 /// Use sizes already observed in authorized handlers; the trace never stats or
 /// reads a path of its own. For a batch the largest file is most diagnostic.
-pub(crate) fn note_file(size: u64) {
+pub fn note_file(size: u64) {
     if let Some(mut shape) = CURRENT.get() {
         shape.file_bytes = Some(shape.file_bytes.map_or(size, |max| max.max(size)));
         CURRENT.set(Some(shape));
     }
 }
 
-pub(crate) fn note_symbols(count: usize) {
+pub fn note_symbols(count: usize) {
     if let Some(mut shape) = CURRENT.get() {
         shape.symbols = Some(shape.symbols.unwrap_or(0).saturating_add(count));
         CURRENT.set(Some(shape));

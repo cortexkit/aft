@@ -34,8 +34,15 @@ async fn notice_records_gate_opens_only_after_every_notice_view_put_is_acknowled
     assert!(!ready.wait(Duration::ZERO).await);
 
     let mut writer = RecordingWriter::default();
-    publication.sync_for_test(&mut writer, &notice_views).await.unwrap();
-    assert_eq!(writer.writes().len(), 1, "only the unacknowledged view is retried");
+    publication
+        .sync_for_test(&mut writer, &notice_views)
+        .await
+        .unwrap();
+    assert_eq!(
+        writer.writes().len(),
+        1,
+        "only the unacknowledged view is retried"
+    );
     assert!(
         ready.wait(Duration::ZERO).await,
         "acknowledgments reopen admission even after a timed-out send"

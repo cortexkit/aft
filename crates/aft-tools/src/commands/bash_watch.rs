@@ -1273,8 +1273,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn remote_timeout_metadata_cannot_extend_the_worker_watch_limit() {
-        use aft_engine::test_bridge::bash_remote::remote_support::accepted_task_past_runner_timeout_for_test;
         use crate::commands::blocking_wait::ReplyBudget;
+        use aft_engine::test_bridge::bash_remote::remote_support::accepted_task_past_runner_timeout_for_test;
 
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path(), dir.path());
