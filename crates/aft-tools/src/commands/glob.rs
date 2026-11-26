@@ -1066,7 +1066,13 @@ mod tests {
         let files: Vec<_> = (0..20)
             .map(|i| root.join("deep/".repeat(600)).join(format!("file_{i}.rs")))
             .collect();
-        let (text, shown) = format_glob_output(&files, "**/*.rs", root, false);
+        let (text, shown) = format_glob_output(
+            &files,
+            "**/*.rs",
+            root,
+            false,
+            crate::list_envelope::Total::Exact(files.len()),
+        );
         assert!(shown > 0 && shown < files.len());
         assert!(text.len() <= crate::tool_output::LIST_BODY_BYTES);
         assert_eq!(

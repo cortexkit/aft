@@ -568,7 +568,7 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        47,
+        48,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {
