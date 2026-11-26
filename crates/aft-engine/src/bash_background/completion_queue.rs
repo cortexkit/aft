@@ -42,6 +42,30 @@ impl BgTask {
 }
 
 impl BgTaskRegistry {
+    pub(super) fn emit_bash_pattern_match(&self, session_id: &str, pattern_match: PatternMatch) {
+        let mut frame = pattern_notice_frame(session_id, pattern_match);
+        frame.launching_identity = self.task_launching_identity(session_id, &frame.task_id);
+        if self.publish_awaited_progress(&frame) {
+            return;
+        }
+        if frame.launching_identity.is_none()
+            && !self.originating_session_has_live_route(session_id)
+        {
+            return;
+        }
+        let Ok(progress_sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map(|sender| sender.clone())
+        else {
+            return;
+        };
+        if let Some(sender) = progress_sender.as_ref() {
+            sender(PushFrame::BashPatternMatch(frame));
+        }
+    }
+
     pub(super) fn enqueue_completion_if_needed(
         &self,
         metadata: &PersistedTask,
@@ -377,6 +401,37 @@ impl BgTaskRegistry {
             sender(PushFrame::BashLongRunning(frame));
         }
     }
+}
+
+fn pattern_notice_frame(session_id: &str, mut pattern: PatternMatch) -> BashPatternMatchFrame {
+    let terminal_summary = pattern.batch.as_mut().is_some_and(|batch| {
+        if !batch.terminal_summary {
+            return false;
+        }
+        batch.lines.clear();
+        pattern.context = crate::task_watch_lines::format_watch_line_batch(&pattern.task_id, batch);
+        true
+    });
+    let mut frame = if !terminal_summary && pattern.match_text == WATCH_TASK_EXIT_TEXT {
+        BashPatternMatchFrame::task_exit(
+            pattern.task_id,
+            session_id,
+            pattern.match_text,
+            pattern.context,
+        )
+    } else {
+        BashPatternMatchFrame::new(
+            pattern.task_id,
+            session_id,
+            pattern.watch_id,
+            pattern.match_text,
+            pattern.match_offset,
+            pattern.context,
+            pattern.once,
+        )
+    };
+    frame.batch = pattern.batch;
+    frame
 }
 
 /// Notices queued for one session.

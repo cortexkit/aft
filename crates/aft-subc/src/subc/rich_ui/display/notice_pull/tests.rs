@@ -11,6 +11,73 @@ use subc_protocol::Principal;
 use super::super::{announce_retained, read_for_reader, tests::test_writer};
 
 #[tokio::test]
+async fn tool_provider_awaited_finish_writes_its_own_send_id_without_a_notice_wake() {
+    use crate::bash_background::{
+        persistence::PersistedTask, BgTaskRegistry, BgTaskStatus, TaskIdentity,
+    };
+    use crate::protocol::{BashCompletedFrame, PushFrame};
+    use crate::subc::rich_ui::notices::for_awaited_work;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writer = test_writer(dir.path().join("aft.db"));
+    let key = "bash-0000000000000001";
+    let mut task = PersistedTask::starting(
+        key.into(),
+        "worker".into(),
+        "printf hello".into(),
+        dir.path().into(),
+        None,
+        None,
+        true,
+        false,
+    );
+    task.launching_identity = Some(TaskIdentity {
+        principal: Some("reserved:broca".into()),
+        harness: "runner".into(),
+        session: "worker".into(),
+    });
+    task.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    let frame = PushFrame::BashCompleted(BashCompletedFrame::new(
+        key,
+        "worker",
+        BgTaskStatus::Completed,
+        Some(0),
+        "printf hello",
+        "hello",
+        false,
+        None,
+        None,
+        false,
+    ));
+    let registry = BgTaskRegistry::new(Default::default());
+    let record = for_awaited_work(&registry, &frame, &task, task.started_at).unwrap();
+    let id = record.id.clone();
+    assert_eq!(
+        persist_without_wake(&writer, record, Duration::from_secs(5))
+            .await
+            .as_deref(),
+        Some(id.as_str())
+    );
+    let bytes = writer
+        .store
+        .read(id.clone(), crate::db::display_records::now_ms())
+        .await
+        .unwrap();
+    let notice: NoticeWrite = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(notice.send_id, id);
+    assert_eq!(notice.session, "worker");
+    assert_eq!(notice.kind, "notice");
+    assert_eq!(notice.body.view, "bash_finished:1");
+    assert!(writer
+        .outbox
+        .lock()
+        .unwrap()
+        .reads
+        .due(Instant::now())
+        .is_none());
+}
+
+#[tokio::test]
 async fn notice_records_no_write_or_announcement_queued_before_views_publish() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.db");

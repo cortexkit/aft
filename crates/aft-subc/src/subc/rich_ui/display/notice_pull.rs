@@ -23,6 +23,31 @@ pub(in crate::subc) async fn stage_notice(record: PullRecord) {
     }
 }
 
+pub(in crate::subc) async fn stage_awaited_notice(record: PullRecord) -> Option<String> {
+    persist_without_wake(SENDER.get()?, record, WRITE_BUDGET).await
+}
+
+async fn persist_without_wake(
+    writer: &Writer,
+    record: PullRecord,
+    budget: Duration,
+) -> Option<String> {
+    // The orchestrator's awaited-work notice owns the card. Enqueuing an AFT
+    // display wake would publish a second card for the same bash event.
+    let PullRecord { id, bytes } = record;
+    let available = tokio::time::timeout(budget, async {
+        writer.store.persist(id.clone(), bytes).await == Ok(true)
+            || writer
+                .store
+                .read(id.clone(), crate::db::display_records::now_ms())
+                .await
+                .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    available.then_some(id)
+}
+
 async fn stage_after_views(
     writer: &Writer,
     record: PullRecord,

@@ -69,9 +69,9 @@ impl BgTaskRegistry {
         *self.inner.awaited_work.lock() = Arc::downgrade(service);
     }
 
-    fn send_awaited(&self, task: &BgTask, event: Event) {
+    fn send_awaited(&self, task: &BgTask, event: Event, notice: Option<PushFrame>) {
         if let Some(service) = self.inner.awaited_work.lock().upgrade() {
-            service.submit(self.clone(), task.task_id.clone(), event);
+            service.submit(self.clone(), task.task_id.clone(), event, notice);
         }
     }
 
@@ -136,7 +136,7 @@ impl BgTaskRegistry {
         let Some(task) = self.task(key) else {
             return false;
         };
-        let (metadata, decision) = {
+        let metadata = {
             let mut db = DeferredDbWrites::new(self, &task);
             let Ok(mut state) = task.lock_state() else {
                 return false;
@@ -159,20 +159,13 @@ impl BgTaskRegistry {
             if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {
                 log::warn!("could not persist awaited-work registration for {key}: {error}");
             }
-            (
-                state.metadata.clone(),
-                state
-                    .metadata
-                    .awaited_work
-                    .as_ref()
-                    .and_then(State::decision),
-            )
+            state.metadata.clone()
         };
         if opened && recovering {
             let _ = self.remove_pending_completion(key);
         }
-        if let Some(decision) = decision {
-            self.send_awaited(&task, decision);
+        if matches!(metadata.awaited_work, Some(State::Cancel)) {
+            self.send_awaited(&task, Event::Cancel, None);
         } else if metadata.status.is_terminal() {
             if let Some(service) = self.inner.awaited_work.lock().upgrade() {
                 let registry = self.clone();
@@ -191,8 +184,10 @@ impl BgTaskRegistry {
                 .awaited_work
                 .as_ref()
                 .is_some_and(State::opening)
-                || (matches!(state.metadata.awaited_work, Some(State::Open))
-                    && self.inner.awaited_work.lock().strong_count() == 0)
+                || (matches!(
+                    state.metadata.awaited_work,
+                    Some(State::Open | State::Finish { .. })
+                ) && self.inner.awaited_work.lock().strong_count() == 0)
         })
     }
 
@@ -224,30 +219,38 @@ impl BgTaskRegistry {
         let Ok(mut state) = task.lock_state() else {
             return false;
         };
-        match state.metadata.awaited_work {
+        let decision = match &state.metadata.awaited_work {
             None => return false,
-            Some(State::Open) => {}
+            Some(State::Open) => {
+                let outcome = if completion.status == BgTaskStatus::Completed
+                    && completion.exit_code == Some(0)
+                {
+                    Outcome::Done
+                } else {
+                    Outcome::Failed
+                };
+                let summary = crate::subc::awaited_work::completion_summary(completion);
+                state.metadata.awaited_work = Some(State::Finish {
+                    outcome,
+                    summary: summary.clone(),
+                });
+                if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
+                    log::warn!(
+                        "could not persist awaited-work result for {}: {error}",
+                        task.task_id
+                    );
+                }
+                Event::Finish { outcome, summary }
+            }
+            Some(State::Finish { outcome, summary }) => Event::Finish {
+                outcome: *outcome,
+                summary: summary.clone(),
+            },
             Some(_) => return true,
-        }
-        let outcome =
-            if completion.status == BgTaskStatus::Completed && completion.exit_code == Some(0) {
-                Outcome::Done
-            } else {
-                Outcome::Failed
-            };
-        let summary = crate::subc::awaited_work::completion_summary(completion);
-        let marker = State::Finish { outcome, summary };
-        let decision = marker.decision().expect("finish decision");
-        state.metadata.awaited_work = Some(marker);
-        if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
-            log::warn!(
-                "could not persist awaited-work result for {}: {error}",
-                task.task_id
-            );
-        }
+        };
         drop(state);
         drop(db);
-        self.send_awaited(task, decision);
+        self.send_awaited(task, decision, Some(completion.clone().into_push_frame()));
         true
     }
 
@@ -278,12 +281,12 @@ impl BgTaskRegistry {
         drop(state);
         drop(db);
         if let Some(decision) = decision {
-            self.send_awaited(&task, decision);
+            self.send_awaited(&task, decision, None);
         }
         true
     }
 
-    pub(super) fn publish_awaited_progress(&self, pattern: &PatternMatch) -> bool {
+    pub(super) fn publish_awaited_progress(&self, pattern: &BashPatternMatchFrame) -> bool {
         let Some(task) = self.task(&pattern.task_id) else {
             return false;
         };
@@ -292,7 +295,7 @@ impl BgTaskRegistry {
         };
         let active = state.metadata.awaited_work.is_some();
         let open = matches!(state.metadata.awaited_work, Some(State::Open));
-        if open && pattern.match_text != WATCH_TASK_EXIT_TEXT {
+        if open && pattern.reason != "task_exit" {
             let context = if pattern.context.is_empty() {
                 &pattern.match_text
             } else {
@@ -302,6 +305,7 @@ impl BgTaskRegistry {
                 self.send_awaited(
                     &task,
                     Event::Progress(crate::subc::awaited_work::bounded(context, 2000)),
+                    Some(PushFrame::BashPatternMatch(pattern.clone())),
                 );
             }
         }

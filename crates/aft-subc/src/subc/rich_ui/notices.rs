@@ -187,10 +187,20 @@ pub(super) fn pull(
     send_id: &str,
     body: NoticeBody,
 ) -> Option<PullRecord> {
+    pull_inner(runner, session, send_id, body, false)
+}
+
+fn pull_inner(
+    runner: &str,
+    session: &str,
+    send_id: &str,
+    body: NoticeBody,
+    awaited: bool,
+) -> Option<PullRecord> {
     let writer = Principal::Reserved {
         module_id: "aft".into(),
     };
-    let write = NoticeWrite::new(
+    let mut write = NoticeWrite::new(
         Principal::Reserved {
             module_id: runner.into(),
         },
@@ -201,9 +211,29 @@ pub(super) fn pull(
     write.check(&writer).ok()?;
     let key = cortexkit_role_tool_display::notice_idempotency_key(&writer, &write).ok()?;
     let id = format!("{RECORD_ID_PREFIX}{:x}", Sha256::digest(key));
+    if awaited {
+        // The shell event names the record; no runner send names the notice.
+        write.send_id.clone_from(&id);
+        write.check(&writer).ok()?;
+    }
     let bytes =
         cortexkit_role_tool_display::canonical_body(&super::records::object(json!(write))).ok()?;
     Some(PullRecord { id, bytes })
+}
+
+pub(in crate::subc) fn for_awaited_work(
+    registry: &crate::bash_background::BgTaskRegistry,
+    frame: &PushFrame,
+    metadata: &PersistedTask,
+    now_ms: u64,
+) -> Option<PullRecord> {
+    let owner = metadata.launching_identity.as_ref()?;
+    let runner = owner.principal.as_deref()?.strip_prefix("reserved:")?;
+    let send_id = super::super::runner_notices::notice_send_id(frame);
+    let body = body(frame, metadata, now_ms, |text| {
+        registry.mask_notice_text(metadata, text)
+    })?;
+    pull_inner(runner, &owner.session, &send_id, body, true)
 }
 
 pub(in crate::subc) fn for_send(

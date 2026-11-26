@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bash_background::registry::BgCompletion;
 use crate::bash_background::BgTaskRegistry;
+use crate::protocol::PushFrame;
 
 const ORCHESTRATOR: &str = "prefrontal";
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -153,7 +154,13 @@ impl Service {
         serde_json::from_slice(&reply).map_err(|error| Failure::Transport(error.to_string()))
     }
 
-    pub(crate) fn submit(self: &Arc<Self>, registry: BgTaskRegistry, key: String, event: Event) {
+    pub(crate) fn submit(
+        self: &Arc<Self>,
+        registry: BgTaskRegistry,
+        key: String,
+        event: Event,
+        notice: Option<PushFrame>,
+    ) {
         let terminal = !matches!(event, Event::Progress(_));
         let token = CancellationToken::new();
         let mut pending_progress = None;
@@ -171,24 +178,6 @@ impl Service {
         } else if let Some(older) = self.progress.lock().insert(key.clone(), token.clone()) {
             older.cancel();
         }
-        let req = match event {
-            Event::Finish { outcome, summary } => Request::Finish(FinishParams {
-                instance: self.instance.clone(),
-                more: Some(format!("full output: bash_status({{ taskId: \"{key}\" }})")),
-                key: key.clone(),
-                outcome,
-                summary,
-            }),
-            Event::Cancel => Request::Cancel(CancelParams {
-                instance: self.instance.clone(),
-                key: key.clone(),
-            }),
-            Event::Progress(text) => Request::Progress(ProgressParams {
-                instance: self.instance.clone(),
-                key: key.clone(),
-                text,
-            }),
-        };
         let service = Arc::clone(self);
         self.runtime.spawn(async move {
             // A final output scan can report a match just before exit. Give
@@ -198,6 +187,8 @@ impl Service {
             }
             let mut delay = Duration::from_millis(100);
             let mut persisted = !terminal;
+            let mut event = Some((event, notice));
+            let mut request = None;
             loop {
                 let guard = registry.clone();
                 let task = key.clone();
@@ -216,9 +207,13 @@ impl Service {
                 }
                 persisted = saved;
                 if let Some(wire) = service.wire().filter(|_| persisted) {
+                    if let Some((event, notice)) = event.take() {
+                        request = Some(service.request_for(&registry, &key, event, notice).await);
+                    }
+                    let req = request.as_ref().expect("prepared awaited-work request");
                     let result = tokio::select! {
                         _ = token.cancelled() => break,
-                        result = Service::call::<ItemReply>(wire.as_ref(), &req, None) => result,
+                        result = Service::call::<ItemReply>(wire.as_ref(), req, None) => result,
                     };
                     match result {
                         Ok(_) => break,
@@ -253,9 +248,62 @@ impl Service {
         });
     }
 
+    async fn request_for(
+        &self,
+        registry: &BgTaskRegistry,
+        key: &str,
+        event: Event,
+        notice: Option<PushFrame>,
+    ) -> Request {
+        // The agent-orchestrator 0.1.0 contract has no field for the notice id.
+        // Store the record without a wake for use by a contract that can link it.
+        let _notice_record_id = if let Some(frame) = notice {
+            stage_notice_record(registry.clone(), key.into(), frame).await
+        } else {
+            None
+        };
+        match event {
+            Event::Finish { outcome, summary } => Request::Finish(FinishParams {
+                instance: self.instance.clone(),
+                key: key.into(),
+                outcome,
+                summary,
+                more: Some(format!("full output: bash_status({{ taskId: \"{key}\" }})")),
+            }),
+            Event::Cancel => Request::Cancel(CancelParams {
+                instance: self.instance.clone(),
+                key: key.into(),
+            }),
+            Event::Progress(text) => Request::Progress(ProgressParams {
+                instance: self.instance.clone(),
+                key: key.into(),
+                text,
+            }),
+        }
+    }
+
     pub(crate) fn replay_terminal(&self, run: impl FnOnce() + Send + 'static) {
         self.runtime.spawn_blocking(run);
     }
+}
+
+async fn stage_notice_record(
+    registry: BgTaskRegistry,
+    key: String,
+    frame: PushFrame,
+) -> Option<String> {
+    let record = tokio::task::spawn_blocking(move || {
+        let metadata = registry.notice_metadata(&key)?;
+        super::rich_ui::notices::for_awaited_work(
+            &registry,
+            &frame,
+            &metadata,
+            crate::bash_background::persistence::unix_millis(),
+        )
+    })
+    .await
+    .ok()??;
+    super::rich_ui::display::stage_awaited_notice(record).await
 }
 
 pub(crate) enum Event {

@@ -2,6 +2,7 @@
 //! the same notice twice. Runner sessions do not acknowledge AFT push frames.
 
 mod bash_requests;
+pub(super) use bash_requests::notice_send_id;
 pub(crate) mod notice_templates;
 
 use super::*;

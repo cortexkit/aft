@@ -24,7 +24,7 @@ mod edit_hunks;
 mod notice_pull;
 mod store;
 use counters::{count, Counter::*};
-pub(in crate::subc) use notice_pull::stage_notice;
+pub(in crate::subc) use notice_pull::{stage_awaited_notice, stage_notice};
 
 struct Writer {
     outbox: Mutex<Outbox>,
