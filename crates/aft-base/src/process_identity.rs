@@ -33,7 +33,10 @@ impl LinuxBirth {
 }
 
 /// A PID and its recorded epoch start time, with a stronger birth on Linux.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Use [`Self::same_process`] to compare identities. An old record without a
+/// native birth can match two identities with the same epoch. Those identities
+/// do not match each other if their native births differ.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub started_at_ms: u64,
@@ -225,6 +228,29 @@ pub fn process_start_time_ms(pid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_process_matches_legacy_and_native_identities_at_the_same_epoch() {
+        let legacy = ProcessIdentity::from_epoch(42, 1000);
+        let native = ProcessIdentity {
+            pid: 42,
+            started_at_ms: 1000,
+            native_birth: Some(LinuxBirth {
+                boot_id: "boot".into(),
+                start_ticks: 80,
+            }),
+        };
+        assert!(legacy.same_process(&native));
+        assert!(native.same_process(&legacy));
+        assert!(!ProcessIdentity::from_epoch(42, 1001).same_process(&native));
+        assert!(!ProcessIdentity::from_epoch(43, 1000).same_process(&native));
+
+        let mut reused = native.clone();
+        reused.native_birth.as_mut().unwrap().start_ticks += 1;
+        assert!(legacy.same_process(&reused));
+        assert!(!native.same_process(&reused));
+    }
+
     #[test]
     fn audit_growth_boot_time_cache_reads_its_source_once() {
         let directory = tempfile::tempdir().unwrap();

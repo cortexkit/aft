@@ -3264,7 +3264,12 @@ mod tests {
             let owner = decoded.launch_owner.as_ref().unwrap();
             assert_eq!(owner.started_at_ms, 12345);
             assert_eq!(owner.native_birth.as_ref(), Some(birth));
-            assert_eq!(&decoded.group_member_identities, &[owner.clone()]);
+            let [member] = decoded.group_member_identities.as_slice() else {
+                panic!("expected one recorded group member");
+            };
+            assert_eq!(member.pid, owner.pid);
+            assert_eq!(member.started_at_ms, owner.started_at_ms);
+            assert_eq!(member.native_birth, owner.native_birth);
             assert_eq!(serde_json::to_value(decoded).unwrap()["start_ticks"], 27);
         }
     }

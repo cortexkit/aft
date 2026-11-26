@@ -31,7 +31,7 @@ pub const OMITTED_ARGUMENTS_MARKER: &str = "…";
 pub use crate::protocol::{LiveDescendant, LiveDescendantsUnavailable};
 
 /// One check of a task's process group.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct GroupListing {
     /// The live members found, at most [`LIVE_DESCENDANT_CAP`], lowest pid first.
     pub members: Vec<LiveDescendant>,
