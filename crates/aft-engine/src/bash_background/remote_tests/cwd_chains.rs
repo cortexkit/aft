@@ -50,6 +50,41 @@ fn runon_cwd_chains_allow_mc_after_shell_home_replacement() {
     }
 }
 
+#[test]
+fn runon_cwd_chains_allow_mc_with_pipeline_home_prefixes() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    request.platform = Some(Platform::Linux);
+    let checkout = Path::new(&request.workspace_key);
+    let plugin = checkout.join("packages/plugin");
+    let pi_plugin = checkout.join("packages/pi-plugin");
+    for package in [&plugin, &pi_plugin] {
+        fs::create_dir_all(package).unwrap();
+        fs::write(package.join("package.json"), "{}\n").unwrap();
+    }
+    let package_tests = concat!(
+        "cd packages/plugin && HOME=$(mktemp -d) bun test x | tail -6; echo \"PLUGIN_EXIT=$?\"; ",
+        "bun run typecheck 2>&1 | tail -3; ",
+        "cd ../pi-plugin && HOME=$(mktemp -d) bun test src/dreamer 2>&1 | tail -5"
+    );
+    let command =
+        format!("git log -1 --format='%H %P' && bun install >/dev/null 2>&1; {package_tests}");
+    for (command, require_second_target) in [(&*command, false), (package_tests, true)] {
+        assert_eq!(runon_cd_refusal(command, &request).unwrap(), None);
+        assert_eq!(runon_write_refusal(command, &request), None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let targets = crate::bash_permissions::scan::top_level_directory_targets(
+            command,
+            checkout,
+            &|path| runon_snapshot_directory_known(checkout, path, Path::new("git"), deadline),
+        );
+        assert_eq!(targets.first().map(|target| &target.path), Some(&plugin));
+        let second_target = targets.get(1).map(|target| &target.path);
+        if require_second_target || second_target.is_some() {
+            assert_eq!(second_target, Some(&pi_plugin));
+        }
+    }
+}
+
 fn rune_checkout() -> (tempfile::TempDir, RunRequest) {
     let (dir, request) = runon_cd_snapshot_fixture();
     let rune = Path::new(&request.workspace_key).join("rune");
