@@ -2612,7 +2612,7 @@ fn write_format_validate_impl(
         .warnings;
     drop(file_locks);
     crate::tool_progress::report();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let admission_extended = after_syntax.map(|_| std::time::Instant::now());
     drop(write_phase);
 
