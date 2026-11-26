@@ -363,6 +363,7 @@ dependencies = [
  "aft-tokenizer",
  "aft-tools",
  "async-compression",
+ "async-trait",
  "base64 0.22.1",
  "blake3",
  "bytes",

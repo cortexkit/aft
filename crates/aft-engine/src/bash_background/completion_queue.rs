@@ -19,6 +19,28 @@ use std::ops::{Deref, DerefMut};
 use super::*;
 use crate::protocol::BashLongRunningFrame;
 
+impl BgTask {
+    pub(super) fn set_completion_delivered(
+        &self,
+        delivered: bool,
+        registry: &BgTaskRegistry,
+    ) -> std::io::Result<()> {
+        registry.retry_terminal_persist(self)?;
+        let mut db = DeferredDbWrites::new(registry, self);
+        let mut state = self
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        if delivered && state.metadata.has_unsettled_awaited_work() {
+            return Ok(());
+        }
+        let updated = registry.update_task_metadata_locked(self, &mut db, |metadata| {
+            metadata.completion_delivered = delivered;
+        })?;
+        state.metadata = updated;
+        Ok(())
+    }
+}
+
 impl BgTaskRegistry {
     pub(super) fn enqueue_completion_if_needed(
         &self,

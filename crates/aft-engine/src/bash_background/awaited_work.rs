@@ -37,6 +37,12 @@ impl State {
     }
 }
 
+impl PersistedTask {
+    pub(super) fn has_unsettled_awaited_work(&self) -> bool {
+        self.awaited_work.is_some() && !matches!(self.awaited_work, Some(State::Settled))
+    }
+}
+
 thread_local! {
     static CANDIDATE: Cell<bool> = const { Cell::new(false) };
 }
@@ -137,13 +143,12 @@ impl BgTaskRegistry {
             };
             match &state.metadata.awaited_work {
                 Some(mark) if mark.opening() => {
+                    let consumed = matches!(mark, State::OpeningConsumed);
                     state.metadata.awaited_work = if opened {
-                        Some(if matches!(mark, State::OpeningConsumed) {
-                            State::Cancel
-                        } else {
-                            State::Open
-                        })
+                        Some(if consumed { State::Cancel } else { State::Open })
                     } else {
+                        state.metadata.completion_delivered =
+                            !state.metadata.notify_on_completion || consumed;
                         None
                     };
                 }
@@ -246,23 +251,24 @@ impl BgTaskRegistry {
         true
     }
 
-    pub(crate) fn ack_awaited_terminal_reply(&self, key: &str, session: &str) {
+    pub(crate) fn ack_awaited_terminal_reply(&self, key: &str, session: &str) -> bool {
         let Some(task) = self.task_for_session(key, session) else {
-            return;
+            return false;
         };
         let mut db = DeferredDbWrites::new(self, &task);
         let Ok(mut state) = task.lock_state() else {
-            return;
+            return false;
         };
         if !state.metadata.status.is_terminal() {
-            return;
+            return false;
         }
         // Publication uses this same lock. Once either side commits the
         // awaited result, a later read still returns output but cannot switch it.
         let marker = match state.metadata.awaited_work {
             Some(State::Opening) => State::OpeningConsumed,
             Some(State::Open) => State::Cancel,
-            _ => return,
+            None => return false,
+            Some(_) => return true,
         };
         let decision = marker.decision();
         state.metadata.awaited_work = Some(marker);
@@ -274,6 +280,7 @@ impl BgTaskRegistry {
         if let Some(decision) = decision {
             self.send_awaited(&task, decision);
         }
+        true
     }
 
     pub(super) fn publish_awaited_progress(&self, pattern: &PatternMatch) -> bool {
@@ -285,7 +292,6 @@ impl BgTaskRegistry {
         };
         let active = state.metadata.awaited_work.is_some();
         let open = matches!(state.metadata.awaited_work, Some(State::Open));
-        drop(state);
         if open && pattern.match_text != WATCH_TASK_EXIT_TEXT {
             let context = if pattern.context.is_empty() {
                 &pattern.match_text

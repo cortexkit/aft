@@ -11248,7 +11248,9 @@ impl BgTaskRegistry {
     /// Consume a terminal result returned directly to its originating session,
     /// without treating a running-status poll or a foreign observation as ack.
     pub fn ack_terminal_result_for_session(&self, task_id: &str, session_id: &str) {
-        self.ack_awaited_terminal_reply(task_id, session_id);
+        if self.ack_awaited_terminal_reply(task_id, session_id) {
+            return;
+        }
         let Some(task) = self.task_for_session(task_id, session_id) else {
             return;
         };
@@ -17090,23 +17092,6 @@ impl BgTask {
                 *terminal_at = Some(Instant::now());
             }
         }
-    }
-
-    fn set_completion_delivered(
-        &self,
-        delivered: bool,
-        registry: &BgTaskRegistry,
-    ) -> std::io::Result<()> {
-        registry.retry_terminal_persist(self)?;
-        let mut db = DeferredDbWrites::new(registry, self);
-        let mut state = self
-            .lock_state()
-            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
-        let updated = registry.update_task_metadata_locked(self, &mut db, |metadata| {
-            metadata.completion_delivered = delivered;
-        })?;
-        state.metadata = updated;
-        Ok(())
     }
 }
 

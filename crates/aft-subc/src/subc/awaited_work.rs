@@ -156,9 +156,17 @@ impl Service {
     pub(crate) fn submit(self: &Arc<Self>, registry: BgTaskRegistry, key: String, event: Event) {
         let terminal = !matches!(event, Event::Progress(_));
         let token = CancellationToken::new();
+        let mut pending_progress = None;
         if terminal {
             if !self.terminal.lock().insert(key.clone()) {
                 return;
+            }
+            if matches!(event, Event::Cancel) {
+                if let Some(progress) = self.progress.lock().remove(&key) {
+                    progress.cancel();
+                }
+            } else {
+                pending_progress = self.progress.lock().get(&key).cloned();
             }
         } else if let Some(older) = self.progress.lock().insert(key.clone(), token.clone()) {
             older.cancel();
@@ -183,6 +191,11 @@ impl Service {
         };
         let service = Arc::clone(self);
         self.runtime.spawn(async move {
+            // A final output scan can report a match just before exit. Give
+            // that progress call a chance to complete before sending finish.
+            if let Some(progress) = pending_progress {
+                let _ = tokio::time::timeout(CALL_TIMEOUT, progress.cancelled()).await;
+            }
             let mut delay = Duration::from_millis(100);
             let mut persisted = !terminal;
             loop {
@@ -235,6 +248,7 @@ impl Service {
                 if !token.is_cancelled() {
                     progress.remove(&key);
                 }
+                token.cancel();
             }
         });
     }

@@ -802,7 +802,9 @@ impl PersistedTask {
         self.duration_ms = Some(finished_at.saturating_sub(self.started_at));
         self.child_pid = None;
         self.status_reason = reason;
-        self.completion_delivered = !self.notify_on_completion;
+        // Reconciliation uses the undelivered-task index. Keep awaited results
+        // in that index until the orchestrator acknowledges the decision.
+        self.completion_delivered = !self.notify_on_completion && self.awaited_work.is_none();
     }
 
     pub fn to_bash_task_row(

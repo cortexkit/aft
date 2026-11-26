@@ -3,9 +3,10 @@ use super::*;
 impl BgTaskRegistry {
     pub(crate) fn seed_awaited_task_for_test(&self, storage: &Path, root: &Path) -> String {
         let key = "bash-0000000000000100";
-        let paths =
-            super::super::super::persistence::task_paths(storage, "shell-session", key).unwrap();
-        std::fs::create_dir_all(&paths.dir).unwrap();
+        let layout =
+            super::super::super::persistence::create_task_layout(storage, "shell-session", key)
+                .unwrap();
+        let paths = layout.paths().clone();
         let mut metadata = PersistedTask::starting(
             key.into(),
             "shell-session".into(),
