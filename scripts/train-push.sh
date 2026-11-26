@@ -1637,6 +1637,7 @@ if ! cortexkit_tracked="$(git -C "$REPO" ls-files -- .cortexkit)"; then
 fi
 cortexkit_forbidden=""
 while IFS= read -r path; do
+  [ -n "$path" ] || continue
   if [[ "$path" =~ ^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$|[a-z0-9-]+\.jsonc$) ]]; then
     continue
   fi
