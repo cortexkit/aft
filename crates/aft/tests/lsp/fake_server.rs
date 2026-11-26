@@ -631,6 +631,10 @@ pub(crate) fn main() -> io::Result<()> {
     let open_burst_count = std::env::var("AFT_FAKE_LSP_OPEN_BURST_COUNT")
         .ok()
         .map(|value| value.parse::<usize>().unwrap());
+    let reopen_burst_uri = std::env::var("AFT_FAKE_LSP_REOPEN_BURST_URI").ok();
+    let mut reopen_burst_ready = std::env::var_os("AFT_FAKE_LSP_REOPEN_BURST_READY");
+    let mut held_close = None;
+    let mut held_reopen = None;
     let mut held_hover = None;
     let mut client_dynamic_pull = false;
     let mut client_disables_pull = false;
@@ -1059,6 +1063,12 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/hover" => {
+                    if let Some(uri) = held_reopen.take() {
+                        write_publish_diagnostics(&mut writer, held_close.take().unwrap(), json!([]))?;
+                        write_publish_diagnostics(&mut writer, uri, json!([]))?;
+                        write_response(&mut writer, id, Value::Null)?;
+                        continue;
+                    }
                     if let Some((_, publishes)) = open_burst.take() {
                         for (uri, version) in publishes {
                             write_publish_diagnostics_versioned(
@@ -1618,6 +1628,11 @@ pub(crate) fn main() -> io::Result<()> {
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if held_close.as_ref() == Some(&uri) {
+                        held_reopen = Some(uri);
+                        std::fs::write(reopen_burst_ready.take().unwrap(), b"ready")?;
+                        continue;
+                    }
                     if let Some((ready, publishes)) = &mut open_burst {
                         publishes.push((uri, version));
                         if Some(publishes.len()) == open_burst_count {
@@ -1892,6 +1907,10 @@ pub(crate) fn main() -> io::Result<()> {
                         uri.clone(),
                         Value::Null,
                     )?;
+                    if reopen_burst_ready.is_some() && reopen_burst_uri.as_deref() == uri.as_str() {
+                        held_close = Some(uri);
+                        continue;
+                    }
                     // AFT_FAKE_LSP_CLOSE_DELAY_MS=<ms>: answer the close late.
                     if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_CLOSE_DELAY_MS")
                         .ok()

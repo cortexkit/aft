@@ -1071,6 +1071,105 @@ fn lifecycle_fake_client_with_env<'a>(
     client
 }
 
+fn scoped_publish_fixture() -> (tempfile::TempDir, LspManager, ServerKey, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(tmp.path()).unwrap();
+    let file = root.join("main.kt");
+    std::fs::write(&file, "fun main() {}\n").unwrap();
+    let key = ServerKey {
+        kind: ServerKind::KotlinLs,
+        root,
+    };
+    let mut manager = LspManager::new();
+    let client = lifecycle_fake_client(&manager, &key);
+    manager.clients.insert(key.clone(), client);
+    (tmp, manager, key, file)
+}
+
+fn queue_scoped_publish(
+    manager: &LspManager,
+    key: &ServerKey,
+    file: &Path,
+    version: Option<i32>,
+    diagnostics: serde_json::Value,
+) {
+    manager
+        .event_tx
+        .send(ReceivedLspEvent {
+            instance: Some(manager.clients[key].instance),
+            receive_order: None,
+            event: LspEvent::Notification {
+                server_kind: key.kind.clone(),
+                root: key.root.clone(),
+                method: "textDocument/publishDiagnostics".into(),
+                params: Some(serde_json::json!({
+                    "uri": uri_for_path(file).unwrap(),
+                    "version": version,
+                    "diagnostics": diagnostics,
+                })),
+            },
+        })
+        .unwrap();
+}
+
+#[test]
+fn scoped_publish_teaches_version_support_even_before_an_unversioned_publish() {
+    let (_tmp, mut manager, key, file) = scoped_publish_fixture();
+    let mut lease = manager.scoped_report_lease();
+    manager.reserve_scoped_reports_for_file(&mut lease, &file, std::slice::from_ref(&key), 1);
+    queue_scoped_publish(&manager, &key, &file, Some(1), serde_json::json!([]));
+    queue_scoped_publish(&manager, &key, &file, None, serde_json::json!([]));
+    manager.drain_events();
+
+    manager.note_inspect_closed_document(&key, &file);
+    manager.reopen_inspect_closed_document(&key, &file);
+    assert!(
+        manager.is_late_close_reply(&key, &file, false, true),
+        "a later unversioned publish must not hide the evidence that the server versions reports"
+    );
+}
+
+#[test]
+fn scoped_publish_teaches_close_reply_support_before_new_diagnostics() {
+    let (_tmp, mut manager, key, file) = scoped_publish_fixture();
+    let mut lease = manager.scoped_report_lease();
+    manager.reserve_scoped_reports_for_file(&mut lease, &file, std::slice::from_ref(&key), 1);
+    manager.note_inspect_closed_document(&key, &file);
+    queue_scoped_publish(&manager, &key, &file, None, serde_json::json!([]));
+    queue_scoped_publish(&manager, &key, &file, None, new_closed_diagnostics());
+    manager.drain_events();
+
+    assert!(
+        manager.close_answering_servers.contains(&key),
+        "later diagnostics must not hide an earlier close reply"
+    );
+    assert!(!manager.inspect_closed_documents.contains_key(&(key, file)));
+}
+
+fn new_closed_diagnostics() -> serde_json::Value {
+    serde_json::json!([{
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+        "message": "new diagnostics after close",
+    }])
+}
+
+#[test]
+fn scoped_publish_ends_the_closed_exception_before_a_later_empty_report() {
+    let (_tmp, mut manager, key, file) = scoped_publish_fixture();
+    let mut lease = manager.scoped_report_lease();
+    manager.reserve_scoped_reports_for_file(&mut lease, &file, std::slice::from_ref(&key), 1);
+    manager.note_inspect_closed_document(&key, &file);
+    queue_scoped_publish(&manager, &key, &file, None, new_closed_diagnostics());
+    queue_scoped_publish(&manager, &key, &file, None, serde_json::json!([]));
+    manager.drain_events();
+
+    assert!(
+        !manager.close_answering_servers.contains(&key),
+        "the later empty publish is a live report, not an answer to the earlier close"
+    );
+    assert!(!manager.inspect_closed_documents.contains_key(&(key, file)));
+}
+
 #[test]
 fn review_gpt5_event_overflow_preserves_response_and_exit() {
     let tmp = tempfile::tempdir().unwrap();

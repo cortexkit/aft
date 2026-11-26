@@ -2,6 +2,69 @@ use super::*;
 use lsp_types::request::HoverRequest;
 use lsp_types::{HoverParams, Position, TextDocumentIdentifier, TextDocumentPositionParams};
 
+#[test]
+fn scoped_inspect_reopen_keeps_the_clean_publish_queued_behind_the_close_reply() {
+    let (_temp, root) = fixture_project();
+    write_file(
+        &root,
+        "settings.gradle",
+        "rootProject.name = 'close-reply'\n",
+    );
+    write_file(&root, "warm.kt", "fun warm() {}\n");
+    let file = write_file(&root, "target.kt", "fun target() {}\n");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 5_000);
+    let ready = root.join("reopen-burst-ready");
+    let uri = file_uri(&file);
+    {
+        let mut lsp = ctx.lsp();
+        lsp.override_binary(ServerKind::KotlinLs, fake_server_path());
+        lsp.set_extra_env("AFT_FAKE_LSP_UNVERSIONED_PUSH", "1");
+        lsp.set_extra_env("AFT_FAKE_LSP_REOPEN_BURST_URI", &uri);
+        lsp.set_extra_env("AFT_FAKE_LSP_REOPEN_BURST_READY", ready.to_str().unwrap());
+    }
+
+    // Let the manager observe a close reply from this server before holding
+    // the target file's reply back until the next inspect reopens it.
+    let warm = scoped_diagnostics_inspect(&ctx, "close-reply-warm", "warm.kt");
+    assert_eq!(warm["complete"], true, "{warm:#}");
+    wait_for_close_reply(&ctx);
+    let first = scoped_diagnostics_inspect(&ctx, "close-reply-first", "target.kt");
+    assert_eq!(first["summary"]["diagnostics"]["errors"], 1, "{first:#}");
+    assert!(!ctx.lsp().document_is_open_for_test(&file));
+
+    let reopened = thread::scope(|thread| {
+        let inspect =
+            thread.spawn(|| scoped_diagnostics_inspect(&ctx, "close-reply-reopen", "target.kt"));
+        wait_for_path_event(&ready, "fake analyzer to receive the reopened document");
+        let config = ctx.config().clone();
+        {
+            // The reader ingests both publishes before waking this request.
+            // The manager lock prevents a drain between the two publishes.
+            let mut lsp = ctx.lsp();
+            lsp.client_for_file_mut(&file, &config)
+                .unwrap()
+                .send_request::<HoverRequest>(HoverParams {
+                    text_document_position_params: TextDocumentPositionParams::new(
+                        TextDocumentIdentifier::new(uri.parse().unwrap()),
+                        Position::new(0, 0),
+                    ),
+                    work_done_progress_params: Default::default(),
+                })
+                .expect("flush the close reply and clean report before draining");
+        }
+        inspect.join().unwrap()
+    });
+
+    assert_eq!(
+        reopened["summary"]["diagnostics"]["coverage"]["authoritative"], 1,
+        "the reopened file's clean publish must not be discarded as its close reply: {reopened:#}"
+    );
+    assert_eq!(
+        reopened["summary"]["diagnostics"]["errors"], 0,
+        "{reopened:#}"
+    );
+}
+
 /// The scope reports its exact cap even when the analyzer batches all of its
 /// didOpen diagnostics and the manager cannot drain them during the burst.
 #[test]
