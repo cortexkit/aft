@@ -1838,7 +1838,7 @@ fn gh_shim_bound_governed_write_refuses_ambient_credential_identity_ambiguity() 
 }
 
 #[test]
-fn gh_shim_without_manifest_refuses_write_when_daemon_is_unreachable() {
+fn gh_shim_without_manifest_history_passes_write_when_daemon_is_unreachable() {
     let temp = tempfile::tempdir().expect("create test root");
     let config_home = temp.path().join("config");
     let state_home = temp.path().join("state");
@@ -1861,12 +1861,13 @@ fn gh_shim_without_manifest_refuses_write_when_daemon_is_unreachable() {
     )
     .output()
     .expect("spawn dormant gh shim invocation");
-    assert_eq!(output.status.code(), Some(86));
-    assert!(output.stdout.is_empty());
-    assert!(output
-        .stderr
-        .starts_with(b"gh-shim: gh_shim_manifest_unavailable: "));
-    assert!(!recorder.exists());
+    assert_eq!(output.status.code(), Some(73), "{output:?}");
+    assert_eq!(output.stdout, b"r2-passthrough\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        fs::read(recorder).unwrap(),
+        b"issue comment 42 --body hello\n"
+    );
 }
 
 #[test]
