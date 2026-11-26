@@ -370,6 +370,10 @@ fn rust_worker_inspect_capacity_waits_for_released_slot() {
 #[test]
 fn rust_worker_user_capacity_of_three_admits_three_analyzers() {
     use aft::config_resolve::{resolve_config, ConfigTier};
+    use aft::lsp::manager::{
+        ensure_server_for_file_detailed_unlocked, start_applicable_server_unlocked,
+        walk_applicable_area,
+    };
 
     let _guard = rust_worker_policy_test_guard();
     let resolved = resolve_config(&[ConfigTier {
@@ -381,7 +385,7 @@ fn rust_worker_user_capacity_of_three_admits_three_analyzers() {
     let config = resolved.config;
     let fixtures = (0..4).map(|_| rust_fixture_files()).collect::<Vec<_>>();
     let mut workers = Vec::new();
-    for (temp, file, _) in &fixtures[..3] {
+    for (temp, file, _) in &fixtures[..2] {
         let mut manager = rust_worker_logged_manager(&temp.path().join("initialization.jsonl"));
         manager.disable_rust_cargo_for_worker();
         assert_eq!(
@@ -392,12 +396,28 @@ fn rust_worker_user_capacity_of_three_admits_three_analyzers() {
         );
         workers.push(manager);
     }
+    let (temp, file, _) = &fixtures[2];
+    let mut third = rust_worker_logged_manager(&temp.path().join("initialization.jsonl"));
+    third.disable_rust_cargo_for_worker();
+    let walk = walk_applicable_area(temp.path(), Some(std::slice::from_ref(file)), &config, None)
+        .expect("walk source");
+    let snapshot = third.classify_applicable_servers(walk, &config);
+    let key = &snapshot.server_keys[0];
+    let third = Arc::new(parking_lot::Mutex::new(third));
+    let outcome = start_applicable_server_unlocked(
+        &third,
+        &snapshot,
+        key,
+        &config,
+        Instant::now() + Duration::from_secs(5),
+    );
+    assert_eq!(outcome.successful.as_slice(), std::slice::from_ref(key));
+
     let (temp, file, _) = &fixtures[3];
     let mut manager = rust_worker_logged_manager(&temp.path().join("initialization.jsonl"));
     manager.disable_rust_cargo_for_worker();
-    let result = crate::test_helpers::settled_lsp(&mut manager, |manager| {
-        manager.ensure_server_for_file_detailed(file, &config)
-    });
+    let manager = parking_lot::Mutex::new(manager);
+    let result = ensure_server_for_file_detailed_unlocked(|| manager.lock(), file, &config);
     assert!(result.successful.is_empty());
     let reason = result.attempts[0].result.failure_reason();
     assert!(reason.contains("cap=3 reached (current=3)"), "{reason}");
