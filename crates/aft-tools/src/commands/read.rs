@@ -389,6 +389,11 @@ static ACTIVE_IMAGE_DECODERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 const MAX_IMAGE_DECODERS: usize = 2;
 
+#[cfg(test)]
+thread_local! {
+    static HOLD_IMAGE_DECODER: std::cell::Cell<Option<(crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>)>> = const { std::cell::Cell::new(None) };
+}
+
 struct ImageDecoderPermit;
 
 impl Drop for ImageDecoderPermit {
@@ -426,6 +431,8 @@ fn process_image_with_budget_timeout(
     ).map_err(|active| format!("image decoder capacity reached ({active}/{MAX_IMAGE_DECODERS} active); retry after existing image reads finish"))?;
     let permit = ImageDecoderPermit;
     let (tx, rx) = crossbeam_channel::bounded(1);
+    #[cfg(test)]
+    let hold = HOLD_IMAGE_DECODER.take();
     // The worker owns admission until decoding actually ends, including after a
     // caller timeout. Reject overload rather than queueing retained image bytes.
     let spawned = std::thread::Builder::new()
@@ -433,6 +440,11 @@ fn process_image_with_budget_timeout(
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let _permit = permit;
+            #[cfg(test)]
+            if let Some((entered, release)) = hold {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
             let result = match budget {
                 Some(budget) => process_image_fitting(raw_bytes, kind, budget, deadline),
                 None => process_image(raw_bytes, kind),
@@ -3335,6 +3347,56 @@ mod tests {
             "{}",
             unchanged.text
         );
+    }
+
+    #[test]
+    fn image_decoder_four_parallel_reads_all_attach() {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let png = encode_png(&rgba_image(192, 160, true)).unwrap();
+        let paths =
+            std::array::from_fn::<_, 4, _>(|i| write_fixture(root, &format!("{i}.png"), &png));
+
+        std::thread::scope(|scope| {
+            let (entered, decoding) = crossbeam_channel::unbounded();
+            let (release, hold) = crossbeam_channel::bounded::<()>(0);
+            let (done, responses) = crossbeam_channel::unbounded();
+            for path in &paths[..2] {
+                let (entered, hold, done) = (entered.clone(), hold.clone(), done.clone());
+                scope.spawn(move || {
+                    HOLD_IMAGE_DECODER.set(Some((entered, hold)));
+                    let _body = crate::context::call_context::enter(true);
+                    done.send(read_response(root, path, json!({}))).unwrap();
+                });
+            }
+            for _ in 0..2 {
+                decoding.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            for path in &paths[2..] {
+                let done = done.clone();
+                scope.spawn(move || {
+                    let _body = crate::context::call_context::enter(true);
+                    done.send(read_response(root, path, json!({}))).unwrap();
+                });
+            }
+            // Keep both decoders occupied while the other reads try to acquire a slot.
+            if let Ok(response) = responses.recv_timeout(Duration::from_millis(250)) {
+                panic!(
+                    "a saturated image read returned before a decoder was released: {}",
+                    response.data
+                );
+            }
+            drop(release);
+            for _ in &paths {
+                let response = responses.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(response.success, "{}", response.data);
+                assert_eq!(
+                    decoded_attachment_bytes(first_attachment(&response.data)),
+                    png
+                );
+            }
+        });
     }
 
     fn noisy_fit_fixture(transparent: bool) -> Vec<u8> {
