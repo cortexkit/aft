@@ -1,9 +1,17 @@
 use super::{types::*, *};
 use serde::Serialize;
 use serde_json::json;
-use std::{path::Path, sync::Arc, time::Instant};
-use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer, SubscribeOptions, Subscription};
+use std::{
+    path::Path,
+    sync::{Arc, OnceLock, RwLock},
+    time::{Duration, Instant},
+};
+use subc_client_rs::{
+    CallError, CallOptions, ConsumerOptions, RouteCloseDisposition, RouteEndReason, RouteHandle,
+    SubcConsumer, SubscribeOptions, Subscription,
+};
 use subc_protocol::{BindIdentity, RouteTarget};
+use tokio::{sync::Mutex, time::Instant as Deadline};
 
 /// Capability ck-motor advertises when it accepts Windows jobs. Capability
 /// names must have the `<name>/v<N>` shape the subc daemon validates.
@@ -22,6 +30,7 @@ pub(crate) struct LaunchTimings {
     entered: Instant,
     phase: &'static str,
     phases: Vec<(&'static str, std::time::Duration)>,
+    admission_deadline: Option<Deadline>,
 }
 
 impl LaunchTimings {
@@ -31,7 +40,13 @@ impl LaunchTimings {
             entered: started,
             phase,
             phases: Vec::new(),
+            admission_deadline: None,
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn limit_admission(&mut self, remaining: Duration) {
+        self.admission_deadline = Deadline::now().checked_add(remaining);
     }
 
     pub(crate) fn enter(&mut self, phase: &'static str) {
@@ -73,26 +88,82 @@ pub(crate) struct RunDiagnostics<'a> {
 }
 
 /// An authenticated daemon route to the catalog's sole capability provider.
-/// No module ID fallback, SSH transport, or snapshotting. Only a typed cap
-/// refusal before job creation permits one automatic return-cap resubmit.
+/// No module ID fallback, SSH transport, or snapshotting.
 #[derive(Clone)]
 pub struct ExecRemoteClient {
     consumer: Arc<SubcConsumer>,
-    route: subc_client_rs::RouteHandle,
+    identity: BindIdentity,
+    route: Arc<SharedRoute>,
+}
+
+struct SharedRoute {
+    current: RwLock<Arc<OpenedRoute>>,
+    reopening: Mutex<()>,
+}
+
+struct OpenedRoute {
+    handle: RouteHandle,
     module_id: String,
-    /// The capabilities the daemon catalog lists for `module_id`, read by the
-    /// first capability check and reused by every later check on this route
-    /// (one submission makes several). Recovery after a failed call opens a
-    /// new route ([`Self::reopen_route`]) or connection, whose first check
-    /// reads the catalog again.
-    provided: Arc<std::sync::OnceLock<Arc<[String]>>>,
+    /// Capability checks on the same route share one successful catalog read.
+    /// A replacement route checks again before sending a job.
+    provided: OnceLock<Arc<[String]>>,
+}
+
+enum StreamRequest<'a> {
+    Run(&'a RunRequest),
+    ReturnRetry(&'a RunRequest),
+    Attach(ResumePoint),
+}
+
+impl StreamRequest<'_> {
+    fn queue_limit(&self) -> Option<Duration> {
+        match self {
+            Self::Run(run) | Self::ReturnRetry(run) => {
+                run.queue_wait_limit_s.map(Duration::from_secs)
+            }
+            Self::Attach(_) => None,
+        }
+    }
+}
+
+impl OpenedRoute {
+    async fn open(
+        consumer: &SubcConsumer,
+        identity: BindIdentity,
+        deadline: Option<Deadline>,
+    ) -> Result<Self, CallError> {
+        let module_id = consumer.resolve_provider(CAPABILITY).await?;
+        let mut options = CallOptions::default();
+        if let Some(deadline) = deadline {
+            options.timeout = deadline.saturating_duration_since(Deadline::now());
+        }
+        let handle = consumer
+            .open_route(
+                RouteTarget::ManagementSurface {
+                    module_id: module_id.clone(),
+                },
+                identity,
+                options,
+            )
+            .await?;
+        Ok(Self {
+            handle,
+            module_id,
+            provided: OnceLock::new(),
+        })
+    }
 }
 
 impl ExecRemoteClient {
+    #[cfg(any(unix, test))]
     pub(crate) async fn return_max_bytes(&self) -> Result<u64, Error> {
+        self.return_max_bytes_on(&self.opened_route()).await
+    }
+
+    async fn return_max_bytes_on(&self, route: &OpenedRoute) -> Result<u64, Error> {
         Ok(
             if self
-                .advertises(RETURN_LARGE_CAPABILITY)
+                .advertises(route, RETURN_LARGE_CAPABILITY)
                 .await
                 .map_err(Error::Transport)?
             {
@@ -119,28 +190,54 @@ impl ExecRemoteClient {
         consumer: Arc<SubcConsumer>,
         identity: BindIdentity,
     ) -> Result<Self, Error> {
-        let module_id = consumer
-            .resolve_provider(CAPABILITY)
-            .await
-            .map_err(Error::Transport)?;
-        let route = consumer
-            .open_route(
-                RouteTarget::ManagementSurface {
-                    module_id: module_id.clone(),
-                },
-                identity,
-                CallOptions {
-                    ..CallOptions::default()
-                },
-            )
+        let route = OpenedRoute::open(&consumer, identity.clone(), None)
             .await
             .map_err(Error::Transport)?;
         Ok(Self {
             consumer,
-            route,
-            module_id,
-            provided: Arc::default(),
+            identity,
+            route: Arc::new(SharedRoute {
+                current: RwLock::new(Arc::new(route)),
+                reopening: Mutex::new(()),
+            }),
         })
+    }
+
+    fn opened_route(&self) -> Arc<OpenedRoute> {
+        Arc::clone(&self.route.current.read().unwrap())
+    }
+
+    async fn refresh_route(
+        &self,
+        failed: &Arc<OpenedRoute>,
+        deadline: Option<Deadline>,
+    ) -> Result<Arc<OpenedRoute>, CallError> {
+        let _reopening = self.route.reopening.lock().await;
+        let current = self.opened_route();
+        if !Arc::ptr_eq(&current, failed) {
+            return Ok(current);
+        }
+        let mut delay = Duration::from_millis(25);
+        let opened = loop {
+            match OpenedRoute::open(&self.consumer, self.identity.clone(), deadline).await {
+                Ok(opened) => break Arc::new(opened),
+                // The catalog may briefly have no provider while ck-motor
+                // registers again. Once listed, the SDK's route.open handles
+                // the daemon's module_reloading/warming/target_unavailable refusals.
+                Err(error @ CallError::CapabilityUnprovided { .. }) => {
+                    if deadline
+                        .is_none_or(|end| end.saturating_duration_since(Deadline::now()) <= delay)
+                    {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = next_route_delay(delay);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        *self.route.current.write().unwrap() = Arc::clone(&opened);
+        Ok(opened)
     }
 
     pub async fn run(&self, request: &RunRequest) -> Result<RemoteStream, Error> {
@@ -165,13 +262,35 @@ impl ExecRemoteClient {
     async fn submit_run(
         &self,
         request: &RunRequest,
-        mut diagnostics: Option<RunDiagnostics<'_>>,
+        diagnostics: Option<RunDiagnostics<'_>>,
     ) -> Result<RemoteStream, Error> {
+        #[cfg(unix)]
+        let capture = diagnostics.as_ref().and_then(|d| d.capture.clone());
+        self.stream(
+            StreamRequest::Run(request),
+            diagnostics,
+            #[cfg(unix)]
+            capture,
+        )
+        .await
+    }
+
+    async fn prepare_run(
+        &self,
+        route: &OpenedRoute,
+        request: &RunRequest,
+        diagnostics: &mut Option<RunDiagnostics<'_>>,
+        negotiated_return_cap: bool,
+    ) -> Result<RunRequest, Error> {
         if request.submission_key().is_some() || request.resume_from_seq().is_some() {
             if let Some(diagnostics) = diagnostics.as_mut() {
                 diagnostics.timings.enter("run_supports_submission_key");
             }
-            if !self.supports_submission_key().await? {
+            if !self
+                .advertises(route, SUBMISSION_KEY_CAPABILITY)
+                .await
+                .map_err(Error::Transport)?
+            {
                 return Err(Error::Protocol(
                     "executor does not advertise submission keys".into(),
                 ));
@@ -181,9 +300,13 @@ impl ExecRemoteClient {
             if let Some(diagnostics) = diagnostics.as_mut() {
                 diagnostics.timings.enter("advertises_memory");
             }
-            if !self.advertises(MEMORY_CAPABILITY).await.map_err(|error| {
-                Error::Protocol(format!("{MEMORY_UNSUPPORTED_REFUSAL} ({error})"))
-            })? {
+            if !self
+                .advertises(route, MEMORY_CAPABILITY)
+                .await
+                .map_err(|error| {
+                    Error::Protocol(format!("{MEMORY_UNSUPPORTED_REFUSAL} ({error})"))
+                })?
+            {
                 return Err(Error::Protocol(MEMORY_UNSUPPORTED_REFUSAL.into()));
             }
         }
@@ -191,11 +314,15 @@ impl ExecRemoteClient {
             if let Some(diagnostics) = diagnostics.as_mut() {
                 diagnostics.timings.enter("advertises_windows");
             }
-            if !self.advertises(WINDOWS_CAPABILITY).await.map_err(|error| {
-                Error::Protocol(format!(
-                    "runon \"windows\" capability discovery failed before launch: {error}"
-                ))
-            })? {
+            if !self
+                .advertises(route, WINDOWS_CAPABILITY)
+                .await
+                .map_err(|error| {
+                    Error::Protocol(format!(
+                        "runon \"windows\" capability discovery failed before launch: {error}"
+                    ))
+                })?
+            {
                 return Err(Error::Protocol(format!("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing {WINDOWS_CAPABILITY})")));
             }
         }
@@ -206,7 +333,7 @@ impl ExecRemoteClient {
                 diagnostics.timings.enter("advertises_return_chunked");
             }
             if !self
-                .advertises(RETURN_CHUNKED_CAPABILITY)
+                .advertises(route, RETURN_CHUNKED_CAPABILITY)
                 .await
                 .map_err(|error| {
                     Error::Protocol(format!(
@@ -222,45 +349,39 @@ impl ExecRemoteClient {
         }
         // Progress is optional display data. Older executors receive no opt-in,
         // even if a saved request was created against a newer executor.
-        let mut request = request
-            .clone()
-            .with_progress(self.advertises(PROGRESS_CAPABILITY).await.unwrap_or(false));
-        if !request.return_paths.is_empty() {
-            let maximum = self.return_max_bytes().await?;
+        let mut request = request.clone().with_progress(
+            self.advertises(route, PROGRESS_CAPABILITY)
+                .await
+                .unwrap_or(false),
+        );
+        if !request.return_paths.is_empty() && !negotiated_return_cap {
+            let maximum = self.return_max_bytes_on(route).await?;
             request.return_max_bytes =
                 Some(request.return_max_bytes.unwrap_or(maximum).min(maximum));
         }
-        let mut stream = self
-            .stream(
-                "exec.run",
-                &request,
-                StreamConsumer::keyed_run(request.resume_from_seq()),
-                diagnostics,
-            )
-            .await?;
-        if !request.return_paths.is_empty() {
-            stream.return_request = Some(request.clone());
-            stream.return_retry = Some((self.clone(), request));
-        }
-        Ok(stream)
+        Ok(request)
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) async fn supports_submission_key(&self) -> Result<bool, Error> {
-        self.advertises(SUBMISSION_KEY_CAPABILITY)
+        self.advertises(&self.opened_route(), SUBMISSION_KEY_CAPABILITY)
             .await
             .map_err(Error::Transport)
     }
 
     #[cfg(unix)]
-    pub(crate) async fn reopen_route(&self, identity: BindIdentity) -> Result<Self, Error> {
-        Self::from_consumer(Arc::clone(&self.consumer), identity).await
+    pub(crate) async fn reopen_route(&self) -> Result<(), Error> {
+        self.refresh_route(&self.opened_route(), None)
+            .await
+            .map(|_| ())
+            .map_err(Error::Transport)
     }
 
     /// Whether the module serving this route advertises `capability` in the
     /// daemon catalog.
-    async fn advertises(&self, capability: &str) -> Result<bool, subc_client_rs::CallError> {
+    async fn advertises(&self, route: &OpenedRoute, capability: &str) -> Result<bool, CallError> {
         Ok(self
-            .provided()
+            .provided(route)
             .await?
             .iter()
             .any(|provided| provided == capability))
@@ -268,8 +389,8 @@ impl ExecRemoteClient {
 
     /// The capabilities the catalog lists for this route's module, read once
     /// per route (see the `provided` field).
-    async fn provided(&self) -> Result<Arc<[String]>, subc_client_rs::CallError> {
-        if let Some(provided) = self.provided.get() {
+    async fn provided(&self, route: &OpenedRoute) -> Result<Arc<[String]>, CallError> {
+        if let Some(provided) = route.provided.get() {
             return Ok(Arc::clone(provided));
         }
         let catalog = self.consumer.catalog_list().await?;
@@ -277,7 +398,7 @@ impl ExecRemoteClient {
         let provided: Arc<[String]> = catalog
             .modules
             .iter()
-            .filter(|module| module.module_id == self.module_id)
+            .filter(|module| module.module_id == route.module_id)
             .inspect(|_| listed = true)
             .filter_map(|module| module.capabilities.as_ref())
             .flat_map(|capabilities| capabilities.provides.iter().cloned())
@@ -287,60 +408,149 @@ impl ExecRemoteClient {
             // again): it advertises nothing now, and the next check looks again.
             return Ok(provided);
         }
-        Ok(Arc::clone(self.provided.get_or_init(|| provided)))
+        Ok(Arc::clone(route.provided.get_or_init(|| provided)))
     }
 
     /// Resume from the last durably delivered seq, not from the last received
     /// packet. `from_seq` on the wire is inclusive, so this sends last_seq + 1.
     pub async fn attach(&self, point: ResumePoint) -> Result<RemoteStream, Error> {
-        let request = point.attach_request()?;
-        self.stream("exec.attach", &request, StreamConsumer::resume(point), None)
-            .await
+        self.stream(
+            StreamRequest::Attach(point),
+            None,
+            #[cfg(unix)]
+            None,
+        )
+        .await
     }
 
-    async fn stream<T: Serialize>(
+    async fn stream(
         &self,
-        method: &str,
-        params: &T,
-        #[allow(unused_mut)] mut consumer: StreamConsumer,
+        request: StreamRequest<'_>,
         mut diagnostics: Option<RunDiagnostics<'_>>,
+        #[cfg(unix)] capture: Option<crate::bash_background::registry::runon_capture::Submission>,
     ) -> Result<RemoteStream, Error> {
-        #[cfg(unix)]
-        let capture = diagnostics.as_ref().and_then(|d| d.capture.clone());
-        #[cfg(unix)]
-        if let Some(capture) = &capture {
+        let mut route = self.opened_route();
+        let mut retry = None;
+        let mut delay = Duration::from_millis(25);
+        let (subscription, consumer, attached, return_request) = loop {
+            let prepare = async {
+                #[allow(unused_mut)]
+                let (body, mut consumer, attached, return_request) = match &request {
+                    StreamRequest::Run(run) | StreamRequest::ReturnRetry(run) => {
+                        let cap_retry = matches!(request, StreamRequest::ReturnRetry(_));
+                        let run = self
+                            .prepare_run(&route, run, &mut diagnostics, cap_retry)
+                            .await?;
+                        let body = envelope("exec.run", &run)?;
+                        let consumer = StreamConsumer::keyed_run(run.resume_from_seq());
+                        let record_return = !run.return_paths.is_empty() && !cap_retry;
+                        (body, consumer, false, record_return.then_some(run))
+                    }
+                    StreamRequest::Attach(point) => (
+                        envelope("exec.attach", &point.attach_request()?)?,
+                        StreamConsumer::resume(point.clone()),
+                        true,
+                        None,
+                    ),
+                };
+                #[cfg(unix)]
+                if let Some(capture) = &capture {
+                    if let Some(diagnostics) = diagnostics.as_mut() {
+                        diagnostics.timings.enter("foreground_capture_wait");
+                    }
+                    consumer.capture = Some(capture.before_send().await?);
+                }
+                Ok::<_, Error>((body, consumer, attached, return_request))
+            };
+            #[allow(unused_mut)]
+            let (body, mut consumer, attached, return_request) = match retry.as_ref() {
+                Some((deadline, _)) => match tokio::time::timeout_at(*deadline, prepare).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(Error::Transport(retry.unwrap().1)),
+                },
+                None => prepare.await?,
+            };
             if let Some(diagnostics) = diagnostics.as_mut() {
-                diagnostics.timings.enter("foreground_capture_wait");
+                diagnostics.timings.enter("send");
             }
-            consumer.capture = Some(capture.before_send().await?);
-        }
-        if let Some(diagnostics) = diagnostics.as_mut() {
-            diagnostics.timings.enter("send");
-        }
-        let subscription = self
-            .consumer
-            .subscribe_route(
-                &self.route,
-                envelope(method, params)?,
-                SubscribeOptions::default(),
-            )
-            .await
-            .map_err(Error::Transport)?;
+            let mut options = SubscribeOptions::default();
+            let now = Deadline::now();
+            let deadline = if let Some((deadline, _)) = &retry {
+                options.route_open_timeout = deadline.saturating_duration_since(now);
+                if options.route_open_timeout.is_zero() {
+                    #[cfg(unix)]
+                    if let Some(copy) = consumer.capture.take() {
+                        copy.discard();
+                    }
+                    return Err(Error::Transport(retry.unwrap().1));
+                }
+                *deadline
+            } else {
+                let budget = request
+                    .queue_limit()
+                    .map_or(options.route_open_timeout, |limit| {
+                        options.route_open_timeout.min(limit)
+                    });
+                let end = now + budget;
+                diagnostics
+                    .as_ref()
+                    .and_then(|d| d.timings.admission_deadline)
+                    .map_or(end, |limit| end.min(limit))
+            };
+            // Give the SDK the remaining send time rather than cancelling a
+            // subscription future that might already have queued the request.
+            match self
+                .consumer
+                .subscribe_route(&route.handle, body, options)
+                .await
+            {
+                Ok(subscription) => break (subscription, consumer, attached, return_request),
+                Err(error) if route_failed_before_send(&error) => {
+                    #[cfg(unix)]
+                    if let Some(copy) = consumer.capture.take() {
+                        copy.discard();
+                    }
+                    retry.get_or_insert((deadline, error));
+                }
+                Err(error) => {
+                    return Err(Error::Transport(match retry {
+                        Some((end, original))
+                            if Deadline::now() >= end && error.never_forwarded() == Some(true) =>
+                        {
+                            original
+                        }
+                        _ => error,
+                    }));
+                }
+            }
+            // Reopening and waiting for another caller's reopen are both
+            // pre-dispatch, so the existing refusal is still true on timeout.
+            let reopen = async {
+                tokio::time::sleep(delay).await;
+                self.refresh_route(&route, Some(deadline)).await
+            };
+            route = match tokio::time::timeout_at(deadline, reopen).await {
+                Ok(Ok(route)) => route,
+                _ => return Err(Error::Transport(retry.unwrap().1)),
+            };
+            delay = next_route_delay(delay);
+        };
         let sent_at = Instant::now();
         if let Some(diagnostics) = diagnostics {
             diagnostics
                 .timings
                 .sent(diagnostics.task_id, diagnostics.session, sent_at);
         }
+        let return_retry = return_request.clone().map(|run| (self.clone(), run));
         Ok(RemoteStream {
             subscription,
             consumer,
             finished: false,
             received_frame: false,
-            attached: method == "exec.attach",
-            sent_at: (method == "exec.run").then_some(sent_at),
-            return_request: None,
-            return_retry: None,
+            attached,
+            sent_at: (!attached).then_some(sent_at),
+            return_request,
+            return_retry,
             pending_return_retry: None,
             #[cfg(unix)]
             capture,
@@ -396,7 +606,7 @@ impl ExecRemoteClient {
         let bytes = self
             .consumer
             .request(
-                &self.route,
+                &self.opened_route().handle,
                 envelope(method, params)?,
                 CallOptions::default(),
             )
@@ -404,6 +614,27 @@ impl ExecRemoteClient {
             .map_err(Error::Transport)?;
         decode_reply(method, &bytes)
     }
+}
+
+fn next_route_delay(delay: Duration) -> Duration {
+    (delay * 2).min(Duration::from_secs(1))
+}
+
+fn route_failed_before_send(error: &CallError) -> bool {
+    // For subscribe_route, the SDK rejects stale or retired handles before
+    // emitting a frame. A typed close can be retried only if the SDK says the
+    // request was never forwarded. A module error or a closed subscription
+    // alone cannot prove ck-motor did not accept the job.
+    matches!(error, CallError::StaleRouteHandle(_))
+        || (error.never_forwarded() == Some(true)
+            && error.terminal() != Some(true)
+            && match error.close_reason() {
+                Some(RouteEndReason::Daemon(reason)) => {
+                    reason.disposition() == RouteCloseDisposition::MayReopen
+                }
+                Some(RouteEndReason::ClosedByCaller | RouteEndReason::ConnectionLost) => true,
+                _ => false,
+            })
 }
 
 fn envelope<T: Serialize>(method: &str, params: &T) -> Result<Vec<u8>, Error> {
@@ -515,14 +746,14 @@ impl RemoteStream {
                                     copy.discard();
                                 }
                                 self.pending_return_retry = Some(Box::pin(async move {
-                                    #[allow(unused_mut)]
-                                    let mut consumer =
-                                        StreamConsumer::keyed_run(request.resume_from_seq());
-                                    #[cfg(unix)]
-                                    if let Some(capture) = capture {
-                                        consumer.capture = Some(capture.before_send().await?);
-                                    }
-                                    client.stream("exec.run", &request, consumer, None).await
+                                    client
+                                        .stream(
+                                            StreamRequest::ReturnRetry(&request),
+                                            None,
+                                            #[cfg(unix)]
+                                            capture,
+                                        )
+                                        .await
                                 }));
                                 continue;
                             }

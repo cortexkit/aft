@@ -342,7 +342,53 @@ pub async fn daemon_with_clients(script: Script, claim: &str, clients: usize) ->
     daemon_with_capabilities(script, &[claim], clients).await
 }
 
-pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: usize) -> Daemon {
+pub async fn daemon_with_capabilities(
+    script: Script,
+    claims: &[&str],
+    clients: usize,
+) -> Daemon {
+    daemon_with_route_restart(script, claims, clients, None).await
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RouteRestart {
+    BeforeRun,
+    AfterAccepted,
+}
+
+fn motor_route_closed(epoch: u32) -> [Frame; 2] {
+    let closing = Frame::build(
+        FrameType::Push,
+        subc_protocol::Flags(0),
+        0,
+        0,
+        0,
+        serde_json::to_vec(&json!({
+            "op":"route.closed", "module_id":"executor-picked-by-capability",
+            "channels":[40], "reason":"restart", "terminal":false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let goodbye = Frame::build(
+        FrameType::Goodbye,
+        subc_protocol::Flags(0),
+        40,
+        epoch,
+        0,
+        vec![],
+    )
+    .unwrap();
+    [closing, goodbye]
+}
+
+#[rustfmt::skip]
+pub(super) async fn daemon_with_route_restart(
+    script: Script,
+    claims: &[&str],
+    clients: usize,
+    restart: Option<RouteRestart>,
+) -> Daemon {
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -384,6 +430,9 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut producers = Vec::new();
             let mut cancelled = false;
+            let mut route_epoch = 0;
+            let mut route_closed = false;
+            let mut warming = false;
             while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
                 if let Some(reply) = aft_base::subc_fake::server_describe_reply(&frame) {
                     if subc_transport::write_frame(&mut *writer.lock().await, &reply)
@@ -416,8 +465,17 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                     negotiated_ver: PROTOCOL_VERSION, subc_ops: vec!["catalog.list".into()], subc_capabilities: vec![], storage: None, machine_id: None,
                 }).unwrap())),
                 FrameType::Request if header.channel == 0 => match body["op"].as_str() {
-                    Some("catalog.list") => replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"],
-                        "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":claims, "requires":[]}}]}))),
+                     Some("catalog.list") => {
+                         // The first capability check after route.open is a
+                         // barrier: the close is processed before exec.run sends.
+                         if matches!(restart, Some(RouteRestart::BeforeRun)) && route_epoch == 1 && !route_closed {
+                             replies.extend(motor_route_closed(route_epoch));
+                             route_closed = true;
+                             warming = true;
+                         }
+                         replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"],
+                             "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":claims, "requires":[]}}]})));
+                     },
                     Some("route.open") if matches!(script, Script::GatedRoute) => {
                         let frame = reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}));
                         let writer = writer.clone();
@@ -427,11 +485,23 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                             let _ = subc_transport::write_frame(&mut *writer.lock().await, &frame).await;
                         }));
                     },
-                    Some("route.open") => replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}))),
+                     Some("route.open") if warming => {
+                         warming = false;
+                         replies.push(reply(FrameType::Error, json!({"code":"module_warming","message":"executor is warming"})));
+                     },
+                     Some("route.open") => {
+                         route_epoch = if restart.is_some() { route_epoch + 1 } else { 1 };
+                         route_closed = false;
+                         replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":route_epoch})));
+                     },
                     _ => panic!("unexpected control request {body}"),
                 },
-                FrameType::Request => {
-                    match body["method"].as_str().unwrap() {
+                 FrameType::Request => {
+                     if restart.is_some() {
+                         assert!(!route_closed);
+                         assert_eq!(header.epoch, route_epoch);
+                     }
+                     match body["method"].as_str().unwrap() {
                         "exec.run" if matches!(script, Script::CaptureCheckout { .. }) => {
                             if matches!(script, Script::CaptureCheckout { gated: true }) {
                                 server_acceptance_gate.notified().await;
@@ -778,13 +848,19 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                                     }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
                                     if matches!(script, Script::Reported) { terminal = report_vector("all"); }
-                                    if matches!(script, Script::Utf8) {
-                                        terminal.pipestatus=Some(vec![3,0]);
-                                        terminal.workspace_changes=Some(vec!["generated.txt".into()]);
-                                    }
-                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap()));
-                                }
-                                replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                                     if matches!(script, Script::Utf8) {
+                                         terminal.pipestatus=Some(vec![3,0]);
+                                         terminal.workspace_changes=Some(vec!["generated.txt".into()]);
+                                     }
+                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap()));
+                                 }
+                                 if !attaching && matches!(restart, Some(RouteRestart::AfterAccepted)) {
+                                     route_closed = true;
+                                     warming = true;
+                                     replies.extend(motor_route_closed(route_epoch));
+                                 } else {
+                                     replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                                 }
                             }
                             }
                         },

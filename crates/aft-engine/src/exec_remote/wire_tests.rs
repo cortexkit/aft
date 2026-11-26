@@ -175,14 +175,104 @@ async fn capability_checks_read_the_catalog_once_per_route() {
     assert_eq!(catalog_lists(), connected + 1);
     #[cfg(unix)]
     {
-        let reopened = client
-            .reopen_route(BindIdentity::new("aft-test", "session"))
-            .await
-            .unwrap();
-        assert!(reopened.supports_submission_key().await.unwrap());
+        client.reopen_route().await.unwrap();
+        assert!(client.supports_submission_key().await.unwrap());
         // The reopened route resolves the executor and reads its capabilities.
         assert_eq!(catalog_lists(), connected + 3);
     }
+}
+
+#[tokio::test]
+async fn stale_runon_route_reopens_once_for_concurrent_submissions() {
+    let daemon = daemon_with_route_restart(
+        Script::ReturnVector("two-files-one-empty"),
+        &[client::CAPABILITY, RETURN_CHUNKED_CAPABILITY],
+        1,
+        Some(RouteRestart::BeforeRun),
+    )
+    .await;
+    let client = client(&daemon).await;
+    let other = client.clone();
+    let request = |command| {
+        RunRequest::new(
+            "/workspace/task",
+            "/workspace/repo",
+            "/workspace/task",
+            command,
+        )
+        .with_return_paths(vec!["dist/hello.txt".into(), "dist/empty.txt".into()])
+        .with_return_chunked(true)
+        .with_queue_wait_limit_s(5)
+    };
+    let (first, second) = (request("first"), request("second"));
+    let (first, second) = tokio::join!(client.run(&first), other.run(&second));
+    for stream in [first, second] {
+        let mut sink = MemorySink::default();
+        let verdict = drain(&mut stream.unwrap(), &mut sink).await.unwrap();
+        assert_eq!(verdict, Verdict::Exited { code: 0 });
+        assert_eq!(sink.terminals, [verdict]);
+    }
+    let log = daemon.log.lock().unwrap();
+    // Initial route, a warming refusal, and one successful replacement.
+    assert_eq!(
+        log.iter()
+            .filter(|(_, body)| body["op"] == "route.open")
+            .count(),
+        3
+    );
+    let mut commands = Vec::new();
+    for (header, body) in log.iter().filter(|(_, body)| body["method"] == "exec.run") {
+        assert_eq!(header.epoch, 2);
+        assert_eq!(
+            body["params"]["return_paths"],
+            json!(["dist/hello.txt", "dist/empty.txt"])
+        );
+        commands.push(body["params"]["command"].as_str().unwrap());
+    }
+    commands.sort_unstable();
+    assert_eq!(commands, ["first", "second"]);
+}
+
+#[tokio::test]
+async fn stale_runon_route_reattaches_accepted_job_without_resubmitting() {
+    let daemon = daemon_with_route_restart(
+        Script::Restart,
+        &[client::CAPABILITY],
+        1,
+        Some(RouteRestart::AfterAccepted),
+    )
+    .await;
+    let client = client(&daemon).await;
+    let request = RunRequest::new("/workspace", "/src/repo", "/workspace", "test");
+    let mut stream = client.run(&request).await.unwrap();
+    let mut sink = MemorySink::default();
+    let Err(Error::RecoveryRequired {
+        resume: Some(point),
+        ..
+    }) = drain(&mut stream, &mut sink).await
+    else {
+        panic!("route close should preserve the accepted job's resume point");
+    };
+    assert_eq!(point.job_id, id());
+    assert_eq!(point.last_seq, Some(1));
+    let mut stream = client.attach(point).await.unwrap();
+    let verdict = drain(&mut stream, &mut sink).await.unwrap();
+    assert_eq!(verdict, Verdict::Exited { code: 0 });
+    assert_eq!(sink.stdout, b"ABCD");
+    assert_eq!(sink.terminals, [verdict]);
+
+    let log = daemon.log.lock().unwrap();
+    let operations: Vec<_> = log
+        .iter()
+        .filter(|(_, body)| body["method"].is_string())
+        .collect();
+    assert_eq!(operations.len(), 2);
+    assert_eq!(operations[0].0.epoch, 1);
+    assert_eq!(operations[0].1["method"], "exec.run");
+    assert_eq!(operations[1].0.epoch, 2);
+    assert_eq!(operations[1].1["method"], "exec.attach");
+    assert_eq!(operations[1].1["params"]["job_id"], json!(id()));
+    assert_eq!(operations[1].1["params"]["from_seq"], 2);
 }
 
 #[tokio::test]

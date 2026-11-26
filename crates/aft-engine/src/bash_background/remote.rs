@@ -3182,13 +3182,10 @@ impl BgTaskRegistry {
                     remote.harness.clone(),
                     remote.session.clone(),
                 );
-                *client = match client.reopen_route(identity.clone()).await {
-                    Ok(reconnected) => reconnected,
-                    Err(error) => match &remote.connection_file {
-                        Some(path) => ExecRemoteClient::connect(path, identity).await?,
-                        None => return Err(error),
-                    },
-                };
+                if let Err(error) = client.reopen_route().await {
+                    let path = remote.connection_file.as_ref().ok_or(error)?;
+                    *client = ExecRemoteClient::connect(path, identity).await?;
+                }
                 timings.enter("supports_submission_key");
                 if !client.supports_submission_key().await? {
                     return Err(exec::Error::Protocol(
@@ -4364,6 +4361,9 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         retry.resubmits += 1;
+        timings.limit_admission(Duration::from_millis(
+            retry.deadline_ms.saturating_sub(draining_now_ms(root)),
+        ));
         match resubmit(client, task, &request, root, timings).await {
             Err(exec::Error::CancelledBeforeCapture) => {
                 self.cancel_draining_retry(task);
@@ -4437,20 +4437,17 @@ impl BgTaskRegistry {
                     remote.harness.clone(),
                     remote.session.clone(),
                 );
-                let reconnected = recovery
+                let _ = recovery
                     .wait(point.job_id, async {
                         // The SDK reconnects its transport, but the old provider
                         // route stays closed. Reuse that connection when possible;
                         // reread the connection file if the daemon itself changed.
-                        match client.reopen_route(identity.clone()).await {
-                            Ok(reconnected) => Ok(reconnected),
-                            Err(_) => ExecRemoteClient::connect(path, identity).await,
+                        if client.reopen_route().await.is_err() {
+                            *client = ExecRemoteClient::connect(path, identity).await?;
                         }
+                        Ok::<_, exec::Error>(())
                     })
                     .await?;
-                if let Ok(reconnected) = reconnected {
-                    *client = reconnected;
-                }
             }
         }
     }
