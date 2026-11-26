@@ -22,7 +22,7 @@ runs:
       with:
         components: rustfmt, clippy, rust-analyzer
     - uses: dtolnay/rust-toolchain@stable
-      if: inputs.platform == 'windows' && runner.environment == 'github-hosted'
+      if: inputs.platform == 'windows'
       with:
         targets: x86_64-pc-windows-msvc
         components: rustfmt, clippy, rust-analyzer

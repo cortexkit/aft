@@ -474,20 +474,22 @@ jobs:
   # Windows-specific bugs at the integration level (bash spawning + timeout
   # behavior — issue #26, ONNX install via tar.exe, file URI handling, lock
   # recovery). Windows containers require a Windows Docker host and add no
-  # value over running natively on the dedicated Windows machine.
+  # value over running natively on a GitHub-hosted Windows runner.
   # ---------------------------------------------------------------------------
   e2e-windows:
     name: E2E (Windows native)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: [self-hosted, narli]
+    runs-on: windows-2025
     timeout-minutes: 30
     env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v6
-        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -504,7 +506,6 @@ jobs:
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
-        if: runner.environment == 'github-hosted'
         with:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
@@ -529,11 +530,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build AFT binary (Windows x64)
-        run: python scripts/ci-stage-aft.py --legacy-msvc-profile-dir "x86_64-pc-windows-msvc/$env:CARGO_PROFILE" cargo rustc --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --features wasm-grammars
+        run: python scripts/ci-stage-aft.py cargo rustc --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --features wasm-grammars
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target
-          CARGO_BUILD_BUILD_DIR: ${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}
+          CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/target
 
       - name: Install workspace deps + build aft-bridge
         run: |
@@ -572,12 +573,6 @@ jobs:
           name: e2e-windows-plugin-log-${{ github.run_attempt }}
           path: ${{ runner.temp }}/aft-e2e-artifacts/windows/aft-plugin.log
           if-no-files-found: warn
-
-      - name: Clean native test processes
-        if: always()
-        uses: ./.github/actions/native-ci-state
-        with:
-          phase: cleanup
 
   # ---------------------------------------------------------------------------
   # macOS native e2e — exercises the same OpenCode + plugin + binary stack on
