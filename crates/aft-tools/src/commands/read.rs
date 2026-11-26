@@ -381,7 +381,7 @@ fn image_attachment_response_with_budget(
     )
 }
 
-const MAX_IMAGE_DECODERS: usize = 2;
+const MAX_IMAGE_DECODERS: usize = 4;
 const IMAGE_DECODER_WAIT: Duration = Duration::from_secs(10);
 const IMAGE_DECODER_CANCEL_POLL: Duration = Duration::from_millis(25);
 static IMAGE_DECODERS: LazyLock<ImageDecoderSlots> = LazyLock::new(ImageDecoderSlots::default);
@@ -3448,19 +3448,20 @@ mod tests {
     }
 
     #[test]
-    fn image_decoder_four_parallel_reads_all_attach() {
+    fn image_decoder_reads_beyond_capacity_wait_and_all_attach() {
         let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let png = encode_png(&rgba_image(160, 144, true)).unwrap();
-        let paths =
-            std::array::from_fn::<_, 4, _>(|i| write_fixture(root, &format!("{i}.png"), &png));
+        let paths = std::array::from_fn::<_, { MAX_IMAGE_DECODERS + 2 }, _>(|i| {
+            write_fixture(root, &format!("{i}.png"), &png)
+        });
 
         std::thread::scope(|scope| {
             let (entered, decoding) = crossbeam_channel::unbounded();
             let (release, hold) = crossbeam_channel::bounded::<()>(0);
             let (done, responses) = crossbeam_channel::unbounded();
-            for path in &paths[..2] {
+            for path in &paths[..MAX_IMAGE_DECODERS] {
                 let (entered, hold, done) = (entered.clone(), hold.clone(), done.clone());
                 scope.spawn(move || {
                     HOLD_IMAGE_DECODER.set(Some((entered, hold)));
@@ -3468,17 +3469,17 @@ mod tests {
                     let _ = done.send(read_response(root, path, json!({})));
                 });
             }
-            for _ in 0..2 {
+            for _ in 0..MAX_IMAGE_DECODERS {
                 decoding.recv_timeout(Duration::from_secs(5)).unwrap();
             }
-            for path in &paths[2..] {
+            for path in &paths[MAX_IMAGE_DECODERS..] {
                 let done = done.clone();
                 scope.spawn(move || {
                     let _body = crate::context::call_context::enter(true);
                     let _ = done.send(read_response(root, path, json!({})));
                 });
             }
-            // Wait for both later reads to queue before freeing either decoder.
+            // Wait for both later reads to queue before freeing the decoders.
             wait_for_image_decoder_queue(2);
             if let Ok(response) = responses.try_recv() {
                 panic!(
@@ -3504,8 +3505,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let png = encode_png(&rgba_image(32, 16, false)).unwrap();
         let path = write_fixture(temp.path(), "image.png", &png);
-        let _first = IMAGE_DECODERS.acquire(None).unwrap();
-        let _second = IMAGE_DECODERS.acquire(None).unwrap();
+        let _slots: [_; MAX_IMAGE_DECODERS] =
+            std::array::from_fn(|_| IMAGE_DECODERS.acquire(None).unwrap());
 
         let start = Instant::now();
         let response = read_response(temp.path(), &path, json!({}));
@@ -3518,7 +3519,7 @@ mod tests {
         assert_eq!(response.data["attachments"], json!([]));
         assert_eq!(
             response.data["content"],
-            "Attachment omitted: image decoder capacity reached (2/2 active); retry after existing image reads finish"
+            "Attachment omitted: image decoder capacity reached (4/4 active); retry after existing image reads finish"
         );
         assert!(IMAGE_DECODERS.state.lock().waiters.is_empty());
     }
@@ -3531,7 +3532,8 @@ mod tests {
         let png = encode_png(&rgba_image(32, 16, false)).unwrap();
         let path = &write_fixture(root, "image.png", &png);
         let first_slot = IMAGE_DECODERS.acquire(None).unwrap();
-        let _second_slot = IMAGE_DECODERS.acquire(None).unwrap();
+        let _other_slots: [_; MAX_IMAGE_DECODERS - 1] =
+            std::array::from_fn(|_| IMAGE_DECODERS.acquire(None).unwrap());
         let cancellation = crate::executor::JobCancellation::new();
 
         std::thread::scope(|scope| {

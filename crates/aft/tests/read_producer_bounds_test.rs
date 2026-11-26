@@ -118,14 +118,11 @@ fn small_streamed_range_preserves_crlf_and_unicode() {
 }
 
 #[test]
-fn concurrent_image_reads_report_decoder_capacity() {
+fn concurrent_image_reads_all_attach() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("large.png");
-    image::DynamicImage::new_rgb8(2048, 2048)
-        .save(&path)
-        .unwrap();
+    image::DynamicImage::new_rgb8(160, 144).save(&path).unwrap();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-    let started = std::time::Instant::now();
     let responses = std::thread::scope(|scope| {
         let handles = (0..8)
             .map(|_| {
@@ -143,23 +140,12 @@ fn concurrent_image_reads_report_decoder_capacity() {
             .map(|handle| handle.join().unwrap())
             .collect::<Vec<_>>()
     });
-    let busy = responses
-        .iter()
-        .filter(|response| {
-            response.data["attachment_omitted_reason"]
-                .as_str()
-                .unwrap_or("")
-                .contains("decoder capacity")
-        })
-        .count();
-    eprintln!(
-        "8 concurrent image reads: busy={busy}, elapsed={:?}",
-        started.elapsed()
-    );
-    assert!(
-        busy > 0,
-        "concurrent decoders must have a finite admission capacity"
-    );
+    for response in responses {
+        assert!(response.success, "{}", response.data);
+        let attachments = response.data["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 1, "{}", response.data);
+        assert_eq!(attachments[0]["kind"], "image");
+    }
 }
 
 #[test]
