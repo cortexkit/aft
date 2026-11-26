@@ -38,7 +38,7 @@ fn grammar_luau_identity_and_storage_path_match_the_single_grammar_release() {
         RecordKey::new(
             content,
             IDENTITY,
-            "ruled-callgraph-v14-resolver-precision+record-24"
+            "ruled-callgraph-v14-resolver-precision+record-25"
         )
     );
 }

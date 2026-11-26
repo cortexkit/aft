@@ -291,7 +291,7 @@ fn luau_s4_keyed_language_preserves_every_builtin_key() {
     // Pins the shared extractor version so that a Luau change can never move a
     // built-in language's record keys. Update it only together with a deliberate
     // record-format change for the built-in extractors.
-    const ORIGINAL_EXTRACTOR: &str = "ruled-callgraph-v14-resolver-precision+record-24";
+    const ORIGINAL_EXTRACTOR: &str = "ruled-callgraph-v14-resolver-precision+record-25";
     assert_eq!(
         crate::data_layer::content::EXTRACTOR_VERSION,
         ORIGINAL_EXTRACTOR

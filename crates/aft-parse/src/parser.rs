@@ -4123,7 +4123,7 @@ fn rust_impl_parent_name(impl_target: &str) -> String {
 
 test_support_visibility! {
 /// Extract symbols from Rust source without compiling a tree-sitter query.
-/// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
+/// Includes functions, types, constants, statics, and associated items.
 ///
 /// tree-sitter parses the body of a `macro_rules!` arm and of an item-position
 /// macro invocation as an opaque token tree, so items written there would be
@@ -4214,6 +4214,14 @@ fn parse_rust_macro_body(source: &str, body: tree_sitter::Range) -> Option<Tree>
     })
 }
 
+fn rust_value_or_type_kind(kind: &str) -> Option<SymbolKind> {
+    match kind {
+        "const_item" | "static_item" => Some(SymbolKind::Variable),
+        "type_item" | "associated_type" => Some(SymbolKind::TypeAlias),
+        _ => None,
+    }
+}
+
 /// Walk one Rust syntax tree, appending its symbols and queueing the bodies of
 /// item-position macros for a separate parse.
 fn extract_rs_symbols_from_root<'tree>(
@@ -4241,13 +4249,14 @@ fn extract_rs_symbols_from_root<'tree>(
 
     // Inside a `macro_rules!` template an item may be named by a metavariable
     // such as `$name`. That is a placeholder filled in per invocation, not a
-    // symbol anyone can look up, so such items are left out.
+    // symbol anyone can look up. Likewise, `const _` has no lookup name.
     let symbol_name = |node: &Node<'_>| -> Option<String> {
         let name_node = node.child_by_field_name("name")?;
-        if name_node.kind() == "metavariable" {
+        let name = node_text(source, &name_node);
+        if name_node.kind() == "metavariable" || name == "_" {
             return None;
         }
-        Some(node_text(source, &name_node).to_string())
+        Some(name.to_string())
     };
 
     let item_symbol = |node: Node<'tree>, kind: SymbolKind| -> Option<Symbol> {
@@ -4307,17 +4316,10 @@ fn extract_rs_symbols_from_root<'tree>(
                     declaration_list_owner.is_some_and(|owner| nav.kind(owner) != "mod_item");
 
                 if !in_non_module_declaration_list {
-                    if let Some(name) = symbol_name(&node) {
-                        let scope_chain = rust_mod_scope_chain(&node, source, nav);
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::Function,
-                            range: node_range_with_decorators_with(&node, source, lang, nav),
-                            signature: Some(extract_signature(source, &node)),
-                            scope_chain: scope_chain.clone(),
-                            exported: is_pub(&node),
-                            parent: scope_chain.last().cloned(),
-                        });
+                    if let Some(mut symbol) = item_symbol(node, SymbolKind::Function) {
+                        symbol.scope_chain = rust_mod_scope_chain(&node, source, nav);
+                        symbol.parent = symbol.scope_chain.last().cloned();
+                        symbols.push(symbol);
                     }
                 }
             }
@@ -4337,75 +4339,58 @@ fn extract_rs_symbols_from_root<'tree>(
                 }
             }
             "impl_item" => {
-                let mut type_names = Vec::new();
                 let mut child_cursor = node.walk();
-                if child_cursor.goto_first_child() {
-                    loop {
-                        let child = child_cursor.node();
-                        if child.kind() == "type_identifier" || child.kind() == "generic_type" {
-                            type_names.push(node_text(source, &child).to_string());
-                        }
-                        if !child_cursor.goto_next_sibling() {
-                            break;
-                        }
-                    }
-                }
-
-                let scope_name = if type_names.len() >= 2 {
-                    format!("{} for {}", type_names[0], type_names[1])
-                } else {
-                    type_names.first().cloned().unwrap_or_default()
+                let type_names: Vec<_> = node
+                    .children(&mut child_cursor)
+                    .filter(|child| matches!(child.kind(), "type_identifier" | "generic_type"))
+                    .map(|child| node_text(source, &child))
+                    .collect();
+                let scope_name = match type_names.as_slice() {
+                    [trait_name, target, ..] => Some(format!("{trait_name} for {target}")),
+                    [target] => Some(target.to_string()),
+                    [] => None,
                 };
-                let parent_name = type_names
-                    .last()
-                    .map(|name| rust_impl_parent_name(name))
-                    .unwrap_or_default();
+                let parent_name = type_names.last().map(|name| rust_impl_parent_name(name));
 
-                let mut child_cursor = node.walk();
-                if child_cursor.goto_first_child() {
-                    loop {
-                        let child = child_cursor.node();
-                        if child.kind() == "declaration_list" {
-                            let mut method_cursor = child.walk();
-                            if method_cursor.goto_first_child() {
-                                loop {
-                                    let method = method_cursor.node();
-                                    if method.kind() == "function_item" {
-                                        if let Some(name) = symbol_name(&method) {
-                                            symbols.push(Symbol {
-                                                name,
-                                                kind: SymbolKind::Method,
-                                                range: node_range_with_decorators_with(
-                                                    &method, source, lang, nav,
-                                                ),
-                                                signature: Some(extract_signature(source, &method)),
-                                                scope_chain: if scope_name.is_empty() {
-                                                    Vec::new()
-                                                } else {
-                                                    vec![scope_name.clone()]
-                                                },
-                                                exported: is_pub(&method),
-                                                parent: if parent_name.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(parent_name.clone())
-                                                },
-                                            });
-                                        }
-                                    }
-                                    if !method_cursor.goto_next_sibling() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if !child_cursor.goto_next_sibling() {
-                            break;
+                if let Some(body) = node.child_by_field_name("body") {
+                    for item in body.named_children(&mut body.walk()) {
+                        let kind = match item.kind() {
+                            "function_item" => Some(SymbolKind::Method),
+                            kind => rust_value_or_type_kind(kind),
+                        };
+                        if let Some(mut symbol) = kind.and_then(|kind| item_symbol(item, kind)) {
+                            symbol.scope_chain = scope_name.iter().cloned().collect();
+                            symbol.parent = parent_name.clone();
+                            symbols.push(symbol);
                         }
                     }
                 }
             }
-            _ => {}
+            _ => {
+                if let Some(kind) = rust_value_or_type_kind(kind) {
+                    let parent = nav.parent(node);
+                    let scope_chain = match parent.map(|parent| nav.kind(parent)) {
+                        Some("source_file") => Some(Vec::new()),
+                        Some("declaration_list") => parent.and_then(|parent| {
+                            let owner = nav.parent(parent)?;
+                            match nav.kind(owner) {
+                                "mod_item" => Some(rust_mod_scope_chain(&node, source, nav)),
+                                "trait_item" => Some(vec![symbol_name(&owner)?]),
+                                // The impl arm collects its own children with the method scope.
+                                _ => None,
+                            }
+                        }),
+                        _ => None,
+                    };
+                    if let Some(scope_chain) = scope_chain {
+                        if let Some(mut symbol) = item_symbol(node, kind) {
+                            symbol.parent = scope_chain.last().cloned();
+                            symbol.scope_chain = scope_chain;
+                            symbols.push(symbol);
+                        }
+                    }
+                }
+            }
         }
         true
     });
