@@ -25,7 +25,7 @@ use allocator::CachedAllocatorObservation;
 mod contention;
 use contention::{
     root_health_rollup_state, scheduler_contention_degraded, RootContention,
-    EXECUTOR_SCHEDULER_CONTENTION_DETAIL, SNAPSHOT_CONTENTION_DEGRADED_AFTER,
+    EXECUTOR_SCHEDULER_CONTENTION_DETAIL,
 };
 #[path = "health/demand.rs"]
 mod demand;
@@ -7321,6 +7321,7 @@ mod tests {
     }
     use super::super::test_support::{test_ctx, test_root};
     use super::super::{Lane, Response};
+    use super::contention::SNAPSHOT_CONTENTION_DEGRADED_AFTER;
     use super::*;
 
     #[test]
