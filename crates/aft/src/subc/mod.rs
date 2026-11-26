@@ -14545,6 +14545,8 @@ pub(crate) mod test_support {
     /// a lock race that nothing in production depends on: `register_actor` wakes
     /// the scheduler, which grabs the same lock, and on a loaded runner that
     /// window is wide enough to lose. Sweep to the outcome instead.
+    /// If task cleanup needs a second attempt, advance the sweep clock to its
+    /// retry deadline once instead of spending the test's time budget in backoff.
     pub(super) fn reap_until_forgotten(
         root: &ProjectRootId,
         live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -14554,9 +14556,12 @@ pub(crate) mod test_support {
         metrics: &DispatchPathMetrics,
     ) -> IdleReapOutcome {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut sweep_clock_floor = None;
         loop {
+            let now = Instant::now();
+            let now = now.max(sweep_clock_floor.unwrap_or(now));
             let outcome = reap_idle_roots(
-                Instant::now(),
+                now,
                 live_roots,
                 pending_binds,
                 root_channels,
@@ -14566,10 +14571,44 @@ pub(crate) mod test_support {
             if outcome.forgotten_deleted_roots.contains(root) {
                 return outcome;
             }
-            assert!(
-                Instant::now() < deadline,
-                "deleted root was never forgotten: {root:?}"
-            );
+            let meta = &live_roots[root];
+            let retry_due = meta
+                .reclaim_kill_submitted_at
+                .map(|at| at + RECLAIM_KILL_RETRY);
+            if sweep_clock_floor.is_none() && retry_due.is_some_and(|due| now < due) {
+                let census = metrics.reap_census_for_test();
+                if census["deleted_task_blockers"]["task_kill_backoff"] == 1 {
+                    sweep_clock_floor = retry_due;
+                    continue;
+                }
+            }
+            if Instant::now() >= deadline {
+                let actor_idle = executor.try_actor_is_idle(root);
+                let ctx = executor.try_actor_context(root).flatten();
+                let tasks_reclaimable = ctx.as_ref().and_then(|ctx| {
+                    ctx.bash_background()
+                        .try_has_reclaimable_tasks_for_root(root)
+                });
+                #[cfg(unix)]
+                let group_samples = ctx.as_ref().and_then(|ctx| {
+                    crate::bash_background::registry::root_reclaim_tests::reclaim_group_samples(
+                        ctx.bash_background(),
+                        root,
+                    )
+                });
+                #[cfg(not(unix))]
+                let group_samples = "not available on this platform";
+                let kill_in_flight = meta
+                    .reclaim_kill_in_flight
+                    .as_ref()
+                    .map(|flag| flag.load(Ordering::Acquire));
+                panic!(
+                    "deleted root was never forgotten: {root:?}; absence_count={}, presence_generation={}, actor_idle={actor_idle:?}, kill_in_flight={kill_in_flight:?}, kill_retry_due={retry_due:?}, sweep_at={now:?}, tasks_reclaimable={tasks_reclaimable:?}, group_samples={group_samples:?}, census={}",
+                    meta.consecutive_missing_sweeps,
+                    meta.presence_generation_seen,
+                    metrics.reap_census_for_test()
+                );
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -16330,6 +16369,11 @@ mod tests {
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         assert!(executor.actor_is_idle(&root));
         root_dir.close().expect("delete project root");
+        assert_eq!(
+            root.as_path().metadata().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "the routing path must report a confirmed absence"
+        );
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
         let pending_binds = HashMap::new();
         let root_channels = HashMap::new();
@@ -16344,6 +16388,7 @@ mod tests {
             &metrics,
         );
         assert!(first.forgotten_deleted_roots.is_empty());
+        assert_eq!(live_roots[&root].consecutive_missing_sweeps, 1);
         assert!(crate::process_identity::is_process_alive(pid));
 
         let outcome = reap_until_forgotten(

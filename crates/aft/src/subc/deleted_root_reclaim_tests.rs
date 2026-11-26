@@ -243,6 +243,89 @@ fn deleted_root_is_not_blocked_by_another_roots_running_task() {
 }
 
 #[test]
+fn deleted_root_reclaim_retries_after_failed_terminal_group_sample() {
+    use crate::bash_background::process::{test_hooks, LiveDescendantsUnavailable};
+    use crate::bash_background::registry::install_kill_signal_gate_for_test;
+
+    let mut fixture = ReclaimFixture::new();
+    let registry = fixture.ctx.bash_background().clone();
+    // Keep the watchdog from racing the test's terminal publisher.
+    registry.inner.shutdown.store(true, Ordering::SeqCst);
+    let hold = fixture.storage.path().join("hold");
+    let hold = std::ffi::CString::new(hold.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(hold.as_ptr(), 0o600) }, 0);
+    let task_id = registry
+        .spawn(
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            "read -r line < hold",
+            "reclaim".into(),
+            fixture.storage.path().to_path_buf(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(60)),
+            None,
+            fixture.storage.path().to_path_buf(),
+            8,
+            true,
+            false,
+            Some(fixture.root.as_path().to_path_buf()),
+        )
+        .expect("spawn task blocked on FIFO");
+    let pgid = registry.notice_metadata(&task_id).unwrap().pgid.unwrap();
+    let (terminal_published, release) =
+        install_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
+
+    // Run the same kill worker directly so the test can join it. Model a first
+    // submission on the sweep after the test's 30-second wait started.
+    let old_deadline = fixture.now + Duration::from_secs(30);
+    let first_attempt_at = fixture.now + Duration::from_millis(10);
+    fixture
+        .roots
+        .get_mut(&fixture.root)
+        .unwrap()
+        .reclaim_kill_submitted_at = Some(first_attempt_at);
+    let worker = {
+        let registry = registry.clone();
+        let root = fixture.root.clone();
+        std::thread::spawn(move || registry.kill_running_tasks_for_root(root.as_path()))
+    };
+    terminal_published
+        .recv_timeout(Duration::from_secs(10))
+        .expect("kill published terminal state before sampling the group");
+    let listing_failure = test_hooks::scoped_listing_failure(pgid);
+    release.send(()).unwrap();
+    assert_eq!(worker.join().unwrap(), 1);
+    drop(listing_failure);
+    let metadata = registry.notice_metadata(&task_id).unwrap();
+    assert_eq!(metadata.status, BgTaskStatus::Killed);
+    assert!(metadata.live_descendants.is_none());
+    assert_eq!(
+        metadata.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingFailed)
+    );
+
+    fixture.now = old_deadline;
+    let old_final_sweep = fixture.sweep();
+    assert!(old_final_sweep.forgotten_deleted_roots.is_empty());
+    assert_eq!(kill_attempts(&registry), 1);
+    assert_eq!(
+        fixture.metrics.reap_census_for_test()["deleted_task_blockers"]["task_kill_backoff"],
+        1,
+        "the root should still be in backoff at the old test deadline"
+    );
+
+    let outcome = test_support::reap_until_forgotten(
+        &fixture.root,
+        &mut fixture.roots,
+        &HashMap::new(),
+        &HashMap::new(),
+        &fixture.executor,
+        &fixture.metrics,
+    );
+    fixture.assert_reclaimed(outcome);
+    assert_eq!(kill_attempts(&registry), 2);
+}
+
+#[test]
 fn deleted_root_unkillable_task_backs_off_counted_kill_threads() {
     let mut fixture = ReclaimFixture::new();
     fixture.task(

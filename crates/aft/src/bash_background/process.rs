@@ -211,6 +211,20 @@ pub(crate) mod test_hooks {
             .insert(pgid);
     }
 
+    #[cfg(unix)]
+    pub(crate) fn scoped_listing_failure(pgid: i32) -> impl Drop {
+        struct RestoreListing(i32);
+
+        impl Drop for RestoreListing {
+            fn drop(&mut self) {
+                LISTING_FAILS.get().unwrap().lock().unwrap().remove(&self.0);
+            }
+        }
+
+        fail_listing(pgid);
+        RestoreListing(pgid)
+    }
+
     pub(super) fn listing_fails(pgid: i32) -> bool {
         LISTING_FAILS
             .get()
