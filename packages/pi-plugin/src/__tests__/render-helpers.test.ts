@@ -5,6 +5,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import type { Component } from "@earendil-works/pi-tui";
 import {
   collapsibleResult,
@@ -97,6 +98,27 @@ describe("render helper utilities", () => {
       ["  1 line one", "- 2 old", "+ 2 new", " 10 context", "-11 old tail", "+11 new tail"].join(
         "\n",
       ),
+    );
+  });
+
+  test("diff fallback colors numbered rows and removes carriage returns without host renderDiff", () => {
+    const renderer = new URL("../tools/render-helpers.ts", import.meta.url).href;
+    const diff = "  9 context\r\n-10 old\r\n+24 new\r";
+    // Keep the host-module mock in a child process so it cannot affect other tests.
+    const source = `
+      import { mock } from "bun:test";
+      mock.module("@earendil-works/pi-coding-agent", () => ({}));
+      const { renderNumberedDiff } = await import(${JSON.stringify(renderer)});
+      const theme = { fg: (color, text) => "[" + color + "]" + text };
+      process.stdout.write(renderNumberedDiff(${JSON.stringify(diff)}, theme));
+    `;
+    const output = execFileSync(process.execPath, ["-e", source], {
+      cwd: import.meta.dir,
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    expect(output).toBe(
+      "[toolDiffContext]  9 context\n[toolDiffRemoved]-10 old\n[toolDiffAdded]+24 new",
     );
   });
 

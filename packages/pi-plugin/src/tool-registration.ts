@@ -1,5 +1,5 @@
 import { ADAPTER_UNIMPLEMENTED_TOOLS, CANONICAL_TOOLS } from "@cortexkit/aft-bridge";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
 import type { AftConfig } from "./config.js";
@@ -210,6 +210,40 @@ export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiTo
 
 const FUNNEL_BOUND = Symbol.for("aft.pi.registration_funnel_bound");
 
+function withOmpRenderers<TParams extends TSchema, TDetails, TState>(
+  tool: ToolDefinition<TParams, TDetails, TState>,
+): ToolDefinition<TParams, TDetails, TState> {
+  const { renderCall, renderResult } = tool;
+  return {
+    ...tool,
+    renderCall:
+      renderCall &&
+      ((args, theme, context) => {
+        // oh-my-pi (OMP) passes (args, options, theme) rather than (args, theme, context).
+        const ompTheme = context as unknown as Theme;
+        if (typeof ompTheme?.fg !== "function") return renderCall(args, theme, context);
+        return renderCall(args, ompTheme, {
+          args,
+          lastComponent: undefined,
+          isError: false,
+        } as typeof context);
+      }),
+    renderResult:
+      renderResult &&
+      ((result, options, theme, context) => {
+        // oh-my-pi (OMP) includes argsComplete in options; its fourth parameter is the tool arguments.
+        if (!("argsComplete" in (options ?? {})) || typeof context?.invalidate === "function") {
+          return renderResult(result, options, theme, context);
+        }
+        return renderResult(result, options, theme, {
+          args: context,
+          lastComponent: undefined,
+          isError: (result as { isError?: boolean }).isError === true,
+        } as unknown as typeof context);
+      }),
+  };
+}
+
 /**
  * Wrap an ExtensionAPI instance so every `pi.registerTool` call flows through the
  * shared registration funnel with harness-aware loadMode and guidance folding.
@@ -234,7 +268,10 @@ export function bindToolRegistrationFunnel(
   >(
     tool: ToolDefinition<TParams, TDetails, TState>,
   ): void => {
-    const hostAware = effectiveHarness === "omp" ? withOmpInternalUrls(tool, ctx.ompRouter) : tool;
+    const hostAware =
+      effectiveHarness === "omp"
+        ? withOmpRenderers(withOmpInternalUrls(tool, ctx.ompRouter))
+        : tool;
     const prepared = prepareToolDefinitionForRegistration(
       hostAware,
       effectiveHarness,

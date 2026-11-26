@@ -4,7 +4,7 @@ import type {
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui/dist/components/text.js";
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import { detectPiHarness } from "./harness.js";
