@@ -51,6 +51,37 @@ fn runon_cwd_chains_refuse_escapes_after_unproven_or_child_cd() {
 }
 
 #[test]
+fn runon_cwd_chains_follow_two_packages_only_if_initial_cd_is_known() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    request.platform = Some(Platform::Linux);
+    let checkout = Path::new(&request.workspace_key);
+    let plugin = checkout.join("packages/plugin");
+    let cli = checkout.join("packages/cli");
+    fs::create_dir_all(&cli).unwrap();
+    fs::write(cli.join("package.json"), "{}\n").unwrap();
+    let command = "set -eo pipefail; cd packages/plugin && bun test src/__tests__; cd ../cli && bun test src/commands; cd ../.. && GATE_CPUS=4 bash scripts/gate.sh preflight";
+
+    let outside = checkout.parent().unwrap().join("cli");
+    let expected = format!(
+        "runon refused: the command changes into {}, which is outside the checkout the build server copies ({}); the command did not run. Set the bash tool's workdir to that folder instead of using cd.",
+        outside.display(),
+        checkout.display()
+    );
+    assert_eq!(runon_cd_refusal(command, &request).unwrap(), Some(expected));
+
+    fs::create_dir(&plugin).unwrap();
+    fs::write(plugin.join("package.json"), "{}\n").unwrap();
+    assert_eq!(runon_cd_refusal(command, &request).unwrap(), None);
+    assert_eq!(runon_write_refusal(command, &request), None);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let targets =
+        crate::bash_permissions::scan::top_level_directory_targets(command, checkout, &|path| {
+            runon_snapshot_directory_known(checkout, path, Path::new("git"), deadline)
+        });
+    assert!(targets.iter().any(|target| target.path == cli));
+}
+
+#[test]
 fn runon_cd_sequential_command_after_setup_is_allowed() {
     let (_dir, request) = runon_cd_snapshot_fixture();
     let checkout = Path::new(&request.workspace_key);
