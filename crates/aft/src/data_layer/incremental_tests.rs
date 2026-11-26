@@ -271,8 +271,14 @@ fn every_engine_resolves_on_the_one_shared_pool() {
     let first = LiveCheckout::cold(checkout(&files, &[])).unwrap();
     let second = LiveCheckout::cold(checkout(&files, &[])).unwrap();
     assert!(first.shares_pool_with(&second));
+    // The pool's size comes from the memory profile. Lean mode, chosen below
+    // 8 GiB of RAM, pins it (four threads outside Windows) whatever the core
+    // count, so a small 3-core runner gets four.
     let cores = std::thread::available_parallelism().map_or(4, usize::from);
-    assert_eq!(first.install(rayon::current_num_threads), cores);
+    let expected = crate::memory::profile::current()
+        .resolver_threads
+        .unwrap_or(cores);
+    assert_eq!(first.install(rayon::current_num_threads), expected);
 }
 
 #[test]
