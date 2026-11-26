@@ -1,5 +1,55 @@
 use super::*;
 
+#[test]
+fn runon_cwd_chains_refuse_subc_home_relative_checkout() {
+    let (dir, mut request) = runon_cd_snapshot_fixture();
+    request.platform = Some(Platform::Linux);
+    let home = std::env::home_dir().unwrap().canonicalize().unwrap();
+    let outside = dir
+        .path()
+        .join("Work/Projects/CortexKit-scratch/subc-stack1126b");
+    git_fixture(&outside);
+    let relative = outside.strip_prefix(&home).unwrap();
+    let command = format!(
+        "cd ~/{} && cargo test --lib; cargo clippy --all-targets",
+        relative.display()
+    );
+    let expected = format!(
+        "runon refused: the command changes into {}, which is outside the checkout the build server copies ({}); the command did not run. Set the bash tool's workdir to that folder instead of using cd.",
+        outside.display(), request.workspace_key
+    );
+    assert_eq!(
+        runon_cd_refusal(&command, &request).unwrap(),
+        Some(expected)
+    );
+}
+
+#[test]
+fn runon_cwd_chains_allow_mc_after_shell_home_replacement() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    request.platform = Some(Platform::Linux);
+    let checkout = Path::new(&request.workspace_key);
+    for package in ["plugin", "cli"] {
+        let package = checkout.join("packages").join(package);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), "{}\n").unwrap();
+    }
+    let command = concat!(
+        "set -o pipefail; export HOME=$(mktemp -d); unset OPENCODE_DB; ",
+        "bun install --frozen-lockfile >/dev/null 2>&1; echo \"install rc=$?\"; ",
+        "bun packages/cli/scripts/generate-issue-log-templates.ts 2>&1 | tail -3; echo \"gen rc=$?\"; ",
+        "git diff --stat -- packages/cli/src/lib/issue-log-templates.generated.ts | cat; ",
+        "grep -n \"v2 compaction hook: fired\" packages/cli/src/lib/issue-log-templates.generated.ts; ",
+        "cd packages/plugin && bun test src/v2/hooks/rowless-compaction-hook.test.ts 2>&1 | tail -8; echo \"plugin rc=$?\"; ",
+        "cd ../cli && bun test src/commands 2>&1 | tail -6; echo \"cli rc=$?\"; ",
+        "cd ../.. && GATE_CPUS=4 bash scripts/gate.sh preflight 2>&1 | tail -14; echo \"preflight rc=$?\""
+    );
+    for command in [command.to_owned(), format!("{command}; cd ~/fresh")] {
+        assert_eq!(runon_cd_refusal(&command, &request).unwrap(), None);
+        assert_eq!(runon_write_refusal(&command, &request), None);
+    }
+}
+
 fn rune_checkout() -> (tempfile::TempDir, RunRequest) {
     let (dir, request) = runon_cd_snapshot_fixture();
     let rune = Path::new(&request.workspace_key).join("rune");
