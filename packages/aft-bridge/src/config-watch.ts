@@ -132,6 +132,7 @@ export function aftLiveConfigKeys<C>(
     pathKey<C>("lsp.idle_minutes"),
     pathKey<C>("lsp.idle_shutdown"),
     pathKey<C>("lsp.max_servers"),
+    pathKey<C>("lsp.worker_rust_analyzers"),
     ...[
       "diagnostics",
       "todos",
@@ -622,6 +623,11 @@ export function aftLiveSecurityKeys<C>(keys: readonly LiveConfigKey<C>[]): LiveS
       key: pick("lsp.max_servers"),
       loosens: (current, next) =>
         (typeof next === "number" ? next : 8) > (typeof current === "number" ? current : 8),
+    },
+    {
+      key: pick("lsp.worker_rust_analyzers"),
+      loosens: (current, next) =>
+        (typeof next === "number" ? next : 2) > (typeof current === "number" ? current : 2),
     },
     ...[
       "diagnostics",

@@ -206,6 +206,31 @@ fn prepared_bind_watches_keep_the_captured_source() {
 }
 
 #[test]
+fn worker_rust_analyzers_reload_user_ceiling_and_hold_project_loosening() {
+    let fixture = Fixture::new(
+        r#"{"lsp":{"worker_rust_analyzers":2}}"#,
+        Some(r#"{"lsp":{"worker_rust_analyzers":1}}"#),
+    );
+    write(&fixture.user_path, r#"{"lsp":{"worker_rust_analyzers":3}}"#);
+    let outcome = fixture.reload();
+    assert!(applied(&outcome).contains(&"lsp.worker_rust_analyzers"));
+    assert_eq!(fixture.ctx.config().lsp_user_worker_rust_analyzers, Some(3));
+    assert_eq!(fixture.ctx.config().lsp_worker_rust_analyzers, 1);
+    write(
+        &fixture.project_path,
+        r#"{"lsp":{"worker_rust_analyzers":0}}"#,
+    );
+    assert!(applied(&fixture.reload()).contains(&"lsp.worker_rust_analyzers"));
+    assert_eq!(fixture.ctx.config().lsp_worker_rust_analyzers, 0);
+    write(
+        &fixture.project_path,
+        r#"{"lsp":{"worker_rust_analyzers":2}}"#,
+    );
+    fixture.reload();
+    assert_eq!(fixture.ctx.config().lsp_worker_rust_analyzers, 0);
+}
+
+#[test]
 fn inspect_categories_and_lsp_idle_reload_without_restart() {
     let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60,"max_servers":8}}"#, None);
     write(

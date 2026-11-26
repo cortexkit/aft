@@ -1067,6 +1067,15 @@ failure. Project config may lower, but never raise, the user's value
 not the process budget available to other roots. The limit applies to all
 language-server kinds.
 
+`lsp.worker_rust_analyzers` limits rust-analyzer processes for worker sessions,
+including starts in progress. The default is `2`; use a nonnegative integer.
+Project config may lower the limit for its own root, but cannot raise the user
+limit or reduce the budget available to other roots. This setting applies live
+to new starts and does not stop already running analyzers. A value of `0`
+prevents new worker rust-analyzer starts; inspect reports **PARTIAL** with
+`rust_analyzer_capacity_exhausted` when it cannot start one. Head analyzers do
+not count toward this limit. The general `lsp.max_servers` limit still applies.
+
 TypeScript packages in one repository share a server per resolved SDK version,
 even with separate `node_modules` installs and no root `package.json`. Packages
 pinned to different SDKs keep separate servers and diagnostics at the same

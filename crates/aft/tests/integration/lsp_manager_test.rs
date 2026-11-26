@@ -368,6 +368,42 @@ fn rust_worker_inspect_capacity_waits_for_released_slot() {
 }
 
 #[test]
+fn rust_worker_user_capacity_of_three_admits_three_analyzers() {
+    use aft::config_resolve::{resolve_config, ConfigTier};
+
+    let _guard = rust_worker_policy_test_guard();
+    let resolved = resolve_config(&[ConfigTier {
+        tier: "user".into(),
+        source: "user.jsonc".into(),
+        doc: r#"{"lsp":{"worker_rust_analyzers":3}}"#.into(),
+    }]);
+    assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+    let config = resolved.config;
+    let fixtures = (0..4).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let mut workers = Vec::new();
+    for (temp, file, _) in &fixtures[..3] {
+        let mut manager = rust_worker_logged_manager(&temp.path().join("initialization.jsonl"));
+        manager.disable_rust_cargo_for_worker();
+        assert_eq!(
+            crate::test_helpers::settled_lsp(&mut manager, |manager| manager
+                .ensure_server_for_file(file, &config))
+            .len(),
+            1
+        );
+        workers.push(manager);
+    }
+    let (temp, file, _) = &fixtures[3];
+    let mut manager = rust_worker_logged_manager(&temp.path().join("initialization.jsonl"));
+    manager.disable_rust_cargo_for_worker();
+    let result = crate::test_helpers::settled_lsp(&mut manager, |manager| {
+        manager.ensure_server_for_file_detailed(file, &config)
+    });
+    assert!(result.successful.is_empty());
+    let reason = result.attempts[0].result.failure_reason();
+    assert!(reason.contains("cap=3 reached (current=3)"), "{reason}");
+}
+
+#[test]
 fn rust_worker_cap_never_counts_or_refuses_head_analyzers() {
     let _guard = rust_worker_policy_test_guard();
     let fixtures = (0..4).map(|_| rust_fixture_files()).collect::<Vec<_>>();

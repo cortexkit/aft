@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -39,22 +39,18 @@ const CAUSE_STDERR_LINE_BYTES: usize = 200;
 /// Longest command line quoted in exit reports.
 const COMMAND_DISPLAY_BYTES: usize = 512;
 
-// Delegated sessions can fan out across many worktrees, each with independent
-// analyzer thread pools and caches. Bound that fan-out without withholding
-// diagnostics from primary or standalone sessions on other repositories.
-const RUST_ANALYZER_WORKER_PROCESS_CAP: usize = 2;
-
 #[derive(Debug)]
 pub(crate) struct RustAnalyzerCapacityExhausted {
     pub(super) cap: usize,
     pub(super) current: usize,
+    pub(super) project_limited: bool,
 }
 
 impl std::fmt::Display for RustAnalyzerCapacityExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f,
-            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached (current={}); retry after another worker analyzer stops",
-            self.cap, self.current)
+            "rust_analyzer_capacity_exhausted: {} worker-policy rust-analyzer process cap={} reached (current={}); retry after another worker analyzer stops",
+            if self.project_limited { "project" } else { "daemon-wide" }, self.cap, self.current)
     }
 }
 
@@ -63,29 +59,75 @@ impl std::error::Error for RustAnalyzerCapacityExhausted {}
 pub(super) struct RustAnalyzerCapacity {
     active: Mutex<usize>,
     slot_released: std::sync::Condvar,
-    cap: usize,
     refusals: AtomicU64,
 }
 
-pub(super) struct RustAnalyzerPermit(Arc<RustAnalyzerCapacity>);
+#[derive(Clone, Default)]
+pub(super) struct WorkerAnalyzerRoot(Arc<AtomicUsize>);
+
+impl WorkerAnalyzerRoot {
+    pub(super) fn same_root(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+pub(super) struct WorkerAnalyzerAdmission {
+    pub(super) root: WorkerAnalyzerRoot,
+    pub(super) project_limit: usize,
+    pub(super) process_limit: usize,
+}
+
+impl WorkerAnalyzerAdmission {
+    fn exhausted(&self, active: usize) -> Option<RustAnalyzerCapacityExhausted> {
+        let in_root = self.root.0.load(Ordering::Relaxed);
+        if self.project_limit < self.process_limit && in_root >= self.project_limit {
+            Some(RustAnalyzerCapacityExhausted {
+                cap: self.project_limit,
+                current: in_root,
+                project_limited: true,
+            })
+        } else if active >= self.process_limit {
+            Some(RustAnalyzerCapacityExhausted {
+                cap: self.process_limit,
+                current: active,
+                project_limited: false,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+pub(super) struct RustAnalyzerPermit {
+    capacity: Arc<RustAnalyzerCapacity>,
+    root: WorkerAnalyzerRoot,
+}
 
 impl RustAnalyzerCapacity {
-    pub(super) fn acquire(self: &Arc<Self>) -> io::Result<RustAnalyzerPermit> {
-        self.try_acquire().map_err(|error| self.refuse(error))
+    pub(super) fn acquire(
+        self: &Arc<Self>,
+        admission: &WorkerAnalyzerAdmission,
+    ) -> io::Result<RustAnalyzerPermit> {
+        self.try_acquire(admission)
+            .map_err(|error| self.refuse(error))
     }
 
     pub(super) fn try_acquire(
         self: &Arc<Self>,
+        admission: &WorkerAnalyzerAdmission,
     ) -> Result<RustAnalyzerPermit, RustAnalyzerCapacityExhausted> {
         let mut active = self.active.lock().unwrap();
-        if *active >= self.cap {
-            return Err(RustAnalyzerCapacityExhausted {
-                cap: self.cap,
-                current: *active,
-            });
+        if let Some(error) = admission.exhausted(*active) {
+            return Err(error);
         }
+        // The global lock keeps the process and root counts in sync. The
+        // permit keeps both slots reserved until the child has stopped.
         *active += 1;
-        Ok(RustAnalyzerPermit(self.clone()))
+        admission.root.0.fetch_add(1, Ordering::Relaxed);
+        Ok(RustAnalyzerPermit {
+            capacity: Arc::clone(self),
+            root: admission.root.clone(),
+        })
     }
 
     pub(super) fn refuse(&self, error: RustAnalyzerCapacityExhausted) -> io::Error {
@@ -93,15 +135,20 @@ impl RustAnalyzerCapacity {
         io::Error::new(io::ErrorKind::WouldBlock, error)
     }
 
-    pub(super) fn is_full(&self) -> bool {
-        *self.active.lock().unwrap() >= self.cap
+    pub(super) fn exhausted(
+        &self,
+        admission: &WorkerAnalyzerAdmission,
+    ) -> Option<RustAnalyzerCapacityExhausted> {
+        admission.exhausted(*self.active.lock().unwrap())
     }
 
-    pub(super) fn wait_for_release(&self, timeout: Duration) {
+    pub(super) fn wait_for_release(&self, admission: &WorkerAnalyzerAdmission, timeout: Duration) {
         let active = self.active.lock().unwrap();
         drop(
             self.slot_released
-                .wait_timeout_while(active, timeout, |active| *active >= self.cap)
+                .wait_timeout_while(active, timeout, |active| {
+                    admission.exhausted(*active).is_some()
+                })
                 .unwrap(),
         );
     }
@@ -109,8 +156,11 @@ impl RustAnalyzerCapacity {
 
 impl Drop for RustAnalyzerPermit {
     fn drop(&mut self) {
-        *self.0.active.lock().unwrap() -= 1;
-        self.0.slot_released.notify_all();
+        let mut active = self.capacity.active.lock().unwrap();
+        *active -= 1;
+        self.root.0.fetch_sub(1, Ordering::Relaxed);
+        drop(active);
+        self.capacity.slot_released.notify_all();
     }
 }
 
@@ -120,7 +170,6 @@ pub(super) fn rust_analyzer_capacity() -> &'static Arc<RustAnalyzerCapacity> {
         Arc::new(RustAnalyzerCapacity {
             active: Mutex::new(0),
             slot_released: std::sync::Condvar::new(),
-            cap: RUST_ANALYZER_WORKER_PROCESS_CAP,
             refusals: AtomicU64::new(0),
         })
     })
@@ -1223,8 +1272,15 @@ impl LspClient {
         reclaim_root: Option<&Path>,
         worker_policy: bool,
     ) -> io::Result<Self> {
+        let limit = crate::config::DEFAULT_WORKER_RUST_ANALYZERS;
         let permit = (kind == ServerKind::Rust && worker_policy)
-            .then(|| rust_analyzer_capacity().acquire())
+            .then(|| {
+                rust_analyzer_capacity().acquire(&WorkerAnalyzerAdmission {
+                    root: WorkerAnalyzerRoot::default(),
+                    project_limit: limit,
+                    process_limit: limit,
+                })
+            })
             .transpose()?;
         Self::spawn_with_worker_permit(
             kind,
@@ -1569,12 +1625,15 @@ impl LspClient {
         })
     }
 
-    pub(crate) fn enable_rust_worker_policy(&mut self) -> io::Result<()> {
+    pub(super) fn enable_rust_worker_policy(
+        &mut self,
+        admission: &WorkerAnalyzerAdmission,
+    ) -> io::Result<()> {
         if self.kind == ServerKind::Rust && !self.rust_cargo_disabled_for_worker {
             // A worker can arrive after a primary session spawned the child
             // but before initialize. Count that conversion before sending the
             // worker configuration; refusal drops the still-uninitialized child.
-            self._rust_analyzer_permit = Some(rust_analyzer_capacity().acquire()?);
+            self._rust_analyzer_permit = Some(rust_analyzer_capacity().acquire(admission)?);
             self.rust_cargo_disabled_for_worker = true;
         }
         Ok(())
@@ -3569,14 +3628,18 @@ mod tests {
     #[test]
     fn rust_capacity_refusal_reports_cap_and_current_count() {
         let capacity = Arc::new(RustAnalyzerCapacity {
-            cap: 1,
             active: Mutex::new(0),
             slot_released: std::sync::Condvar::new(),
             refusals: AtomicU64::new(0),
         });
-        let permit = capacity.acquire().unwrap();
+        let admission = WorkerAnalyzerAdmission {
+            root: WorkerAnalyzerRoot::default(),
+            project_limit: 1,
+            process_limit: 1,
+        };
+        let permit = capacity.acquire(&admission).unwrap();
         assert_eq!(capacity.refusals.load(Ordering::Relaxed), 0);
-        let error = capacity.acquire().err().unwrap();
+        let error = capacity.acquire(&admission).err().unwrap();
         let refused = error
             .get_ref()
             .unwrap()
@@ -3586,12 +3649,44 @@ mod tests {
         assert_eq!(refused.current, 1);
         assert!(error.to_string().contains("cap=1 reached (current=1)"));
         assert_eq!(capacity.refusals.load(Ordering::Relaxed), 1);
-        assert!(capacity.acquire().is_err());
+        assert!(capacity.acquire(&admission).is_err());
         assert_eq!(capacity.refusals.load(Ordering::Relaxed), 2);
         drop(permit);
-        let next = capacity.acquire().unwrap();
+        let next = capacity.acquire(&admission).unwrap();
         assert_eq!(capacity.refusals.load(Ordering::Relaxed), 2);
         drop(next);
+    }
+
+    #[test]
+    fn worker_rust_analyzers_project_limit_does_not_spend_peer_budget() {
+        let capacity = Arc::new(RustAnalyzerCapacity {
+            active: Mutex::new(0),
+            slot_released: std::sync::Condvar::new(),
+            refusals: AtomicU64::new(0),
+        });
+        let project = WorkerAnalyzerAdmission {
+            root: WorkerAnalyzerRoot::default(),
+            project_limit: 1,
+            process_limit: 3,
+        };
+        let peer = WorkerAnalyzerAdmission {
+            root: WorkerAnalyzerRoot::default(),
+            project_limit: 3,
+            process_limit: 3,
+        };
+        let first = capacity.acquire(&project).unwrap();
+        let refusal = capacity.try_acquire(&project).err().unwrap();
+        assert!(refusal.project_limited);
+        assert_eq!((refusal.cap, refusal.current), (1, 1));
+        let _peers = [
+            capacity.acquire(&peer).unwrap(),
+            capacity.acquire(&peer).unwrap(),
+        ];
+        let refusal = capacity.try_acquire(&peer).err().unwrap();
+        assert!(!refusal.project_limited);
+        assert_eq!((refusal.cap, refusal.current), (3, 3));
+        drop(first);
+        assert!(capacity.acquire(&project).is_ok());
     }
 
     #[test]

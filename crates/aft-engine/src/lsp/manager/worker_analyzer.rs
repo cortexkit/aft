@@ -1,5 +1,5 @@
 use super::*;
-use crate::lsp::client::{rust_analyzer_capacity, RustAnalyzerPermit};
+use crate::lsp::client::{rust_analyzer_capacity, RustAnalyzerPermit, WorkerAnalyzerAdmission};
 
 const RECLAIM_IDLE_AGE: Duration = Duration::from_secs(2 * 60);
 const CAPACITY_WAIT_LIMIT: Duration = Duration::from_secs(60);
@@ -40,6 +40,32 @@ fn reclaim_priority(
 }
 
 impl LspManager {
+    pub(crate) fn enable_background_document_pulls(
+        &mut self,
+        owner: Weak<parking_lot::Mutex<LspManager>>,
+    ) {
+        self.startup_owner = owner.clone();
+        self.capacity.lock().managers.push(owner.clone());
+        self.background_pull_owner = owner;
+    }
+
+    pub(crate) fn set_server_capacity(
+        &mut self,
+        capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
+    ) {
+        self.capacity = capacity;
+    }
+
+    pub(super) fn worker_analyzer_admission(&self, config: &Config) -> WorkerAnalyzerAdmission {
+        WorkerAnalyzerAdmission {
+            root: self.worker_analyzer_root.clone(),
+            project_limit: config.lsp_worker_rust_analyzers,
+            process_limit: config
+                .lsp_user_worker_rust_analyzers
+                .unwrap_or(config.lsp_worker_rust_analyzers),
+        }
+    }
+
     fn oldest_reclaimable_worker(
         &self,
         activity: &DiagnosticsActivity,
@@ -67,13 +93,21 @@ impl LspManager {
     }
 }
 
-fn try_reclaim_worker(shared: &parking_lot::Mutex<ServerCapacity>, requester: &ServerKey) {
+fn try_reclaim_worker(
+    shared: &parking_lot::Mutex<ServerCapacity>,
+    requester: &ServerKey,
+    admission: &WorkerAnalyzerAdmission,
+) {
     let Some(mut shared) = shared.try_lock() else {
         return;
     };
     // A detached client retains its process permit until it exits. Do not
     // stop a second analyzer merely because the first is still shutting down.
-    if shared.worker_reap.strong_count() != 0 || !rust_analyzer_capacity().is_full() {
+    let capacity = rust_analyzer_capacity();
+    let Some(failure) = capacity.exhausted(admission) else {
+        return;
+    };
+    if shared.worker_reap.strong_count() != 0 || failure.cap == 0 {
         return;
     }
     let now = Instant::now();
@@ -87,6 +121,9 @@ fn try_reclaim_worker(shared: &parking_lot::Mutex<ServerCapacity>, requester: &S
         let Some(manager) = owner.try_lock() else {
             continue;
         };
+        if failure.project_limited && !admission.root.same_root(&manager.worker_analyzer_root) {
+            continue;
+        }
         let activity = manager.diagnostics_activity.lock();
         if let Some(candidate) = manager.oldest_reclaimable_worker(&activity, now) {
             if oldest
@@ -106,7 +143,9 @@ fn try_reclaim_worker(shared: &parking_lot::Mutex<ServerCapacity>, requester: &S
     let activity = Arc::clone(&manager.diagnostics_activity);
     let activity = activity.lock();
     if manager.oldest_reclaimable_worker(&activity, now).as_ref() != Some(&candidate)
-        || !rust_analyzer_capacity().is_full()
+        || capacity.exhausted(admission).is_none_or(|failure| {
+            failure.project_limited && !admission.root.same_root(&manager.worker_analyzer_root)
+        })
     {
         return;
     }
@@ -128,6 +167,7 @@ fn try_reclaim_worker(shared: &parking_lot::Mutex<ServerCapacity>, requester: &S
 fn reserve_worker_permit(
     shared: &parking_lot::Mutex<ServerCapacity>,
     server: &ServerKey,
+    admission: &WorkerAnalyzerAdmission,
     signal: &StartSignal,
     startup_deadline: Instant,
 ) -> Result<RustAnalyzerPermit, LspError> {
@@ -142,15 +182,16 @@ fn reserve_worker_permit(
         {
             return Err(LspError::ProjectClosed);
         }
-        let failure = match capacity.try_acquire() {
+        let failure = match capacity.try_acquire(admission) {
             Ok(permit) => return Ok(permit),
             Err(failure) => failure,
         };
-        if Instant::now() >= deadline {
+        if failure.cap == 0 || Instant::now() >= deadline {
             return Err(capacity.refuse(failure).into());
         }
-        try_reclaim_worker(shared, server);
+        try_reclaim_worker(shared, server, admission);
         capacity.wait_for_release(
+            admission,
             deadline
                 .saturating_duration_since(Instant::now())
                 .min(CAPACITY_RECHECK_INTERVAL),
@@ -194,7 +235,13 @@ fn begin_inspect_start(
 
     // Reserve before starting the child, but outside the manager lock so other
     // clients can finish their work or shut down while inspect waits.
-    match reserve_worker_permit(&capacity, server, &signal, deadline) {
+    match reserve_worker_permit(
+        &capacity,
+        server,
+        &prepared.worker_admission,
+        &signal,
+        deadline,
+    ) {
         Ok(permit) => {
             prepared.worker_permit = Some(permit);
             let lsp = manager.lock();
@@ -408,8 +455,10 @@ mod tests {
         );
 
         let signal = StartSignal::default();
+        let config = Config::default();
+        let admission = LspManager::new().worker_analyzer_admission(&config);
         let deadline = Instant::now() + Duration::from_millis(120);
-        let result = reserve_worker_permit(&shared, &request_key, &signal, deadline);
+        let result = reserve_worker_permit(&shared, &request_key, &admission, &signal, deadline);
         assert!(
             Instant::now() >= deadline,
             "busy analyzers must not cause immediate refusal"
@@ -458,6 +507,7 @@ mod tests {
         let permit = reserve_worker_permit(
             &shared,
             &request_key,
+            &admission,
             &signal,
             Instant::now() + Duration::from_secs(5),
         )
@@ -475,7 +525,7 @@ mod tests {
             "head is never a reclaim candidate"
         );
         assert!(
-            rust_analyzer_capacity().is_full(),
+            rust_analyzer_capacity().exhausted(&admission).is_some(),
             "new permit still counts toward the cap"
         );
         drop(permit);
@@ -487,7 +537,6 @@ mod tests {
             "[package]\nname = 'first-worker'\nversion = '0.1.0'\n[lib]\npath = 'lib.rs'\n",
         )
         .unwrap();
-        let config = Config::default();
         let walk = walk_applicable_area(&first_key.root, Some(&[file]), &config, None).unwrap();
         let snapshot = first.lock().classify_applicable_servers(walk, &config);
         let outcome = start_applicable_server_unlocked(

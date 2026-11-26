@@ -543,6 +543,10 @@ pub struct RawLsp {
         description = "Maximum live language servers process-wide, including starts in progress. Evicts the least recently used client with no pending requests before refusing a start. Project config may only lower the user value. Zero prevents new starts."
     )]
     pub max_servers: Option<usize>,
+    #[schemars(
+        description = "Maximum rust-analyzer processes for worker sessions. Defaults to 2. A project may lower the user limit for its own root. Set 0 to prevent new worker rust-analyzers from starting. Applies live."
+    )]
+    pub worker_rust_analyzers: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_lsp_servers")]
     #[schemars(
         description = "User-defined LSP server map keyed by server id (e.g. { 'terraform-ls': { ... } })."
@@ -585,6 +589,7 @@ impl RawLsp {
         self.idle_minutes.is_none()
             && self.idle_shutdown.is_none()
             && self.max_servers.is_none()
+            && self.worker_rust_analyzers.is_none()
             && self.servers.is_none()
             && self.disabled.is_none()
             && self.python.is_none()
@@ -1037,6 +1042,7 @@ pub(crate) fn resolve_parsed_config_for_harness<'a>(
 ) -> ResolveResult {
     let mut merged = RawAftConfig::default();
     let mut lsp_user_max_servers = 8;
+    let mut lsp_user_worker_rust_analyzers = crate::config::DEFAULT_WORKER_RUST_ANALYZERS;
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
 
@@ -1159,6 +1165,7 @@ pub(crate) fn resolve_parsed_config_for_harness<'a>(
                 .as_ref()
                 .and_then(|lsp| lsp.max_servers)
                 .unwrap_or(8);
+            lsp_user_worker_rust_analyzers = worker_rust_analyzer_limit(merged.lsp.as_ref());
         } else {
             record_project_drops(&raw, &tier.tier, &mut dropped);
             record_resource_loosening(&merged, &raw, &tier.tier, &mut dropped);
@@ -1177,6 +1184,7 @@ pub(crate) fn resolve_parsed_config_for_harness<'a>(
     }
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
     config.lsp_user_max_servers = Some(lsp_user_max_servers);
+    config.lsp_user_worker_rust_analyzers = Some(lsp_user_worker_rust_analyzers);
     let cache_dir = merged.storage.and_then(|storage| storage.cache_dir);
     if let Some(RawCacheDir::Dir { path: raw }) = cache_dir.as_ref() {
         let home = std::env::var_os("HOME")
@@ -2436,6 +2444,11 @@ fn merge_semantic_config(
     (!semantic.is_empty()).then_some(semantic)
 }
 
+fn worker_rust_analyzer_limit(lsp: Option<&RawLsp>) -> usize {
+    lsp.and_then(|lsp| lsp.worker_rust_analyzers)
+        .unwrap_or(crate::config::DEFAULT_WORKER_RUST_ANALYZERS)
+}
+
 fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Option<RawLsp> {
     let mut lsp = base.unwrap_or_default();
 
@@ -2443,6 +2456,11 @@ fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Optio
         if let Some(max_servers) = project.max_servers {
             if max_servers <= lsp.max_servers.unwrap_or(8) {
                 lsp.max_servers = Some(max_servers);
+            }
+        }
+        if let Some(limit) = project.worker_rust_analyzers {
+            if limit <= worker_rust_analyzer_limit(Some(&lsp)) {
+                lsp.worker_rust_analyzers = Some(limit);
             }
         }
         if let Some(idle) = project.idle_minutes {
@@ -2844,6 +2862,14 @@ fn record_resource_loosening(
         if next > floor {
             push_drop(dropped, "lsp.max_servers", tier, REASON);
         }
+    }
+    if project
+        .lsp
+        .as_ref()
+        .and_then(|lsp| lsp.worker_rust_analyzers)
+        .is_some_and(|next| next > worker_rust_analyzer_limit(base.lsp.as_ref()))
+    {
+        push_drop(dropped, "lsp.worker_rust_analyzers", tier, REASON);
     }
     let cap = |raw: &RawAftConfig| raw.bash.as_ref().and_then(|bash| bash.memory_limit_mib);
     if let (Some(user), Some(project)) = (cap(base), cap(project)) {
@@ -3574,6 +3600,7 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     config.lsp_idle_minutes = lsp_idle_minutes(lsp.and_then(|lsp| lsp.idle_minutes));
     config.lsp_idle_shutdown = lsp.and_then(|lsp| lsp.idle_shutdown).unwrap_or(true);
     config.lsp_max_servers = lsp.and_then(|lsp| lsp.max_servers).unwrap_or(8);
+    config.lsp_worker_rust_analyzers = worker_rust_analyzer_limit(lsp);
     let mut disabled: HashSet<String> = lsp
         .and_then(|lsp| lsp.disabled.as_ref())
         .into_iter()
@@ -4706,6 +4733,41 @@ mod tests {
         let opt_out = resolve_config(&[tier("user", r#"{"storage":{"cache_dir":null}}"#)]);
         assert!(opt_out.errors.is_empty());
         assert!(opt_out.config.cache_dir_opt_out);
+    }
+
+    #[test]
+    fn worker_rust_analyzers_default_and_project_only_tightens() {
+        let default = resolve_config(&[]).config;
+        assert_eq!(default.lsp_worker_rust_analyzers, 2);
+        assert_eq!(default.lsp_user_worker_rust_analyzers, Some(2));
+
+        let user = tier("user", r#"{"lsp":{"worker_rust_analyzers":3}}"#);
+        for (project, expected, dropped) in [(4, 3, true), (1, 1, false), (0, 0, false)] {
+            let resolved = resolve_config(&[
+                user.clone(),
+                tier(
+                    "project",
+                    &format!(r#"{{"lsp":{{"worker_rust_analyzers":{project}}}}}"#),
+                ),
+            ]);
+            assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+            assert_eq!(resolved.config.lsp_worker_rust_analyzers, expected);
+            assert_eq!(resolved.config.lsp_user_worker_rust_analyzers, Some(3));
+            assert_eq!(
+                drop_keys(&resolved).contains(&"lsp.worker_rust_analyzers".to_owned()),
+                dropped
+            );
+        }
+        let resolved = resolve_config(&[tier("project", r#"{"lsp":{"worker_rust_analyzers":3}}"#)]);
+        assert_eq!(resolved.config.lsp_worker_rust_analyzers, 2);
+        assert!(drop_keys(&resolved).contains(&"lsp.worker_rust_analyzers".to_owned()));
+        for invalid in ["-1", "1.5", "\"3\""] {
+            let resolved = resolve_config(&[tier(
+                "user",
+                &format!(r#"{{"lsp":{{"worker_rust_analyzers":{invalid}}}}}"#),
+            )]);
+            assert!(!resolved.errors.is_empty(), "accepted {invalid}");
+        }
     }
 
     #[test]

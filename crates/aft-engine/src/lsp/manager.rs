@@ -1020,6 +1020,7 @@ type ShutdownResult = (Option<ServerKey>, u32, Result<(), LspError>);
 
 pub struct LspManager {
     capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
+    worker_analyzer_root: super::client::WorkerAnalyzerRoot,
     pub(crate) diagnostics_activity: Arc<parking_lot::Mutex<DiagnosticsActivity>>,
     capacity_slots: HashMap<ServerKey, Arc<()>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1379,6 +1380,7 @@ impl LspManager {
             super::pending_changes::PendingLspChangeQueue::new(event_tx.clone());
         Self {
             capacity: Arc::default(),
+            worker_analyzer_root: Default::default(),
             diagnostics_activity: Arc::default(),
             capacity_slots: HashMap::new(),
             #[cfg(any(test, feature = "test-support"))]
@@ -1448,22 +1450,6 @@ impl LspManager {
     #[doc(hidden)]
     pub fn set_retry_clock(&mut self, clock: RetryClock) {
         self.retry_clock = clock;
-    }
-
-    pub(crate) fn enable_background_document_pulls(
-        &mut self,
-        owner: Weak<parking_lot::Mutex<LspManager>>,
-    ) {
-        self.startup_owner = owner.clone();
-        self.capacity.lock().managers.push(owner.clone());
-        self.background_pull_owner = owner;
-    }
-
-    pub(crate) fn set_server_capacity(
-        &mut self,
-        capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
-    ) {
-        self.capacity = capacity;
     }
 
     fn queue_background_document_pull(&mut self, key: &ServerKey, file: &Path) {
@@ -6925,6 +6911,7 @@ impl LspManager {
         Ok(PreparedSpawn {
             start_signal: None,
             worker_permit: None,
+            worker_admission: self.worker_analyzer_admission(config),
             #[cfg(any(test, feature = "test-support"))]
             spawn_hook: self.spawn_hook.clone(),
             #[cfg(test)]
@@ -7858,6 +7845,7 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
 /// from `LspManager` state so the slow part can run without the manager lock.
 struct PreparedSpawn {
     worker_permit: Option<super::client::RustAnalyzerPermit>,
+    worker_admission: super::client::WorkerAnalyzerAdmission,
     start_signal: Option<Arc<StartSignal>>,
     #[cfg(any(test, feature = "test-support"))]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -7992,7 +7980,9 @@ impl PreparedSpawn {
             )?;
         let permit = match self.worker_permit.take() {
             Some(permit) => Ok(Some(permit)),
-            None if worker => super::client::rust_analyzer_capacity().acquire().map(Some),
+            None if worker => super::client::rust_analyzer_capacity()
+                .acquire(&self.worker_admission)
+                .map(Some),
             None => Ok(None),
         };
         let mut client = match permit.and_then(|permit| {
@@ -8053,7 +8043,7 @@ impl PreparedSpawn {
                 .rust_worker_policy
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            if let Err(error) = client.enable_rust_worker_policy() {
+            if let Err(error) = client.enable_rust_worker_policy(&self.worker_admission) {
                 return Err(SpawnFailure::NotStarted {
                     exit_log_line: format!(
                         "worker analyzer admission refused before initialize: {error}"

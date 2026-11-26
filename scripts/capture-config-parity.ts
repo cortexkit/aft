@@ -286,6 +286,10 @@ const CASES: ParityCase[] = [
   { name: "lsp_max_servers_project_default_floor", project: { lsp: { max_servers: 23 } } },
   { name: "pi_lsp_max_servers_project_tighten", user: { lsp: { max_servers: 8 } }, project: { lsp: { max_servers: 0 } }, harness: "pi" },
   { name: "pi_lsp_max_servers_project_loosen_refused", user: { lsp: { max_servers: 3 } }, project: { lsp: { max_servers: 23 } }, harness: "pi" },
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `${harness}_worker_rust_analyzers_user`, harness, user: { lsp: { worker_rust_analyzers: 3 } }, project: { lsp: { worker_rust_analyzers: 4 } } },
+    { name: `${harness}_worker_rust_analyzers_project_zero`, harness, project: { lsp: { worker_rust_analyzers: 0 } } },
+  ]),
   { name: "lsp_idle_never", user: { lsp: { idle_minutes: "never" } } },
   { name: "lsp_idle_clamped_min", user: { lsp: { idle_minutes: 0 } } },
   { name: "lsp_idle_clamped_max", user: { lsp: { idle_minutes: 2000 } } },

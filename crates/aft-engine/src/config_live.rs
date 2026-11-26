@@ -664,6 +664,10 @@ fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'stati
         candidate.lsp_max_servers = floor.lsp_max_servers;
         held.push("lsp.max_servers");
     }
+    if candidate.lsp_worker_rust_analyzers > floor.lsp_worker_rust_analyzers {
+        candidate.lsp_worker_rust_analyzers = floor.lsp_worker_rust_analyzers;
+        held.push("lsp.worker_rust_analyzers");
+    }
     if candidate.lsp_idle_minutes > floor.lsp_idle_minutes {
         candidate.lsp_idle_minutes = floor.lsp_idle_minutes;
         held.push("lsp.idle_minutes");
@@ -957,6 +961,8 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("lsp.idle_shutdown", lsp_idle_shutdown);
     live!("lsp.max_servers", lsp_max_servers);
     live!("lsp.max_servers", lsp_user_max_servers);
+    live!("lsp.worker_rust_analyzers", lsp_worker_rust_analyzers);
+    live!("lsp.worker_rust_analyzers", lsp_user_worker_rust_analyzers);
     live!("backup.max_file_size", backup.max_file_size);
     // Sandbox: every spawn reads the snapshot its request pinned.
     live!("sandbox.profile.worker", sandbox.profile.worker);
@@ -1092,6 +1098,8 @@ fn classification_is_exhaustive(config: &Config) {
         lsp_idle_shutdown: _,
         lsp_max_servers: _,
         lsp_user_max_servers: _,
+        lsp_worker_rust_analyzers: _,
+        lsp_user_worker_rust_analyzers: _,
         url_fetch_allow_private: _,
         disabled_tools: _,
         idle,

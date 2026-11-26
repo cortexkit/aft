@@ -2368,42 +2368,8 @@ fn rust_worker_inspect_is_partial_and_never_invokes_cargo_on_path() {
     );
 }
 
-#[test]
-fn rust_worker_inspect_capacity_refusal_is_partial_and_names_cap() {
-    let _guard = super::lsp_manager_test::rust_worker_policy_test_guard();
-    let fixtures = (0..2)
-        .map(|_| single_crate_fixture("occupied-worker-slot"))
-        .collect::<Vec<_>>();
-    let mut occupied = Vec::new();
-    for (_, _, file) in &fixtures {
-        let mut manager = aft::lsp::manager::LspManager::new();
-        manager.override_binary(ServerKind::Rust, fake_server_path());
-        manager.disable_rust_cargo_for_worker();
-        assert_eq!(
-            crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
-                .ensure_server_for_file(file, &Config::default()))
-            .len(),
-            1
-        );
-        occupied.push(manager);
-    }
-    let (_temp, root, _) = single_crate_fixture("refused-worker-slot");
-    let ctx = configured_context(&root);
-    ctx.lsp()
-        .override_binary(ServerKind::Rust, fake_server_path());
-    let response = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "worker-inspect-cap", "command": "inspect", "scope": "src/lib.rs",
-            "sections": "diagnostics", "worker_session": true,
-        }),
-    );
-    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
-    let text = response["text"].as_str().unwrap();
-    assert!(text.contains("rust_analyzer_capacity_exhausted"), "{text}");
-    assert!(text.contains("cap=2"), "{text}");
-    assert_eq!(ctx.lsp().server_count(), 0);
-}
+#[path = "inspect_command_test/worker_capacity.rs"]
+mod worker_capacity;
 
 fn scoped_diagnostics_inspect(ctx: &AppContext, id: &str, scope: &str) -> Value {
     inspect_tool_call(
