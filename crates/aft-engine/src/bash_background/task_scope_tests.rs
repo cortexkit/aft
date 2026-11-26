@@ -671,6 +671,14 @@ fn task_scope_kill_reports_killed_when_scope_is_collected_during_open() {
     let cgroup = root.path().join("fake-cgroup");
     std::fs::create_dir(&cgroup).unwrap();
     std::fs::write(cgroup.join("cgroup.kill"), "0").unwrap();
+    // A real scope lists its processes; the scope's SIGTERM reaches them.
+    let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+    let procs: String = super::super::process::process_group_identities(pgid)
+        .unwrap()
+        .iter()
+        .map(|identity| format!("{}\n", identity.pid))
+        .collect();
+    std::fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
     registry
         .inner
         .task_scopes
