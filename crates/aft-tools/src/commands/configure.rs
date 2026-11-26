@@ -723,13 +723,15 @@ fn restore_watcher(ctx: &AppContext, generation: u64, gap_epoch: u64) {
 
 /// Fence cached views before acknowledging a rebind, without any filesystem
 /// or database work on the daemon frame loop.
-pub(crate) fn fence_subc_watcher_gap(ctx: &AppContext) {
+#[doc(hidden)]
+pub fn fence_subc_watcher_gap(ctx: &AppContext) {
     let _ = begin_watcher_restore(ctx);
 }
 
 /// Restore after the route is installed: only a bound root may rescan its
 /// indexes. Filesystem and SQLite work never runs on the frame loop.
-pub(crate) fn restore_subc_watcher(ctx: Arc<AppContext>) {
+#[doc(hidden)]
+pub fn restore_subc_watcher(ctx: Arc<AppContext>) {
     let Some((generation, epoch)) = begin_watcher_restore(&ctx) else {
         return;
     };
@@ -7386,7 +7388,7 @@ mod tests {
         let (probe_released, wait_probe_released) = mpsc::channel();
         let probe_thread = std::thread::spawn(move || {
             {
-                let _probe = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
+                let _probe = git_root_commit_probe_override_lock_for_test();
                 if probe_held.send(()).is_err()
                     || wait_env_checked.recv_timeout(hang_guard).is_err()
                 {

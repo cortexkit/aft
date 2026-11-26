@@ -500,31 +500,20 @@ fn handle_append_with_open(
     // the same `lsp_diagnostics`, `lsp_complete`, `lsp_pending_servers`, and
     // `lsp_exited_servers` shape as `write` and `edit_match` find/replace.
     if lsp_outcome.is_some() {
-        let write_result = edit::WriteResult {
-            markdown_table_advisory: None,
+        let write_result = edit::WriteResult::for_append(
             syntax_valid,
             syntax_skipped_reason,
             syntax_error_line,
             formatted,
-            format_skipped_reason: format_skipped_reason.clone(),
-            validate_requested: false,
-            validation_errors: Vec::new(),
-            validate_skipped_reason: None,
-            // Append-mode does not currently snapshot pre-write validity for
-            // rollback (handled by the shared write pipeline only). Surface
-            // false until/unless append gains the same rollback flow.
-            rolled_back: false,
-            rollback_skipped_reason: None,
+            format_skipped_reason.clone(),
             lsp_outcome,
-            final_text: None,
-            write_warnings: Vec::new(),
-            reformatted_excerpt: final_content.as_deref().and_then(|content| {
+            final_content.as_deref().and_then(|content| {
                 edit::compute_reformatted_excerpt(
                     &format!("{before_content}{append_content}"),
                     content,
                 )
             }),
-        };
+        );
         write_result.append_lsp_diagnostics_to(&mut result);
         write_result.append_reformatted_excerpt_to(&mut result);
     }

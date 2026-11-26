@@ -55,10 +55,12 @@ const WORKER_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 /// Output preview a watch result carries for a finished task.
 const PREVIEW_BYTES: usize = crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES;
 
-pub(crate) type WatchReplyTimingSink = Arc<OnceLock<WatchReplyTiming>>;
+#[doc(hidden)]
+pub type WatchReplyTimingSink = Arc<OnceLock<WatchReplyTiming>>;
 
 #[derive(Default)]
-pub(crate) struct WatchReplyTiming {
+#[doc(hidden)]
+pub struct WatchReplyTiming {
     recovery: Duration,
     scan: Duration,
     status: Duration,
@@ -67,7 +69,7 @@ pub(crate) struct WatchReplyTiming {
 }
 
 impl WatchReplyTiming {
-    pub(crate) fn append_log_fields(&self, line: &mut String) {
+    pub fn append_log_fields(&self, line: &mut String) {
         use std::fmt::Write;
         let _ = write!(
             line,

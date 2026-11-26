@@ -2210,6 +2210,36 @@ pub fn format_validation_errors(errors: &[format::ValidationError]) -> String {
 
 impl WriteResult {
     #[doc(hidden)]
+    pub fn for_append(
+        syntax_valid: Option<bool>,
+        syntax_skipped_reason: Option<&'static str>,
+        syntax_error_line: Option<usize>,
+        formatted: bool,
+        format_skipped_reason: Option<String>,
+        lsp_outcome: Option<crate::lsp::manager::PostEditWaitOutcome>,
+        reformatted_excerpt: Option<ReformattedExcerpt>,
+    ) -> Self {
+        Self {
+            markdown_table_advisory: None,
+            syntax_valid,
+            syntax_skipped_reason,
+            syntax_error_line,
+            formatted,
+            format_skipped_reason,
+            validate_requested: false,
+            validation_errors: Vec::new(),
+            validate_skipped_reason: None,
+            // Append does not run the shared syntax rollback pipeline.
+            rolled_back: false,
+            rollback_skipped_reason: None,
+            lsp_outcome,
+            final_text: None,
+            write_warnings: Vec::new(),
+            reformatted_excerpt,
+        }
+    }
+
+    #[doc(hidden)]
     pub fn append_rollback_skipped_to(&self, result: &mut serde_json::Value) {
         if let Some(reason) = self.rollback_skipped_reason {
             result["rollback_skipped_reason"] = serde_json::json!(reason);

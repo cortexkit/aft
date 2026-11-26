@@ -829,7 +829,8 @@ pub fn run_tool_call(
     )
 }
 
-pub(crate) fn run_carrier_tool_call(
+#[doc(hidden)]
+pub fn run_carrier_tool_call(
     bare_name: &str,
     args: Value,
     format_context: &crate::subc_format::FormatContext,
