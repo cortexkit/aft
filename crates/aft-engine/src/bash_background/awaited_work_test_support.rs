@@ -6,7 +6,7 @@ impl BgTaskRegistry {
         let layout =
             super::super::super::persistence::create_task_layout(storage, "shell-session", key)
                 .unwrap();
-        let paths = layout.paths().clone();
+        let paths = layout.paths.clone();
         let mut metadata = PersistedTask::starting(
             key.into(),
             "shell-session".into(),
