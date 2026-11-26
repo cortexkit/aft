@@ -162,6 +162,7 @@ pub fn publish_after_document_sync_for_test(
     Some(version)
 }
 
+#[cfg(any(test, unix))]
 pub(super) fn lifecycle_fake_client_with_env<'a>(
     manager: &LspManager,
     key: &ServerKey,
