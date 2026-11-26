@@ -1126,6 +1126,7 @@ fn event_overflow_does_not_strand_analysis_progress() {
     let (_tmp, mut manager, key) = progress_overflow_client(ServerKind::Python);
     let file = key.root.join("main.py");
     std::fs::write(&file, "n = 1\n").unwrap();
+    manager.sync_document_version_for_test(&key, &file, 1);
 
     send_work_done(&manager, &key, 1, "analysis", "begin");
     publish_for_progress(&manager, &key, 2, &file);
@@ -1156,7 +1157,7 @@ fn event_overflow_does_not_strand_analysis_progress() {
     send_work_done(&manager, &key, end + 4, "next", "end");
     manager.drain_events();
     assert!(!manager.diagnostics.entries_for_file(&file)[0].1.provisional);
-    assert!(manager.producer_has_settled(&key));
+    assert!(manager.has_authoritative_report_for_server(&key));
 }
 
 #[test]
@@ -1164,6 +1165,7 @@ fn event_overflow_retains_queued_begin_and_create() {
     let (_tmp, mut manager, key) = progress_overflow_client(ServerKind::Python);
     let file = key.root.join("main.py");
     std::fs::write(&file, "n = 1\n").unwrap();
+    manager.sync_document_version_for_test(&key, &file, 1);
     send_work_done(&manager, &key, 1, "active", "begin");
     send_work_done(&manager, &key, 2, "announced", "create");
     let dropped = fill_progress_queue(&manager, &key, 3);
@@ -1207,6 +1209,7 @@ fn analysis_progress_token_limit_retires_instance_without_certifying() {
     let (_tmp, mut manager, key) = progress_overflow_client(ServerKind::Python);
     let file = key.root.join("main.py");
     std::fs::write(&file, "n = 1\n").unwrap();
+    manager.sync_document_version_for_test(&key, &file, 1);
     publish_for_progress(&manager, &key, 1, &file);
     manager.drain_events();
     assert!(manager.has_authoritative_report_for_server(&key));
@@ -1289,7 +1292,9 @@ fn publish_for_progress(manager: &LspManager, key: &ServerKey, order: u64, file:
             server_kind: key.kind.clone(),
             root: key.root.clone(),
             method: "textDocument/publishDiagnostics".into(),
-            params: Some(json!({"uri": uri_for_path(file).unwrap(), "diagnostics": []})),
+            params: Some(
+                json!({"uri": uri_for_path(file).unwrap(), "version": 1, "diagnostics": []}),
+            ),
         },
     );
 }
@@ -1355,6 +1360,7 @@ fn flycheck_overflow_leaves_no_running_or_completed_check_and_rearms() {
     manager.event_tx.send(progress("end")).unwrap();
     let file = key.root.join("main.rs");
     std::fs::write(&file, "fn main() {}\n").unwrap();
+    manager.sync_document_version_for_test(&key, &file, 1);
     publish_for_progress(&manager, &key, 1, &file);
     manager.drain_events();
     assert_eq!(manager.rust_check_state(&key), RustCheckState::Unreported);
