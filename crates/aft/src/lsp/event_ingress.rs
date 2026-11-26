@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use parking_lot::Mutex;
 
 use super::analysis_progress::{self, AnalysisProgressShadow, Transition};
@@ -12,9 +13,199 @@ pub(super) const EVENT_CAP: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct EventIngress {
-    ordinary: Sender<ReceivedLspEvent>,
+    inbox: Weak<Mutex<Inbox>>,
     wake: Sender<()>,
     controls: Arc<Mutex<HashMap<ServerInstanceId, Control>>>,
+}
+
+#[derive(Clone)]
+pub(super) struct EventReceiver {
+    inbox: Arc<Mutex<Inbox>>,
+    ready: Receiver<()>,
+}
+
+struct Inbox {
+    ready: Sender<()>,
+    next: u64,
+    ordinary: usize,
+    pending: BTreeMap<u64, Queued>,
+    scoped: HashMap<ServerInstanceId, HashMap<String, Slot>>,
+}
+
+struct Queued {
+    event: ReceivedLspEvent,
+    scoped_uri: Option<String>,
+}
+
+#[derive(Default)]
+struct Slot {
+    users: usize,
+    pending: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScopedReportLease {
+    inbox: Weak<Mutex<Inbox>>,
+    slots: Vec<(ServerInstanceId, String)>,
+}
+
+impl ScopedReportLease {
+    pub(super) fn reserve(
+        &mut self,
+        selected: impl IntoIterator<Item = (ServerInstanceId, String)>,
+        per_server_cap: usize,
+    ) {
+        if let Some(inbox) = self.inbox.upgrade() {
+            let mut inbox = inbox.lock();
+            for (instance, uri) in selected {
+                let slots = inbox.scoped.entry(instance).or_default();
+                if !slots.contains_key(&uri) && slots.len() >= per_server_cap {
+                    continue;
+                }
+                slots.entry(uri.clone()).or_default().users += 1;
+                self.slots.push((instance, uri));
+            }
+        }
+    }
+}
+
+impl Drop for ScopedReportLease {
+    fn drop(&mut self) {
+        let Some(inbox) = self.inbox.upgrade() else {
+            return;
+        };
+        let mut inbox = inbox.lock();
+        for (instance, uri) in &self.slots {
+            let slots = inbox.scoped.get_mut(instance).expect("registered instance");
+            let slot = slots.get_mut(uri).expect("registered document");
+            slot.users -= 1;
+            if slot.users == 0 && slot.pending.is_none() {
+                slots.remove(uri);
+                if slots.is_empty() {
+                    inbox.scoped.remove(instance);
+                }
+            }
+        }
+    }
+}
+
+impl EventReceiver {
+    pub(super) fn len(&self) -> usize {
+        self.inbox.lock().pending.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(super) fn ready(&self) -> &Receiver<()> {
+        &self.ready
+    }
+
+    pub(super) fn try_recv(&self) -> Result<ReceivedLspEvent, TryRecvError> {
+        let mut inbox = self.inbox.lock();
+        let _ = self.ready.try_recv();
+        let Some((_, queued)) = inbox.pending.pop_first() else {
+            return Err(TryRecvError::Empty);
+        };
+        if let Some(uri) = queued.scoped_uri {
+            let instance = queued.event.instance.expect("scoped publish instance");
+            let slots = inbox.scoped.get_mut(&instance).unwrap();
+            let slot = slots.get_mut(&uri).unwrap();
+            if slot.users == 0 {
+                slots.remove(&uri);
+                if slots.is_empty() {
+                    inbox.scoped.remove(&instance);
+                }
+            } else {
+                slot.pending = None;
+            }
+        } else {
+            inbox.ordinary -= 1;
+        }
+        if !inbox.pending.is_empty() {
+            let _ = inbox.ready.try_send(());
+        }
+        Ok(queued.event)
+    }
+
+    pub(super) fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ReceivedLspEvent, RecvTimeoutError> {
+        self.recv_deadline(Instant::now() + timeout)
+    }
+
+    pub(super) fn recv_deadline(
+        &self,
+        deadline: Instant,
+    ) -> Result<ReceivedLspEvent, RecvTimeoutError> {
+        loop {
+            if let Ok(event) = self.try_recv() {
+                return Ok(event);
+            }
+            self.ready.recv_deadline(deadline)?;
+        }
+    }
+}
+
+fn document_publish(event: &LspEvent) -> Option<(&str, Option<i64>)> {
+    match event {
+        LspEvent::Notification {
+            method,
+            params: Some(params),
+            ..
+        } if method == "textDocument/publishDiagnostics" => Some((
+            params.get("uri")?.as_str()?,
+            params.get("version").and_then(serde_json::Value::as_i64),
+        )),
+        _ => None,
+    }
+}
+
+impl Inbox {
+    fn push(&mut self, event: ReceivedLspEvent) -> Result<(), TrySendError<ReceivedLspEvent>> {
+        let scoped_uri = if let Some((instance, (uri, version))) =
+            event.instance.zip(document_publish(&event.event))
+        {
+            if let Some(slot) = self
+                .scoped
+                .get_mut(&instance)
+                .and_then(|slots| slots.get_mut(uri))
+                .filter(|slot| slot.users != 0)
+            {
+                if let Some(previous) = slot.pending {
+                    let previous_version = document_publish(&self.pending[&previous].event.event)
+                        .and_then(|(_, version)| version);
+                    if previous_version
+                        .zip(version)
+                        .is_some_and(|(previous, next)| previous > next)
+                    {
+                        return Ok(());
+                    }
+                    self.pending.remove(&previous);
+                }
+                slot.pending = Some(self.next);
+                Some(uri.to_owned())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if scoped_uri.is_none() {
+            if self.ordinary == EVENT_CAP {
+                return Err(TrySendError::Full(event));
+            }
+            self.ordinary += 1;
+        }
+        // Put a replacement in its new receive position. Progress and
+        // registration notifications that came before it must still run first.
+        self.pending.insert(self.next, Queued { event, scoped_uri });
+        self.next += 1;
+        let _ = self.ready.try_send(());
+        Ok(())
+    }
 }
 
 struct Control {
@@ -49,18 +240,35 @@ impl Drop for EventIngressLease {
 }
 
 impl EventIngress {
-    pub(super) fn new() -> (Self, Receiver<ReceivedLspEvent>, Receiver<()>) {
-        let (ordinary, events) = bounded(EVENT_CAP);
+    pub(super) fn new() -> (Self, EventReceiver, Receiver<()>) {
+        let (ready, received) = bounded(1);
         let (wake, hints) = bounded(1);
+        let inbox = Arc::new(Mutex::new(Inbox {
+            ready,
+            next: 0,
+            ordinary: 0,
+            pending: BTreeMap::new(),
+            scoped: HashMap::new(),
+        }));
         (
             Self {
-                ordinary,
+                inbox: Arc::downgrade(&inbox),
                 wake,
                 controls: Arc::default(),
             },
-            events,
+            EventReceiver {
+                inbox,
+                ready: received,
+            },
             hints,
         )
+    }
+
+    pub(super) fn scoped_report_lease(&self) -> ScopedReportLease {
+        ScopedReportLease {
+            inbox: self.inbox.clone(),
+            slots: Vec::new(),
+        }
     }
 
     pub(super) fn register(&self, instance: ServerInstanceId, key: ServerKey) -> EventIngressLease {
@@ -107,7 +315,11 @@ impl EventIngress {
                 }
             }
         }
-        match self.ordinary.try_send(event) {
+        let Some(inbox) = self.inbox.upgrade() else {
+            return Err(TrySendError::Disconnected(event));
+        };
+        let result = inbox.lock().push(event);
+        match result {
             Err(TrySendError::Full(event)) => {
                 if matches!(event.event, LspEvent::ServerExited { .. }) {
                     // One exit per reader. Its instance owns exactly one slot,
@@ -238,5 +450,66 @@ impl EventIngress {
             .lock()
             .get(&id)
             .is_some_and(|control| control.exit.is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::registry::ServerKind;
+    use serde_json::json;
+
+    #[test]
+    fn scoped_inbox_keeps_the_latest_version_in_receive_order() {
+        let (ingress, events, _) = EventIngress::new();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: "fixture".into(),
+        };
+        let instance = ServerInstanceId::next();
+        let _registration = ingress.register(instance, key.clone());
+        let uri = "file:///fixture/lib.rs";
+        let notify = |order, method: &str, params| ReceivedLspEvent {
+            event: LspEvent::Notification {
+                server_kind: key.kind.clone(),
+                root: key.root.clone(),
+                method: method.into(),
+                params,
+            },
+            instance: Some(instance),
+            receive_order: Some(order),
+        };
+        let publish = |order, version| {
+            notify(
+                order,
+                "textDocument/publishDiagnostics",
+                Some(json!({
+                    "uri": uri, "version": version, "diagnostics": []
+                })),
+            )
+        };
+        let mut lease = ingress.scoped_report_lease();
+        lease.reserve([(instance, uri.into())], 1);
+        ingress.send(publish(1, 1)).unwrap();
+        for order in 2..=EVENT_CAP as u64 + 1 {
+            ingress
+                .send(notify(order, "fixture/ordinary", None))
+                .unwrap();
+        }
+        let latest_order = EVENT_CAP as u64 + 2;
+        ingress.send(publish(latest_order, 3)).unwrap();
+        ingress.send(publish(latest_order + 1, 2)).unwrap();
+        assert_eq!(events.len(), EVENT_CAP + 1);
+        assert!(ingress.take_overflows(|_, _| true).is_empty());
+        drop(lease);
+
+        // A pending report survives release, but it cannot jump ahead of
+        // ordinary events received before the newer publication.
+        for order in 2..latest_order {
+            assert_eq!(events.try_recv().unwrap().receive_order, Some(order));
+        }
+        assert_eq!(events.try_recv().unwrap().receive_order, Some(latest_order));
+        assert!(events.is_empty());
+        assert!(events.inbox.lock().scoped.is_empty());
     }
 }

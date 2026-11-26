@@ -9,7 +9,7 @@ mod diagnostic_registration;
 pub mod diagnostics;
 pub mod document;
 pub mod environmental;
-mod event_ingress;
+pub(crate) mod event_ingress;
 pub mod fresh_wait;
 pub mod jsonrpc;
 pub mod manager;

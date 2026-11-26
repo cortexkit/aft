@@ -1,12 +1,35 @@
 use super::*;
 use crate::lsp::analysis_progress::{Transition, ANALYSIS_TOKEN_LIMIT};
-use crate::lsp::event_ingress::IngressOverflow;
+use crate::lsp::event_ingress::{IngressOverflow, ScopedReportLease};
 
 fn earliest_settle(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
     current.into_iter().chain(candidate).min()
 }
 
 impl LspManager {
+    pub(crate) fn scoped_report_lease(&self) -> ScopedReportLease {
+        self.event_tx.scoped_report_lease()
+    }
+
+    pub(crate) fn reserve_scoped_reports_for_file(
+        &self,
+        lease: &mut ScopedReportLease,
+        file: &Path,
+        keys: &[ServerKey],
+        file_cap: usize,
+    ) {
+        let Ok(uri) = canonicalize_for_lsp(file).and_then(|path| uri_for_path(&path)) else {
+            return;
+        };
+        lease.reserve(
+            keys.iter().filter_map(|key| {
+                let client = self.clients.get(key)?;
+                Some((client.instance, uri.as_str().to_owned()))
+            }),
+            file_cap,
+        );
+    }
+
     /// Drain all pending LSP events. Call from the main loop.
     pub fn drain_events(&mut self) -> DrainedLspEvents {
         self.drain_events_bounded(usize::MAX)

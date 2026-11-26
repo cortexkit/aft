@@ -12,7 +12,7 @@ use lsp_types::{
     DidSaveTextDocumentParams, FileChangeType, FileEvent, TextDocumentIdentifier, TextDocumentItem,
 };
 
-use super::event_ingress::{EventIngress, EVENT_CAP};
+use super::event_ingress::{EventIngress, EventReceiver, EVENT_CAP};
 use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
@@ -913,7 +913,7 @@ pub struct DrainedLspEvents {
 }
 
 /// State carried by an `AppContext` post-edit wait after it releases the
-/// manager mutex. The raw receiver clone competes for each event exactly once;
+/// manager mutex. The inbox receiver clone competes for each event exactly once;
 /// the dedicated wake receiver covers the case where another drain path wins
 /// that race and updates the manager before this waiter sees the raw event.
 pub(crate) struct PostEditDiagnosticsWait {
@@ -921,7 +921,7 @@ pub(crate) struct PostEditDiagnosticsWait {
     expected_versions: Vec<(ServerKey, i32)>,
     pre_snapshot: HashMap<ServerKey, PreEditSnapshot>,
     responses_at_start: HashMap<ServerKey, u64>,
-    event_rx: Receiver<ReceivedLspEvent>,
+    event_rx: EventReceiver,
     ingress_rx: Receiver<()>,
     wake_rx: Receiver<()>,
     waiter_id: u64,
@@ -944,7 +944,7 @@ impl PostEditDiagnosticsWait {
         }
 
         crossbeam_channel::select! {
-            recv(self.event_rx) -> event => event.ok(),
+            recv(self.event_rx.ready()) -> _ => self.event_rx.try_recv().ok(),
             recv(self.ingress_rx) -> _ => None,
             recv(self.wake_rx) -> _ => None,
             default(remaining) => None,
@@ -957,7 +957,7 @@ impl PostEditDiagnosticsWait {
 /// returns when an event arrives or another drain path handled one, so the
 /// caller re-checks at once instead of sleeping a fixed interval.
 pub(crate) struct LspEventWait {
-    event_rx: Receiver<ReceivedLspEvent>,
+    event_rx: EventReceiver,
     ingress_rx: Receiver<()>,
     wake_rx: Receiver<()>,
     waiter_id: u64,
@@ -973,7 +973,7 @@ impl LspEventWait {
             return None;
         }
         crossbeam_channel::select! {
-            recv(self.event_rx) -> event => event.ok(),
+            recv(self.event_rx.ready()) -> _ => self.event_rx.try_recv().ok(),
             recv(self.ingress_rx) -> _ => None,
             recv(self.wake_rx) -> _ => None,
             default(remaining) => None,
@@ -1057,7 +1057,7 @@ pub struct LspManager {
     ready_startup_events: std::collections::VecDeque<StartupEventDelivery>,
     /// Unified event channel — all server reader threads send here.
     event_tx: EventIngress,
-    event_rx: Receiver<ReceivedLspEvent>,
+    event_rx: EventReceiver,
     ingress_rx: Receiver<()>,
     pending_change_slot: super::pending_changes::PendingLspChangeSlot,
     delivering_watched_changes: bool,

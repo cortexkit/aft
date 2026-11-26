@@ -104,6 +104,7 @@ pub(crate) struct ScopedSweep {
     pub(crate) still_checking: HashSet<ServerKey>,
     /// Documents this sweep opened, to close once diagnostics are read.
     opened: Vec<(PathBuf, Vec<ServerKey>)>,
+    push_reports: Option<crate::lsp::event_ingress::ScopedReportLease>,
     pull_pause: Option<crate::lsp::manager::BackgroundDocumentPullPause>,
     deadline: Option<Instant>,
 }
@@ -125,6 +126,7 @@ impl ScopedSweep {
     /// open retain their synchronized versions, so the next request can resync
     /// changes rather than treating the server's old text as current.
     pub(crate) fn close_opened(&mut self, ctx: &AppContext) {
+        drop(self.push_reports.take());
         let opened = std::mem::take(&mut self.opened);
         if opened.is_empty() {
             return;
@@ -250,7 +252,7 @@ pub(crate) fn sweep_scoped_files(
     ctx.lsp_forward_queued_watcher_changes();
     // A check an earlier request expected and that never began is asked for
     // again now, so it can run while the files are opened.
-    {
+    let mut push_reports = {
         let mut lsp = ctx.lsp();
         // Apply queued compiler pushes first, so the files whose compiler
         // errors could not be matched to their content are known below.
@@ -258,7 +260,8 @@ pub(crate) fn sweep_scoped_files(
         for key in involved.iter().filter(|key| key.kind == ServerKind::Rust) {
             lsp.rearm_unreported_rust_check(key);
         }
-    }
+        lsp.scoped_report_lease()
+    };
 
     // Deliver all document bodies before starting expensive analysis requests.
     // Otherwise a server busy analyzing an earlier pull can stop reading stdin
@@ -284,10 +287,12 @@ pub(crate) fn sweep_scoped_files(
             continue;
         }
         let mut lsp = ctx.lsp();
-        // Push servers can answer didOpen immediately. Apply their queued
-        // reports as the sweep opens files so it does not fill LSP ingress
-        // before reaching the wait for diagnostics.
+        // Apply already queued reports and progress before recording the
+        // diagnostic epochs and opening the next document.
         lsp.drain_events();
+        // Reserve before resync or didOpen: a push can arrive as soon as the
+        // message reaches the server, even while the manager is still locked.
+        lsp.reserve_scoped_reports_for_file(&mut push_reports, file, keys, SCOPED_SWEEP_FILE_CAP);
         // A document left open (by an AFT edit, say) still holds the text
         // the server was last sent. When the file changed on disk since, send
         // the current text first, so the decisions below are about the
@@ -703,5 +708,6 @@ pub(crate) fn sweep_scoped_files(
             }
         }
     }
+    sweep.push_reports = Some(push_reports);
     sweep
 }
