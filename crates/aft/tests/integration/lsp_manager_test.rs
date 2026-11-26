@@ -313,6 +313,61 @@ fn rust_worker_cap_admits_next_request_after_slot_release_without_restart() {
 }
 
 #[test]
+fn rust_worker_inspect_capacity_waits_for_released_slot() {
+    use aft::lsp::manager::{start_applicable_server_unlocked, walk_applicable_area};
+
+    let _guard = rust_worker_policy_test_guard();
+    let fixtures = (0..3).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let config = Config::default();
+    let mut occupied = Vec::new();
+    for (temp, file, _) in &fixtures[..2] {
+        let mut manager = rust_worker_logged_manager(&temp.path().join("initialization.jsonl"));
+        manager.disable_rust_cargo_for_worker();
+        assert_eq!(
+            crate::test_helpers::settled_lsp(&mut manager, |manager| manager
+                .ensure_server_for_file(file, &config))
+            .len(),
+            1
+        );
+        occupied.push(manager);
+    }
+    let (temp, file, _) = &fixtures[2];
+    let mut manager = rust_worker_logged_manager(&temp.path().join("initialization.jsonl"));
+    manager.disable_rust_cargo_for_worker();
+    let walk = walk_applicable_area(temp.path(), Some(std::slice::from_ref(file)), &config, None)
+        .expect("walk source");
+    let snapshot = manager.classify_applicable_servers(walk, &config);
+    let key = snapshot.server_keys[0].clone();
+    let manager = Arc::new(parking_lot::Mutex::new(manager));
+    let (send, receive) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        let start_key = &key;
+        let start_manager = &manager;
+        let start_config = &config;
+        scope.spawn(move || {
+            let outcome = start_applicable_server_unlocked(
+                start_manager,
+                &snapshot,
+                start_key,
+                start_config,
+                Instant::now() + Duration::from_secs(5),
+            );
+            send.send(outcome).unwrap();
+        });
+        assert!(
+            matches!(
+                receive.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "inspect must wait while both worker slots are occupied"
+        );
+        drop(occupied.pop());
+        let outcome = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(outcome.successful.as_slice(), std::slice::from_ref(&key));
+    });
+}
+
+#[test]
 fn rust_worker_cap_never_counts_or_refuses_head_analyzers() {
     let _guard = rust_worker_policy_test_guard();
     let fixtures = (0..4).map(|_| rust_fixture_files()).collect::<Vec<_>>();
