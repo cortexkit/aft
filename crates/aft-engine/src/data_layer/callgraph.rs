@@ -1098,15 +1098,41 @@ impl FileLists {
 #[derive(Debug, Default)]
 pub(crate) struct BindCache {
     files: Mutex<BoundSet>,
-    lists: Mutex<Option<Arc<FileLists>>>,
+    lists: Mutex<Option<MeasuredBindingIndex<FileLists>>>,
     /// Every file a resolver bound on first use: what resolution waited on
     /// that nothing bound beforehand.
     bound_on_first_use: FirstReads,
     /// Each declared Rust module's parent over every module-declaring file,
     /// once a cold build has found them all (see [`Self::index_module_parents`]).
-    module_parents: Mutex<Option<Arc<crate::callgraph_store::ModuleParents>>>,
+    module_parents: Mutex<Option<MeasuredBindingIndex<crate::callgraph_store::ModuleParents>>>,
     /// Whether the cache is bounded, readable without its lock.
     bounded: bool,
+}
+
+/// An immutable resolver index whose strings and containers are exclusively
+/// owned. Measure its heap once, before it is put in the cache.
+#[derive(Debug)]
+struct MeasuredBindingIndex<T> {
+    value: Arc<T>,
+    bytes: usize,
+}
+
+impl<T: aft_store::heap::HeapBytes> MeasuredBindingIndex<T> {
+    fn new(value: T) -> Self {
+        let value = Arc::new(value);
+        let bytes = aft_store::heap::heap_bytes_of(&value);
+        Self { value, bytes }
+    }
+}
+
+impl<T> aft_store::heap::HeapBytes for MeasuredBindingIndex<T> {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        if seen.first(Arc::as_ptr(&self.value)) {
+            self.bytes
+        } else {
+            0
+        }
+    }
 }
 
 /// The bound files a [`BindCache`] holds, and what bounds them.
@@ -1117,8 +1143,12 @@ struct BoundSet {
     /// second-chance sweep visits them; empty when unbounded.
     limit: Option<usize>,
     order: std::collections::VecDeque<String>,
-    /// The bytes the files held count for, when bounded.
+    /// Bound files and their map keys. The bounded cache uses the same count
+    /// for its limit, without charging for the table or sweep queue.
     held: usize,
+    /// Heap bytes of the sweep queue's path strings, including stale paths
+    /// that still wait for the sweep after an explicit removal.
+    order_path_bytes: usize,
     /// How many files were bound and how many let go, when bounded.
     bound: usize,
     evicted: usize,
@@ -1127,29 +1157,33 @@ struct BoundSet {
 #[derive(Debug)]
 struct BoundEntry {
     bound: Arc<BoundFile>,
-    /// The file's heap bytes, counted when bounded.
+    /// Heap bytes of the binding and its map key (a right-sized path clone).
     bytes: usize,
     /// Read since the sweep last passed it.
     used: std::sync::atomic::AtomicBool,
 }
 
-impl BoundSet {
-    fn insert(&mut self, path: String, bound: Arc<BoundFile>) {
-        let bytes = match self.limit {
-            Some(_) => {
-                use aft_store::heap::HeapBytes as _;
-                bound.heap_bytes(&mut aft_store::heap::Seen::new()) + path.len()
-            }
-            None => 0,
-        };
-        let entry = BoundEntry {
+impl BoundEntry {
+    fn new(path: &str, bound: BoundFile) -> Self {
+        let bound = Arc::new(bound);
+        // The binding and its surface are created for this cache entry. No
+        // other field of the checkout retains either allocation.
+        let bytes = aft_store::heap::heap_bytes_of(&bound) + path.len();
+        Self {
             bound,
             bytes,
             used: std::sync::atomic::AtomicBool::new(false),
-        };
+        }
+    }
+}
+
+impl BoundSet {
+    fn insert(&mut self, path: String, entry: BoundEntry) {
+        let bytes = entry.bytes;
         if let Some(old) = self.map.insert(path.clone(), entry) {
             self.held -= old.bytes;
         } else if self.limit.is_some() {
+            self.order_path_bytes += path.capacity();
             self.order.push_back(path);
         }
         self.held += bytes;
@@ -1168,12 +1202,14 @@ impl BoundSet {
                 break;
             };
             let Some(entry) = self.map.get(&path) else {
+                self.order_path_bytes -= path.capacity();
                 continue;
             };
             if entry.used.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 self.order.push_back(path);
                 continue;
             }
+            self.order_path_bytes -= path.capacity();
             let entry = self.map.remove(&path).expect("found above");
             self.held -= entry.bytes;
             self.evicted += 1;
@@ -1188,21 +1224,112 @@ impl BoundSet {
 }
 
 impl aft_store::heap::HeapBytes for BoundSet {
-    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
-        self.map
-            .iter()
-            .map(|(path, entry)| {
-                path.heap_bytes(seen)
-                    + std::mem::size_of::<(String, BoundEntry)>()
-                    + entry.bound.heap_bytes(seen)
-            })
-            .sum::<usize>()
+    fn heap_bytes(&self, _seen: &mut aft_store::heap::Seen) -> usize {
+        self.held
+            + self.map.len() * std::mem::size_of::<(String, BoundEntry)>()
             + self.order.capacity() * std::mem::size_of::<String>()
-            + self
-                .order
-                .iter()
-                .map(|path| path.heap_bytes(seen))
-                .sum::<usize>()
+            + self.order_path_bytes
+    }
+}
+
+#[cfg(test)]
+mod binding_cache_census {
+    use super::*;
+    use aft_store::heap::{heap_bytes_of, HeapBytes as _, Seen};
+
+    fn bound(facts: u8) -> BoundFile {
+        use crate::callgraph_store::fact_answers::{FactAnswer, FactQuestion};
+        let mut binding = ViewBindingDependencies::default();
+        for fact in 0..facts {
+            binding
+                .binding_answers
+                .insert(FactQuestion::IsFile(vec![fact]), FactAnswer::Bool(true));
+        }
+        BoundFile {
+            surface: Arc::new(DbFileIndex::empty(None)),
+            binding,
+        }
+    }
+
+    fn assert_matches_walk(cache: &BindCache) {
+        // Count the cache's live allocations directly, without using its
+        // saved totals.
+        let files = cache.files.lock().unwrap();
+        let mut reference = Seen::new();
+        let mut expected = files.order.capacity() * std::mem::size_of::<String>();
+        expected += files.order.iter().map(String::capacity).sum::<usize>();
+        for (path, entry) in &files.map {
+            expected += std::mem::size_of::<(String, BoundEntry)>()
+                + path.capacity()
+                + entry.bound.heap_bytes(&mut reference);
+        }
+        drop(files);
+        if let Some(lists) = &*cache.lists.lock().unwrap() {
+            expected += lists.value.heap_bytes(&mut reference);
+        }
+        if let Some(parents) = &*cache.module_parents.lock().unwrap() {
+            expected += parents.value.heap_bytes(&mut reference);
+        }
+        let mut seen = Seen::counting_map_set_entries();
+        assert_eq!(cache.heap_bytes(&mut seen), expected);
+        assert_eq!(
+            seen.map_set_entries_visited(),
+            0,
+            "the census revisited cache entries"
+        );
+    }
+
+    #[test]
+    fn binding_cache_census_does_not_visit_entries_as_the_cache_grows() {
+        let cache = BindCache::default();
+        for count in [1, 256] {
+            let paths = (0..count)
+                .map(|i| format!("src/{i}.rs"))
+                .collect::<Vec<_>>();
+            for path in &paths {
+                cache.set_new(path, bound(32));
+            }
+            *cache.module_parents.lock().unwrap() = Some(MeasuredBindingIndex::new(
+                paths
+                    .iter()
+                    .map(|path| (path.clone(), ("lib.rs".into(), "mod".into())))
+                    .collect(),
+            ));
+            cache.set_lists(FileLists {
+                rust: paths,
+                module_declaring: vec!["lib.rs".into()],
+            });
+            assert_matches_walk(&cache);
+        }
+        let before = heap_bytes_of(&cache);
+        cache.set("src/0.rs".into(), bound(64));
+        assert!(heap_bytes_of(&cache) > before);
+        assert_matches_walk(&cache);
+        cache.remove("src/0.rs");
+        assert!(heap_bytes_of(&cache) < before);
+        assert_matches_walk(&cache);
+    }
+
+    #[test]
+    fn binding_cache_census_stays_exact_through_removal_and_second_chance_eviction() {
+        let cache = BindCache::bounded(usize::MAX);
+        let mut stale = String::with_capacity(256);
+        stale.push_str("removed.rs");
+        cache.set(stale, bound(1));
+        cache.remove("removed.rs");
+        cache.set("recent.rs".into(), bound(3));
+        cache.set("old.rs".into(), bound(4));
+        let kept = cache.get("recent.rs").unwrap();
+        assert_matches_walk(&cache);
+        cache.files.lock().unwrap().evict_to(0);
+        assert!(cache.get("recent.rs").is_some());
+        assert!(cache.get("old.rs").is_none());
+        assert_eq!(
+            cache.counts().held,
+            heap_bytes_of(&kept) + "recent.rs".len()
+        );
+        assert_eq!(cache.counts().evicted, 1);
+        assert_matches_walk(&cache);
     }
 }
 
@@ -1239,7 +1366,7 @@ impl BindCache {
         BindCacheCounts {
             bound: files.bound,
             evicted: files.evicted,
-            held: files.held,
+            held: if self.bounded { files.held } else { 0 },
         }
     }
 
@@ -1252,23 +1379,25 @@ impl BindCache {
 
     /// Records `bound` as `path`'s binding, replacing any earlier one.
     pub(crate) fn set(&self, path: String, bound: BoundFile) -> Arc<BoundFile> {
-        let bound = Arc::new(bound);
+        let entry = BoundEntry::new(&path, bound);
+        let bound = Arc::clone(&entry.bound);
         self.files
             .lock()
             .expect("no panics while holding it")
-            .insert(path, Arc::clone(&bound));
+            .insert(path, entry);
         bound
     }
 
     /// Records `bound` unless another thread bound `path` first; the two are
     /// equal, since binding reads only the file and the checkout.
     fn set_new(&self, path: &str, bound: BoundFile) -> Arc<BoundFile> {
+        let new = BoundEntry::new(path, bound);
         let mut files = self.files.lock().expect("no panics while holding it");
         if let Some(entry) = files.map.get(path) {
             return Arc::clone(&entry.bound);
         }
-        let bound = Arc::new(bound);
-        files.insert(path.to_string(), Arc::clone(&bound));
+        let bound = Arc::clone(&new.bound);
+        files.insert(path.to_string(), new);
         bound
     }
 
@@ -1310,17 +1439,19 @@ impl BindCache {
             }
         }
         let count = parents.len();
+        let parents = MeasuredBindingIndex::new(parents);
         *self
             .module_parents
             .lock()
-            .expect("no panics while holding it") = Some(Arc::new(parents));
+            .expect("no panics while holding it") = Some(parents);
         Ok(count)
     }
 
     /// Sets the whole-checkout lists, built by a caller that read every
     /// parse anyway, so resolution does not read them all again.
     fn set_lists(&self, lists: FileLists) {
-        *self.lists.lock().expect("no panics while holding it") = Some(Arc::new(lists));
+        let lists = MeasuredBindingIndex::new(lists);
+        *self.lists.lock().expect("no panics while holding it") = Some(lists);
     }
 
     /// Updates the whole-checkout lists, once built, for `paths`, whose
@@ -1335,7 +1466,7 @@ impl BindCache {
         let Some(current) = slot.as_ref() else {
             return;
         };
-        let mut lists = FileLists::clone(current);
+        let mut lists = FileLists::clone(&current.value);
         for path in paths {
             let (rust, declaring) = inputs
                 .parses
@@ -1344,24 +1475,28 @@ impl BindCache {
             FileLists::place(&mut lists.rust, path, rust);
             FileLists::place(&mut lists.module_declaring, path, declaring);
         }
-        *slot = Some(Arc::new(lists));
+        *slot = Some(MeasuredBindingIndex::new(lists));
     }
 
     fn lists(&self, inputs: &CheckoutInputs) -> Arc<FileLists> {
         let mut slot = self.lists.lock().expect("no panics while holding it");
-        Arc::clone(slot.get_or_insert_with(|| {
-            let mut lists = FileLists::default();
-            for (path, (_, parse)) in &inputs.parses {
-                let (rust, declaring) = FileLists::kinds(parse);
-                if rust {
-                    lists.rust.push(path.clone());
-                }
-                if declaring {
-                    lists.module_declaring.push(path.clone());
-                }
-            }
-            Arc::new(lists)
-        }))
+        Arc::clone(
+            &slot
+                .get_or_insert_with(|| {
+                    let mut lists = FileLists::default();
+                    for (path, (_, parse)) in &inputs.parses {
+                        let (rust, declaring) = FileLists::kinds(parse);
+                        if rust {
+                            lists.rust.push(path.clone());
+                        }
+                        if declaring {
+                            lists.module_declaring.push(path.clone());
+                        }
+                    }
+                    MeasuredBindingIndex::new(lists)
+                })
+                .value,
+        )
     }
 
     /// Binds, in parallel, every file that declares Rust modules and is not
@@ -1409,7 +1544,7 @@ impl BindCache {
             .expect("no panics while holding it")
             .as_ref()
         {
-            return Ok(Arc::clone(lists));
+            return Ok(Arc::clone(&lists.value));
         }
         let paths = inputs.parses.keys().collect::<Vec<_>>();
         let known = {
@@ -1449,8 +1584,9 @@ impl BindCache {
                 lists.module_declaring.push(path.clone());
             }
         }
+        let lists = MeasuredBindingIndex::new(lists);
         let mut slot = self.lists.lock().expect("no panics while holding it");
-        Ok(Arc::clone(slot.get_or_insert_with(|| Arc::new(lists))))
+        Ok(Arc::clone(&slot.get_or_insert(lists).value))
     }
 
     /// The files resolution bound on first use since the last call.
@@ -1597,7 +1733,8 @@ impl LoadedFileIndexes for BoundFiles<'_> {
             .module_parents
             .lock()
             .expect("no panics while holding it")
-            .clone()
+            .as_ref()
+            .map(|parents| Arc::clone(&parents.value))
     }
 }
 
@@ -3373,7 +3510,6 @@ impl aft_store::heap::HeapBytes for BindCache {
             + self.module_parents.heap_bytes(seen)
     }
 }
-aft_store::heap_bytes_none!(BoundEntry);
 aft_store::heap_bytes_of_fields!(OrdinaryCalls {
     syntax,
     associated,

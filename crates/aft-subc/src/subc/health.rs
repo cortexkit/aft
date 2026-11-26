@@ -33,9 +33,12 @@ mod demand;
 mod legacy_root;
 #[path = "health/reply_tracking.rs"]
 mod reply_tracking;
+#[path = "health/rollup_timing.rs"]
+mod rollup_timing;
 mod root_evidence;
 pub(super) use reply_tracking::bash_watch_warning_wait_ms;
 use reply_tracking::UnansweredTool;
+use rollup_timing::RollupStepTimer;
 use root_evidence::{health_failure_evidence, health_failure_field, health_nondefault};
 
 /// Why the idle reaper kept an existing, unbound root that is past its idle
@@ -4035,53 +4038,6 @@ macro_rules! rollup_mark {
     };
 }
 
-struct RollupStepTimer {
-    started: Instant,
-    previous: Instant,
-    steps: std::collections::BTreeMap<&'static str, (Duration, u64)>,
-    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-    cpu: rollup_bench::Timer,
-}
-
-impl RollupStepTimer {
-    fn new() -> Self {
-        let started = Instant::now();
-        Self {
-            started,
-            previous: started,
-            steps: Default::default(),
-            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-            cpu: rollup_bench::Timer::new(),
-        }
-    }
-
-    fn mark(&mut self, step: &'static str) {
-        let now = Instant::now();
-        let entry = self.steps.entry(step).or_default();
-        entry.0 += now.duration_since(self.previous);
-        entry.1 += 1;
-        self.previous = now;
-        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-        self.cpu.mark(step);
-    }
-
-    fn metrics(&self) -> Value {
-        // Elapsed time includes scheduler waits; the offline benchmark also
-        // measures thread CPU so host contention is distinguishable from work.
-        let steps = self
-            .steps
-            .iter()
-            .map(|(step, (elapsed, calls))| {
-                (
-                    (*step).to_owned(),
-                    json!({"elapsed_ms": elapsed.as_secs_f64() * 1000.0, "calls": calls}),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
-        json!({"elapsed_ms": self.started.elapsed().as_secs_f64() * 1000.0, "steps": steps})
-    }
-}
-
 /// Storage roots resolved once per rollup tick. Every context in one tick
 /// that names the same configured storage and cache roots resolves to the
 /// same directories, so resolving once per distinct configuration keeps a
@@ -4666,9 +4622,7 @@ fn build_health_diagnostic_rollup_from_actors(
     });
     rollup_mark!(timer, "metrics JSON assembly");
     let tick = timer.metrics();
-    if log::log_enabled!(log::Level::Debug) && cache.step_log_due() {
-        log::debug!("health rollup tick: {tick}");
-    }
+    rollup_timing::log_tick(root_count, &tick, || cache.step_log_due());
     // Keep detailed timing outside the size-budgeted health reply: adding it
     // there would displace root diagnostics. The uncapped census retains the
     // timing of the rollup that measured it.

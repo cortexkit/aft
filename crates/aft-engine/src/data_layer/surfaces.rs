@@ -1355,7 +1355,13 @@ fn memory_estimate_with(ctx: &dyn IndexHost, reuse_dirty: bool) -> Option<DataLa
                 .as_ref()
                 .map(|snapshot| Arc::as_ptr(snapshot) as usize);
             let walk = || {
-                let mut seen = aft_store::heap::Seen::new();
+                let started =
+                    (reuse_dirty && log::log_enabled!(log::Level::Warn)).then(Instant::now);
+                let mut seen = if started.is_some() {
+                    aft_store::heap::Seen::counting_map_set_entries()
+                } else {
+                    aft_store::heap::Seen::new()
+                };
                 // aft_inspect's dead-code scan may hold the same snapshot the
                 // checkout's dead-code memo holds; the root's
                 // `callgraph_projection` plane counts it then.
@@ -1364,6 +1370,18 @@ fn memory_estimate_with(ctx: &dyn IndexHost, reuse_dirty: bool) -> Option<DataLa
                 }
                 let memory = checkout.checkout().memory(&mut seen);
                 let meaning = checkout.meaning_memory(&mut seen);
+                if let Some(started) = started {
+                    let elapsed = started.elapsed();
+                    if elapsed > Duration::from_millis(250) {
+                        log::warn!(
+                            "health rollup slow checkout memory walk: root={} map_set_entries_visited={} elapsed_ms={} locked_parts={}",
+                            checkout.root().display(),
+                            seen.map_set_entries_visited(),
+                            elapsed.as_millis(),
+                            seen.contended(),
+                        );
+                    }
+                }
                 checkout_estimate(memory, meaning, seen.contended())
             };
             if reuse_dirty {
