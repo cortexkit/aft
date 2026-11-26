@@ -325,6 +325,7 @@ pub(super) fn walk_shell_commands(
     struct Targets<'a> {
         directories: Vec<DirectoryTarget>,
         on_command: &'a mut dyn FnMut(Node<'_>, Option<&Path>),
+        inherited_home: Option<PathBuf>,
     }
     impl std::ops::Deref for Targets<'_> {
         type Target = Vec<DirectoryTarget>;
@@ -338,10 +339,27 @@ pub(super) fn walk_shell_commands(
         }
     }
 
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    struct ShellOptions {
+        physical: Option<bool>,
+        inherited_home: bool,
+    }
+    impl ShellOptions {
+        fn join(self, other: Self) -> Self {
+            Self {
+                physical: if self.physical == other.physical {
+                    self.physical
+                } else {
+                    None
+                },
+                inherited_home: self.inherited_home && other.inherited_home,
+            }
+        }
+    }
     #[derive(Clone, PartialEq, Eq)]
     struct ShellState {
         cwd: PathBuf,
-        physical: Option<bool>,
+        options: ShellOptions,
         snapshot_unchanged: bool,
         // A possible failure after another command, not a missing snapshot folder.
         uncertain_cd_failure: bool,
@@ -349,8 +367,8 @@ pub(super) fn walk_shell_commands(
     #[derive(Clone)]
     enum Paths {
         Known(Vec<ShellState>),
-        // The folder is unknown, but its default cd mode may still be known.
-        Unknown(Option<bool>),
+        // The folder is unknown, but the shell options may still be known.
+        Unknown(ShellOptions),
     }
     impl Paths {
         fn empty() -> Self {
@@ -359,7 +377,10 @@ pub(super) fn walk_shell_commands(
         fn one(cwd: PathBuf, physical: bool) -> Self {
             Self::Known(vec![ShellState {
                 cwd,
-                physical: Some(physical),
+                options: ShellOptions {
+                    physical: Some(physical),
+                    inherited_home: true,
+                },
                 snapshot_unchanged: true,
                 uncertain_cd_failure: false,
             }])
@@ -367,36 +388,29 @@ pub(super) fn walk_shell_commands(
         fn is_empty(&self) -> bool {
             matches!(self, Self::Known(paths) if paths.is_empty())
         }
-        fn mode(&self) -> Option<bool> {
+        fn options(&self) -> ShellOptions {
             match self {
-                Self::Unknown(mode) => *mode,
-                Self::Known(states) => {
-                    let first = states.first()?.physical;
-                    if states.iter().all(|state| state.physical == first) {
-                        first
-                    } else {
-                        None
-                    }
-                }
+                Self::Unknown(options) => *options,
+                Self::Known(states) => states
+                    .iter()
+                    .map(|state| state.options)
+                    .reduce(ShellOptions::join)
+                    .unwrap_or_default(),
             }
         }
         fn insert(&mut self, state: ShellState) {
             match self {
-                Self::Unknown(mode) => {
-                    if *mode != state.physical {
-                        *mode = None;
-                    }
+                Self::Unknown(options) => {
+                    *options = options.join(state.options);
                 }
                 Self::Known(paths) if !paths.contains(&state) => {
                     // Too many possible shell states make the set unknown; never discard
                     // just the extra folder and keep pretending the set is complete.
                     if paths.len() >= MAX_CWD_PATHS {
-                        let mode = paths
+                        let options = paths
                             .iter()
-                            .all(|path| path.physical == state.physical)
-                            .then_some(state.physical)
-                            .flatten();
-                        *self = Self::Unknown(mode);
+                            .fold(state.options, |options, path| options.join(path.options));
+                        *self = Self::Unknown(options);
                     } else {
                         paths.push(state);
                     }
@@ -409,7 +423,7 @@ pub(super) fn walk_shell_commands(
                 return other;
             }
             match other {
-                Self::Unknown(mode) => Self::Unknown(if self.mode() == mode { mode } else { None }),
+                Self::Unknown(options) => Self::Unknown(self.options().join(options)),
                 Self::Known(paths) => {
                     for path in paths {
                         self.insert(path);
@@ -418,18 +432,27 @@ pub(super) fn walk_shell_commands(
                 }
             }
         }
-        fn with_physical(self, physical: Option<bool>) -> Self {
+        fn map_options(self, mut update: impl FnMut(&mut ShellOptions)) -> Self {
             match self {
-                Self::Unknown(_) => Self::Unknown(physical),
+                Self::Unknown(mut options) => {
+                    update(&mut options);
+                    Self::Unknown(options)
+                }
                 Self::Known(states) => {
                     let mut result = Self::empty();
                     for mut state in states {
-                        state.physical = physical;
+                        update(&mut state.options);
                         result.insert(state);
                     }
                     result
                 }
             }
+        }
+        fn forget_home(self) -> Self {
+            self.map_options(|options| options.inherited_home = false)
+        }
+        fn with_physical(self, physical: Option<bool>) -> Self {
+            self.map_options(|options| options.physical = physical)
         }
         fn snapshot_unchanged(&self) -> bool {
             match self {
@@ -489,14 +512,14 @@ pub(super) fn walk_shell_commands(
         }
         fn all(self) -> Paths {
             let mut paths = self.success.union(self.failure);
-            let mode = paths.mode();
+            let options = paths.options();
             if let Paths::Known(states) = &mut paths {
                 let uncertain_failure = states.iter().any(|state| state.uncertain_cd_failure);
                 let different_folders = states
                     .first()
                     .is_some_and(|first| states.iter().any(|state| state.cwd != first.cwd));
                 if uncertain_failure && different_folders {
-                    return Paths::Unknown(mode);
+                    return Paths::Unknown(options);
                 }
                 for state in states {
                     state.uncertain_cd_failure = false;
@@ -630,6 +653,7 @@ pub(super) fn walk_shell_commands(
         head: &str,
         parts: &[Part],
         cwd: Option<&Path>,
+        inherited_home: Option<&Path>,
         default_physical: bool,
     ) -> Option<(DirectoryTarget, PathBuf)> {
         let mut physical = default_physical;
@@ -666,18 +690,29 @@ pub(super) fn walk_shell_commands(
             options = false;
         }
         let raw = operand?;
-        // The runner's home is not the local account's home. Quoted or escaped
-        // tildes remain ordinary path text, but home expansion is unknown.
-        if raw == "~" || raw.starts_with("~/") {
-            return None;
-        }
-        let text = literal_word(raw)
-            .filter(|text| text != "-" && !(head == "pushd" && text.starts_with('+')))?;
-        let literal_absolute = Path::new(&text).is_absolute();
-        let joined = if literal_absolute {
-            PathBuf::from(text)
+        let (joined, literal_absolute) = if raw == "~" || raw.starts_with("~/") {
+            // Inspect the caller's intended local path without rewriting the
+            // command. Only the unquoted tilde is special; the suffix must
+            // still parse as literal shell text.
+            let text = literal_word(&format!("\\{raw}"))?;
+            let suffix = text[1..].trim_start_matches('/');
+            let home = inherited_home?;
+            let mut path = home.to_path_buf();
+            if !suffix.is_empty() {
+                // The slash after `~` belongs to HOME even if the remaining
+                // text starts with another slash or a drive prefix.
+                path.as_mut_os_string().push("/");
+                path.as_mut_os_string().push(suffix);
+            }
+            (path, false)
         } else {
-            cwd?.join(text)
+            let text = literal_word(raw)
+                .filter(|text| text != "-" && !(head == "pushd" && text.starts_with('+')))?;
+            if Path::new(&text).is_absolute() {
+                (PathBuf::from(text), true)
+            } else {
+                (cwd?.join(text), false)
+            }
         };
         let (path, next_cwd) = if physical {
             let resolved = crate::system_temp::resolve_with_existing_ancestors(&joined);
@@ -711,19 +746,23 @@ pub(super) fn walk_shell_commands(
             // Stack rotation or an unmodeled stack edit cannot establish a
             // successful cwd. Failure still leaves the incoming folder intact.
             return Flow {
-                success: Paths::Unknown(incoming.mode()),
+                success: Paths::Unknown(incoming.options()),
                 failure: incoming,
             };
         }
         let mut success = Paths::empty();
         let mut failure = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
-        let mut resolve = |cwd, mode, snapshot_unchanged| {
-            let resolved = match mode {
-                Some(physical) => resolve_target(head, parts, cwd, physical)
+        let inherited_home = targets
+            .inherited_home
+            .as_deref()
+            .filter(|_| incoming.options().inherited_home);
+        let mut resolve = |cwd, options: ShellOptions, snapshot_unchanged| {
+            let resolved = match options.physical {
+                Some(physical) => resolve_target(head, parts, cwd, inherited_home, physical)
                     .map(|(target, next_cwd)| (target, Some(next_cwd))),
-                None => resolve_target(head, parts, cwd, false)
-                    .zip(resolve_target(head, parts, cwd, true))
+                None => resolve_target(head, parts, cwd, inherited_home, false)
+                    .zip(resolve_target(head, parts, cwd, inherited_home, true))
                     .map(|((mut logical, logical_cwd), (physical, physical_cwd))| {
                         if logical.path != physical.path {
                             logical.alternate_path = Some(physical.path);
@@ -744,19 +783,19 @@ pub(super) fn walk_shell_commands(
                 if let Some(next_cwd) = next_cwd {
                     success.insert(ShellState {
                         cwd: next_cwd,
-                        physical: mode,
+                        options,
                         snapshot_unchanged,
                         uncertain_cd_failure: false,
                     });
                 } else {
-                    success = Paths::Unknown(None);
+                    success = success.clone().union(Paths::Unknown(options));
                 }
                 if !emitted.contains(&target) {
                     emitted.push(target);
                 }
                 known_success
             } else {
-                success = success.clone().union(Paths::Unknown(mode));
+                success = success.clone().union(Paths::Unknown(options));
                 false
             }
         };
@@ -765,7 +804,7 @@ pub(super) fn walk_shell_commands(
                 for state in paths {
                     if !resolve(
                         Some(state.cwd.as_path()),
-                        state.physical,
+                        state.options,
                         state.snapshot_unchanged,
                     ) {
                         let mut unchanged = state.clone();
@@ -774,8 +813,8 @@ pub(super) fn walk_shell_commands(
                     }
                 }
             }
-            Paths::Unknown(mode) => {
-                if !resolve(None, *mode, false) {
+            Paths::Unknown(options) => {
+                if !resolve(None, *options, false) {
                     failure = incoming.clone();
                 }
             }
@@ -938,6 +977,29 @@ pub(super) fn walk_shell_commands(
             _ => false,
         }
     }
+    fn assigns_home(node: Node<'_>, source: &str) -> bool {
+        node.kind() == "variable_assignment"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(source, name) == "HOME")
+    }
+    fn changes_home(node: Node<'_>, source: &str) -> bool {
+        match node.kind() {
+            "variable_assignment" => assigns_home(node, source),
+            "command" | "declaration_command" | "unset_command" => {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor);
+                if node.kind() == "unset_command" {
+                    children.any(|child| {
+                        literal_word(node_text(source, child)).as_deref() == Some("HOME")
+                    })
+                } else {
+                    children.any(|child| assigns_home(child, source))
+                }
+            }
+            _ => false,
+        }
+    }
     fn evaluate(
         node: Node<'_>,
         source: &str,
@@ -968,17 +1030,30 @@ pub(super) fn walk_shell_commands(
                     for value in node.children_by_field_name("value", &mut cursor) {
                         inspect_substitutions(value, source, &incoming, targets, known_directory);
                     }
-                    let _ = evaluate(body, source, incoming.clone(), targets, known_directory);
-                    return Flow::either(incoming);
+                    let incoming = if node
+                        .child_by_field_name("variable")
+                        .is_some_and(|name| node_text(source, name) == "HOME")
+                    {
+                        incoming.forget_home()
+                    } else {
+                        incoming
+                    };
+                    let iteration =
+                        evaluate(body, source, incoming.clone(), targets, known_directory);
+                    return Flow::either(if iteration.all().options().inherited_home {
+                        incoming
+                    } else {
+                        incoming.forget_home()
+                    });
                 }
                 inspect_independent_children(
                     node,
                     source,
-                    Paths::Unknown(None),
+                    Paths::Unknown(ShellOptions::default()),
                     targets,
                     known_directory,
                 );
-                return Flow::either(Paths::Unknown(None));
+                return Flow::either(Paths::Unknown(ShellOptions::default()));
             }
             "function_definition" => return Flow::success(incoming.invalidate_snapshot()),
             "if_statement" | "c_style_for_statement" | "while_statement" | "case_statement" => {
@@ -987,11 +1062,11 @@ pub(super) fn walk_shell_commands(
                 inspect_independent_children(
                     node,
                     source,
-                    Paths::Unknown(None),
+                    Paths::Unknown(ShellOptions::default()),
                     targets,
                     known_directory,
                 );
-                return Flow::either(Paths::Unknown(None));
+                return Flow::either(Paths::Unknown(ShellOptions::default()));
             }
             "negated_command" => {
                 if let Some(body) = node.named_child(0) {
@@ -1025,6 +1100,11 @@ pub(super) fn walk_shell_commands(
                 (targets.on_command)(node, cwd);
                 let has_substitution =
                     inspect_substitutions(node, source, &incoming, targets, known_directory);
+                let incoming = if changes_home(node, source) {
+                    incoming.forget_home()
+                } else {
+                    incoming
+                };
                 let parts = command_parts(source, node);
                 let head = parts.first().and_then(|part| literal_word(&part.text));
                 let set = (head.as_deref() == Some("set")).then(|| set_options(&parts));
@@ -1048,10 +1128,12 @@ pub(super) fn walk_shell_commands(
                         directory_change(head, &parts, incoming, targets, known_directory)
                     }
                     Some("popd") => Flow {
-                        success: Paths::Unknown(incoming.mode()),
+                        success: Paths::Unknown(incoming.options()),
                         failure: incoming,
                     },
-                    Some("source" | "." | "eval") | None => Flow::either(Paths::Unknown(None)),
+                    Some("source" | "." | "eval") | None => {
+                        Flow::either(Paths::Unknown(ShellOptions::default()))
+                    }
                     Some("set") => {
                         let flow = match set.unwrap().0 {
                             SetModeChange::Unchanged => Flow::success(incoming.clone()),
@@ -1092,7 +1174,15 @@ pub(super) fn walk_shell_commands(
             }
             _ => {}
         }
-        evaluate_sequence(node, source, incoming, targets, known_directory)
+        let flow = evaluate_sequence(node, source, incoming, targets, known_directory);
+        if changes_home(node, source) {
+            Flow {
+                success: flow.success.forget_home(),
+                failure: flow.failure.forget_home(),
+            }
+        } else {
+            flow
+        }
     }
     fn evaluate_sequence(
         node: Node<'_>,
@@ -1163,6 +1253,9 @@ pub(super) fn walk_shell_commands(
     let mut targets = Targets {
         directories: Vec::new(),
         on_command,
+        // Match local shell path interpretation. A bash request cannot
+        // override HOME through its env argument.
+        inherited_home: std::env::home_dir().filter(|path| path.is_absolute()),
     };
     if let Some(tree) = parse_tree(command) {
         let _ = evaluate(
@@ -1924,8 +2017,8 @@ mod tests {
             "pushd +1",
             "popd",
             "cd",
-            "cd ~",
-            "cd ~/nested",
+            "cd ~another_user",
+            "cd ~/nested/*",
             "cd ../*",
         ] {
             let command = format!("{prefix} && cd ..; cd '{}' && cd nested", cwd.display());
@@ -2225,6 +2318,10 @@ mod tests {
             vec![cwd.join("~/nested")]
         );
         assert_eq!(
+            directory_paths(r"cd \~/nested", &cwd),
+            vec![cwd.join("~/nested")]
+        );
+        assert_eq!(
             directory_paths(
                 "cd ../sibling\\ repo; cd '../literal*'; cd '../$literal'",
                 &cwd
@@ -2235,6 +2332,44 @@ mod tests {
                 cwd.parent().unwrap().join("$literal")
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_targets_expand_inherited_home_until_the_shell_changes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let home = std::env::home_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(directory_paths("cd ~", &cwd), [home.clone()]);
+        for command in [
+            "cd ~/fresh",
+            "cd \"$UNKNOWN\"; cd ~/fresh",
+            "pushd ~//fresh",
+            "export HOME; cd ~/fresh",
+            "unset OPENCODE_DB; cd ~/fresh",
+            "false && export HOME=/elsewhere; cd ~/fresh",
+            "(unset HOME); cd ~/fresh",
+            "echo \"$(export HOME=/elsewhere)\"; cd ~/fresh",
+            "export HOME=/elsewhere | true; cd ~/fresh",
+            "export HOME=/elsewhere & cd ~/fresh",
+        ] {
+            assert_eq!(
+                directory_paths(command, &cwd),
+                [home.join("fresh")],
+                "{command}"
+            );
+        }
+        for command in [
+            "export HOME=$(mktemp -d); cd ~/fresh",
+            "HOME=/elsewhere; cd ~/fresh",
+            "HOME=/elsewhere true; cd ~/fresh",
+            "unset HOME; cd ~/fresh",
+            "unknown && export HOME=/elsewhere; cd ~/fresh",
+            "for c in first; do HOME=/elsewhere true; done; cd ~/fresh",
+            "for HOME in /elsewhere; do true; done; cd ~/fresh",
+        ] {
+            assert!(directory_paths(command, &cwd).is_empty(), "{command}");
+        }
     }
 
     #[cfg(unix)]

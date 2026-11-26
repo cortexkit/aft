@@ -7316,8 +7316,8 @@ fn runon_cd_scoped_and_unknown_directories_preserve_refusals() {
         "cd \"$DIR\" && cd ../x",
         "cd \"$DIR\"; cd ../x",
         "cd && cd ../x",
-        "cd ~ && cd ../x",
-        "cd ~/src && cd ../x",
+        "HOME=/tmp; cd ~ && cd ../x",
+        "unset HOME; cd ~/src && cd ../x",
         "cd - && cd ../x",
         "cd */sub && cd ../x",
     ] {
