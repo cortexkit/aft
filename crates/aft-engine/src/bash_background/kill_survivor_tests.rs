@@ -440,7 +440,7 @@ while [ ! -f ready ] && kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.02; done
     assert!(!child_is_in_group(), "explicit kill left the child running");
     assert!(
         logs.iter().any(|line| line.contains(&format!(
-            "bash kill task={task_id} pid={pgid} pgid=Some({pgid}) reason=\"kill_requested\""
+            "bash kill task={task_id} pid=unknown pgid=Some({pgid}) target=pgid reason=\"kill_requested\""
         ))),
         "kill attempt was not logged: {logs:?}"
     );

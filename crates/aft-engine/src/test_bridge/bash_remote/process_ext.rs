@@ -58,6 +58,7 @@ pub trait BgTaskRegistryTestExt: Sized {
     fn forget_task_record_for_test(&self, task_id: &str);
     fn route_delivery_snapshot(&self) -> Arc<std::collections::HashSet<String>>;
     fn task_for_test(&self, task_id: &str) -> Option<Arc<BgTask>>;
+    fn replay_live_task_for_test(&self, storage: &Path, session: &str, task: &str);
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask);
 
     fn status_relaxed(
@@ -240,6 +241,10 @@ impl BgTaskRegistryTestExt for BgTaskRegistry {
     }
     fn task_for_test(&self, task_id: &str) -> Option<Arc<BgTask>> {
         Self::task_for_test(self, task_id)
+    }
+
+    fn replay_live_task_for_test(&self, storage: &Path, session: &str, task: &str) {
+        Self::replay_live_task_for_test(self, storage, session, task);
     }
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
         BgTaskRegistry::dual_write_task(self, paths, metadata)

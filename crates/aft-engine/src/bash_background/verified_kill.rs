@@ -948,15 +948,12 @@ pub(in crate::bash_background) fn log_bash_kill(
     pgid: Option<i32>,
     reason: &str,
 ) {
-    let target = pid.or_else(|| pgid.and_then(|pgid| u32::try_from(pgid).ok()));
-    match target {
-        Some(pid) => {
-            crate::slog_info!("bash kill task={task_id} pid={pid} pgid={pgid:?} reason={reason:?}")
-        }
-        None => crate::slog_info!(
-            "bash kill task={task_id} pid=unknown pgid={pgid:?} reason={reason:?}"
-        ),
-    }
+    let (pid, target) = match pid {
+        Some(pid) => (pid.to_string(), ""),
+        None if pgid.is_some() => ("unknown".into(), " target=pgid"),
+        None => ("unknown".into(), ""),
+    };
+    crate::slog_info!("bash kill task={task_id} pid={pid} pgid={pgid:?}{target} reason={reason:?}");
 }
 
 /// Stop independent commands concurrently so a batch shares one grace window.
