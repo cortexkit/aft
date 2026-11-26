@@ -147,7 +147,7 @@ impl Service {
         scope: Option<&SessionScope>,
     ) -> Result<T, Failure> {
         req.validate()
-            .map_err(|error| Failure::Refused(error.code.to_string()))?;
+            .map_err(|error| Failure::Refused(error.code.as_str().to_owned()))?;
         let body = serde_json::to_vec(req).expect("serializable awaited-work request");
         let reply = wire.request(body, scope).await?;
         serde_json::from_slice(&reply).map_err(|error| Failure::Transport(error.to_string()))

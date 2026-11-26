@@ -9,7 +9,7 @@ use std::cell::Cell;
 #[path = "awaited_work_test_support.rs"]
 mod test_support;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum State {
     Opening,

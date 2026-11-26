@@ -40,11 +40,14 @@ impl BgTaskRegistry {
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|threads| {
             let ready = &barrier;
+            let reader_task = &task;
             threads.spawn(move || {
+                assert!(reader_task.state.try_lock().is_err());
                 ready.wait();
                 read_terminal();
             });
             threads.spawn(|| {
+                assert!(task.state.try_lock().is_err());
                 barrier.wait();
                 self.publish_awaited_for_test(key);
             });

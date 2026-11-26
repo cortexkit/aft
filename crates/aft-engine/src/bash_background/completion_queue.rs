@@ -301,13 +301,12 @@ impl BgTaskRegistry {
         {
             return;
         }
-        if self.uses_awaited_work(&task.task_id) {
-            return;
-        }
-        let interval_ms = task
-            .lock_state()
-            .ok()
-            .and_then(|state| state.metadata.runner_notice_policy)
+        let policy = match task.lock_state() {
+            Ok(state) if state.metadata.awaited_work.is_some() => return,
+            Ok(state) => state.metadata.runner_notice_policy,
+            Err(_) => None,
+        };
+        let interval_ms = policy
             .map(|policy| policy.reminder_interval_ms)
             .unwrap_or_else(|| {
                 self.inner

@@ -408,9 +408,10 @@ mod bash_background {
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
         registry.attach_awaited_for_test(&service);
         let (legacy, mut legacy_rx) = mpsc::unbounded_channel();
-        f.ctx.set_progress_sender(Some(Arc::new(move |frame| {
-            let _ = legacy.send(frame);
-        })));
+        f.ctx
+            .set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+                let _ = legacy.send(frame);
+            }))));
         registry.awaited_progress_for_test(&key);
         assert!(
             matches!(call(&mut calls).await, (Request::Progress(progress), None) if progress.key == key && progress.text == "one matched line")
