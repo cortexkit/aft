@@ -529,6 +529,7 @@ pub(super) fn run_pass(
     awaiting_reader: &mut HashMap<String, Instant>,
 ) {
     let _marker_reads = MarkerReadPass::begin(pass_cause);
+    registry.flush_deferred_watch_acks();
     // With no task to poll and no watch to check there is nothing to do, and
     // the published sizes say so without taking the database, watch or task
     // index locks.

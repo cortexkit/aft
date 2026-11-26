@@ -272,8 +272,12 @@ fn acknowledge_terminal_bash_reply(
         return;
     }
     if let Some(task_id) = response.data.get("task_id").and_then(Value::as_str) {
-        ctx.bash_background()
-            .ack_terminal_result_for_session(task_id, session_id);
+        let registry = ctx.bash_background();
+        if command == "bash_watch" {
+            registry.ack_terminal_watch_reply(task_id, session_id);
+        } else {
+            registry.ack_terminal_result_for_session(task_id, session_id);
+        }
     }
 }
 

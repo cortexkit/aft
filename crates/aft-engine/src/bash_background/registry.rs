@@ -1103,6 +1103,7 @@ mod completion_listener;
 mod scratch_retention;
 #[path = "shell_registry.rs"]
 mod shell_registry;
+mod terminal_watch_ack;
 
 pub use shell_registry::{ShellReader, ShellSnapshot, ShellSnapshotCache, SHELL_MASK_WITHHELD};
 #[path = "replay_liveness.rs"]
@@ -1372,6 +1373,7 @@ pub(crate) struct RegistryInner {
     /// task's current row; without that, a task that finished in the gap would
     /// keep a missing or stale (still running) row.
     db_writes_awaiting_pool: Mutex<HashMap<String, super::store_writes::Ticket>>,
+    deferred_watch_acks: terminal_watch_ack::DeferredWatchAcks,
     /// Whether the current interval without a handle has been logged, so the
     /// skipped writes are reported once per interval instead of once each.
     db_detached_logged: AtomicBool,
@@ -1909,6 +1911,7 @@ impl BgTaskRegistry {
                 runner_completion_delivery_cutover: std::sync::OnceLock::new(),
                 speech_db_path: RwLock::new(None),
                 db_writes_awaiting_pool: Mutex::new(HashMap::new()),
+                deferred_watch_acks: Default::default(),
                 db_detached_logged: AtomicBool::new(false),
                 db_harness: RwLock::new(None),
                 session_harnesses: Mutex::new(HashMap::new()),
@@ -4117,6 +4120,7 @@ impl BgTaskRegistry {
 
         rows.into_iter()
             .filter(|(_, row)| row.pending_match)
+            .filter(|(_, row)| !self.inner.deferred_watch_acks.suppresses(row))
             .filter(|(harness, row)| {
                 self.task_launching_identity_record(session_id, &row.task_id, Some(harness))
                     .map_or(identity.is_none(), |owner| {
@@ -4975,53 +4979,6 @@ impl BgTaskRegistry {
             watch_removed: removed,
             task_settled: settled,
         }))
-    }
-
-    /// Task-wide ack: once-watches (and any terminal-task watches)
-    /// are dropped after delivery is confirmed; sticky watches clear pending only.
-    fn ack_persisted_watches_for_task(&self, session_id: &str, task_id: &str, task_terminal: bool) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
-        else {
-            return;
-        };
-        let Ok(conn) = pool.lock() else {
-            return;
-        };
-        let Ok(rows) = crate::db::bash_watches::list_bash_pattern_watches_for_task(
-            &conn, &harness, session_id, task_id,
-        ) else {
-            return;
-        };
-        for mut row in rows {
-            // A task acknowledgement carries no watch version and cannot
-            // confirm delivery of a newer retry-overflow warning.
-            if row.pending_match
-                && row
-                    .match_batch
-                    .as_deref()
-                    .and_then(|b| serde_json::from_str::<super::watch_lines::LineBatch>(b).ok())
-                    .is_some_and(|b| b.retry_gap.is_some())
-            {
-                continue;
-            }
-            if task_terminal || (row.once && !row.scanning) {
-                let _ = crate::db::bash_watches::delete_bash_pattern_watch(
-                    &conn,
-                    &harness,
-                    session_id,
-                    task_id,
-                    &row.watch_id,
-                );
-                continue;
-            }
-            if row.pending_match {
-                row.pending_match = false;
-                row.match_text = None;
-                row.match_offset = None;
-                row.match_context = None;
-                let _ = crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row);
-            }
-        }
     }
 
     pub fn record_scanner_report(
@@ -7516,9 +7473,12 @@ impl BgTaskRegistry {
                     if disk.task_id == metadata.task_id
                         && disk.session_id == metadata.session_id =>
                 {
-                    // Output and cursor commit to the task file together;
-                    // the database mirror may lag after a process crash.
-                    if disk.remote.is_some()
+                    // Output, cursor and direct terminal acknowledgement can
+                    // commit to the task file before its database mirror.
+                    if (disk.is_terminal()
+                        && disk.completion_delivered
+                        && !metadata.completion_delivered)
+                        || disk.remote.is_some()
                         || disk.local_fallback_started
                         || metadata.remote.is_some()
                         || (metadata.status == BgTaskStatus::Starting
