@@ -103,10 +103,8 @@ impl BgTaskRegistry {
         let Some(pid) = metadata.child_pid else {
             return Ok(None);
         };
-        let answer = if let Some(start) = metadata.child_start_time_ms {
-            self.inner
-                .task_scopes
-                .adopt(&metadata.task_id, pid, start)?
+        let answer = if let Some(identity) = metadata.child_identity(pid) {
+            self.inner.task_scopes.adopt(&metadata.task_id, &identity)?
         } else {
             match lookup_state(&metadata.task_id)? {
                 ScopeLookup::Present(_) => {

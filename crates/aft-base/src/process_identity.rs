@@ -9,6 +9,75 @@ use std::sync::Mutex;
 #[cfg(any(target_os = "linux", any(test, feature = "test-support")))]
 use std::sync::OnceLock;
 
+use serde::{Deserialize, Serialize};
+
+/// Boot-relative Linux process birth, independent of the realtime clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxBirth {
+    pub boot_id: String,
+    pub start_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBirth {
+    pub fn of(pid: u32) -> Option<Self> {
+        Self::from_start_ticks(subc_os::start_time(pid)?)
+    }
+
+    pub(crate) fn from_start_ticks(start_ticks: u64) -> Option<Self> {
+        Some(Self {
+            start_ticks,
+            boot_id: subc_os::boot_id::current().ok()?,
+        })
+    }
+}
+
+/// A PID and its recorded epoch start time, with a stronger birth on Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub started_at_ms: u64,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub native_birth: Option<LinuxBirth>,
+}
+
+impl ProcessIdentity {
+    pub fn of(pid: u32) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(start) = process_start_time_override(pid) {
+                return Some(Self::from_epoch(pid, start?));
+            }
+            if let Some(birth) = LinuxBirth::of(pid) {
+                return Some(Self {
+                    pid,
+                    started_at_ms: linux_start_time_ms(birth.start_ticks, boot_time_secs()?)?,
+                    native_birth: Some(birth),
+                });
+            }
+        }
+        Some(Self::from_epoch(pid, process_start_time_ms(pid)?))
+    }
+
+    pub fn from_epoch(pid: u32, started_at_ms: u64) -> Self {
+        Self {
+            pid,
+            started_at_ms,
+            native_birth: None,
+        }
+    }
+
+    /// Unlike structural equality, matching a legacy record uses its exact epoch.
+    pub fn same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && match (&self.native_birth, &other.native_birth) {
+                (Some(saved), Some(current)) => saved == current,
+                _ => self.started_at_ms == other.started_at_ms,
+            }
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 static PROCESS_START_TIME_OVERRIDES: OnceLock<Mutex<HashMap<u32, Option<u64>>>> = OnceLock::new();
 
@@ -50,7 +119,11 @@ pub fn process_start_time_ms(pid: u32) -> Option<u64> {
     let after_comm = stat.rsplit_once(") ")?.1;
     let fields = after_comm.split_whitespace().collect::<Vec<_>>();
     let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
-    let boot_time_secs = boot_time_secs()?;
+    linux_start_time_ms(start_ticks, boot_time_secs()?)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_start_time_ms(start_ticks: u64, boot_time_secs: u64) -> Option<u64> {
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if ticks_per_second <= 0 {
         return None;
@@ -64,7 +137,16 @@ pub fn process_start_time_ms(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_boot_time_secs() -> Option<u64> {
+pub(crate) fn read_boot_time_secs() -> Option<u64> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(seconds) = BOOT_TIME_OVERRIDE.get() {
+        return Some(seconds);
+    }
+    read_proc_boot_time_secs()
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_boot_time_secs() -> Option<u64> {
     fs::read_to_string("/proc/stat")
         .ok()?
         .lines()
@@ -73,11 +155,32 @@ fn read_boot_time_secs() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn boot_time_secs() -> Option<u64> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(seconds) = BOOT_TIME_OVERRIDE.get() {
+        return Some(seconds);
+    }
     static BOOT_TIME_SECS: OnceLock<Option<u64>> = OnceLock::new();
-    cached_boot_time_secs(&BOOT_TIME_SECS, read_boot_time_secs)
+    cached_boot_time_secs(&BOOT_TIME_SECS, read_proc_boot_time_secs)
 }
 
-/// Read once per process: boot time cannot change while the process runs.
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
+thread_local! {
+    static BOOT_TIME_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
+pub fn with_linux_boot_time_for_test<T>(seconds: u64, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOOT_TIME_OVERRIDE.set(self.0);
+        }
+    }
+    let _restore = Restore(BOOT_TIME_OVERRIDE.replace(Some(seconds)));
+    run()
+}
+
+/// Keep the legacy epoch conversion consistent within one AFT process.
 /// Shared with the platform-independent test that proves the reader runs once.
 #[cfg(any(target_os = "linux", any(test, feature = "test-support")))]
 #[cfg_attr(not(test), allow(dead_code))]

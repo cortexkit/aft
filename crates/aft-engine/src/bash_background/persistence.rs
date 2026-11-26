@@ -434,6 +434,8 @@ pub struct PersistedTask {
     /// Used to detect when the OS reuses that PID for a different process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_start_time_ms: Option<u64>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub(crate) child_native_birth: Option<crate::process_identity::LinuxBirth>,
     /// AFT process responsible for publishing a local shell's launch result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) launch_owner: Option<ProcessIdentity>,
@@ -690,6 +692,7 @@ impl PersistedTask {
             child_pid: None,
             pgid: None,
             child_start_time_ms: None,
+            child_native_birth: None,
             launch_owner: None,
             live_descendants: None,
             live_descendants_omitted: 0,
@@ -760,12 +763,27 @@ impl PersistedTask {
         }
     }
 
+    pub(super) fn record_child_identity(&mut self, child_pid: u32) {
+        let identity = ProcessIdentity::of(child_pid);
+        self.child_start_time_ms = identity.as_ref().map(|value| value.started_at_ms);
+        self.child_native_birth = identity.and_then(|value| value.native_birth);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn child_identity(&self, pid: u32) -> Option<ProcessIdentity> {
+        Some(ProcessIdentity {
+            pid,
+            started_at_ms: self.child_start_time_ms?,
+            native_birth: self.child_native_birth.clone(),
+        })
+    }
+
     pub fn mark_running(&mut self, child_pid: u32, pgid: i32) {
         self.status = BgTaskStatus::Running;
         self.launch_owner = None;
         self.child_pid = Some(child_pid);
         self.pgid = Some(pgid);
-        self.child_start_time_ms = crate::process_identity::process_start_time_ms(child_pid);
+        self.record_child_identity(child_pid);
         crate::gh_shim_ticket::seal_spawn(self);
     }
 
@@ -877,6 +895,7 @@ impl From<BashTaskRow> for PersistedTask {
             child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
             pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
             child_start_time_ms: None,
+            child_native_birth: None,
             launch_owner: None,
             live_descendants: None,
             live_descendants_omitted: 0,
@@ -3212,7 +3231,7 @@ pub(crate) fn metadata_open_attempts_for_test() -> u32 {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn rollback_birth_fields_task_decoders_read_json_and_sqlite_metadata() {
+    fn native_birth_fields_round_trip_in_task_json_and_sqlite_metadata() {
         let storage = tempfile::tempdir().unwrap();
         let (resolved, mut task) = counted_task(storage.path());
         task.child_pid = Some(42);
@@ -3223,8 +3242,6 @@ mod tests {
         let mut value = serde_json::to_value(&task).unwrap();
         value["boot_id"] = "boot".into();
         value["start_ticks"] = 27.into();
-        value["child_boot_id"] = "boot".into();
-        value["child_start_ticks"] = 27.into();
         value["launch_owner"] = identity.clone();
         value["group_member_identities"] = serde_json::json!([identity]);
         let metadata = value.to_string();
@@ -3241,8 +3258,14 @@ mod tests {
                 .unwrap();
         for decoded in [read_task_at(&resolved).unwrap(), PersistedTask::from(saved)] {
             assert_eq!(decoded.child_start_time_ms, task.child_start_time_ms);
-            assert_eq!(decoded.launch_owner.unwrap().started_at_ms, 12345);
-            assert_eq!(decoded.group_member_identities[0].started_at_ms, 12345);
+            let birth = decoded.child_native_birth.as_ref().unwrap();
+            assert_eq!(birth.boot_id, "boot");
+            assert_eq!(birth.start_ticks, 27);
+            let owner = decoded.launch_owner.as_ref().unwrap();
+            assert_eq!(owner.started_at_ms, 12345);
+            assert_eq!(owner.native_birth.as_ref(), Some(birth));
+            assert_eq!(&decoded.group_member_identities, &[owner.clone()]);
+            assert_eq!(serde_json::to_value(decoded).unwrap()["start_ticks"], 27);
         }
     }
 

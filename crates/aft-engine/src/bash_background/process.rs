@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+pub use crate::process_identity::ProcessIdentity;
 /// Shared process-termination helpers for both foreground bash and background
 /// bash tasks. Extracted to avoid duplication between `commands/bash.rs` and
 /// `bash_background/registry.rs`.
@@ -50,7 +50,7 @@ pub struct GroupListing {
 
 /// The most member identities one check keeps. Far above the members a task
 /// shows, so the display limit never limits which survivors a kill can stop,
-/// while a task record stays small (about 50 bytes per identity).
+/// while a task record stays bounded.
 pub const GROUP_IDENTITY_CAP: usize = 1_024;
 
 /// The identities of up to [`GROUP_IDENTITY_CAP`] of `pids`, in order, and
@@ -433,31 +433,10 @@ fn process_group_gone(pgid: i32) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// A process as AFT recorded it: its pid and the time it started. A pid alone
-/// can be reused by an unrelated process; the pair cannot.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProcessIdentity {
-    pub pid: u32,
-    pub started_at_ms: u64,
-}
-
-impl ProcessIdentity {
-    /// The identity of a running process, or `None` when it has exited or
-    /// its start time cannot be read.
-    pub fn of(pid: u32) -> Option<Self> {
-        Some(Self {
-            pid,
-            started_at_ms: crate::process_identity::process_start_time_ms(pid)?,
-        })
-    }
-
-    /// Whether this exact process is still running and still in `pgid`. It is
-    /// the evidence that a process group answering under a task's saved
-    /// number is still that task's group, not a later one the system gave the
-    /// same number after the original group had exited.
-    pub fn is_running_in_group(self, pgid: i32) -> bool {
-        Self::of(self.pid) == Some(self) && process_group_of(self.pid) == Some(pgid)
-    }
+/// Both the saved birth and current group membership must still match.
+pub(crate) fn is_running_in_group(identity: &ProcessIdentity, pgid: i32) -> bool {
+    ProcessIdentity::of(identity.pid).is_some_and(|current| identity.same_process(&current))
+        && process_group_of(identity.pid) == Some(pgid)
 }
 
 /// The process group a process belongs to, read the same way for every user's
@@ -1926,12 +1905,7 @@ fn bounded_members_stops_describing_at_the_cap() {
 /// past the cap, and says when members were left out.
 #[test]
 fn capped_identities_keeps_every_member_up_to_the_cap() {
-    let identity = |pid| {
-        Some(ProcessIdentity {
-            pid,
-            started_at_ms: u64::from(pid),
-        })
-    };
+    let identity = |pid| Some(ProcessIdentity::from_epoch(pid, u64::from(pid)));
     let (identities, truncated) = capped_identities(1..21_u32, identity);
     assert_eq!(identities.len(), 20, "not limited to the members shown");
     assert!(!truncated);

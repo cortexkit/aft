@@ -87,7 +87,7 @@ fn sweep_provider_layouts_at(parent: &Parent) -> io::Result<()> {
             continue;
         };
         let stale = match ProcessIdentity::of(owner.pid) {
-            Some(current) => current != owner,
+            Some(current) => !owner.same_process(&current),
             None => !crate::fs_lock::process_alive(owner.pid),
         };
         if stale {
@@ -356,12 +356,61 @@ fn sweep_stale(
 
 #[cfg(test)]
 mod tests {
+    fn provider_layout_with_owner(
+        parent: &Parent,
+        identity: &crate::process_identity::ProcessIdentity,
+    ) -> PathBuf {
+        let path = parent.allocate(Path::new("")).unwrap();
+        fs::write(
+            parent.path.join(format!(
+                "{}.owner",
+                path.file_name().unwrap().to_string_lossy()
+            )),
+            serde_json::to_vec(identity).unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn rollback_birth_fields_provider_owner_decoder_reads_json() {
+    fn clock_step_preserves_live_provider_layout_but_not_reused_pid() {
+        use crate::process_identity::{with_linux_boot_time_for_test, ProcessIdentity};
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = Parent::open(&fixture.path().join("env-provider")).unwrap();
+        let pid = std::process::id();
+        let saved = with_linux_boot_time_for_test(100, || ProcessIdentity::of(pid).unwrap());
+        let live = provider_layout_with_owner(&parent, &saved);
+        let legacy = provider_layout_with_owner(
+            &parent,
+            &ProcessIdentity::from_epoch(pid, saved.started_at_ms),
+        );
+        with_linux_boot_time_for_test(200, || {
+            let mut current = ProcessIdentity::of(pid).unwrap();
+            assert_ne!(saved.started_at_ms, current.started_at_ms);
+            current.native_birth.as_mut().unwrap().start_ticks += 1;
+            let reused = provider_layout_with_owner(&parent, &current);
+            sweep_provider_layouts_at(&parent).unwrap();
+            assert!(
+                live.is_dir(),
+                "the clock step did not change the scratch owner"
+            );
+            assert!(!legacy.exists(), "legacy records require exact epoch");
+            assert!(!reused.exists(), "matching epoch must not hide PID reuse");
+        });
+    }
+
+    #[test]
+    fn native_birth_fields_round_trip_and_legacy_provider_owner_remains_readable() {
         use crate::bash_background::process::ProcessIdentity;
         let json = br#"{"pid":42,"started_at_ms":12345,"boot_id":"boot","start_ticks":27}"#;
         let decoded: ProcessIdentity = serde_json::from_reader(&json[..]).unwrap();
         assert_eq!((decoded.pid, decoded.started_at_ms), (42, 12345));
+        assert_eq!(serde_json::to_value(decoded).unwrap()["start_ticks"], 27);
+        let old = serde_json::json!({"pid": 42, "started_at_ms": 12345});
+        let decoded: ProcessIdentity = serde_json::from_value(old.clone()).unwrap();
+        assert!(decoded.native_birth.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
     }
 
     #[test]
@@ -374,28 +423,10 @@ mod tests {
             .args(["-c", "exit 0"])
             .spawn()
             .unwrap();
-        let dead = ProcessIdentity {
-            pid: child.id(),
-            started_at_ms: 0,
-        };
+        let dead = ProcessIdentity::from_epoch(child.id(), 0);
         child.wait().unwrap();
-        let reused = ProcessIdentity {
-            started_at_ms: live.started_at_ms + 1,
-            ..live
-        };
-        let mut paths = Vec::new();
-        for identity in [dead, reused, live] {
-            let path = parent.allocate(Path::new("")).unwrap();
-            fs::write(
-                parent.path.join(format!(
-                    "{}.owner",
-                    path.file_name().unwrap().to_string_lossy()
-                )),
-                serde_json::to_vec(&identity).unwrap(),
-            )
-            .unwrap();
-            paths.push(path);
-        }
+        let reused = ProcessIdentity::from_epoch(live.pid, live.started_at_ms + 1);
+        let paths = [dead, reused, live].map(|owner| provider_layout_with_owner(&parent, &owner));
         let ordinary = Parent::open(&fixture.path().join("ordinary"))
             .unwrap()
             .allocate(Path::new(""))

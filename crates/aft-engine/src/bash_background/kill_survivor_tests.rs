@@ -851,10 +851,10 @@ fn bash_kill_does_not_signal_a_group_that_reused_the_tasks_number() {
         storage.path(),
         pgid,
         None,
-        vec![ProcessIdentity {
-            pid: member,
-            started_at_ms: real.started_at_ms - 60_000,
-        }],
+        vec![ProcessIdentity::from_epoch(
+            member,
+            real.started_at_ms - 60_000,
+        )],
     );
     let killed = registry.kill(&task_id, SESSION).unwrap();
     assert!(
@@ -969,7 +969,7 @@ fn bash_kill_stops_a_survivor_that_was_only_counted_not_shown() {
 /// their cap) stays small.
 #[test]
 fn a_task_record_at_the_identity_cap_stays_bounded() {
-    const MAX_RECORD_BYTES: usize = 96 * 1024;
+    const MAX_RECORD_BYTES: usize = 160 * 1024;
     let storage = tempfile::tempdir().unwrap();
     let mut metadata = PersistedTask::starting(
         "bash-0123456789abcdef".into(),
@@ -999,6 +999,10 @@ fn a_task_record_at_the_identity_cap_stays_bounded() {
         .map(|offset| ProcessIdentity {
             pid: u32::MAX - offset,
             started_at_ms: u64::MAX,
+            native_birth: Some(crate::process_identity::LinuxBirth {
+                boot_id: "ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+                start_ticks: u64::MAX,
+            }),
         })
         .collect();
     metadata.group_member_identities_truncated = true;

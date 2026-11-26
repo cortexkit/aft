@@ -814,6 +814,7 @@ fn task_scope_replay_identity_refusal_does_not_block_session() {
         .clone();
     metadata.child_pid = healthy_metadata.child_pid;
     metadata.child_start_time_ms = healthy_metadata.child_start_time_ms;
+    metadata.child_native_birth = healthy_metadata.child_native_birth;
     write_task_at(&layout, &metadata).unwrap();
     first.detach();
     let second = BgTaskRegistry::default();
@@ -879,6 +880,7 @@ fn task_scope_kill_without_handle_does_not_need_pid_identity() {
     let task = first.task(&id).unwrap();
     let mut metadata = task.lock_state().unwrap().metadata.clone();
     metadata.child_start_time_ms = metadata.child_start_time_ms.map(|start| start + 1);
+    metadata.child_native_birth = None;
     first.detach();
     let second = BgTaskRegistry::default();
     second

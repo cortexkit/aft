@@ -101,6 +101,7 @@ pub fn disown_group_identities(registry: &BgTaskRegistry, id: &str) {
     *state.metadata.child_start_time_ms.as_mut().unwrap() += 1;
     for identity in &mut state.metadata.group_member_identities {
         identity.started_at_ms += 1;
+        identity.native_birth = None;
     }
 }
 

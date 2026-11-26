@@ -579,11 +579,11 @@ fn finished_group_is_still_the_tasks(metadata: &PersistedTask, pgid: i32) -> boo
     let leader = u32::try_from(pgid)
         .ok()
         .zip(metadata.child_start_time_ms)
-        .map(|(pid, started_at_ms)| ProcessIdentity { pid, started_at_ms });
+        .map(|(pid, started_at_ms)| ProcessIdentity::from_epoch(pid, started_at_ms));
     leader
-        .into_iter()
-        .chain(metadata.group_member_identities.iter().copied())
-        .any(|identity| identity.is_running_in_group(pgid))
+        .iter()
+        .chain(&metadata.group_member_identities)
+        .any(|identity| super::process::is_running_in_group(identity, pgid))
 }
 
 /// Store the outcome of one check of a task's process group: the surviving
@@ -5763,7 +5763,7 @@ impl BgTaskRegistry {
         // recoverable PID checkpoint in the existing record format.
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
-        metadata.child_start_time_ms = crate::process_identity::process_start_time_ms(child_pid);
+        metadata.record_child_identity(child_pid);
         #[cfg(target_os = "linux")]
         {
             metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
@@ -6208,7 +6208,7 @@ impl BgTaskRegistry {
             if let Some(pid) = runtime.child_pid {
                 metadata.child_pid = Some(pid);
                 metadata.pgid = Some(pid as i32);
-                metadata.child_start_time_ms = crate::process_identity::process_start_time_ms(pid);
+                metadata.record_child_identity(pid);
             }
             if let Err(error) = self.persist_task(&paths, &metadata) {
                 let _ = crate::gh_shim_speech::service::revoke_task_records(&session_id, &task_id);
