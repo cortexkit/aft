@@ -22,12 +22,17 @@ pub(crate) enum State {
         notice: Option<FinishNotice>,
     },
     Cancel,
+    FallbackCancel,
     Settled,
 }
 
 impl State {
     fn opening(&self) -> bool {
         matches!(self, Self::Opening | Self::OpeningConsumed)
+    }
+
+    fn suppresses_legacy(&self) -> bool {
+        !matches!(self, Self::FallbackCancel)
     }
 
     fn decision(&self) -> Option<Event> {
@@ -62,8 +67,40 @@ impl FinishNotice {
 
 impl PersistedTask {
     pub(super) fn has_unsettled_awaited_work(&self) -> bool {
-        self.awaited_work.is_some() && !matches!(self.awaited_work, Some(State::Settled))
+        self.suppresses_legacy_completion() && !matches!(self.awaited_work, Some(State::Settled))
     }
+
+    pub(super) fn suppresses_legacy_completion(&self) -> bool {
+        self.awaited_work
+            .as_ref()
+            .is_some_and(State::suppresses_legacy)
+    }
+
+    pub(crate) fn has_pending_fallback_cancel(&self) -> bool {
+        matches!(self.awaited_work, Some(State::FallbackCancel))
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Runtime {
+    opening: bool,
+    pub(super) kill_reply: bool,
+}
+
+impl Runtime {
+    pub(super) fn spawning(metadata: &PersistedTask) -> Self {
+        Self {
+            opening: CANDIDATE.get() && metadata.awaited_work.as_ref().is_some_and(State::opening),
+            kill_reply: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OpenOutcome {
+    Opened,
+    NotOpened,
+    Unknown,
 }
 
 thread_local! {
@@ -83,8 +120,34 @@ pub(crate) fn state_for_spawn() -> Option<State> {
 }
 
 impl BgTaskRegistry {
-    pub(crate) fn awaited_finish_notice(&self, key: &str) -> Option<Option<String>> {
-        let task = self.task(key)?;
+    pub(crate) fn kill_for_reply(
+        &self,
+        key: &str,
+        session: &str,
+    ) -> Result<BgTaskSnapshot, RegistryError> {
+        self.kill_with_reply_intent(key, session, BgTaskStatus::Killed, None, true)
+    }
+
+    pub(super) fn reserve_awaited_kill_reply(
+        &self,
+        task: &BgTask,
+        state: &mut BgTaskState,
+    ) -> bool {
+        let owns_reply = matches!(
+            state.metadata.awaited_work,
+            Some(State::Open | State::Opening)
+        ) && state
+            .metadata
+            .lifecycle_scope()
+            .is_some_and(crate::subc::awaited_work::owns_kill_reply)
+            && super::super::TaskIdentity::current().as_ref() == task.launching_identity.as_ref();
+        if owns_reply {
+            state.awaited_runtime.kill_reply = true;
+        }
+        owns_reply
+    }
+
+    pub(crate) fn awaited_finish_notice(&self, task: &BgTask) -> Option<Option<String>> {
         let state = task.lock_state().ok()?;
         match &state.metadata.awaited_work {
             Some(State::Finish {
@@ -97,13 +160,11 @@ impl BgTaskRegistry {
 
     pub(crate) fn freeze_awaited_finish_notice(
         &self,
-        key: &str,
+        task: &BgTask,
         id: Option<String>,
     ) -> std::io::Result<Option<String>> {
-        let task = self
-            .task(key)
-            .ok_or_else(|| std::io::Error::other("unknown awaited task"))?;
-        let mut db = DeferredDbWrites::new(self, &task);
+        let still_registered = self.task(&task.task_id).is_some();
+        let mut db = DeferredDbWrites::new(self, task);
         let mut state = task
             .lock_state()
             .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
@@ -113,10 +174,15 @@ impl BgTaskRegistry {
         if let Some(notice) = notice {
             return Ok(notice.id());
         }
+        if !still_registered {
+            // The event's terminal decision was already saved. Pruning its
+            // task may cost the display card, but must not strand the item.
+            return Ok(None);
+        }
         let saved = id
             .clone()
             .map_or(FinishNotice::WithoutCard, FinishNotice::Card);
-        state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+        state.metadata = self.update_task_metadata_locked(task, &mut db, |metadata| {
             if let Some(State::Finish { notice, .. }) = &mut metadata.awaited_work {
                 *notice = Some(saved);
             }
@@ -133,78 +199,147 @@ impl BgTaskRegistry {
         *self.inner.awaited_work.lock() = Arc::downgrade(service);
     }
 
-    fn send_awaited(&self, task: &BgTask, event: Event, notice: Option<PushFrame>) {
+    fn send_awaited(
+        &self,
+        task: &Arc<BgTask>,
+        event: Event,
+        notice: Option<PushFrame>,
+        persisted: bool,
+    ) {
         if let Some(service) = self.inner.awaited_work.lock().upgrade() {
-            service.submit(self.clone(), task.task_id.clone(), event, notice);
+            service.submit(
+                self.clone(),
+                task.clone(),
+                task.task_id.clone(),
+                event,
+                notice,
+                persisted,
+            );
         }
     }
 
     pub(crate) fn knows_awaited_work(&self, key: &str) -> bool {
         self.task(key).is_some_and(|task| {
-            task.lock_state().is_ok_and(|state| {
-                !matches!(state.metadata.awaited_work, Some(State::Settled))
-                    && (!state.metadata.status.is_terminal()
-                        || !state.metadata.completion_delivered
-                        || state.metadata.awaited_work.is_some())
-            })
+            task.lock_state()
+                .is_ok_and(|state| !matches!(state.metadata.awaited_work, Some(State::Settled)))
         })
     }
 
-    pub(crate) fn awaited_work_live(&self, key: &str) -> bool {
-        self.task(key).is_some_and(|task| {
-            task.lock_state().is_ok_and(|state| {
-                matches!(
-                    state.metadata.awaited_work,
-                    Some(State::Open | State::Finish { .. } | State::Cancel)
-                ) && state
-                    .metadata
-                    .lifecycle_scope()
-                    .is_none_or(|scope| !self.scope_revoked(scope))
-            })
+    pub(crate) fn awaited_work_live(&self, task: &BgTask) -> bool {
+        task.lock_state().is_ok_and(|state| {
+            matches!(
+                state.metadata.awaited_work,
+                Some(State::Open | State::Finish { .. } | State::Cancel | State::FallbackCancel)
+            ) && state
+                .metadata
+                .lifecycle_scope()
+                .is_none_or(|scope| !self.scope_revoked(scope))
         })
     }
 
-    pub(crate) fn retire_awaited_work(&self, key: &str) {
-        let Some(task) = self.task(key) else { return };
-        let mut db = DeferredDbWrites::new(self, &task);
+    pub(crate) fn retire_awaited_work(&self, task: &BgTask) {
+        let mut db = DeferredDbWrites::new(self, task);
         if let Ok(mut state) = task.lock_state() {
-            if let Ok(metadata) = self.update_task_metadata_locked(&task, &mut db, |metadata| {
-                metadata.awaited_work = Some(State::Settled);
-                metadata.completion_delivered |= metadata.status.is_terminal();
-            }) {
-                state.metadata = metadata;
-            }
+            self.settle_awaited_locked(task, &mut state, &mut db);
         };
     }
 
-    pub(crate) fn persist_awaited_decision(&self, key: &str) -> bool {
-        self.task(key).is_some_and(|task| {
-            let mut db = DeferredDbWrites::new(self, &task);
-            task.lock_state().is_ok_and(|state| {
-                self.persist_task_locked(&task, &state.metadata, &mut db)
-                    .is_ok()
+    fn settle_awaited_locked(
+        &self,
+        task: &BgTask,
+        state: &mut BgTaskState,
+        db: &mut DeferredDbWrites<'_>,
+    ) {
+        match self.update_task_metadata_locked(task, db, |metadata| {
+            if metadata.has_pending_fallback_cancel() {
+                metadata.awaited_work = None;
+            } else if metadata.awaited_work.is_some() {
+                metadata.awaited_work = Some(State::Settled);
+                metadata.completion_delivered = true;
+            }
+        }) {
+            Ok(metadata) => state.metadata = metadata,
+            Err(error) => log::warn!(
+                "could not persist awaited-work settlement for {}: {error}",
+                task.task_id
+            ),
+        }
+    }
+
+    pub(crate) async fn settle_missing_awaited(
+        &self,
+        listed: Arc<HashSet<String>>,
+        service: Arc<Service>,
+    ) {
+        let registry = self.clone();
+        let Ok(tasks) = tokio::task::spawn_blocking(move || registry.task_arcs()).await else {
+            return;
+        };
+        let mut tasks = tasks.into_iter();
+        loop {
+            let batch: Vec<_> = (&mut tasks).take(64).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let (registry, listed, service) = (self.clone(), listed.clone(), service.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                for task in batch {
+                    if listed.contains(&task.task_id) {
+                        continue;
+                    }
+                    let mut db = DeferredDbWrites::new(&registry, &task);
+                    let Ok(mut state) = task.lock_state() else {
+                        continue;
+                    };
+                    if state.metadata.has_pending_fallback_cancel() {
+                        drop(state);
+                        registry.attach_awaited_work(&service);
+                        registry.send_awaited(&task, Event::CleanupOpen, None, true);
+                        continue;
+                    }
+                    if !state.awaited_runtime.opening
+                        && state.metadata.awaited_work.is_some()
+                        && !matches!(state.metadata.awaited_work, Some(State::Settled))
+                    {
+                        registry.settle_awaited_locked(&task, &mut state, &mut db);
+                    }
+                }
             })
-        })
+            .await;
+        }
+    }
+
+    pub(crate) fn persist_awaited_decision(&self, task: &BgTask) -> std::io::Result<()> {
+        let mut db = DeferredDbWrites::new(self, task);
+        let state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        self.persist_task_locked(task, &state.metadata, &mut db)
     }
 
     pub(crate) fn resume_awaited_work(&self, key: &str, service: &Arc<Service>) {
         self.attach_awaited_work(service);
-        self.transition_awaited_open(key, true, true);
+        self.transition_awaited_open(key, OpenOutcome::Opened, true);
     }
 
-    pub(crate) fn settle_awaited_open(&self, key: &str, opened: bool) -> bool {
-        self.transition_awaited_open(key, opened, false)
+    pub(crate) fn settle_awaited_open(&self, key: &str, outcome: OpenOutcome) -> bool {
+        self.transition_awaited_open(key, outcome, false)
     }
 
-    fn transition_awaited_open(&self, key: &str, opened: bool, recovering: bool) -> bool {
+    fn transition_awaited_open(&self, key: &str, outcome: OpenOutcome, recovering: bool) -> bool {
         let Some(task) = self.task(key) else {
             return false;
         };
-        let metadata = {
+        let opened = matches!(outcome, OpenOutcome::Opened);
+        let (metadata, persisted) = {
             let mut db = DeferredDbWrites::new(self, &task);
             let Ok(mut state) = task.lock_state() else {
                 return false;
             };
+            if recovering && state.awaited_runtime.opening {
+                return false;
+            }
+            state.awaited_runtime.opening = false;
             match &state.metadata.awaited_work {
                 Some(mark) if mark.opening() => {
                     let consumed = matches!(mark, State::OpeningConsumed);
@@ -213,24 +348,28 @@ impl BgTaskRegistry {
                     } else {
                         state.metadata.completion_delivered =
                             !state.metadata.notify_on_completion || consumed;
-                        None
+                        matches!(outcome, OpenOutcome::Unknown).then_some(State::FallbackCancel)
                     };
                 }
-                None if recovering => state.metadata.awaited_work = Some(State::Open),
+                None if recovering => state.metadata.awaited_work = Some(State::FallbackCancel),
                 _ if recovering => {}
                 _ => return false,
             }
-            if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {
+            let saved = self.persist_task_locked(&task, &state.metadata, &mut db);
+            if let Err(error) = &saved {
                 log::warn!("could not persist awaited-work registration for {key}: {error}");
             }
-            state.metadata.clone()
+            (state.metadata.clone(), saved.is_ok())
         };
-        if opened && recovering {
+        if opened && recovering && metadata.suppresses_legacy_completion() {
             let _ = self.remove_pending_completion(key);
         }
         if matches!(metadata.awaited_work, Some(State::Cancel)) {
-            self.send_awaited(&task, Event::Cancel, None);
-        } else if metadata.status.is_terminal() {
+            self.send_awaited(&task, Event::Cancel, None, persisted);
+        } else if metadata.has_pending_fallback_cancel() {
+            self.send_awaited(&task, Event::CleanupOpen, None, persisted);
+        }
+        if metadata.status.is_terminal() && !matches!(metadata.awaited_work, Some(State::Cancel)) {
             if let Some(service) = self.inner.awaited_work.lock().upgrade() {
                 let registry = self.clone();
                 service.replay_terminal(move || {
@@ -270,21 +409,36 @@ impl BgTaskRegistry {
     pub(super) fn uses_awaited_work(&self, key: &str) -> bool {
         self.task(key).is_some_and(|task| {
             task.lock_state()
-                .is_ok_and(|state| state.metadata.awaited_work.is_some())
+                .is_ok_and(|state| state.metadata.suppresses_legacy_completion())
         })
     }
 
     pub(super) fn publish_awaited_completion(
         &self,
-        task: &BgTask,
+        task: &Arc<BgTask>,
         completion: &BgCompletion,
     ) -> bool {
         let mut db = DeferredDbWrites::new(self, task);
         let Ok(mut state) = task.lock_state() else {
             return false;
         };
+        let mut persisted = true;
         let decision = match &state.metadata.awaited_work {
-            None => return false,
+            None | Some(State::FallbackCancel) => return false,
+            Some(State::Open)
+                if state.awaited_runtime.kill_reply
+                    && completion.status == BgTaskStatus::Killed =>
+            {
+                state.metadata.awaited_work = Some(State::Cancel);
+                if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
+                    persisted = false;
+                    log::warn!(
+                        "could not persist awaited-work kill reply for {}: {error}",
+                        task.task_id
+                    );
+                }
+                Event::Cancel
+            }
             Some(State::Open) => {
                 let outcome = if completion.status == BgTaskStatus::Completed
                     && completion.exit_code == Some(0)
@@ -300,6 +454,7 @@ impl BgTaskRegistry {
                     notice: None,
                 });
                 if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
+                    persisted = false;
                     log::warn!(
                         "could not persist awaited-work result for {}: {error}",
                         task.task_id
@@ -317,7 +472,9 @@ impl BgTaskRegistry {
         };
         drop(state);
         drop(db);
-        self.send_awaited(task, decision, Some(completion.clone().into_push_frame()));
+        let notice =
+            matches!(decision, Event::Finish { .. }).then(|| completion.clone().into_push_frame());
+        self.send_awaited(task, decision, notice, persisted);
         true
     }
 
@@ -337,18 +494,19 @@ impl BgTaskRegistry {
         let marker = match state.metadata.awaited_work {
             Some(State::Opening) => State::OpeningConsumed,
             Some(State::Open) => State::Cancel,
-            None => return false,
+            None | Some(State::FallbackCancel) => return false,
             Some(_) => return true,
         };
         let decision = marker.decision();
         state.metadata.awaited_work = Some(marker);
-        if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {
+        let saved = self.persist_task_locked(&task, &state.metadata, &mut db);
+        if let Err(error) = &saved {
             log::warn!("could not persist awaited-work reply for {key}: {error}");
         }
         drop(state);
         drop(db);
         if let Some(decision) = decision {
-            self.send_awaited(&task, decision, None);
+            self.send_awaited(&task, decision, None, saved.is_ok());
         }
         true
     }
@@ -360,7 +518,7 @@ impl BgTaskRegistry {
         let Ok(state) = task.lock_state() else {
             return false;
         };
-        let active = state.metadata.awaited_work.is_some();
+        let active = state.metadata.suppresses_legacy_completion();
         let open = matches!(state.metadata.awaited_work, Some(State::Open));
         if open && pattern.reason != "task_exit" {
             let context = if pattern.context.is_empty() {
@@ -373,6 +531,7 @@ impl BgTaskRegistry {
                     &task,
                     Event::Progress(crate::subc::awaited_work::bounded(context, 2000)),
                     Some(PushFrame::BashPatternMatch(pattern.clone())),
+                    true,
                 );
             }
         }

@@ -5556,6 +5556,7 @@ impl BgTaskRegistry {
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
                 scratch_released: false,
+                awaited_runtime: awaited_work::Runtime::spawning(&metadata),
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
                 io_handles: Some(io_handles),
@@ -6064,6 +6065,7 @@ impl BgTaskRegistry {
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
                 scratch_released: false,
+                awaited_runtime: awaited_work::Runtime::spawning(&metadata),
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
                 io_handles: Some(io_handles),
@@ -6452,6 +6454,7 @@ impl BgTaskRegistry {
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
                 scratch_released: false,
+                awaited_runtime: awaited_work::Runtime::spawning(&metadata),
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
                 io_handles: Some(io_handles),
@@ -10301,65 +10304,6 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn kill_for_scope_revocation(
-        &self,
-        task_id: &str,
-        session_id: &str,
-    ) -> Result<BgTaskSnapshot, String> {
-        self.kill_with_status_reason(
-            task_id,
-            session_id,
-            BgTaskStatus::Killed,
-            Some(SCOPE_REVOKED_REASON.into()),
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    /// Kill a codemode program's task once its run scope is confirmed ended.
-    pub(crate) fn kill_for_run_end(
-        &self,
-        task_id: &str,
-        session_id: &str,
-    ) -> Result<BgTaskSnapshot, String> {
-        self.kill_with_status_reason(
-            task_id,
-            session_id,
-            BgTaskStatus::Killed,
-            Some(RUN_ENDED_REASON.into()),
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    /// Kill a running call's task because its caller withdrew the call
-    /// (`tool.withdraw`). The task is named by the call ledger row, so it is
-    /// found by id alone; its status reason is [`WITHDRAWN_REASON`].
-    pub fn kill_withdrawn(&self, task_id: &str) -> Result<BgTaskSnapshot, String> {
-        let session_id = self
-            .task(task_id)
-            .map(|task| task.session_id.clone())
-            .ok_or_else(|| format!("background task not found: {task_id}"))?;
-        self.kill_with_status_reason(
-            task_id,
-            &session_id,
-            BgTaskStatus::Killed,
-            Some(WITHDRAWN_REASON.into()),
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
-        self.kill_typed(task_id, session_id)
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn kill_typed(
-        &self,
-        task_id: &str,
-        session_id: &str,
-    ) -> Result<BgTaskSnapshot, RegistryError> {
-        self.kill_with_status_reason(task_id, session_id, BgTaskStatus::Killed, None)
-    }
-
     /// Terminate live tasks and terminal tasks' surviving process groups after
     /// subc's consecutive directory-absence scans confirm their root is absent.
     /// Root deletion is a definitive end, like scope termination: descendants
@@ -13255,6 +13199,7 @@ impl BgTaskRegistry {
                 temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
                 scratch_released: false,
+                awaited_runtime: awaited_work::Runtime::spawning(&metadata),
                 metadata,
                 runtime: if mode == BgMode::Pty {
                     TaskRuntime::Pty(None)
@@ -13601,6 +13546,17 @@ impl BgTaskRegistry {
         terminal_status: BgTaskStatus,
         reason: Option<String>,
     ) -> Result<BgTaskSnapshot, RegistryError> {
+        self.kill_with_reply_intent(task_id, session_id, terminal_status, reason, false)
+    }
+
+    fn kill_with_reply_intent(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        terminal_status: BgTaskStatus,
+        reason: Option<String>,
+        reply_kill: bool,
+    ) -> Result<BgTaskSnapshot, RegistryError> {
         #[cfg(feature = "test-timing-hooks")]
         let scope_diagnostic = scope_end_label(reason.as_deref()).is_some();
         #[cfg(feature = "test-timing-hooks")]
@@ -13679,7 +13635,7 @@ impl BgTaskRegistry {
                 return Ok(snapshot);
             }
             return self
-                .kill_remote_task_with_saves(&task, saves)
+                .kill_remote_task_with_saves(&task, saves, reply_kill && !resource_kill)
                 .map_err(RegistryError::from);
         }
         let mut terminalized = false;
@@ -13826,6 +13782,9 @@ impl BgTaskRegistry {
                 }
             } else {
                 let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
+                if reply_kill && !was_already_killing && terminal_status == BgTaskStatus::Killed {
+                    self.reserve_awaited_kill_reply(&task, &mut state);
+                }
                 let mut killing = state.metadata.clone();
                 if !was_already_killing {
                     killing.status = BgTaskStatus::Killing;

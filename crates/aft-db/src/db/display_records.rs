@@ -195,7 +195,11 @@ pub fn persist_awaited_notice(
 
 /// Only linked notices use the persistent queue. Selecting one row by its key
 /// prefix avoids loading display bodies or replaying legacy announcements.
-pub fn pending_awaited_notice(conn: &Connection, now_ms: i64) -> rusqlite::Result<Option<String>> {
+pub fn pending_awaited_notice(
+    conn: &Connection,
+    now_ms: i64,
+    deferred: &[String],
+) -> rusqlite::Result<Option<String>> {
     if !available(conn)? {
         return Ok(None);
     }
@@ -203,11 +207,29 @@ pub fn pending_awaited_notice(conn: &Connection, now_ms: i64) -> rusqlite::Resul
         "SELECT record_id FROM display_records
          WHERE record_id >= ?1 AND record_id < 'notice:awaited;'
            AND wake_acked_at_ms IS NULL AND announced_at_ms + 86400000 >= ?2
+           AND record_id NOT IN (SELECT value FROM json_each(?3))
          ORDER BY record_id LIMIT 1",
-        params![AWAITED_NOTICE_PREFIX, now_ms],
+        params![
+            AWAITED_NOTICE_PREFIX,
+            now_ms,
+            serde_json::to_string(deferred).expect("record ids are serializable")
+        ],
         |row| row.get(0),
     )
     .optional()
+}
+
+pub fn count_pending_awaited_notices(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
+    if !available(conn)? {
+        return Ok(0);
+    }
+    conn.query_row(
+        "SELECT count(*) FROM display_records
+         WHERE record_id >= ?1 AND record_id < 'notice:awaited;'
+           AND wake_acked_at_ms IS NULL AND announced_at_ms + 86400000 >= ?2",
+        params![AWAITED_NOTICE_PREFIX, now_ms],
+        |row| row.get(0),
+    )
 }
 
 #[cfg(test)]

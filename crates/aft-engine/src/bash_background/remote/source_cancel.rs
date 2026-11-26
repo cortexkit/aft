@@ -101,14 +101,30 @@ impl BgTaskRegistry {
         owed: bool,
         saves: &mut KillStateSave,
     ) -> Result<bool, String> {
+        self.reserve_remote_cancel(task, owed, saves, false)
+            .map(|reserved| reserved.is_some())
+    }
+
+    fn reserve_remote_cancel(
+        &self,
+        task: &Arc<BgTask>,
+        owed: bool,
+        saves: &mut KillStateSave,
+        reply_kill: bool,
+    ) -> Result<Option<bool>, String> {
+        let mut reply_reserved = false;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
             if !state.metadata.is_terminal() {
                 let Some(remote) = state.metadata.remote.as_mut() else {
-                    return Ok(false);
+                    return Ok(None);
                 };
+                let first = !remote.cancel_requested;
                 request_cancel(remote, &task.paths, owed);
+                if first && reply_kill {
+                    reply_reserved = self.reserve_awaited_kill_reply(task, &mut state);
+                }
                 saves.record(
                     task,
                     self.persist_task_locked(task, &state.metadata, &mut db),
@@ -117,18 +133,19 @@ impl BgTaskRegistry {
             }
         }
         task.remote_cancel_notify.notify_one();
-        Ok(true)
+        Ok(Some(reply_reserved))
     }
 
     #[cfg(test)]
     pub(super) fn kill_remote_task(&self, task: &Arc<BgTask>) -> Result<BgTaskSnapshot, String> {
-        self.kill_remote_task_with_saves(task, KillStateSave::default())
+        self.kill_remote_task_with_saves(task, KillStateSave::default(), false)
     }
 
     pub(in crate::bash_background::registry) fn kill_remote_task_with_saves(
         &self,
         task: &Arc<BgTask>,
         mut saves: KillStateSave,
+        reply_kill: bool,
     ) -> Result<BgTaskSnapshot, String> {
         let metadata = task
             .lock_state()
@@ -164,16 +181,21 @@ impl BgTaskRegistry {
             snapshot.kill_state_warning = saves.into_warning();
             return Ok(snapshot);
         }
-        if !self.record_remote_cancel_with_saves(task, false, &mut saves)? {
+        let Some(reply_reserved) =
+            self.reserve_remote_cancel(task, false, &mut saves, reply_kill)?
+        else {
             return self.kill(&task.task_id, &task.session_id);
-        }
+        };
         let bound = remote_kill_settle_bound();
         let state = task.state.lock().map_err(|_| "task lock poisoned")?;
-        let (state, _) = task
+        let (mut state, _) = task
             .kill_settled
             .wait_timeout_while(state, bound, |s| !s.metadata.is_terminal())
             .map_err(|_| "task lock poisoned")?;
         if !state.metadata.is_terminal() {
+            if reply_reserved {
+                state.awaited_runtime.kill_reply = false;
+            }
             if state
                 .metadata
                 .remote

@@ -804,7 +804,10 @@ impl PersistedTask {
         self.status_reason = reason;
         // Reconciliation uses the undelivered-task index. Keep awaited results
         // in that index until the orchestrator acknowledges the decision.
-        self.completion_delivered = !self.notify_on_completion && self.awaited_work.is_none();
+        use super::registry::awaited_work::State;
+        self.completion_delivered = matches!(self.awaited_work, Some(State::Settled))
+            || (!self.notify_on_completion
+                && (self.awaited_work.is_none() || self.has_pending_fallback_cancel()));
     }
 
     pub fn to_bash_task_row(
@@ -841,7 +844,9 @@ impl PersistedTask {
             stderr_path,
             compressed: self.compressed,
             timeout_ms: self.timeout_ms.map(|value| value as i64),
-            completion_delivered: self.completion_delivered,
+            // Keep the task in the startup index until the orchestrator
+            // confirms the fallback cancel, even if the held reply was read.
+            completion_delivered: self.completion_delivered && !self.has_pending_fallback_cancel(),
             output_bytes,
             metadata: serde_json::to_string(&metadata)?,
         })

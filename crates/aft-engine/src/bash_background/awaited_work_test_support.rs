@@ -1,6 +1,26 @@
 use super::*;
 
 impl BgTaskRegistry {
+    pub(crate) fn seed_awaited_opening_for_test(&self, key: &str) {
+        self.set_awaited_marker_for_test(key, State::Opening);
+    }
+
+    pub(crate) fn seed_awaited_fallback_for_test(&self, key: &str) {
+        self.set_awaited_marker_for_test(key, State::FallbackCancel);
+    }
+
+    fn set_awaited_marker_for_test(&self, key: &str, marker: State) {
+        let task = self.task(key).unwrap();
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task.lock_state().unwrap();
+        state.metadata.awaited_work = Some(marker);
+        self.persist_task_locked(&task, &state.metadata, &mut db)
+            .unwrap();
+    }
+
+    pub(crate) fn drop_awaited_task_registration_for_test(&self, key: &str) {
+        assert!(self.inner.tasks.lock().unwrap().remove(key).is_some());
+    }
     pub(crate) fn seed_awaited_task_for_test(&self, storage: &Path, root: &Path) -> String {
         let key = "bash-0000000000000100";
         let layout =
@@ -43,7 +63,7 @@ impl BgTaskRegistry {
                 .unwrap();
         }
         assert_eq!(
-            self.freeze_awaited_finish_notice(key, Some(id.into()))
+            self.freeze_awaited_finish_notice(&task, Some(id.into()))
                 .unwrap()
                 .as_deref(),
             Some(id)

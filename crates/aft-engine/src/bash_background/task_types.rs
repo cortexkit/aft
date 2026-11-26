@@ -102,6 +102,7 @@ pub enum TaskRuntime {
 }
 
 pub struct BgTaskState {
+    pub(super) awaited_runtime: awaited_work::Runtime,
     pub(crate) metadata: PersistedTask,
     /// Only the latest pre-acceptance line, never written to task metadata.
     pub(crate) remote_admission_note: Option<String>,

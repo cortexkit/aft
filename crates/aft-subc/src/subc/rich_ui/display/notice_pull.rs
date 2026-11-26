@@ -37,14 +37,35 @@ async fn stage_for_display(
     // The durable queue only announces that the card's data is ready to pull.
     // The orchestrator owns delivery of the notice that links to it.
     let PullRecord { id, bytes } = record;
-    let stored = tokio::time::timeout(
-        budget,
+    let stored = confirm_linked_write(
         writer.store.persist_awaited_notice(id.clone(), bytes),
+        budget,
     )
     .await
-    .ok()?
     .ok()?;
     stored.then_some(id)
+}
+
+async fn confirm_linked_write<T>(
+    write: impl std::future::Future<Output = T>,
+    budget: Duration,
+) -> T {
+    tokio::pin!(write);
+    match tokio::time::timeout(budget, &mut write).await {
+        Ok(result) => result,
+        // Dropping the future cannot cancel a blocking database write. Wait
+        // off the shell reply path so the request gets the eventual write result.
+        Err(_) => write.await,
+    }
+}
+
+pub(super) async fn restore_awaited() {
+    let writer = SENDER.get().expect("display writer started");
+    match writer.store.restore_awaited_count().await {
+        Ok(count) if count > 0 => crate::late_result_bus::display_committed(),
+        Ok(_) => {}
+        Err(error) => log::warn!("could not restore pending awaited display records: {error}"),
+    }
 }
 
 pub(crate) async fn publish_awaited_notice<F>(
@@ -69,8 +90,14 @@ where
     let Some(id) = writer.store.pending_awaited_notice().await? else {
         return Ok(None);
     };
-    publish(id.clone()).await?;
-    writer.store.acknowledged(id.clone()).await?;
+    if let Err(error) = publish(id.clone()).await {
+        writer.store.defer_awaited_notice(id);
+        return Err(error);
+    }
+    if let Err(error) = writer.store.acknowledged_awaited_notice(id.clone()).await {
+        writer.store.defer_awaited_notice(id);
+        return Err(error);
+    }
     Ok(Some(id))
 }
 

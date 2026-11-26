@@ -37,7 +37,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             .resolve_task_reference(&task_id, req.session(), &storage_dir);
     let result = ctx
         .bash_background()
-        .kill_typed(&task_id, req.session())
+        .kill_for_reply(&task_id, req.session())
         .or_else(|message| {
             if !message.is_missing_task() {
                 return Err(message);
@@ -67,7 +67,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                         .replay_session(&storage_dir, req.session())
                 };
             }
-            ctx.bash_background().kill_typed(&task_id, req.session())
+            ctx.bash_background()
+                .kill_for_reply(&task_id, req.session())
         })
         .or_else(|message| {
             if !message.is_missing_task() {

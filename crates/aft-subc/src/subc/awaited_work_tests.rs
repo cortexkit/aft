@@ -55,6 +55,7 @@ mod bash_background {
         PersistentCancelSignal, RouteChannel,
     };
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
     use subc_protocol::{Flags, Principal, Priority, PROTOCOL_VERSION};
     use tokio::sync::{mpsc, Notify};
@@ -64,13 +65,17 @@ mod bash_background {
         Open,
         Refuse,
         Disconnect,
+        LostReply,
     }
 
     struct Fake {
         calls: mpsc::UnboundedSender<(Request, Option<SessionScope>)>,
         answer: Answer,
         allow_open: Notify,
-        listed: Vec<String>,
+        listed: parking_lot::Mutex<Vec<String>>,
+        cancel_offline: AtomicBool,
+        cancel_refusals: AtomicUsize,
+        finish_failures: AtomicUsize,
     }
 
     fn vector(name: &str) -> Value {
@@ -95,6 +100,7 @@ mod bash_background {
                     let item = listing["items"][0].clone();
                     listing["items"] = json!(self
                         .listed
+                        .lock()
                         .iter()
                         .map(|key| {
                             let mut item = item.clone();
@@ -108,6 +114,7 @@ mod bash_background {
                     let mut reply = examples["sync"][0].clone();
                     reply["lost"] = json!(self
                         .listed
+                        .lock()
                         .iter()
                         .filter(|key| !params.open.contains(key))
                         .collect::<Vec<_>>());
@@ -128,7 +135,25 @@ mod bash_background {
                         Answer::Disconnect => {
                             return Err(Failure::Transport("route closed".into()))
                         }
+                        Answer::LostReply => {
+                            let mut listed = self.listed.lock();
+                            if !listed.contains(&open.key) {
+                                listed.push(open.key);
+                            }
+                            return Err(CallError::OutcomeUnknown(Box::new(
+                                std::io::Error::other("reply lost after write"),
+                            ))
+                            .into());
+                        }
                     }
+                }
+                Request::Finish(_)
+                    if self
+                        .finish_failures
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok() =>
+                {
+                    return Err(Failure::Unknown("finish reply lost".into()));
                 }
                 Request::Finish(finish) => (
                     finish.key,
@@ -139,7 +164,21 @@ mod bash_background {
                         2
                     },
                 ),
-                Request::Cancel(cancel) => (cancel.key, None, 3),
+                Request::Cancel(_) if self.cancel_offline.load(Ordering::SeqCst) => {
+                    return Err(Failure::Transport("cancel route down".into()))
+                }
+                Request::Cancel(_)
+                    if self
+                        .cancel_refusals
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok() =>
+                {
+                    return Err(Failure::Refused("unknown_key".into()));
+                }
+                Request::Cancel(cancel) => {
+                    self.listed.lock().retain(|key| key != &cancel.key);
+                    (cancel.key, None, 3)
+                }
                 Request::Progress(progress) => (progress.key, None, 0),
                 _ => panic!("unexpected awaited-work method"),
             };
@@ -159,7 +198,10 @@ mod bash_background {
             calls: tx,
             answer,
             allow_open: Notify::new(),
-            listed,
+            listed: listed.into(),
+            cancel_offline: false.into(),
+            cancel_refusals: 0.into(),
+            finish_failures: 0.into(),
         });
         let service = Arc::new(Service::new("worker-provider-test"));
         *service.wire.write() = Some(fake.clone());
@@ -204,6 +246,21 @@ mod bash_background {
         executor: Arc<Executor>,
     }
 
+    fn call_scope(worker: bool) -> ScopeStamp {
+        ScopeStamp::new(
+            Principal::Reserved {
+                module_id: ORCHESTRATOR.into(),
+            },
+            "session-scope",
+            71,
+            if worker {
+                ScopeKind::Worker
+            } else {
+                ScopeKind::Head
+            },
+        )
+    }
+
     impl Fixture {
         fn new() -> Self {
             let (dir, root) = test_support::test_root("awaited-work-shell");
@@ -236,18 +293,7 @@ mod bash_background {
         ) -> mpsc::Receiver<bash::BashDeferredCompletion> {
             let (tx, rx) = mpsc::channel(2);
             let (touch, _) = mpsc::channel(2);
-            let scope = ScopeStamp::new(
-                Principal::Reserved {
-                    module_id: ORCHESTRATOR.into(),
-                },
-                "session-scope",
-                71,
-                if worker {
-                    ScopeKind::Worker
-                } else {
-                    ScopeKind::Head
-                },
-            );
+            let scope = call_scope(worker);
             let command = format!(
                 "while [ ! -f '{}' ]; do sleep 0.02; done; printf 'awaited-finish-tail\\n'",
                 self.dir.path().join("release").display()
@@ -406,7 +452,7 @@ mod bash_background {
     }
 
     #[tokio::test]
-    async fn bash_background_watch_read_first_cancels_instead_of_finishing() {
+    async fn bash_background_terminal_reply_claim_wins_before_publication() {
         let f = Fixture::new();
         let (service, _fake, mut calls) = fake(Answer::Open, Vec::new());
         let registry = f.ctx.bash_background();
@@ -547,4 +593,248 @@ mod bash_background {
     async fn tool_provider_restart_replays_the_same_finish_notice_pointer() {
         restart(false, Some("notice:awaited:saved")).await;
     }
+
+    #[tokio::test]
+    async fn lost_awaited_open_reply_cancels_the_item_but_holds_the_shell_reply() {
+        let f = Fixture::new();
+        let (service, fake, mut calls) = fake(Answer::LostReply, Vec::new());
+        fake.cancel_refusals.store(1, Ordering::SeqCst);
+        let mut rx = f.start(Some(service.clone()), true);
+        let (Request::Open(open), _) = call(&mut calls).await else {
+            panic!("missing open")
+        };
+        fake.allow_open.notify_one();
+        for _ in 0..2 {
+            assert!(
+                matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+            );
+        }
+        assert!(!fake.listed.lock().contains(&open.key));
+        assert!(
+            rx.try_recv().is_err(),
+            "an uncertain open cannot hand back a launch ID"
+        );
+        f.release();
+        assert_eq!(
+            reply(&mut rx).await.response_for_test().data["status"],
+            "completed"
+        );
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn timing_out_at_the_awaited_registration_gate_is_a_definite_non_send() {
+        let f = Fixture::new();
+        let (service, _fake, mut calls) = fake(Answer::Open, Vec::new());
+        let _gate = service.registrations.lock().await;
+        let mut rx = f.start(Some(service.clone()), true);
+        f.release();
+        assert_eq!(
+            reply(&mut rx).await.response_for_test().data["status"],
+            "completed"
+        );
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn awaited_resync_cannot_claim_a_live_open_or_finish_a_fallback() {
+        let f = Fixture::new();
+        let (service, fake, mut calls) = fake(Answer::LostReply, Vec::new());
+        fake.cancel_offline.store(true, Ordering::SeqCst);
+        let mut rx = f.start(Some(service.clone()), true);
+        let (Request::Open(open), _) = call(&mut calls).await else {
+            panic!("missing open")
+        };
+        // The provider recorded the item, but hasn't sent the open reply.
+        fake.listed.lock().push(open.key.clone());
+        let sync = {
+            let (service, wire, executor) = (service.clone(), fake.clone(), f.executor.clone());
+            tokio::spawn(async move { reconcile(&service, wire, &executor).await.unwrap() })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), calls.recv())
+                .await
+                .is_err()
+        );
+        fake.allow_open.notify_one();
+        sync.await.unwrap();
+        let mut saw_sync = false;
+        while let Ok((request, _)) = calls.try_recv() {
+            match request {
+                Request::Sync(sync) => {
+                    assert_eq!(sync.open, [open.key.clone()]);
+                    saw_sync = true;
+                }
+                Request::List(_) | Request::Cancel(_) => {}
+                _ => panic!("resync routed a fallback as awaited work"),
+            }
+        }
+        assert!(saw_sync);
+        assert!(rx.try_recv().is_err());
+        fake.cancel_offline.store(false, Ordering::SeqCst);
+        f.release();
+        assert_eq!(
+            reply(&mut rx).await.response_for_test().data["status"],
+            "completed"
+        );
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        );
+        no_more(&mut calls).await;
+    }
+
+    async fn kill_live_awaited(own_reply: bool) {
+        let f = Fixture::new();
+        let (service, fake, mut calls) = fake(Answer::Open, Vec::new());
+        let mut rx = f.start(Some(service.clone()), true);
+        let (Request::Open(open), _) = call(&mut calls).await else {
+            panic!("missing open")
+        };
+        fake.allow_open.notify_one();
+        let _launch = reply(&mut rx).await;
+        if own_reply {
+            let request: RawRequest =
+                serde_json::from_value(json!({"id":"kill", "command":"bash_kill",
+                "session_id":"shell-session", "params":{"task_id":open.key}}))
+                .unwrap();
+            let result = {
+                let mut route = test_support::route_identity(&f.root, "shell-session");
+                Arc::get_mut(&mut route.0).unwrap().scope = Some(call_scope(true));
+                let _identity = crate::subc::secret_consent::SecretIdentityGuard::install(route);
+                crate::commands::bash_kill::handle(&request, &f.ctx)
+            };
+            assert!(result.success, "{:?}", result.data);
+            assert_eq!(result.data["status"], "killed");
+            assert!(
+                matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+            );
+        } else {
+            f.ctx
+                .bash_background()
+                .kill(&open.key, "shell-session")
+                .unwrap();
+            assert!(
+                matches!(call(&mut calls).await, (Request::Finish(finish), None) if finish.key == open.key && finish.outcome == Outcome::Failed)
+            );
+        }
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn the_awaited_worker_kill_reply_cancels_without_finishing() {
+        kill_live_awaited(true).await;
+    }
+
+    #[tokio::test]
+    async fn an_external_kill_still_finishes_awaited_work() {
+        kill_live_awaited(false).await;
+    }
+
+    fn restored(f: &Fixture) -> (Arc<Executor>, Arc<AppContext>) {
+        let restarted = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(f.root.as_path().into()),
+                storage_dir: Some(f.dir.path().into()),
+                ..Default::default()
+            },
+        ));
+        restarted
+            .bash_background()
+            .replay_session_for_project(f.dir.path(), "shell-session", f.root.as_path())
+            .unwrap();
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(f.root.clone(), restarted.clone());
+        (executor, restarted)
+    }
+
+    async fn unlisted_mark_is_retired(opening: bool) {
+        let f = Fixture::new();
+        let registry = f.ctx.bash_background();
+        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        if opening {
+            registry.seed_awaited_opening_for_test(&key);
+        }
+        let (executor, restarted) = restored(&f);
+        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        *service.wire.write() = None;
+        reconcile(&service, wire, &executor).await.unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open.is_empty())
+        );
+        let registry = restarted.bash_background();
+        let metadata = serde_json::to_value(registry.notice_metadata(&key).unwrap()).unwrap();
+        assert_eq!(metadata["awaited_work"], "settled");
+        assert_eq!(metadata["completion_delivered"], true);
+        registry.attach_awaited_for_test(&service);
+        registry.publish_awaited_for_test(&key);
+        assert!(registry
+            .pending_completions_for_session("shell-session")
+            .is_empty());
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retires_unlisted_awaited_opening_without_a_notice() {
+        unlisted_mark_is_retired(true).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retires_unlisted_open_awaited_task_without_finishing() {
+        unlisted_mark_is_retired(false).await;
+    }
+
+    #[tokio::test]
+    async fn restart_resends_persisted_uncertain_open_cleanup() {
+        let f = Fixture::new();
+        let registry = f.ctx.bash_background();
+        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        registry.seed_awaited_fallback_for_test(&key);
+        let (executor, _restarted) = restored(&f);
+        let (service, wire, mut calls) = fake(Answer::Open, vec![key.clone()]);
+        reconcile(&service, wire, &executor).await.unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [key.clone()])
+        );
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
+        );
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn awaited_finish_retries_after_its_registry_entry_is_dropped() {
+        let f = Fixture::new();
+        let (service, fake, mut calls) = fake(Answer::Open, Vec::new());
+        fake.finish_failures.store(1, Ordering::SeqCst);
+        let mut rx = f.start(Some(service.clone()), true);
+        let (Request::Open(open), _) = call(&mut calls).await else {
+            panic!("missing open")
+        };
+        fake.allow_open.notify_one();
+        let _launch = reply(&mut rx).await;
+        f.release();
+        let (Request::Finish(first), _) = call(&mut calls).await else {
+            panic!("missing finish")
+        };
+        f.ctx
+            .bash_background()
+            .drop_awaited_task_registration_for_test(&open.key);
+        assert!(matches!(call(&mut calls).await, (Request::Finish(retry), None) if retry == first));
+        no_more(&mut calls).await;
+    }
+}
+
+#[test]
+fn awaited_retry_failures_log_at_most_once_per_minute() {
+    let start = tokio::time::Instant::now();
+    let mut log = RetryLog::new(false);
+    assert!(log.due(start));
+    for seconds in 1..60 {
+        assert!(!log.due(start + Duration::from_secs(seconds)));
+    }
+    assert!(log.due(start + Duration::from_secs(60)));
+    assert!(!log.due(start + Duration::from_secs(61)));
 }

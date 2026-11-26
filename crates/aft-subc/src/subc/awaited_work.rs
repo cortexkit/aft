@@ -12,13 +12,41 @@ use subc_protocol::scope::{ScopeKind, ScopeSelector, ScopeStamp};
 use subc_protocol::{BindIdentity, RouteTarget};
 use tokio_util::sync::CancellationToken;
 
-use crate::bash_background::registry::BgCompletion;
-use crate::bash_background::BgTaskRegistry;
+use crate::bash_background::registry::{BgCompletion, BgTask};
+use crate::bash_background::{BgTaskRegistry, OpenOutcome};
 use crate::protocol::PushFrame;
 
 const ORCHESTRATOR: &str = "prefrontal";
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const FIRST_RETRY_DELAY: Duration = Duration::from_millis(100);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+struct RetryLog(Option<tokio::time::Instant>);
+
+impl RetryLog {
+    fn new(already_logged: bool) -> Self {
+        Self(already_logged.then(tokio::time::Instant::now))
+    }
+
+    fn due(&mut self, now: tokio::time::Instant) -> bool {
+        if self
+            .0
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60))
+        {
+            self.0 = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn failure(&mut self, message: std::fmt::Arguments<'_>) {
+        if self.due(tokio::time::Instant::now()) {
+            log::warn!("{message}");
+        }
+    }
+}
 
 static SERVICE: parking_lot::RwLock<Option<Arc<Service>>> = parking_lot::RwLock::new(None);
 
@@ -26,13 +54,23 @@ static SERVICE: parking_lot::RwLock<Option<Arc<Service>>> = parking_lot::RwLock:
 enum Failure {
     Refused(String),
     Transport(String),
+    Unknown(String),
 }
 
 impl From<CallError> for Failure {
     fn from(error: CallError) -> Self {
         match error {
             CallError::Module(body) => Self::Refused(body.code),
-            other => Self::Transport(other.to_string()),
+            other
+                if other.never_forwarded() == Some(true)
+                    || matches!(
+                        other,
+                        CallError::StaleRouteHandle(_) | CallError::DaemonTooOld { .. }
+                    ) =>
+            {
+                Self::Transport(other.to_string())
+            }
+            other => Self::Unknown(other.to_string()),
         }
     }
 }
@@ -55,7 +93,6 @@ trait Wire: Send + Sync {
 struct DaemonWire {
     consumer: Arc<SubcConsumer>,
     management: RouteHandle,
-    scoped_calls: tokio::sync::Mutex<()>,
 }
 
 #[async_trait::async_trait]
@@ -72,11 +109,6 @@ impl Wire for DaemonWire {
                 .await
                 .map_err(Into::into);
         };
-        // Overlapping scoped opens can share one SDK handle. Keep the lease
-        // until the reply so one open cannot close the other's route.
-        let _gate = tokio::time::timeout(CALL_TIMEOUT, self.scoped_calls.lock())
-            .await
-            .map_err(|error| Failure::Transport(error.to_string()))?;
         let route = self
             .consumer
             .open_route_scoped(
@@ -85,7 +117,11 @@ impl Wire for DaemonWire {
                 scope.scope.clone(),
                 options(),
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                CallError::Module(body) => Failure::Refused(body.code),
+                other => Failure::Transport(other.to_string()),
+            })?;
         let result = self.consumer.request(&route, body, options()).await;
         let _ = tokio::time::timeout(
             CALL_TIMEOUT,
@@ -123,6 +159,7 @@ pub(crate) struct Service {
     instance: String,
     runtime: tokio::runtime::Handle,
     wire: parking_lot::RwLock<Option<Arc<dyn Wire>>>,
+    registrations: tokio::sync::Mutex<()>,
     terminal: parking_lot::Mutex<HashSet<String>>,
     progress: parking_lot::Mutex<HashMap<String, CancellationToken>>,
 }
@@ -133,6 +170,7 @@ impl Service {
             instance: instance.into(),
             runtime: tokio::runtime::Handle::current(),
             wire: Default::default(),
+            registrations: Default::default(),
             terminal: Default::default(),
             progress: Default::default(),
         }
@@ -151,15 +189,17 @@ impl Service {
             .map_err(|error| Failure::Refused(error.code.as_str().to_owned()))?;
         let body = serde_json::to_vec(req).expect("serializable awaited-work request");
         let reply = wire.request(body, scope).await?;
-        serde_json::from_slice(&reply).map_err(|error| Failure::Transport(error.to_string()))
+        serde_json::from_slice(&reply).map_err(|error| Failure::Unknown(error.to_string()))
     }
 
     pub(crate) fn submit(
         self: &Arc<Self>,
         registry: BgTaskRegistry,
+        task: Arc<BgTask>,
         key: String,
         event: Event,
         notice: Option<PushFrame>,
+        mut persisted: bool,
     ) {
         let terminal = !matches!(event, Event::Progress(_));
         let token = CancellationToken::new();
@@ -168,7 +208,7 @@ impl Service {
             if !self.terminal.lock().insert(key.clone()) {
                 return;
             }
-            if matches!(event, Event::Cancel) {
+            if matches!(event, Event::Cancel | Event::CleanupOpen) {
                 if let Some(progress) = self.progress.lock().remove(&key) {
                     progress.cancel();
                 }
@@ -185,17 +225,21 @@ impl Service {
             if let Some(progress) = pending_progress {
                 let _ = tokio::time::timeout(CALL_TIMEOUT, progress.cancelled()).await;
             }
-            let mut delay = Duration::from_millis(100);
-            let mut persisted = !terminal;
+            let mut delay = FIRST_RETRY_DELAY;
+            let mut retry_log = RetryLog::new(!persisted);
+            let cleanup = matches!(event, Event::CleanupOpen);
             let mut request = None;
             loop {
                 let guard = registry.clone();
-                let task = key.clone();
+                let retained = task.clone();
                 let Ok((live, saved)) = tokio::task::spawn_blocking(move || {
-                    (
-                        guard.awaited_work_live(&task),
-                        persisted || guard.persist_awaited_decision(&task),
-                    )
+                    let live = guard.awaited_work_live(&retained);
+                    let saved = if live && !persisted {
+                        guard.persist_awaited_decision(&retained)
+                    } else {
+                        Ok(())
+                    };
+                    (live, saved)
                 })
                 .await
                 else {
@@ -204,18 +248,22 @@ impl Service {
                 if token.is_cancelled() || !live {
                     break;
                 }
-                persisted = saved;
+                persisted = saved.is_ok();
+                if let Err(error) = saved {
+                    retry_log.failure(format_args!(
+                        "could not persist awaited-work decision for {key}: {error}"
+                    ));
+                }
                 let wire = service.wire().filter(|_| persisted);
                 if wire.is_some() && request.is_none() {
                     match service
-                        .request_for(&registry, &key, event.clone(), notice.clone())
+                        .request_for(&registry, &task, &key, event.clone(), notice.clone())
                         .await
                     {
                         Ok(prepared) => request = Some(prepared),
-                        Err(error) if delay == Duration::from_millis(100) => {
-                            log::warn!("could not freeze awaited-work result for {key}: {error}");
-                        }
-                        Err(_) => {}
+                        Err(error) => retry_log.failure(format_args!(
+                            "could not freeze awaited-work result for {key}: {error}"
+                        )),
                     }
                 }
                 if let (Some(wire), Some(req)) = (wire, request.as_ref()) {
@@ -225,24 +273,34 @@ impl Service {
                     };
                     match result {
                         Ok(_) => break,
+                        Err(Failure::Refused(code)) if cleanup && code == "unknown_key" => {
+                            // On another route the timed-out open can still be
+                            // committing while its cleanup arrives first.
+                            retry_log.failure(format_args!(
+                                "{} waiting for uncertain open of {key}: {code}",
+                                req.method()
+                            ));
+                        }
                         Err(Failure::Refused(code)) => {
                             log::warn!("{} refused for {key}: {code}", req.method());
                             break;
                         }
-                        Err(Failure::Transport(error)) if delay == Duration::from_millis(100) => {
-                            log::debug!("{} transport failed for {key}: {error}", req.method());
-                        }
-                        Err(Failure::Transport(_)) => {}
+                        Err(Failure::Transport(error) | Failure::Unknown(error)) => retry_log
+                            .failure(format_args!(
+                                "{} transport failed for {key}: {error}",
+                                req.method()
+                            )),
                     }
+                } else if persisted && service.wire().is_none() {
+                    retry_log.failure(format_args!("awaited-work transport unavailable for {key}"));
                 }
                 tokio::select! {
                     _ = token.cancelled() => break,
                     _ = tokio::time::sleep(delay) => {},
                 }
-                delay = (delay * 2).min(Duration::from_secs(5));
+                delay = (delay * 2).min(MAX_RETRY_DELAY);
             }
             if terminal {
-                let task = key.clone();
                 let _ =
                     tokio::task::spawn_blocking(move || registry.retire_awaited_work(&task)).await;
                 service.terminal.lock().remove(&key);
@@ -259,14 +317,15 @@ impl Service {
     async fn request_for(
         &self,
         registry: &BgTaskRegistry,
+        task: &Arc<BgTask>,
         key: &str,
         event: Event,
         notice: Option<PushFrame>,
     ) -> std::io::Result<Request> {
         let is_finish = matches!(event, Event::Finish { .. });
         let saved = if is_finish {
-            let (registry, key) = (registry.clone(), key.to_owned());
-            tokio::task::spawn_blocking(move || registry.awaited_finish_notice(&key))
+            let (registry, task) = (registry.clone(), task.clone());
+            tokio::task::spawn_blocking(move || registry.awaited_finish_notice(&task))
                 .await
                 .map_err(std::io::Error::other)?
         } else {
@@ -283,10 +342,12 @@ impl Service {
             if is_finish {
                 // A restart must replay the same pointer, even when there was
                 // no room for a card on the original attempt.
-                let (registry, key) = (registry.clone(), key.to_owned());
-                tokio::task::spawn_blocking(move || registry.freeze_awaited_finish_notice(&key, id))
-                    .await
-                    .map_err(std::io::Error::other)??
+                let (registry, task) = (registry.clone(), task.clone());
+                tokio::task::spawn_blocking(move || {
+                    registry.freeze_awaited_finish_notice(&task, id)
+                })
+                .await
+                .map_err(std::io::Error::other)??
             } else {
                 id
             }
@@ -308,7 +369,7 @@ impl Service {
                 more: Some(format!("full output: bash_status({{ taskId: \"{key}\" }})")),
                 notice_record,
             }),
-            Event::Cancel => Request::Cancel(CancelParams {
+            Event::Cancel | Event::CleanupOpen => Request::Cancel(CancelParams {
                 instance: self.instance.clone(),
                 key: key.into(),
             }),
@@ -349,6 +410,7 @@ async fn stage_notice_record(
 pub(crate) enum Event {
     Finish { outcome: Outcome, summary: String },
     Cancel,
+    CleanupOpen,
     Progress(String),
 }
 
@@ -364,6 +426,22 @@ pub(crate) fn bounded(text: &str, limit: usize) -> String {
         .nth(limit)
         .map_or(text.len(), |(index, _)| index);
     text[..end].to_owned()
+}
+
+pub(crate) fn owns_kill_reply(task_scope: &ScopeStamp) -> bool {
+    super::secret_consent::current_identity().is_some_and(|caller| {
+        let scope = caller
+            .run_owner
+            .as_ref()
+            .and_then(|owner| owner.owner_route.scope.as_ref())
+            .or(caller.scope.as_ref());
+        scope.is_some_and(|scope| {
+            scope.kind == ScopeKind::Worker
+                && scope.owner == task_scope.owner
+                && scope.scope_ref == task_scope.scope_ref
+                && scope.scope_epoch == task_scope.scope_epoch
+        })
+    })
 }
 
 #[derive(Clone)]
@@ -445,26 +523,41 @@ impl Candidate {
         {
             return false;
         }
-        let mut opened = false;
-        if let Some(wire) = self.service.wire().filter(|_| caller_waits) {
+        let gate = if caller_waits {
+            tokio::time::timeout(CALL_TIMEOUT, self.service.registrations.lock())
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let mut outcome = OpenOutcome::NotOpened;
+        if let Some(wire) = self.service.wire().filter(|_| gate.is_some()) {
             let request = Request::Open(OpenParams {
                 instance: self.service.instance.clone(),
                 key: key.into(),
                 label: self.label.clone(),
             });
             match Service::call::<ItemReply>(wire.as_ref(), &request, Some(&self.scope)).await {
-                Ok(reply) => opened = reply.item.key == key && !reply.item.state.is_ended(),
+                Ok(reply) if reply.item.key != key => outcome = OpenOutcome::Unknown,
+                Ok(reply) if !reply.item.state.is_ended() => outcome = OpenOutcome::Opened,
+                Ok(_) => {}
                 Err(Failure::Refused(code)) => {
                     log::warn!("{} refused for {key}: {code}", request.method())
                 }
                 Err(Failure::Transport(error)) => {
                     log::debug!("{} transport failed for {key}: {error}", request.method())
                 }
+                Err(Failure::Unknown(error)) => {
+                    log::warn!("{} outcome unknown for {key}: {error}", request.method());
+                    outcome = OpenOutcome::Unknown;
+                }
             }
         }
         let registry = registry.clone();
         let key = key.to_owned();
-        tokio::task::spawn_blocking(move || registry.settle_awaited_open(&key, opened))
+        // Defer orchestrator reconciliation until the launch reply and the
+        // saved state agree on whether the worker gets the ordinary held result.
+        tokio::task::spawn_blocking(move || registry.settle_awaited_open(&key, outcome))
             .await
             .unwrap_or(false)
     }
@@ -543,7 +636,7 @@ async fn discover(path: PathBuf, executor: Arc<super::Executor>, service: Weak<S
                             log::warn!("awaited-work discovery refused: {code}");
                             observed = Some(catalog);
                         }
-                        Err(Failure::Transport(error)) => {
+                        Err(Failure::Transport(error) | Failure::Unknown(error)) => {
                             log::debug!("awaited-work discovery failed: {error}")
                         }
                     }
@@ -576,7 +669,6 @@ async fn refresh(
     let wire = Arc::new(DaemonWire {
         consumer: consumer.clone(),
         management: route,
-        scoped_calls: Default::default(),
     });
     let reply = wire
         .request(br#"{"method":"role.describe","params":{}}"#.to_vec(), None)
@@ -600,16 +692,17 @@ async fn reconcile(
     wire: Arc<dyn Wire>,
     executor: &Arc<super::Executor>,
 ) -> Result<(), Failure> {
+    let _gate = service.registrations.lock().await;
     let listed: ListReply =
         Service::call(wire.as_ref(), &Request::List(ListParams::default()), None).await?;
     let executor = executor.clone();
-    let known = tokio::task::spawn_blocking(move || {
+    let (known, registries) = tokio::task::spawn_blocking(move || {
         let registries: Vec<_> = executor
             .actor_contexts()
             .iter()
             .map(|actor| actor.bash_background().clone())
             .collect();
-        listed
+        let known = listed
             .items
             .into_iter()
             .filter_map(|item| {
@@ -618,7 +711,8 @@ async fn reconcile(
                     .find(|registry| registry.knows_awaited_work(&item.key))
                     .map(|registry| (item.key, registry.clone()))
             })
-            .collect::<HashMap<_, _>>()
+            .collect::<HashMap<_, _>>();
+        (known, registries)
     })
     .await
     .map_err(|error| Failure::Transport(error.to_string()))?;
@@ -633,17 +727,29 @@ async fn reconcile(
         None,
     )
     .await?;
-    *service.wire.write() = Some(wire);
-    let service = service.clone();
+    let unknown: HashSet<_> = reply.unknown.into_iter().collect();
+    let retained = Arc::new(
+        known
+            .keys()
+            .filter(|key| !unknown.contains(*key))
+            .cloned()
+            .collect(),
+    );
+    for registry in registries {
+        registry
+            .settle_missing_awaited(retained.clone(), service.clone())
+            .await;
+    }
+    let service_for_replay = service.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let unknown: HashSet<_> = reply.unknown.into_iter().collect();
         for (key, registry) in known {
             if !unknown.contains(&key) {
-                registry.resume_awaited_work(&key, &service);
+                registry.resume_awaited_work(&key, &service_for_replay);
             }
         }
     })
     .await;
+    *service.wire.write() = Some(wire);
     Ok(())
 }
 

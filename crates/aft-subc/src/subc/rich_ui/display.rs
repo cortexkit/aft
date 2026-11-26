@@ -856,6 +856,7 @@ pub(crate) fn start(connection_file: &Path, app: &Arc<crate::context::App>, stor
     }
     tokio::spawn(send_loop(connection_file.to_path_buf(), receiver));
     tokio::spawn(notice_pull::flush_pending());
+    tokio::spawn(notice_pull::restore_awaited());
     count(Started);
 }
 

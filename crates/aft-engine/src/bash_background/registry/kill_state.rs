@@ -28,6 +28,65 @@ impl KillStateSave {
 }
 
 impl BgTaskRegistry {
+    pub(crate) fn kill_for_scope_revocation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, String> {
+        self.kill_with_status_reason(
+            task_id,
+            session_id,
+            BgTaskStatus::Killed,
+            Some(SCOPE_REVOKED_REASON.into()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Kill a codemode program's task once its run scope is confirmed ended.
+    pub(crate) fn kill_for_run_end(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, String> {
+        self.kill_with_status_reason(
+            task_id,
+            session_id,
+            BgTaskStatus::Killed,
+            Some(RUN_ENDED_REASON.into()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Kill a running call's task because its caller withdrew the call
+    /// (`tool.withdraw`). The task is named by the call ledger row, so it is
+    /// found by id alone; its status reason is [`WITHDRAWN_REASON`].
+    pub fn kill_withdrawn(&self, task_id: &str) -> Result<BgTaskSnapshot, String> {
+        let session_id = self
+            .task(task_id)
+            .map(|task| task.session_id.clone())
+            .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        self.kill_with_status_reason(
+            task_id,
+            &session_id,
+            BgTaskStatus::Killed,
+            Some(WITHDRAWN_REASON.into()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
+        self.kill_typed(task_id, session_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn kill_typed(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, RegistryError> {
+        self.kill_with_status_reason(task_id, session_id, BgTaskStatus::Killed, None)
+    }
+
     /// The outcome a PTY's waiter observed, once it has reaped the process:
     /// a kill's outcome is decided, and otherwise the waiter's exit status
     /// stands in for an exit marker it could not save (a full disk, say).

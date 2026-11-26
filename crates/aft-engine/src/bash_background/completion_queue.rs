@@ -281,7 +281,7 @@ impl BgTaskRegistry {
                 self.clear_task_watch_state(&metadata.task_id);
                 return;
             }
-        } else if metadata.awaited_work.is_some() {
+        } else if metadata.suppresses_legacy_completion() {
             return;
         }
 
@@ -348,7 +348,7 @@ impl BgTaskRegistry {
             return;
         }
         let policy = match task.lock_state() {
-            Ok(state) if state.metadata.awaited_work.is_some() => return,
+            Ok(state) if state.metadata.suppresses_legacy_completion() => return,
             Ok(state) => state.metadata.runner_notice_policy,
             Err(_) => None,
         };
