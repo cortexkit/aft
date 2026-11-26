@@ -469,6 +469,8 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "is_false")]
     pub group_member_identities_truncated: bool,
     pub completion_delivered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) awaited_work: Option<super::registry::awaited_work::State>,
     #[serde(default = "default_notify_on_completion")]
     pub notify_on_completion: bool,
     #[serde(default = "default_compressed")]
@@ -701,6 +703,7 @@ impl PersistedTask {
             group_member_identities: Vec::new(),
             group_member_identities_truncated: false,
             completion_delivered: !notify_on_completion,
+            awaited_work: super::registry::awaited_work::state_for_spawn(),
             notify_on_completion,
             compressed,
             completion_has_secret_placeholders,
@@ -903,6 +906,7 @@ impl From<BashTaskRow> for PersistedTask {
             group_member_identities: Vec::new(),
             group_member_identities_truncated: false,
             completion_delivered: row.completion_delivered,
+            awaited_work: None,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,
             completion_has_secret_placeholders: None,

@@ -68,6 +68,7 @@ cortexkit-role-llm-runner = "=0.8.53"
 cortexkit-role-tool-display = "=0.1.14"
 cortexkit-role-agent-data = "=0.3.3"
 cortexkit-role-agent-orchestrator = "=0.1.0"
+async-trait = "0.1"
 cortexkit-role-user-commands = "=0.1.4"
 cortexkit-project-identity = "=0.1.5"
 jsonschema = { version = "0.33", default-features = false }

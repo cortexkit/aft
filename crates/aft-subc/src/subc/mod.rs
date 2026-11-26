@@ -205,6 +205,7 @@ mod bind_ack_fixup_tests;
 #[cfg(test)]
 mod bind_capacity_tests;
 use a0_egress::{A0Egress, ControlCompletion};
+pub(crate) mod awaited_work;
 mod bash;
 mod bind_candidates;
 mod bind_log;
@@ -4975,23 +4976,12 @@ where
     // Arm the existing promised-wake marker before the first turn too: a lock
     // taken before the first select must be just as recoverable as a later one.
     dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
-    let notice_executor = executor.clone();
-    held_task_recovery::start(
+    held_task_recovery::start_with_notices(
         shared_app.clone(),
         executor.clone(),
         push_senders.clone(),
         storage_dir.to_path_buf(),
-        move |replayed| {
-            if replayed.is_empty() {
-                return;
-            }
-            // Each recovered task lives in its own project's registry, and an
-            // offer against a registry that doesn't hold the task does nothing,
-            // so every actor can be offered the whole set.
-            for actor in notice_executor.actor_contexts() {
-                runner_notices::offer_replayed(actor.bash_background().clone(), replayed);
-            }
-        },
+        connection_file_path.to_path_buf(),
     );
     let mut shell_detaches = tool_provider::ShellDetaches::default();
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {

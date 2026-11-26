@@ -20,6 +20,7 @@ pub(crate) mod pty_input;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
+pub use registry::awaited_work::AwaitedSpawn;
 #[doc(hidden)]
 pub mod runner_notice_scheduler;
 #[doc(hidden)]
