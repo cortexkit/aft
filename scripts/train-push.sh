@@ -1632,19 +1632,22 @@ fi
 # job runs scripts/check-cortexkit-tracking.sh; this block repeats the same
 # allowlist inline so train-push.sh needs no extra file. The tree is clean at
 # this point, so the index is exactly what gets pushed.
-if ! cortexkit_tracked="$(git -C "$REPO" ls-files -- .cortexkit)"; then
+cortexkit_listing="$(mktemp "${TMPDIR:-/tmp}/train-push-cortexkit.XXXXXX")" ||
+  refuse "could not create a temporary file for the .cortexkit/ tracking check"
+train_push_cleanup+=("$cortexkit_listing")
+if ! git -C "$REPO" ls-files -z -- .cortexkit > "$cortexkit_listing"; then
   refuse "could not list tracked files under .cortexkit/"
 fi
-cortexkit_forbidden=""
-while IFS= read -r path; do
-  [ -n "$path" ] || continue
+cortexkit_forbidden=0
+while IFS= read -r -d '' path; do
   if [[ "$path" =~ ^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$|[a-z0-9-]+\.jsonc$) ]]; then
     continue
   fi
-  cortexkit_forbidden+="$path"$'\n'
-done <<< "$cortexkit_tracked"
-if [ -n "$cortexkit_forbidden" ]; then
-  printf '%s' "$cortexkit_forbidden" | sed 's/^/  /' >&2
+  cortexkit_forbidden=1
+  printf '  %q\n' "$path" >&2
+done < "$cortexkit_listing"
+rm -f "$cortexkit_listing"
+if [ "$cortexkit_forbidden" -eq 1 ]; then
   refuse "files outside the allowlist are tracked under .cortexkit/ (only release-notes/, skills/, rules/, WORKER.md and top-level [a-z0-9-]+.jsonc project settings are allowed; stop tracking the rest with git rm --cached <path>, which keeps the working copy)"
 fi
 

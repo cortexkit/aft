@@ -2436,9 +2436,24 @@ class CortexkitTrackingGateTests(unittest.TestCase):
             self.assertIn(".cortexkit/sub/x.jsonc", red.stderr)
             self.assertIn("outside the .cortexkit/ allowlist", red.stderr)
 
+    def test_check_prints_a_forbidden_newline_path_unambiguously(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+            path = ".cortexkit/private\nnotes.md"
+            private = repo / path
+            private.parent.mkdir(parents=True)
+            private.write_text("private\n")
+            self._git(repo, "add", "-f", path)
+
+            red = self._check(repo)
+            self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+            self.assertIn("$'.cortexkit/private\\nnotes.md'", red.stderr)
+            self.assertNotIn(path, red.stderr)
+
     def test_check_allows_every_shared_cortexkit_path(self) -> None:
         for path in (
             ".cortexkit/release-notes/v1.0.0.md",
+            ".cortexkit/release-notes/日本語.md",
             ".cortexkit/skills/example/SKILL.md",
             ".cortexkit/rules/example.md",
             ".cortexkit/WORKER.md",

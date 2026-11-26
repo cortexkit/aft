@@ -1793,16 +1793,23 @@ expect_no_out "dependency path resolves outside" "a missing checker is not repor
 # --- refusal: a non-allowlisted file is tracked under .cortexkit/ -----------
 dir="$(new_fixture cortexkit-tracked)"
 printf '/.cortexkit/*\n!/.cortexkit/WORKER.md\n!/.cortexkit/private.txt\n' > "$dir/work/.gitignore"
-mkdir -p "$dir/work/.cortexkit"
+mkdir -p "$dir/work/.cortexkit/release-notes"
 echo "worker guide" > "$dir/work/.cortexkit/WORKER.md"
 echo "private draft" > "$dir/work/.cortexkit/private.txt"
+unicode_path='.cortexkit/release-notes/日本語.md'
+newline_path='.cortexkit/private'$'\n''notes.md'
+echo "shared release note" > "$dir/work/$unicode_path"
+echo "private draft with a newline in its name" > "$dir/work/$newline_path"
 git -C "$dir/work" add .gitignore .cortexkit/WORKER.md .cortexkit/private.txt
+git -C "$dir/work" add -f -- "$unicode_path" "$newline_path"
 git -C "$dir/work" commit -qm "track a re-included private file"
 add_train_commit "$dir/work" "cortexkit-tracked"
 main_before="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
 run_train "$dir" cortexkit-tracked
 expect_rc 2 "a tracked non-allowlisted file under .cortexkit refuses"
 expect_out ".cortexkit/private.txt" "the refusal lists the tracked non-allowlisted file"
+expect_out "\$'.cortexkit/private\\nnotes.md'" "the refusal quotes a newline in a tracked path"
+expect_no_out ".cortexkit/release-notes/" "an allowlisted non-ASCII path is not listed"
 expect_out "files outside the allowlist are tracked under .cortexkit/" "the refusal names the reason"
 expect_no_out ".cortexkit/WORKER.md" "a re-included tracked file is not listed"
 # A train that got through would push train/cortexkit-tracked and then land it

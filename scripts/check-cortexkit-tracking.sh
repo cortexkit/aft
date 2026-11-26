@@ -18,24 +18,27 @@ set -euo pipefail
 
 repo="${1:-.}"
 
-if ! listed="$(git -C "$repo" ls-files -- .cortexkit)"; then
+cortexkit_listing="$(mktemp "${TMPDIR:-/tmp}/check-cortexkit-tracking.XXXXXX")"
+trap 'rm -f "$cortexkit_listing"' EXIT
+if ! git -C "$repo" ls-files -z -- .cortexkit > "$cortexkit_listing"; then
   echo "check-cortexkit-tracking: git ls-files failed in $repo" >&2
   exit 2
 fi
 
-forbidden=""
-while IFS= read -r path; do
-  [ -n "$path" ] || continue
+forbidden=0
+while IFS= read -r -d '' path; do
   if [[ "$path" =~ ^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$|[a-z0-9-]+\.jsonc$) ]]; then
     continue
   fi
-  forbidden+="$path"$'\n'
-done <<< "$listed"
+  if [ "$forbidden" -eq 0 ]; then
+    echo "check-cortexkit-tracking: these tracked files are outside the .cortexkit/ allowlist:" >&2
+  fi
+  forbidden=1
+  printf '  %q\n' "$path" >&2
+done < "$cortexkit_listing"
 
-if [ -n "$forbidden" ]; then
+if [ "$forbidden" -eq 1 ]; then
   {
-    echo "check-cortexkit-tracking: these tracked files are outside the .cortexkit/ allowlist:"
-    printf '%s' "$forbidden" | sed 's/^/  /'
     echo "Only release-notes/, skills/, rules/, WORKER.md and top-level"
     echo "[a-z0-9-]+.jsonc project settings may be tracked there. Stop tracking"
     echo "the rest and keep the working copies with: git rm --cached <path>"
