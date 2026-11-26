@@ -618,6 +618,17 @@ pub fn with_skip_disclosure(run: impl FnOnce() -> Response) -> Response {
     response
 }
 
+pub fn has_skipped_files() -> bool {
+    current().is_some_and(|budget| {
+        !budget
+            .large_read_skips
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .is_empty()
+    })
+}
+
 pub fn skip_disclosure_active() -> bool {
     capture().is_some_and(|budget| {
         budget

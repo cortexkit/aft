@@ -678,7 +678,14 @@ fn settings_editor_error_discards_successful_prior_edits_without_an_old_copy() {
     with_backup_dir_for_test(&data, || super::auto_migrate_user_config(&file));
     assert_eq!(fs::read(&file).unwrap(), original.as_bytes());
     assert!(!data.exists(), "an editor error must not attempt a backup");
-    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != ".aft.jsonc.migrate.lock")
+            .count(),
+        1,
+        "an editor error must not leave any other files"
+    );
 }
 
 #[test]
@@ -837,10 +844,14 @@ fn auto_migration_rewrites_the_user_file_once_and_keeps_a_backup() {
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     assert_eq!(backups(dir.path()).len(), 1);
-    assert!(
-        !dir.path().join(".aft.jsonc.migrate.lock").exists(),
-        "the lock is released"
-    );
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join(".aft.jsonc.migrate.lock"))
+        .unwrap();
+    lock_file
+        .try_lock()
+        .expect("the migration releases its lock");
 }
 
 /// Several loaders migrating at once converge on one rewrite, one backup and
@@ -965,30 +976,45 @@ fn auto_migration_ignores_current_missing_and_unparsable_files() {
     assert!(backups(dir.path()).is_empty());
 }
 
-/// A loader that finds another process's fresh lock waits, then leaves the
-/// file to that process; a lock left behind by a crash is cleared.
 #[test]
-fn a_held_lock_defers_and_a_stale_lock_is_cleared() {
+fn a_held_lock_defers_but_a_leftover_lock_file_does_not_block() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
-    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    fs::write(&path, RETIRED_USER_FILE).unwrap();
     let lock = dir.path().join(".aft.jsonc.migrate.lock");
-    std::fs::write(&lock, "").unwrap();
-    assert_eq!(auto_migrate_user_config(&path), None);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
-
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-    std::fs::File::options()
+    let legacy_contents = "1234-5678-0";
+    fs::write(&lock, legacy_contents).unwrap();
+    let holder = fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(&lock)
-        .unwrap()
-        .set_modified(old)
         .unwrap();
+    holder.try_lock().unwrap();
+
+    let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let start = Instant::now();
+            let outcome = auto_migrate_user_config(&path);
+            let _ = attempt_tx.send((outcome, start.elapsed()));
+        }
+    });
+    let (outcome, elapsed) = attempt_rx
+        .recv_timeout(MIGRATION_LOCK_WAIT + Duration::from_secs(10))
+        .unwrap();
+    assert!(elapsed >= MIGRATION_LOCK_WAIT);
+    assert_eq!(outcome, None);
+    assert_eq!(fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+
+    // Closing the handle leaves the file behind, just as exiting would.
+    // Even recent contents written by an older version do not hold the lock.
+    drop(holder);
     assert!(matches!(
         auto_migrate_user_config(&path),
         Some(UserConfigMigration::Migrated { .. })
     ));
-    assert!(!lock.exists());
+    assert_eq!(fs::read_to_string(&lock).unwrap(), legacy_contents);
 }
 
 /// A symlinked user file (for example from a dotfiles checkout) is rewritten
@@ -1417,4 +1443,120 @@ fn settings_shapes_rewrite_user_with_backup_and_project_with_notice() {
             "project: {project_notice}"
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LockStep {
+    BeforeAttempt,
+    Contended,
+}
+
+type LockHook = Box<dyn FnMut(LockStep)>;
+
+thread_local! {
+    static MIGRATION_LOCK_HOOK: std::cell::RefCell<Option<LockHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(super) fn migration_lock_hook(step: LockStep) {
+    MIGRATION_LOCK_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
+#[test]
+fn three_migration_loaders_never_hold_the_lock_at_once() {
+    use std::sync::mpsc::channel;
+    use std::time::SystemTime;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("aft.jsonc");
+    let lock = dir.path().join(".aft.jsonc.migrate.lock");
+    let stale = std::fs::File::create(&lock).unwrap();
+    stale
+        .set_modified(SystemTime::now() - Duration::from_secs(120))
+        .unwrap();
+    drop(stale);
+    let (step_tx, step_rx) = channel();
+    let (go_tx, go_rx) = channel();
+    let loader_a = {
+        let target = target.clone();
+        std::thread::spawn(move || {
+            let mut steps = [LockStep::BeforeAttempt, LockStep::Contended].into_iter();
+            let mut next = steps.next();
+            MIGRATION_LOCK_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |step| {
+                    if next == Some(step) {
+                        next = steps.next();
+                        step_tx.send(step).unwrap();
+                        go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                }));
+            });
+            acquire_migration_lock(&target)
+        })
+    };
+
+    // A sees the old lock file. B takes the lock while A is paused.
+    assert_eq!(
+        step_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        LockStep::BeforeAttempt
+    );
+    let loader_b = acquire_migration_lock(&target);
+    assert!(matches!(loader_b, LockAttempt::Acquired(_)));
+    go_tx.send(()).unwrap();
+
+    // A has encountered B's live lock. C tries to acquire it while A is
+    // paused again and B is still holding it.
+    assert_eq!(
+        step_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        LockStep::Contended
+    );
+    let lock_remained = lock.exists();
+    let (attempt_tx, attempt_rx) = channel();
+    std::thread::spawn(move || {
+        let _ = attempt_tx.send(acquire_migration_lock(&target));
+    });
+    let loader_c = attempt_rx
+        .recv_timeout(MIGRATION_LOCK_WAIT + Duration::from_secs(5))
+        .unwrap();
+    go_tx.send(()).unwrap();
+    let loader_a = loader_a.join().unwrap();
+
+    let holders = [&loader_a, &loader_b, &loader_c]
+        .into_iter()
+        .filter(|attempt| matches!(attempt, LockAttempt::Acquired(_)))
+        .count();
+    assert_eq!(holders, 1, "more than one loader holds the migration lock");
+    assert!(matches!(loader_a, LockAttempt::Busy));
+    assert!(matches!(loader_c, LockAttempt::Busy));
+    assert!(lock_remained, "A moved the lock file while B held it");
+}
+
+#[test]
+fn config_migration_failure_reason_names_the_settings_file() {
+    let _release = feature_config::override_running_release_for_test((0, 64));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    fs::write(&path, TRANSLATED_USER_FILE).unwrap();
+    let outcome = auto_migrate_user_config_with_writer(&path, |_, _, _, _| {
+        Err(io::Error::other("injected publish failure"))
+    })
+    .expect("reported failure");
+    let UserConfigMigration::NotMigrated { reason, notice, .. } = &outcome else {
+        panic!("a failed publish must be reported: {outcome:?}");
+    };
+    let target = fs::canonicalize(&path).unwrap();
+    assert!(!reason.contains(" at /:"), "{reason}");
+    assert!(
+        reason.contains(&format!(
+            "publish settings at {}: injected publish failure",
+            target.display()
+        )),
+        "{reason}"
+    );
+    assert!(!notice.contains(" at /:"), "{notice}");
 }

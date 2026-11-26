@@ -15,7 +15,6 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::config::{Config, IndexKind};
 use crate::db::standing_roots::{self, StandingRootRecord};
-use crate::root_cache::{ArtifactPublishEpoch, WriterLease};
 use crate::scoped_key::{reject_duplicate_artifact_keys, ResolvedStandingRoot};
 
 /// Configuration snapshots are observed only at standing maintenance-pass
@@ -86,33 +85,21 @@ pub struct StandingReconcileReport {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub replaced: Vec<String>,
+    /// Configured roots this pass could not reconcile, in configuration order,
+    /// with the error that refused each one. A refused root is left out of
+    /// `active_entries` and admits no standing build; the other roots carry on.
+    pub refused: Vec<StandingRootRefusal>,
 }
 
-/// The typed result used when a contained path has no selected index kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StandingRouteError {
-    NoContainingEntry,
-    KindUnavailable {
-        deepest_literal_path: String,
-        deepest_selection: Vec<IndexKind>,
-    },
-    StrictVerificationRequired {
-        literal_path: String,
-        kind: IndexKind,
-    },
-}
-
-/// A successful route discloses the selected configuration entry rather than
-/// implying that the deepest containing entry necessarily served the request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandingRoute {
-    pub entry: StandingRootEntry,
+pub struct StandingRootRefusal {
+    pub literal_path: String,
+    pub error: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StandingPublicationAdmission {
     pub admission_epoch: u64,
-    publication_epoch: u64,
 }
 
 /// An admitted build retains a lifecycle reference until it reaches a
@@ -132,6 +119,14 @@ impl StandingBuildAdmission {
 
     pub fn cancellation_requested(&self) -> bool {
         self.lifecycle.cancellation_requested()
+    }
+
+    /// The strict-mark count at this moment. A pass captures it before its
+    /// verification and hands it to
+    /// [`StandingRoots::record_strict_verification_unless_marked`].
+    #[must_use]
+    pub fn strict_mark_revision(&self) -> u64 {
+        *self.lifecycle.strict_marks.lock()
     }
 }
 
@@ -171,13 +166,22 @@ struct StandingRootsState {
 struct ManagedEntry {
     entry: StandingRootEntry,
     lifecycle: Arc<ArtifactLifecycle>,
+    /// The last reconciliation refused this root (for example its resolved
+    /// path drifted), or could not delete the durable row of a root removed
+    /// from configuration. The entry stays managed so a later pass can retry
+    /// it, but it admits no standing build meanwhile.
+    refused: bool,
 }
 
 struct ArtifactLifecycle {
     state: Mutex<ArtifactLifecycleState>,
     checkpoint_acknowledged: Condvar,
     admission_epoch: AtomicU64,
-    publication_epoch: ArtifactPublishEpoch,
+    /// Counts the durable strict marks made through this lifecycle. A mark
+    /// and a standing pass's clear each hold this lock, and a pass clears
+    /// only while the count still equals the one it captured at admission,
+    /// so a mark made during the pass is never undone by it.
+    strict_marks: Mutex<u64>,
 }
 
 #[derive(Default)]
@@ -199,7 +203,7 @@ impl Default for ArtifactLifecycle {
             }),
             checkpoint_acknowledged: Condvar::new(),
             admission_epoch: AtomicU64::new(0),
-            publication_epoch: ArtifactPublishEpoch::default(),
+            strict_marks: Mutex::new(0),
         }
     }
 }
@@ -215,7 +219,6 @@ impl ArtifactLifecycle {
             lifecycle: Arc::clone(self),
             publication: StandingPublicationAdmission {
                 admission_epoch: self.admission_epoch.load(Ordering::SeqCst),
-                publication_epoch: self.publication_epoch.current(),
             },
         })
     }
@@ -231,10 +234,6 @@ impl ArtifactLifecycle {
             .admission_epoch
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
-        // Advance the publication epoch so any admission captured before this
-        // lifecycle transition is rejected by `StandingRoots::publish_if_current`
-        // while ArtifactPublishEpoch holds its mutex.
-        self.publication_epoch.next();
         if state.checkpoint_acknowledged {
             self.checkpoint_acknowledged.notify_all();
         }
@@ -243,6 +242,33 @@ impl ArtifactLifecycle {
 
     fn bind_pending(&self) -> bool {
         self.state.lock().bind_pending
+    }
+
+    /// Runs a durable strict mark while no pass can clear the flag, counting
+    /// it first so a pass admitted earlier will not clear it.
+    fn mark_strict<T>(&self, mark: impl FnOnce() -> T) -> T {
+        let mut marks = self.strict_marks.lock();
+        *marks = marks.wrapping_add(1);
+        mark()
+    }
+
+    /// Stop standing work on a root that reconciliation refused: cancel running
+    /// builds and fence their publication, keeping any session bind in place.
+    fn refuse(&self) {
+        let bound = {
+            let state = self.state.lock();
+            state.bind_pending || state.session_bound
+        };
+        self.revoke_and_mint(bound);
+    }
+
+    /// Reopen standing admission once a refused root reconciles again. A root
+    /// that a session took over in the meantime stays with that session; its
+    /// unbind resumes standing work as usual.
+    fn recover_from_refusal(&self) {
+        if !self.bind_pending() {
+            self.resume_unbound();
+        }
     }
 
     fn resume_unbound(&self) {
@@ -346,6 +372,7 @@ impl StandingRoots {
                     added: Vec::new(),
                     removed: Vec::new(),
                     replaced: Vec::new(),
+                    refused: Vec::new(),
                 });
             }
         }
@@ -373,13 +400,13 @@ impl StandingRoots {
         let mut state = self.inner.state.lock();
         state.reconciled_empty = false;
         let previous_first_snapshot = state.observed_first_snapshot;
-        let previous = std::mem::take(&mut state.entries);
-        let mut next = BTreeMap::new();
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
-        let mut replaced = Vec::new();
-
-        for entry in &entries {
+        // The durable steps below run while the current map stays in place.
+        // The map and the lifecycle transitions change only after them, so a
+        // root that is refused (for example its symlink now points elsewhere)
+        // or a failed database step never drops the other roots' entries.
+        let mut refused = Vec::new();
+        let mut accepted = Vec::new();
+        for entry in entries {
             // resolve_entries already captured this live identity. Resolving
             // again would spawn git twice more and could mix two filesystem
             // observations in one durable record.
@@ -395,9 +422,62 @@ impl StandingRoots {
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
             };
-            standing_roots::ensure_standing_root(&mut conn, &record, &entry.indexes)?;
+            match standing_roots::ensure_standing_root(&mut conn, &record, &entry.indexes) {
+                Ok(outcome) => accepted.push((entry, outcome)),
+                Err(error) => refused.push(StandingRootRefusal {
+                    literal_path: entry.literal_path,
+                    error: StandingRootsError::from(error).to_string(),
+                }),
+            }
+        }
+        let configured = |literal_path: &String| {
+            accepted
+                .iter()
+                .any(|(entry, _)| &entry.literal_path == literal_path)
+                || refused
+                    .iter()
+                    .any(|refusal| &refusal.literal_path == literal_path)
+        };
+        let mut removed = Vec::new();
+        let mut removal_failed = Vec::new();
+        for literal_path in state.entries.keys().filter(|path| !configured(path)) {
+            match standing_roots::delete_standing_root(&conn, literal_path) {
+                Ok(()) => removed.push(literal_path.clone()),
+                Err(error) => removal_failed.push(StandingRootRefusal {
+                    literal_path: literal_path.clone(),
+                    error: StandingRootsError::from(error).to_string(),
+                }),
+            }
+        }
 
-            if let Some(old) = previous.get(&entry.literal_path) {
+        // Daemon restart is an observation gap. Startup first reconciles an
+        // empty default before subc has received a RouteBind configuration, so
+        // the first non-empty observed snapshot marks every retained row strict.
+        // A root that was refused went unmaintained too, so its first accepted
+        // pass marks its existing row the same way. Only the transactional
+        // strict-verification clear below can consume either mark.
+        for (entry, outcome) in &accepted {
+            let unobserved = match state.entries.get(&entry.literal_path) {
+                Some(old) => old.refused,
+                None => *outcome == standing_roots::EnsureStandingRoot::Reloaded,
+            };
+            if !previous_first_snapshot || unobserved {
+                let mut mark = || {
+                    mark_kinds_needing_strict_verify(&mut conn, &entry.literal_path, &entry.indexes)
+                };
+                match state.entries.get(&entry.literal_path) {
+                    Some(old) => old.lifecycle.mark_strict(mark)?,
+                    None => mark()?,
+                }
+            }
+        }
+
+        let mut previous = std::mem::take(&mut state.entries);
+        let mut next = BTreeMap::new();
+        let mut added = Vec::new();
+        let mut replaced = Vec::new();
+        for (entry, _) in &accepted {
+            if let Some(old) = previous.remove(&entry.literal_path) {
                 let changed = old.entry.resolved_target != entry.resolved_target
                     || old.entry.resolved_git_toplevel != entry.resolved_git_toplevel
                     || old.entry.scoped_relative_path != entry.scoped_relative_path
@@ -407,12 +487,15 @@ impl StandingRoots {
                     old.lifecycle.revoke_and_mint(false);
                     old.lifecycle.resume_unbound();
                     replaced.push(entry.literal_path.clone());
+                } else if old.refused {
+                    old.lifecycle.recover_from_refusal();
                 }
                 next.insert(
                     entry.literal_path.clone(),
                     ManagedEntry {
                         entry: entry.clone(),
-                        lifecycle: Arc::clone(&old.lifecycle),
+                        lifecycle: old.lifecycle,
+                        refused: false,
                     },
                 );
             } else {
@@ -422,41 +505,42 @@ impl StandingRoots {
                     ManagedEntry {
                         entry: entry.clone(),
                         lifecycle: Arc::new(ArtifactLifecycle::default()),
+                        refused: false,
                     },
                 );
             }
         }
-
-        for (literal_path, old) in &previous {
-            if !next.contains_key(literal_path) {
-                old.lifecycle.revoke_and_mint(false);
-                standing_roots::delete_standing_root(&conn, literal_path)?;
-                removed.push(literal_path.clone());
+        // A refused root keeps its last accepted entry, so removing it from
+        // configuration later still deletes its row and retires its actor. A
+        // removed root whose row could not be deleted stays for a retry.
+        for refusal in refused.iter().chain(&removal_failed) {
+            if let Some(old) = previous.remove(&refusal.literal_path) {
+                if !old.refused {
+                    old.lifecycle.refuse();
+                }
+                next.insert(
+                    refusal.literal_path.clone(),
+                    ManagedEntry {
+                        refused: true,
+                        ..old
+                    },
+                );
             }
         }
-
-        // Daemon restart is an observation gap. Startup first reconciles an
-        // empty default before subc has received a RouteBind configuration, so
-        // the first non-empty observed snapshot marks every retained row strict.
-        // Only the transactional strict-verification clear below can consume it.
-        if !previous_first_snapshot && !entries.is_empty() {
-            for entry in next.values() {
-                mark_kinds_needing_strict_verify(
-                    &mut conn,
-                    &entry.entry.literal_path,
-                    &entry.entry.indexes,
-                )?;
-            }
+        for old in previous.into_values() {
+            old.lifecycle.revoke_and_mint(false);
         }
-        state.observed_first_snapshot |= !entries.is_empty();
-        state.reconciled_empty = entries.is_empty();
+        state.observed_first_snapshot |= !accepted.is_empty();
+        state.reconciled_empty = accepted.is_empty() && refused.is_empty();
         state.entries = next;
+        refused.extend(removal_failed);
 
         Ok(StandingReconcileReport {
-            active_entries: entries,
+            active_entries: accepted.into_iter().map(|(entry, _)| entry).collect(),
             added,
             removed,
             replaced,
+            refused,
         })
     }
 
@@ -478,6 +562,7 @@ impl StandingRoots {
             .lock()
             .entries
             .get(literal_path)
+            .filter(|entry| !entry.refused)
             .and_then(|entry| entry.lifecycle.admit())
     }
 
@@ -498,8 +583,10 @@ impl StandingRoots {
             (Arc::clone(&entry.lifecycle), entry.entry.indexes.clone())
         };
         let admission_epoch = lifecycle.revoke_and_mint(true);
-        let mut conn = self.open_database()?;
-        mark_kinds_needing_strict_verify(&mut conn, literal_path, &indexes)?;
+        lifecycle.mark_strict(|| {
+            let mut conn = self.open_database()?;
+            mark_kinds_needing_strict_verify(&mut conn, literal_path, &indexes)
+        })?;
         let cancelled_builds = lifecycle.state.lock().active_builds;
         Ok(BindTransition {
             admission_epoch,
@@ -543,8 +630,10 @@ impl StandingRoots {
             return Ok(());
         }
         if !missing.is_empty() {
-            let mut conn = self.open_database()?;
-            mark_kinds_needing_strict_verify(&mut conn, literal_path, &missing)?;
+            lifecycle.mark_strict(|| {
+                let mut conn = self.open_database()?;
+                mark_kinds_needing_strict_verify(&mut conn, literal_path, &missing)
+            })?;
         }
         lifecycle.resume_unbound();
         Ok(())
@@ -558,8 +647,14 @@ impl StandingRoots {
         literal_path: &str,
         kinds: &[IndexKind],
     ) -> Result<(), StandingRootsError> {
-        let mut conn = self.open_database()?;
-        mark_kinds_needing_strict_verify(&mut conn, literal_path, kinds)
+        let mark = || {
+            let mut conn = self.open_database()?;
+            mark_kinds_needing_strict_verify(&mut conn, literal_path, kinds)
+        };
+        match self.lifecycle(literal_path) {
+            Ok(lifecycle) => lifecycle.mark_strict(mark),
+            Err(_) => mark(),
+        }
     }
 
     /// Clear a durable gap only after a successful current-state strict verify.
@@ -580,84 +675,25 @@ impl StandingRoots {
         Ok(())
     }
 
-    /// Route an explicit path through overlapping entries by deepest recorded
-    /// path then configuration order. If no candidate supports the requested
-    /// kind, preserve the deepest entry in the typed unavailable result.
-    pub fn route_explicit_path(
-        &self,
-        query_path: &Path,
-        kind: IndexKind,
-    ) -> Result<StandingRoute, StandingRouteError> {
-        let query_path = canonicalize_existing_ancestor(query_path);
-        let mut candidates = self
-            .entries()
-            .into_iter()
-            .filter(|entry| query_path.starts_with(&entry.resolved_target))
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            path_depth(&right.resolved_target)
-                .cmp(&path_depth(&left.resolved_target))
-                .then_with(|| left.config_order.cmp(&right.config_order))
-        });
-        let Some(deepest) = candidates.first().cloned() else {
-            return Err(StandingRouteError::NoContainingEntry);
-        };
-        let Some(entry) = candidates
-            .into_iter()
-            .find(|entry| entry.indexes.contains(&kind))
-        else {
-            return Err(StandingRouteError::KindUnavailable {
-                deepest_literal_path: deepest.literal_path,
-                deepest_selection: deepest.indexes,
-            });
-        };
-        let conn = self
-            .open_database()
-            .map_err(|_| StandingRouteError::NoContainingEntry)?;
-        if standing_roots::needs_strict_verify(&conn, &entry.literal_path, kind)
-            .ok()
-            .flatten()
-            .unwrap_or(true)
-        {
-            return Err(StandingRouteError::StrictVerificationRequired {
-                literal_path: entry.literal_path,
-                kind,
-            });
-        }
-        Ok(StandingRoute { entry })
-    }
-
-    /// Execute a standing publication while `ArtifactPublishEpoch` holds its
-    /// exclusive per-root mutex continuously across WriterLease validation,
-    /// admission comparison, caller-supplied fingerprint/generation comparisons,
-    /// and the final rename closure. A failed comparison is a no-op.
-    pub fn publish_if_current<R>(
+    /// Clear a durable gap after a standing pass's strict verification, unless
+    /// a strict mark was made since the pass captured `revision`
+    /// ([`StandingBuildAdmission::strict_mark_revision`]): then the pass's
+    /// proof predates that mark and the flag stays set. Returns whether it
+    /// cleared. Marks from another process are not counted here.
+    pub fn record_strict_verification_unless_marked(
         &self,
         literal_path: &str,
-        admission: StandingPublicationAdmission,
-        writer_lease: &WriterLease,
-        fingerprint_is_current: impl FnOnce() -> bool,
-        generation_is_current: impl FnOnce() -> bool,
-        publish_and_rename: impl FnOnce() -> R,
-    ) -> Result<Option<R>, StandingRootsError> {
+        kind: IndexKind,
+        revision: u64,
+    ) -> Result<bool, StandingRootsError> {
         let lifecycle = self.lifecycle(literal_path)?;
-        Ok(lifecycle
-            .publication_epoch
-            .run_if_current(admission.publication_epoch, || {
-                // Compare the worker's captured admission epoch with the epoch
-                // advanced by a bind or configuration replacement. A mismatch
-                // rejects stale publication before the final rename can run.
-                if lifecycle.admission_epoch.load(Ordering::SeqCst) != admission.admission_epoch
-                    || !lifecycle.state.lock().standing_admission_open
-                    || !writer_lease.verify().unwrap_or(false)
-                    || !fingerprint_is_current()
-                    || !generation_is_current()
-                {
-                    return None;
-                }
-                Some(publish_and_rename())
-            })
-            .flatten())
+        let marks = lifecycle.strict_marks.lock();
+        if *marks != revision {
+            return Ok(false);
+        }
+        self.record_strict_verification(literal_path, kind)?;
+        drop(marks);
+        Ok(true)
     }
 
     fn lifecycle(&self, literal_path: &str) -> Result<Arc<ArtifactLifecycle>, StandingRootsError> {
@@ -777,35 +813,6 @@ fn mark_kinds_needing_strict_verify(
     tx.commit()
         .map_err(standing_roots::StandingRootError::from)?;
     Ok(())
-}
-
-fn path_depth(path: &Path) -> usize {
-    path.components().count()
-}
-
-/// Route containment must compare the same canonical spelling recorded for an
-/// entry, while still accepting an explicit path whose final file is absent.
-fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
-    }
-    let mut missing = Vec::new();
-    let mut ancestor = path;
-    while !ancestor.exists() {
-        let Some(name) = ancestor.file_name() else {
-            return path.to_path_buf();
-        };
-        missing.push(name.to_os_string());
-        let Some(parent) = ancestor.parent() else {
-            return path.to_path_buf();
-        };
-        ancestor = parent;
-    }
-    let mut canonical = std::fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
-    for component in missing.iter().rev() {
-        canonical.push(component);
-    }
-    canonical
 }
 
 fn now_ms() -> i64 {
@@ -1156,8 +1163,11 @@ mod tests {
         roots.reconcile(&snapshot).unwrap();
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(targets.path().join("second"), &link).unwrap();
-        let error = roots.reconcile(&snapshot).unwrap_err();
-        assert!(error.to_string().contains("resolved-path-drift"), "{error}");
+        let report = roots.reconcile(&snapshot).unwrap();
+        assert_eq!(report.refused.len(), 1, "{report:?}");
+        let error = &report.refused[0].error;
+        assert!(error.contains("resolved-path-drift"), "{error}");
+        assert!(report.active_entries.is_empty());
         let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
         let recorded = standing_roots::get_standing_root(&conn, link.to_str().unwrap())
             .unwrap()
@@ -1171,6 +1181,97 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
         );
+    }
+
+    /// One root whose symlink now resolves elsewhere is refused on its own: the
+    /// other root stays managed and admissible, the refused root's running
+    /// build is cancelled, and removing both later deletes both rows.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_root_leaves_the_other_entries_in_place() {
+        let storage = tempdir().unwrap();
+        let healthy = tempdir().unwrap();
+        let targets = tempdir().unwrap();
+        std::fs::create_dir(targets.path().join("first")).unwrap();
+        std::fs::create_dir(targets.path().join("second")).unwrap();
+        let link = targets.path().join("link");
+        std::os::unix::fs::symlink(targets.path().join("first"), &link).unwrap();
+        let healthy_path = healthy.path().to_string_lossy().into_owned();
+        let link_path = link.to_string_lossy().into_owned();
+        let snapshot = config(
+            storage.path(),
+            vec![
+                root(healthy.path(), vec![IndexKind::Search]),
+                root(&link, vec![IndexKind::Search]),
+            ],
+        );
+        let roots = StandingRoots::default();
+        roots.reconcile(&snapshot).unwrap();
+        roots
+            .record_strict_verification(&link_path, IndexKind::Search)
+            .unwrap();
+        let healthy_build = roots.admit_build(&healthy_path).unwrap();
+        let link_build = roots.admit_build(&link_path).unwrap();
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(targets.path().join("second"), &link).unwrap();
+        let report = roots.reconcile_background(&snapshot).unwrap();
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refusal| refusal.literal_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![link_path.as_str()]
+        );
+        assert_eq!(
+            report
+                .active_entries
+                .iter()
+                .map(|entry| entry.literal_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![healthy_path.as_str()]
+        );
+        assert_eq!(roots.entries().len(), 2, "no entry may be dropped");
+        assert!(!healthy_build.cancellation_requested());
+        assert!(link_build.cancellation_requested());
+        drop((healthy_build, link_build));
+        assert!(roots.admit_build(&healthy_path).is_some());
+        assert!(roots.admit_build(&link_path).is_none());
+
+        // Pointing the link back recovers the refused root.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(targets.path().join("first"), &link).unwrap();
+        let report = roots.reconcile_background(&snapshot).unwrap();
+        assert!(report.refused.is_empty(), "{report:?}");
+        let recovered = roots.admit_build(&link_path).unwrap();
+        assert!(!recovered.cancellation_requested());
+        drop(recovered);
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        assert_eq!(
+            standing_roots::needs_strict_verify(&conn, &link_path, IndexKind::Search).unwrap(),
+            Some(true),
+            "a root that went unmaintained must verify strictly again"
+        );
+
+        // Removing both while the link is refused still removes both rows.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(targets.path().join("second"), &link).unwrap();
+        assert_eq!(roots.reconcile(&snapshot).unwrap().refused.len(), 1);
+        let mut removed = roots
+            .reconcile(&config(storage.path(), vec![]))
+            .unwrap()
+            .removed;
+        removed.sort();
+        let mut expected = vec![healthy_path.clone(), link_path.clone()];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert!(roots.entries().is_empty());
+        for literal_path in [&healthy_path, &link_path] {
+            assert!(standing_roots::get_standing_root(&conn, literal_path)
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]
@@ -1272,184 +1373,6 @@ mod tests {
     }
 
     #[test]
-    fn route_falls_back_to_shallower_entry_and_discloses_it() {
-        let storage = tempdir().unwrap();
-        let outer = tempdir().unwrap();
-        let inner = outer.path().join("inner");
-        std::fs::create_dir(&inner).unwrap();
-        let roots = StandingRoots::default();
-        let cfg = config(
-            storage.path(),
-            vec![
-                root(outer.path(), vec![IndexKind::Search]),
-                root(&inner, vec![IndexKind::Callgraph]),
-            ],
-        );
-        roots.reconcile(&cfg).unwrap();
-        roots
-            .record_strict_verification(outer.path().to_str().unwrap(), IndexKind::Search)
-            .unwrap();
-        let route = roots
-            .route_explicit_path(&inner.join("file.rs"), IndexKind::Search)
-            .unwrap();
-        assert_eq!(route.entry.literal_path, outer.path().to_string_lossy());
-    }
-
-    #[test]
-    fn publication_is_a_noop_after_bind_epoch_revocation() {
-        let storage = tempdir().unwrap();
-        let root_dir = tempdir().unwrap();
-        let roots = StandingRoots::default();
-        let cfg = config(
-            storage.path(),
-            vec![root(root_dir.path(), vec![IndexKind::Search])],
-        );
-        let mut report = roots.reconcile(&cfg).unwrap();
-        let entry = report.active_entries.remove(0);
-        let build = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        roots.begin_case_a_bind(&entry.literal_path).unwrap();
-        let published = std::sync::atomic::AtomicBool::new(false);
-        let result = roots
-            .publish_if_current(
-                &entry.literal_path,
-                build.publication,
-                &lease,
-                || true,
-                || true,
-                || published.store(true, Ordering::SeqCst),
-            )
-            .unwrap();
-        assert!(result.is_none());
-        assert!(!published.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn publication_fence_holds_epoch_mutex_through_final_rename() {
-        let storage = tempdir().unwrap();
-        let root_dir = tempdir().unwrap();
-        let roots = StandingRoots::default();
-        let cfg = config(
-            storage.path(),
-            vec![root(root_dir.path(), vec![IndexKind::Search])],
-        );
-        let mut report = roots.reconcile(&cfg).unwrap();
-        let entry = report.active_entries.remove(0);
-        let admission = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        let (rename_entered_tx, rename_entered_rx) = std::sync::mpsc::channel();
-        let (release_rename_tx, release_rename_rx) = std::sync::mpsc::channel();
-        let publish_roots = roots.clone();
-        let publish_literal = entry.literal_path.clone();
-        let publisher = std::thread::spawn(move || {
-            publish_roots
-                .publish_if_current(
-                    &publish_literal,
-                    admission.publication,
-                    &lease,
-                    || true,
-                    || true,
-                    || {
-                        rename_entered_tx.send(()).unwrap();
-                        release_rename_rx.recv().unwrap();
-                    },
-                )
-                .unwrap()
-        });
-        rename_entered_rx.recv().unwrap();
-        let (bind_done_tx, bind_done_rx) = std::sync::mpsc::channel();
-        let bind_roots = roots.clone();
-        let bind_literal = entry.literal_path.clone();
-        let binder = std::thread::spawn(move || {
-            bind_done_tx
-                .send(bind_roots.begin_case_a_bind(&bind_literal))
-                .unwrap();
-        });
-        assert!(bind_done_rx
-            .recv_timeout(Duration::from_millis(100))
-            .is_err());
-        release_rename_tx.send(()).unwrap();
-        assert!(publisher.join().unwrap().is_some());
-        // Only the 100 ms check above is about ordering: the bind must not
-        // finish while the rename holds the fence. Once released, the bind does
-        // real filesystem work, so this receive is just a hang guard, sized
-        // for a loaded Windows runner.
-        bind_done_rx
-            .recv_timeout(Duration::from_secs(30))
-            .unwrap()
-            .unwrap();
-        binder.join().unwrap();
-    }
-
-    #[test]
-    fn superseded_snapshot_publication_is_a_noop() {
-        let storage = tempdir().unwrap();
-        let root_dir = tempdir().unwrap();
-        let roots = StandingRoots::default();
-        let mut cfg = config(
-            storage.path(),
-            vec![root(root_dir.path(), vec![IndexKind::Search])],
-        );
-        let mut initial = roots.reconcile(&cfg).unwrap();
-        let entry = initial.active_entries.remove(0);
-        let build = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        cfg.index.roots[0].indexes = vec![IndexKind::Semantic];
-        let report = roots.reconcile(&cfg).unwrap();
-        assert_eq!(report.replaced, vec![entry.literal_path.clone()]);
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(roots
-            .publish_if_current(
-                &entry.literal_path,
-                build.publication,
-                &lease,
-                || true,
-                || true,
-                || (),
-            )
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
     fn crash_before_freshness_clear_blocks_verify_on_query_until_transactional_clear() {
         let storage = tempdir().unwrap();
         let root_dir = tempdir().unwrap();
@@ -1457,30 +1380,34 @@ mod tests {
             storage.path(),
             vec![root(root_dir.path(), vec![IndexKind::Search])],
         );
+        let literal = root_dir.path().to_str().unwrap();
         let first = StandingRoots::default();
         first.reconcile(&cfg).unwrap();
         first
-            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .record_strict_verification(literal, IndexKind::Search)
             .unwrap();
         first
-            .mark_observation_gap(root_dir.path().to_str().unwrap(), &[IndexKind::Search])
+            .mark_observation_gap(literal, &[IndexKind::Search])
             .unwrap();
         drop(first);
 
         // Restarting between verification and its transaction commit must retain
-        // the durable gap and reject a query rather than serving its baseline.
+        // the durable gap, so a query reading the flag rejects the baseline.
         let restarted = StandingRoots::default();
         restarted.reconcile(&cfg).unwrap();
-        assert!(matches!(
-            restarted.route_explicit_path(&root_dir.path().join("missing.rs"), IndexKind::Search),
-            Err(StandingRouteError::StrictVerificationRequired { .. })
-        ));
+        assert!(strict(storage.path(), literal, IndexKind::Search));
         restarted
-            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .record_strict_verification(literal, IndexKind::Search)
             .unwrap();
-        assert!(restarted
-            .route_explicit_path(&root_dir.path().join("missing.rs"), IndexKind::Search)
-            .is_ok());
+        assert!(!strict(storage.path(), literal, IndexKind::Search));
+    }
+
+    /// The durable strict-verification flag, as queries read it.
+    fn strict(storage: &Path, literal_path: &str, kind: IndexKind) -> bool {
+        let conn = crate::db::open(&storage.join("aft.db")).unwrap();
+        standing_roots::needs_strict_verify(&conn, literal_path, kind)
+            .unwrap()
+            .expect("a freshness row")
     }
 
     #[test]
@@ -1500,10 +1427,7 @@ mod tests {
         roots
             .mark_observation_gap(literal, &[IndexKind::Search])
             .unwrap();
-        assert!(matches!(
-            roots.route_explicit_path(&root_dir.path().join("query.rs"), IndexKind::Search),
-            Err(StandingRouteError::StrictVerificationRequired { .. })
-        ));
+        assert!(strict(storage.path(), literal, IndexKind::Search));
     }
 
     #[test]
@@ -1515,31 +1439,21 @@ mod tests {
             storage.path(),
             vec![root(root_dir.path(), vec![IndexKind::Search])],
         );
+        let literal = root_dir.path().to_str().unwrap();
         roots.reconcile(&cfg).unwrap();
         roots
-            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .record_strict_verification(literal, IndexKind::Search)
             .unwrap();
-        let build = roots
-            .admit_build(root_dir.path().to_str().unwrap())
-            .unwrap();
-        roots
-            .begin_case_a_bind(root_dir.path().to_str().unwrap())
-            .unwrap();
+        let build = roots.admit_build(literal).unwrap();
+        roots.begin_case_a_bind(literal).unwrap();
         assert!(build.checkpoint());
         std::fs::write(root_dir.path().join("edited.rs"), "fn changed() {}\n").unwrap();
+        roots.resume_after_session(literal, &[]).unwrap();
+        assert!(strict(storage.path(), literal, IndexKind::Search));
         roots
-            .resume_after_session(root_dir.path().to_str().unwrap(), &[])
+            .record_strict_verification(literal, IndexKind::Search)
             .unwrap();
-        assert!(matches!(
-            roots.route_explicit_path(&root_dir.path().join("edited.rs"), IndexKind::Search),
-            Err(StandingRouteError::StrictVerificationRequired { .. })
-        ));
-        roots
-            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
-            .unwrap();
-        assert!(roots
-            .route_explicit_path(&root_dir.path().join("edited.rs"), IndexKind::Search)
-            .is_ok());
+        assert!(!strict(storage.path(), literal, IndexKind::Search));
     }
 
     #[test]

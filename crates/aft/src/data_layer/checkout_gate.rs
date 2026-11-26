@@ -1229,7 +1229,7 @@ impl MemoryLog {
 /// memory grows with every comparison while what it uses does not.
 fn release_free_memory() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    crate::memory::return_free_pages();
+    crate::memory::return_free_pages(crate::memory::AllocatorReliefSource::MemoryComparison);
 }
 
 /// What glibc's allocator hands out now, and what it holds from the system

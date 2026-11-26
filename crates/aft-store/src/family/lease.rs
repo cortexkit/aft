@@ -140,6 +140,23 @@ impl Owner {
     }
 }
 
+/// The last reference to an owner goes once the family handle and every
+/// snapshot leasing through it are dropped, so no lease of it is in use.
+/// Its marker is removed then, while its lock is still held, rather than
+/// left for a later writer's reclaim to find unlocked: a process that
+/// reopens a family for reads again and again would otherwise leave one
+/// marker per open. A reclaimer that listed this owner's leases before the
+/// marker went treats them as dead, which they are. Removal is best effort;
+/// a marker that stays (or a lease whose removal kept failing) is still
+/// collected by the next reclaim once the lock is free.
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.retry_stale();
+        let marker = self.leases_dir.join(format!("{}{OWNER_SUFFIX}", self.id));
+        let _ = crate::fs::remove_file(&marker);
+    }
+}
+
 /// A lease record held by a snapshot. Dropping it releases the lease.
 #[derive(Debug)]
 pub(super) struct LeaseFile {

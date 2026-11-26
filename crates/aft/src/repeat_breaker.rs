@@ -11,11 +11,15 @@ pub struct RepeatCall(RepeatObservation);
 impl RepeatCall {
     pub fn new(tool: &str, input: &Value) -> Self {
         let normalized = crate::tool_gate::canonical_tool_name(tool).unwrap_or(tool);
-        Self(RepeatObservation {
+        let mut observation = RepeatObservation {
             tool: normalized.to_string(),
-            semantic_key: semantic_key(normalized, input),
+            semantic_key: String::new(),
             mutating: crate::host_tool_names::tool_call_is_mutating(tool, input),
-        })
+        };
+        if !observation.is_reset_only() {
+            observation.semantic_key = semantic_key(normalized, input);
+        }
+        Self(observation)
     }
 }
 
@@ -74,7 +78,10 @@ pub fn semantic_key(tool: &str, input: &Value) -> String {
             ],
         ),
         "glob" => select_fields(input, &["pattern", "path", "topK", "offset"]),
-        "aft_search" => select_fields(input, &["query", "path", "topK", "offset", "includeTests"]),
+        "aft_search" => select_fields(
+            input,
+            &["query", "pattern", "path", "topK", "offset", "includeTests"],
+        ),
         _ => {
             let mut value = input.clone();
             if let Some(object) = value.as_object_mut() {
@@ -119,6 +126,51 @@ fn canonicalize(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn search_patterns_have_distinct_repeat_histories() {
+        let breaker = RepeatBreaker::default();
+        let start = Instant::now();
+        for (step, pattern) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            let call = RepeatCall::new("search", &serde_json::json!({ "pattern": pattern }));
+            assert!(
+                breaker
+                    .observe_at(
+                        "agent",
+                        &call,
+                        0,
+                        start + Duration::from_secs(15 * step as u64)
+                    )
+                    .is_none(),
+                "the pattern changed to {pattern}"
+            );
+        }
+
+        let call = RepeatCall::new("search", &serde_json::json!({ "pattern": "gamma" }));
+        assert!(breaker
+            .observe_at("agent", &call, 0, start + Duration::from_secs(45))
+            .is_none());
+        assert_eq!(
+            breaker
+                .observe_at("agent", &call, 0, start + Duration::from_secs(60))
+                .unwrap()
+                .count,
+            3
+        );
+    }
+
+    #[test]
+    fn repeat_reset_does_not_serialize_mutation_content() {
+        let args = serde_json::json!({ "path": "data.txt", "content": "x".repeat(8 << 20) });
+        let call = RepeatCall::new("write", &args);
+        assert!(call.mutating);
+        assert_eq!(
+            call.semantic_key.len(),
+            0,
+            "reset-only calls need no input key bytes"
+        );
+    }
 
     #[test]
     fn output_hash_ignores_the_task_line_of_a_finished_bash_call() {

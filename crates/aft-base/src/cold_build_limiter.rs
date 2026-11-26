@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod progress;
@@ -30,39 +30,25 @@ pub fn try_acquire() -> Option<ColdBuildPermit> {
     GLOBAL_COLD_BUILD_LIMITER.try_acquire()
 }
 
-/// Block until a build slot is free, then take it.
-///
-/// For build sites with no reschedule path (search-index builds spawn once per
-/// configure): skipping would strand the index, so past-cap work waits instead.
-/// Production captures showed concurrent per-root builds starving dispatch
-/// while CPU sat idle; waiting serializes that pressure at the source. Only
-/// call from dedicated background threads, never the dispatch thread or an
-/// executor worker.
-/// A permit bounds local build CPU and memory pressure, not backend latency.
-/// A build that yields it during model I/O must separately bound its retained
-/// batches and avoid blocking on a shared gate while holding a cold slot.
-pub fn acquire_blocking(kind: &str) -> ColdBuildPermit {
+/// Hold a global build slot for a limiter test.
+#[cfg(test)]
+fn acquire_blocking(kind: &str) -> ColdBuildPermit {
     acquire_blocking_while(kind, || true).expect("unconditional cold-build admission")
 }
 
-/// Wait for a build slot while `admitted` remains true. The predicate is checked
-/// before every attempt, so a root that becomes unbound does not consume a slot
-/// after spending time queued behind the process-wide cap.
-pub fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option<ColdBuildPermit> {
+#[cfg(test)]
+fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option<ColdBuildPermit> {
     acquire_blocking_while_with_limiter(&GLOBAL_COLD_BUILD_LIMITER, kind, admitted)
 }
 
-#[rustfmt::skip]
-test_support_visibility! {
-
-pub(crate) fn acquire_blocking_while_with_limiter(
+#[cfg(any(test, feature = "test-support"))]
+pub fn acquire_blocking_while_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
     admitted: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
     let request = ColdBuildAdmissionRequest::new(kind, ColdBuildAdmissionClass::Maintenance);
-    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, || false)
-}
+    acquire_blocking_while_inner(limiter, kind, &request, admitted, || false)
 }
 
 /// Identify the source of a cold-build request without exposing a limiter knob.
@@ -204,7 +190,7 @@ pub fn acquire_blocking_while_cancellable_with_limiter(
     admitted: impl Fn() -> bool,
     cancelled: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
-    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, cancelled)
+    acquire_blocking_while_inner(limiter, kind, &request, admitted, cancelled)
 }
 
 /// A Standing permit preserves the lifecycle admission epoch captured before
@@ -229,7 +215,7 @@ pub fn acquire_standing_while_cancellable_with_limiter(
     cancelled: impl Fn() -> bool,
 ) -> Option<StandingColdBuildPermit> {
     let request = ColdBuildAdmissionRequest::new(request_id, ColdBuildAdmissionClass::Standing);
-    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, cancelled).map(|permit| {
+    acquire_blocking_while_inner(limiter, kind, &request, admitted, cancelled).map(|permit| {
         StandingColdBuildPermit {
             _permit: permit,
             admission_epoch,
@@ -240,49 +226,35 @@ pub fn acquire_standing_while_cancellable_with_limiter(
 fn acquire_blocking_while_inner(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
-    request: Option<&ColdBuildAdmissionRequest>,
+    request: &ColdBuildAdmissionRequest,
     admitted: impl Fn() -> bool,
     cancelled: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
-    let waiter = request.map(|request| AdmissionWaiter::register(limiter, request, kind));
-    let ticket = waiter.as_ref().map(|waiter| waiter.census_id);
+    let waiter = AdmissionWaiter::register(limiter, request, kind);
+    let ticket = Some(waiter.census_id);
     let started = Instant::now();
     let mut logged = false;
     loop {
+        let generation = limiter.wake_generation.load(Ordering::Acquire);
         if !admitted() || cancelled() {
             return None;
         }
         // Standing yields to any already-queued interactive or ordinary
         // maintenance contender. Returning None keeps it resumable; callers
         // use the same path again at the next checkpoint without priority tags.
-        if request.is_some_and(|request| request.class == ColdBuildAdmissionClass::Standing)
-            && limiter.has_non_standing_waiters()
+        if request.class == ColdBuildAdmissionClass::Standing && limiter.has_non_standing_waiters()
         {
             return None;
         }
         let revoked_after_acquire = std::cell::Cell::new(false);
-        let permit = match request {
-            Some(request) => limiter.try_acquire_classified(request, kind, ticket, || {
-                let still_admitted = admitted()
-                    && !cancelled()
-                    && (request.class != ColdBuildAdmissionClass::Standing
-                        || !limiter.has_non_standing_waiters());
-                revoked_after_acquire.set(!still_admitted);
-                still_admitted
-            }),
-            None => limiter.try_acquire().and_then(|permit| {
-                // A request can become unbound or cancelled after the pre-attempt
-                // check but before the permit is acquired. Recheck while owning
-                // the slot; dropping the permit returns it before any build starts.
-                if admitted() && !cancelled() {
-                    Some(permit)
-                } else {
-                    revoked_after_acquire.set(true);
-                    drop(permit);
-                    None
-                }
-            }),
-        };
+        let permit = limiter.try_acquire_classified(request, kind, ticket, || {
+            let still_admitted = admitted()
+                && !cancelled()
+                && (request.class != ColdBuildAdmissionClass::Standing
+                    || !limiter.has_non_standing_waiters());
+            revoked_after_acquire.set(!still_admitted);
+            still_admitted
+        });
         if revoked_after_acquire.get() {
             return None;
         }
@@ -296,20 +268,13 @@ fn acquire_blocking_while_inner(
                 );
             }
             if logged {
-                match request {
-                    Some(request) => crate::slog_info!(
-                        "{} cold-build slot acquired after {}ms wait: request={} kind={}",
-                        request.class.label(),
-                        wait_ms,
-                        request.request_id,
-                        kind
-                    ),
-                    None => crate::slog_info!(
-                        "maintenance build slot acquired after {}ms wait: {}",
-                        wait_ms,
-                        kind
-                    ),
-                }
+                crate::slog_info!(
+                    "{} cold-build slot acquired after {}ms wait: request={} kind={}",
+                    request.class.label(),
+                    wait_ms,
+                    request.request_id,
+                    kind
+                );
             }
             return Some(permit);
         }
@@ -318,23 +283,16 @@ fn acquire_blocking_while_inner(
             if let Some(observer) = limiter.refusal_observer.lock().unwrap().as_ref() {
                 let _ = observer.send(kind.to_owned());
             }
-            match request {
-                Some(request) => crate::slog_info!(
-                    "{} cold-build request queued behind concurrency cap ({}): request={} kind={}",
-                    request.class.label(),
-                    limiter.limit(),
-                    request.request_id,
-                    kind
-                ),
-                None => crate::slog_info!(
-                    "maintenance build queued behind concurrency cap ({}): {}",
-                    limiter.limit(),
-                    kind
-                ),
-            }
+            crate::slog_info!(
+                "{} cold-build request queued behind concurrency cap ({}): request={} kind={}",
+                request.class.label(),
+                limiter.limit(),
+                request.request_id,
+                kind
+            );
             logged = true;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        limiter.wait_for_admission_change(generation);
     }
 }
 
@@ -355,6 +313,10 @@ pub struct ColdBuildLimiter {
     /// second hot-path lock. Rotation still uses `admission_state` below.
     waiting_by_class: [AtomicUsize; ADMISSION_CLASS_COUNT],
     admission_state: Mutex<AdmissionState>,
+    wake_generation: AtomicUsize,
+    admission_changed: Condvar,
+    #[cfg(test)]
+    rank_records_examined: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     refusal_observer: Mutex<Option<crossbeam_channel::Sender<String>>>,
 }
@@ -488,6 +450,10 @@ impl ColdBuildLimiter {
                 holders_by_root: BTreeMap::new(),
                 queued: BTreeMap::new(),
             }),
+            wake_generation: AtomicUsize::new(0),
+            admission_changed: Condvar::new(),
+            #[cfg(test)]
+            rank_records_examined: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             refusal_observer: Mutex::new(None),
         }
@@ -495,6 +461,29 @@ impl ColdBuildLimiter {
 
     pub(crate) fn limit(&self) -> usize {
         self.limit
+    }
+
+    fn wait_for_admission_change(&self, generation: usize) -> bool {
+        let state = self
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Cancellation and lifecycle predicates are external to the limiter and
+        // do not signal this condition variable. The timeout rechecks them.
+        let (_state, wake) = self
+            .admission_changed
+            .wait_timeout_while(state, Duration::from_secs(1), |_| {
+                self.wake_generation.load(Ordering::Acquire) == generation
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !wake.timed_out()
+    }
+
+    // The admission lock prevents a release between checking the generation
+    // and parking. The caller must still hold it when notifying.
+    fn wake_waiters_locked(&self, _state: &AdmissionState) {
+        self.wake_generation.fetch_add(1, Ordering::Release);
+        self.admission_changed.notify_all();
     }
 
     fn try_take_slot(&self) -> bool {
@@ -605,14 +594,18 @@ impl ColdBuildLimiter {
         }
 
         let available = self.available.load(Ordering::Acquire);
+        if available == 0 {
+            return None;
+        }
         if let Some(ticket) = ticket {
             let class = request.class.label();
-            let older_same_class = state
-                .queued
-                .range(..ticket)
-                .filter(|(_, record)| record.domain == class)
-                .count();
-            if older_same_class >= available {
+            let mut older_same_class = 0;
+            if state.queued.range(..ticket).any(|(_, record)| {
+                #[cfg(test)]
+                self.rank_records_examined.fetch_add(1, Ordering::Relaxed);
+                older_same_class += usize::from(record.domain == class);
+                older_same_class >= available
+            }) {
                 return None;
             }
         }
@@ -715,9 +708,7 @@ impl ColdBuildLimiter {
     }
     }
 
-    /// O(1) waiter-set inspection used by Standing before its initial permit
-    /// and every checkpoint reacquisition. The counters are maintained by RAII
-    /// waiters and therefore need no scheduler-state lock on this hot path.
+    /// Snapshot holders and queued requests under the admission lock.
     pub fn census(&self) -> ColdBuildLimiterCensus {
         let now_ms = unix_millis_now();
         let state = self
@@ -767,6 +758,8 @@ impl ColdBuildLimiter {
         Ok((count, first))
     }
 
+    /// Standing-root builds check these RAII counters before each acquisition
+    /// without taking the admission lock.
     pub(crate) fn has_non_standing_waiters(&self) -> bool {
         self.waiting_by_class[ColdBuildAdmissionClass::InspectTriggered.index()]
             .load(Ordering::Acquire)
@@ -835,12 +828,13 @@ impl Drop for AdmissionWaiter {
         let previous =
             self.limiter.waiting_by_class[self.class.index()].fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
-        self.limiter
+        let mut state = self
+            .limiter
             .admission_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .queued
-            .remove(&self.census_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.queued.remove(&self.census_id);
+        self.limiter.wake_waiters_locked(&state);
     }
 }
 
@@ -893,15 +887,42 @@ impl Drop for ColdBuildPermitLease {
                 state.holders_by_root.remove(root);
             }
         }
-        drop(state);
         let previous = self.limiter.available.fetch_add(1, Ordering::Release);
         debug_assert!(previous < self.limiter.limit);
+        self.limiter.wake_waiters_locked(&state);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_build_saturated_retry_skips_fifo_scan() {
+        let limiter = isolated_limiter(1);
+        let _hold = limiter.try_acquire().unwrap();
+        let request =
+            ColdBuildAdmissionRequest::new("waiting", ColdBuildAdmissionClass::Maintenance);
+        let _older: Vec<_> = (0..32)
+            .map(|_| AdmissionWaiter::register(&limiter, &request, "older"))
+            .collect();
+        let waiter = AdmissionWaiter::register(&limiter, &request, "waiting");
+        assert!(limiter
+            .install_classified_permit(&request, "waiting", Some(waiter.census_id))
+            .is_none());
+        assert_eq!(limiter.rank_records_examined.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cold_build_release_between_refusal_and_park_is_not_lost() {
+        let limiter = isolated_limiter(1);
+        let held = limiter.try_acquire().unwrap();
+        let generation = limiter.wake_generation.load(Ordering::Acquire);
+        assert!(limiter.try_acquire().is_none());
+        drop(held);
+        assert!(limiter.wait_for_admission_change(generation));
+        assert!(limiter.try_acquire().is_some());
+    }
 
     // These tests mutate the process-global limiter; run them one at a time.
     fn serial() -> std::sync::MutexGuard<'static, ()> {

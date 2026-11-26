@@ -2939,7 +2939,7 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
         // publication would be dropped before alert ingestion.
         server_kind: ServerKind::Rust, root: rust_key.root.clone(),
         method: "textDocument/publishDiagnostics".into(),
-        params: Some(json!({"uri":file_uri(&rust),"version":0,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":"queued Rust alert"}]})),
+        params: Some(json!({"uri":file_uri(&rust),"version":1,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":"queued Rust alert"}]})),
     });
     // Do not drain here: the background completion must consume the queued Rust
     // publication while applying the Python response, then retain the Rust
@@ -4228,52 +4228,8 @@ fn scoped_blocking_inspect_waits_to_pull_native_rust_diagnostics_until_current_c
     assert_eq!(response["inspect_terminal"], "fresh", "{response:#}");
 }
 
-/// A scope with more files than one inspect opens reports how many it
-/// examined, and names the rest with that cause instead of opening them.
-#[test]
-fn scoped_blocking_inspect_caps_the_files_it_opens() {
-    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cap");
-    for index in 0..1000 {
-        write_file(&root, &format!("src/m{index:04}.rs"), "pub fn g() {}\n");
-    }
-    let ctx = configured_context(&root);
-    configure_fake_rust_lsp(&ctx);
-
-    let mut response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap", "src");
-    // The cap intentionally leaves diagnostics partial. Retry only a separate
-    // freshness-budget gap, and keep the exact coverage and header assertions.
-    if response["complete"] == false
-        && response["gaps"].as_array().is_some_and(|gaps| {
-            gaps.iter().any(|gap| {
-                gap["kind"] == "stat_verification_incomplete"
-                && gap["reason"]
-                    == "file freshness verification exceeded the request budget; retry aft_inspect"
-            })
-        })
-    {
-        response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap-retry", "src");
-    }
-
-    assert_eq!(
-        response["summary"]["diagnostics"]["coverage"],
-        json!({"files": 1001, "examined": 1000, "authoritative": 1000, "not_examined": 1, "file_cap": 1000}),
-        "response: {response:#}"
-    );
-    let uncovered = uncovered_files(&response);
-    assert_eq!(uncovered.len(), 1, "response: {response:#}");
-    assert!(
-        uncovered[0].1.starts_with("not examined:"),
-        "response: {response:#}"
-    );
-    let text = response["text"].as_str().expect("rendered text");
-    // The cap's unknown file is explained once in the header; exact coverage
-    // remains structured rather than repeating incompleteness in a body line.
-    assert!(
-        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: not examined:")
-            && text.contains("(1 file); retry aft_inspect."),
-        "{text}"
-    );
-}
+#[path = "inspect_command_test/sweep_cap.rs"]
+mod sweep_cap;
 
 /// When `cargo check` is still running at the end of the budget, the Rust
 /// files are named as incomplete with that cause instead of being certified
@@ -6890,10 +6846,10 @@ fn wait_for_completed_rust_check(
         .watch(&directory, notify::RecursiveMode::NonRecursive)
         .map_err(|error| format!("watch {}: {error}", directory.display()))?;
     ready();
-    // Register before reading so the atomic rename cannot fall between the
-    // absence check and the subscription. Events wake us; record contents prove
-    // the expected check, not an older clean record, reached disk.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Watch before reading so the rename can't slip between. Record contents prove
+    // the expected check reached disk; it trails the first error until cargo check
+    // ends, many seconds on loaded CI, so this positive wait is generous.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(record) = completed_rust_check_record(storage, expected_errors) {
             return Ok(record);
@@ -7191,14 +7147,13 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     };
     let ctx = new_context();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    let warm = loop {
+    loop {
         let warm = scoped_diagnostics_inspect(&ctx, "saved-warm", "src");
         if warm["summary"]["diagnostics"]["errors"] == 0 {
-            break warm;
+            break;
         }
         assert!(std::time::Instant::now() < deadline, "{warm:#}");
-    };
-    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+    }
     // Inspect certifies the live result before its detached cache writer finishes.
     // A restart can restore only the record whose atomic write has completed.
     let record = wait_for_completed_rust_check(&storage, 0, || {}).unwrap();
@@ -7273,16 +7228,17 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         }
         assert!(std::time::Instant::now() < deadline, "{response:#}");
     };
-    let error_record = wait_for_completed_rust_check(
-        &storage,
-        errors["summary"]["diagnostics"]["errors"].as_u64().unwrap(),
-        || {},
-    )
-    .unwrap();
-    println!(
-        "real restart: saved errors {}",
-        fs::read_to_string(error_record).unwrap()
-    );
+    let expected_errors = errors["summary"]["diagnostics"]["errors"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // This context has no daemon maintenance loop to drain the remaining Rust check events.
+    while completed_rust_check_record(&storage, expected_errors).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "no completed Rust check with {expected_errors} errors was persisted: {errors:#}"
+        );
+        aft::runtime_drain::drain_lsp_events(&ctx);
+        thread::sleep(Duration::from_millis(50));
+    }
     drop(ctx);
     let ctx = new_context();
     let started = std::time::Instant::now();
@@ -7300,8 +7256,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         "{restored_errors:#}"
     );
     assert_eq!(
-        restored_errors["summary"]["diagnostics"]["errors"],
-        errors["summary"]["diagnostics"]["errors"],
+        restored_errors["summary"]["diagnostics"]["errors"], expected_errors,
         "{restored_errors:#}"
     );
     assert!(restored_elapsed < std::time::Duration::from_secs(5));

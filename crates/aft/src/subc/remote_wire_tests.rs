@@ -1,5 +1,5 @@
 use super::{
-    tests::{bind, registry, rpc, stamp, REMOTE},
+    tests::{bind, registry, stamp, REMOTE},
     *,
 };
 use crate::db::remote_grant_rows::{self as grants, Mode};
@@ -182,7 +182,7 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
     }
     let entries = registry(root.as_path());
     let executor = Arc::new(Executor::new());
-    let (mut daemon, stream) = tokio::io::duplex(1024 * 1024);
+    let (daemon, stream) = tokio::io::duplex(1024 * 1024);
     let (read, write) = tokio::io::split(stream);
     let connection = storage.path().join("connection.json");
     let module = TEST_REGISTRY.scope(
@@ -206,14 +206,10 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
         ),
     );
     let exercise = async {
-        hello(
-            &mut daemon,
-            vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
-        )
-        .await;
+        let mut daemon = edit_lifetime::Peer::start(daemon).await;
         let mut local = bind(90, "opencode", Value::Null, root.as_path(), "tool_provider");
         local["principal"] = json!({"kind":"direct"});
-        reply(rpc(&mut daemon, 0, 1, local).await);
+        reply(daemon.call(0, 1, local).await);
         for (channel, pairing, caps) in [
             (1, SCOPES[0], &[HELD, RESULT][..]),
             (2, SCOPES[1], &[HELD, RESULT, YIELD][..]),
@@ -222,13 +218,13 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             (5, SCOPES[2], &[RESULT, YIELD][..]),
         ] {
             reply(
-                rpc(
-                    &mut daemon,
-                    0,
-                    u64::from(channel) + 1,
-                    remote_bind(channel, pairing, caps),
-                )
-                .await,
+                daemon
+                    .call(
+                        0,
+                        u64::from(channel) + 1,
+                        remote_bind(channel, pairing, caps),
+                    )
+                    .await,
             );
         }
 
@@ -238,11 +234,11 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
         };
         let mut no_pin = read("head", "a.txt", "no-pin");
         no_pin.as_object_mut().unwrap().remove("schema_pin");
-        refusal(rpc(&mut daemon, 3, 10, no_pin).await, "invalid_request");
+        refusal(daemon.call(3, 10, no_pin).await, "invalid_request");
         let mut malformed_pin = read("head", "a.txt", "malformed-pin");
         malformed_pin["schema_pin"] = json!("unparseable");
         refusal(
-            rpc(&mut daemon, 3, 11, malformed_pin).await,
+            daemon.call(3, 11, malformed_pin.clone()).await,
             "invalid_request",
         );
         let mismatch = request(
@@ -253,7 +249,7 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             pin("read", CatalogPreset::Head, false, false, Some(777)),
         );
         let versions = refusal(
-            rpc(&mut daemon, 3, 12, mismatch).await,
+            daemon.call(3, 12, mismatch).await,
             "remote_tool_versions_differ",
         );
         assert_eq!(
@@ -280,7 +276,7 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             let mut mismatch = read("head", "a.txt", "stale-tp2");
             mismatch["schema_pin"] = json!(stale.encode().unwrap());
             let versions = refusal(
-                rpc(&mut daemon, 3, corr, mismatch).await,
+                daemon.call(3, corr, mismatch).await,
                 "remote_tool_versions_differ",
             );
             assert_eq!(
@@ -290,13 +286,9 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
         }
         for (channel, corr) in [(1, 13), (4, 14), (5, 15)] {
             refusal(
-                rpc(
-                    &mut daemon,
-                    channel,
-                    corr,
-                    read("head", "a.txt", "transport"),
-                )
-                .await,
+                daemon
+                    .call(channel, corr, read("head", "a.txt", "transport"))
+                    .await,
                 "remote_call_not_admitted",
             );
         }
@@ -307,18 +299,12 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             "reader-bash",
             pin("bash", CatalogPreset::Head, true, false, None),
         );
-        refusal(
-            rpc(&mut daemon, 1, 16, bash).await,
-            "remote_tool_not_available",
-        );
+        refusal(daemon.call(1, 16, bash).await, "remote_tool_not_available");
         let mut off = read("head", "a.txt", "ref-off");
         off["arguments"]["ref"] = json!("HEAD");
-        refusal(
-            rpc(&mut daemon, 3, 17, off).await,
-            "revision_reads_disabled",
-        );
+        refusal(daemon.call(3, 17, off).await, "revision_reads_disabled");
         let escape = read("head", outside.to_str().unwrap(), "outside");
-        refusal(rpc(&mut daemon, 3, 18, escape).await, "path_outside_root");
+        refusal(daemon.call(3, 18, escape).await, "path_outside_root");
         let inspect = request(
             "aft_inspect",
             "reader",
@@ -327,35 +313,39 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             pin("inspect", CatalogPreset::Reader, false, false, None),
         );
         refusal(
-            rpc(&mut daemon, 1, 19, inspect).await,
+            daemon.call(1, 19, inspect).await,
             "remote_tool_not_available",
         );
         assert_eq!(card_count.load(Ordering::Relaxed), 0);
         assert!(READS.lock().unwrap().is_empty());
 
         refusal(
-            rpc(&mut daemon, 3, 20, read("head", "a.txt", "denied")).await,
+            daemon.call(3, 20, read("head", "a.txt", "denied")).await,
             "remote_access_denied",
         );
         assert_eq!(card_count.load(Ordering::Relaxed), 1);
         assert!(READS.lock().unwrap().is_empty());
-        let first = reply(rpc(&mut daemon, 1, 21, read("reader", "a.txt", "same-key")).await);
+        let first = reply(
+            daemon
+                .call(1, 21, read("reader", "a.txt", "same-key"))
+                .await,
+        );
         let versioned_pin = current_read.schema_pin().encode().unwrap();
         assert!(versioned_pin.starts_with("tp2:"));
         let second = reply(
-            rpc(
-                &mut daemon,
-                2,
-                22,
-                request(
-                    "read",
-                    "head",
-                    json!({"path":"b.txt"}),
-                    "same-key",
-                    versioned_pin,
-                ),
-            )
-            .await,
+            daemon
+                .call(
+                    2,
+                    22,
+                    request(
+                        "read",
+                        "head",
+                        json!({"path":"b.txt"}),
+                        "same-key",
+                        versioned_pin,
+                    ),
+                )
+                .await,
         );
         assert!(text(&first).contains("first pairing contents"), "{first}");
         assert!(
@@ -364,53 +354,52 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
         );
         assert_eq!(READS.lock().unwrap().as_slice(), ["read", "read"]);
         assert_eq!(
-            reply(rpc(&mut daemon, 1, 23, read("reader", "a.txt", "same-key")).await),
+            reply(
+                daemon
+                    .call(1, 23, read("reader", "a.txt", "same-key"))
+                    .await
+            ),
             first
         );
         assert_eq!(READS.lock().unwrap().as_slice(), ["read", "read"]);
 
         for (channel, pairing) in [(11, SCOPES[0]), (12, SCOPES[1])] {
             reply(
-                rpc(
-                    &mut daemon,
-                    0,
-                    20 + u64::from(channel),
-                    remote_bind(channel, pairing, &[HELD, RESULT]),
-                )
-                .await,
+                daemon
+                    .call(
+                        0,
+                        20 + u64::from(channel),
+                        remote_bind(channel, pairing, &[HELD, RESULT]),
+                    )
+                    .await,
             );
         }
-        let first_feed = reply(rpc(&mut daemon, 11, 33, feed()).await);
+        let first_feed = reply(daemon.call(11, 33, feed()).await);
         assert_eq!(first_feed["entries"].as_array().unwrap().len(), 1);
         assert_eq!(first_feed["entries"][0]["call_key"], "same-key");
         assert_eq!(first_feed["entries"][0]["result"], first);
         reply(
-            rpc(
-                &mut daemon,
-                11,
-                34,
-                json!({"name":"late_results.ack", "arguments":{"through":first_feed["cursor"]}}),
-            )
+            daemon.call(11, 34, json!({"name":"late_results.ack", "arguments":{"through":first_feed["cursor"]}}))
             .await,
         );
         assert_eq!(
-            reply(rpc(&mut daemon, 11, 35, feed()).await)["entries"],
+            reply(daemon.call(11, 35, feed()).await)["entries"],
             json!([])
         );
-        let second_feed = reply(rpc(&mut daemon, 12, 36, feed()).await);
+        let second_feed = reply(daemon.call(12, 36, feed()).await);
         assert_eq!(second_feed["entries"].as_array().unwrap().len(), 1);
         assert_eq!(second_feed["entries"][0]["result"], second);
         reply(
-            rpc(
-                &mut daemon,
-                12,
-                37,
-                json!({"op":"late_results.ack", "through":second_feed["cursor"]}),
-            )
-            .await,
+            daemon
+                .call(
+                    12,
+                    37,
+                    json!({"op":"late_results.ack", "through":second_feed["cursor"]}),
+                )
+                .await,
         );
         assert_eq!(
-            reply(rpc(&mut daemon, 12, 38, json!({"op":"late_results"})).await)["entries"],
+            reply(daemon.call(12, 38, json!({"op":"late_results"})).await)["entries"],
             json!([])
         );
 
@@ -420,7 +409,9 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             .execute_batch("PRAGMA query_only=ON")
             .unwrap();
         refusal(
-            rpc(&mut daemon, 1, 39, read("reader", "a.txt", "no-audit")).await,
+            daemon
+                .call(1, 39, read("reader", "a.txt", "no-audit"))
+                .await,
             "remote_call_not_admitted",
         );
         db.lock()
@@ -471,19 +462,19 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
                 ));
             }
             for (spelling, encoded) in spellings {
-                let frame = rpc(
-                    &mut daemon,
-                    2,
-                    corr,
-                    request(
-                        spelling,
-                        "head",
-                        args.clone(),
-                        &format!("spelling-{corr}"),
-                        encoded,
-                    ),
-                )
-                .await;
+                let frame = daemon
+                    .call(
+                        2,
+                        corr,
+                        request(
+                            spelling,
+                            "head",
+                            args.clone(),
+                            &format!("spelling-{corr}"),
+                            encoded,
+                        ),
+                    )
+                    .await;
                 reply(frame);
                 expected.push(command);
                 assert_eq!(*READS.lock().unwrap(), expected, "{spelling}");
@@ -494,21 +485,25 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             SchemaPin::parse(&pin("conflicts", CatalogPreset::Head, false, false, None)).unwrap();
         for name in ["conflicts", "aft_conflicts"] {
             refusal(
-                rpc(
-                    &mut daemon,
-                    2,
-                    corr,
-                    request(
-                        name,
-                        "head",
-                        json!({}),
-                        &format!("conflicts-{corr}"),
-                        SchemaPin::new(name, &conflicts_pin.schema_digest, conflicts_pin.semantics)
+                daemon
+                    .call(
+                        2,
+                        corr,
+                        request(
+                            name,
+                            "head",
+                            json!({}),
+                            &format!("conflicts-{corr}"),
+                            SchemaPin::new(
+                                name,
+                                &conflicts_pin.schema_digest,
+                                conflicts_pin.semantics,
+                            )
                             .encode()
                             .unwrap(),
-                    ),
-                )
-                .await,
+                        ),
+                    )
+                    .await,
                 "remote_tool_not_available",
             );
             corr += 1;
@@ -524,11 +519,23 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
         let mut enabled_ref = read("head", "a.txt", "ref-on");
         enabled_ref["arguments"]["ref"] = json!("HEAD");
         refusal(
-            rpc(&mut daemon, 2, corr, enabled_ref).await,
+            daemon.call(2, corr, enabled_ref).await,
             "revision_reads_disabled",
         );
         assert_eq!(*READS.lock().unwrap(), expected);
-        let corr = corr + 1;
+        // Remote scope admission confirms liveness before validating the
+        // request. An unverified session must not see pin validation errors.
+        let mut unchecked = remote_bind(6, SCOPES[2], &[HELD, RESULT, YIELD]);
+        unchecked["scope"]["ref"] = json!("unverified-session");
+        reply(daemon.call(0, corr + 1, unchecked).await);
+        daemon.describe_unsynced_once("unverified-session");
+        malformed_pin["call_key"] = json!("unverified-malformed-pin");
+        refusal(
+            daemon.call(6, corr + 2, malformed_pin).await,
+            "remote_call_not_admitted",
+        );
+        daemon.saw_probe("unverified-session").await;
+        let corr = corr + 3;
         executor
             .actor_context(&root)
             .unwrap()
@@ -536,17 +543,14 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
                 config.disabled_tools.push("read".into());
             });
         refusal(
-            rpc(&mut daemon, 1, corr, read("reader", "a.txt", "disabled")).await,
+            daemon
+                .call(1, corr, read("reader", "a.txt", "disabled"))
+                .await,
             "remote_tool_not_available",
         );
         assert_eq!(*READS.lock().unwrap(), expected);
         assert_eq!(card_count.load(Ordering::Relaxed), 1);
-        write_frame(
-            &mut daemon,
-            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, corr + 1, vec![]).unwrap(),
-        )
-        .await
-        .unwrap();
+        daemon.signal(FrameType::Goodbye, 0, corr + 1).await;
     };
     let (end, ()) = tokio::join!(module, exercise);
     end.unwrap();

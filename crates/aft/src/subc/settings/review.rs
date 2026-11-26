@@ -108,7 +108,14 @@ fn review(schema: &Schema, request: ConfigReviewRequest) -> Result<Vec<FieldChan
             continue;
         }
         let key = path.trim_start_matches('/').replace('/', ".");
-        let apply = if crate::config_live::restart_required(&key) {
+        // The declaration classifies a harness override by the root-relative
+        // key it overrides, so `harnesses.<name>.disabled_tools` applies like
+        // `disabled_tools`.
+        let key = match key.strip_prefix("harnesses.") {
+            Some(rest) => rest.split_once('.').map_or("", |(_, field)| field),
+            None => key.as_str(),
+        };
+        let apply = if crate::config_live::restart_required(key) {
             ApplyKind::ModuleRestart
         } else {
             ApplyKind::Live

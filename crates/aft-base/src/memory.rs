@@ -439,6 +439,8 @@ pub struct ProcessMemorySnapshot {
     /// Present only once a checkout of this process has bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_layer_block_cache_bytes: Option<u64>,
+    /// Reusable parser slots are shared across roots by worker threads.
+    pub reusable_parser_pools: MemoryEstimate,
     pub unattributed_bytes: Option<i64>,
     pub root_count: usize,
     pub busy_subsystems: usize,
@@ -937,18 +939,26 @@ static ALLOCATOR_OBSERVATION_PUBLISH_LOCK: std::sync::Mutex<()> = std::sync::Mut
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 static LAST_ALLOCATOR_SLACK_RELIEF_AT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 static LAST_ALLOCATOR_SLACK_RELIEF_ACCOUNTING_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 static LAST_ALLOCATOR_SLACK_RELIEF_RSS_DROP_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-static LAST_ALLOCATOR_SLACK_RELIEF_FOOTPRINT_DROP_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
+
+#[cfg(target_os = "macos")]
+static LAST_MAC_RELIEF: std::sync::Mutex<LastAllocatorRelief> =
+    std::sync::Mutex::new(LastAllocatorRelief {
+        at_ms: None,
+        source: None,
+        accounting_bytes: 0,
+        accounting_source: Some(RELIEF_ACCOUNTING_SOURCE_MACOS),
+        rss_drop_bytes: None,
+        phys_footprint_drop_bytes: None,
+    });
 
 #[cfg(any(test, feature = "test-support"))]
 pub static ALLOCATOR_SNAPSHOT_THREADS: std::sync::Mutex<Vec<String>> =
@@ -1238,84 +1248,94 @@ fn record_last_allocator_relief(relief: &AllocatorPressureRelief) {
         relief.rss_drop_bytes.unwrap_or(UNKNOWN_ALLOCATOR_SLACK),
         ordering,
     );
-    LAST_ALLOCATOR_SLACK_RELIEF_FOOTPRINT_DROP_BYTES.store(
-        relief
-            .phys_footprint_drop_bytes
-            .unwrap_or(UNKNOWN_ALLOCATOR_SLACK),
-        ordering,
-    );
 }
 
-pub fn last_allocator_relief_at_ms() -> Option<u64> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let value = LAST_ALLOCATOR_SLACK_RELIEF_AT_MS.load(std::sync::atomic::Ordering::Acquire);
-        return (value != UNSAMPLED_AT_MS).then_some(value);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+#[derive(Clone, Copy, Default)]
+pub struct LastAllocatorRelief {
+    pub at_ms: Option<u64>,
+    pub source: Option<&'static str>,
+    pub accounting_bytes: u64,
+    pub accounting_source: Option<&'static str>,
+    pub rss_drop_bytes: Option<u64>,
+    pub phys_footprint_drop_bytes: Option<u64>,
 }
 
-/// Allocator-accounting figure from the latest periodic relief pass; see
-/// `allocator_relief_accounting_source` for what it measures on this platform.
-pub fn last_allocator_relief_accounting_bytes() -> u64 {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        return LAST_ALLOCATOR_SLACK_RELIEF_ACCOUNTING_BYTES
-            .load(std::sync::atomic::Ordering::Acquire);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        0
-    }
+#[cfg(target_os = "macos")]
+pub fn last_allocator_relief() -> LastAllocatorRelief {
+    *LAST_MAC_RELIEF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Observed RSS drop across the latest periodic relief pass, if one ran and
-/// both RSS readings were available.
-pub fn last_allocator_relief_rss_drop_bytes() -> Option<u64> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let value =
-            LAST_ALLOCATOR_SLACK_RELIEF_RSS_DROP_BYTES.load(std::sync::atomic::Ordering::Acquire);
-        return (value != UNKNOWN_ALLOCATOR_SLACK).then_some(value);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
+#[cfg(target_os = "linux")]
+pub fn last_allocator_relief() -> LastAllocatorRelief {
+    use std::sync::atomic::Ordering::Acquire;
+    let timestamp = LAST_ALLOCATOR_SLACK_RELIEF_AT_MS.load(Acquire);
+    let at_ms = (timestamp != UNSAMPLED_AT_MS).then_some(timestamp);
+    let rss_drop = LAST_ALLOCATOR_SLACK_RELIEF_RSS_DROP_BYTES.load(Acquire);
+    LastAllocatorRelief {
+        at_ms,
+        source: at_ms.map(|_| "periodic"),
+        accounting_bytes: LAST_ALLOCATOR_SLACK_RELIEF_ACCOUNTING_BYTES.load(Acquire),
+        accounting_source: Some(RELIEF_ACCOUNTING_SOURCE_JEMALLOC),
+        rss_drop_bytes: (rss_drop != UNKNOWN_ALLOCATOR_SLACK).then_some(rss_drop),
+        phys_footprint_drop_bytes: None,
     }
 }
 
-/// Observed physical-footprint drop across the latest periodic relief pass
-/// (macOS only).
-pub fn last_allocator_relief_phys_footprint_drop_bytes() -> Option<u64> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let value = LAST_ALLOCATOR_SLACK_RELIEF_FOOTPRINT_DROP_BYTES
-            .load(std::sync::atomic::Ordering::Acquire);
-        return (value != UNKNOWN_ALLOCATOR_SLACK).then_some(value);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn last_allocator_relief() -> LastAllocatorRelief {
+    LastAllocatorRelief::default()
 }
 
-/// What `last_allocator_relief_accounting_bytes` measures on this platform,
-/// or `None` where no relief pass exists.
-pub fn allocator_relief_accounting_source() -> Option<&'static str> {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub enum AllocatorReliefSource {
+    ColdBuildStage,
+    BuildPoolJob,
+    MemoryComparison,
+    AllRootsIdle,
+    Explicit,
+}
+
+#[cfg(target_os = "macos")]
+fn record_mac_relief(
+    source: AllocatorReliefSource,
+    accounting_bytes: u64,
+    rss_drop_bytes: Option<u64>,
+    phys_footprint_drop_bytes: Option<u64>,
+) {
+    let source = match source {
+        AllocatorReliefSource::ColdBuildStage => "cold_build_stage",
+        AllocatorReliefSource::BuildPoolJob => "build_pool_job",
+        AllocatorReliefSource::MemoryComparison => "memory_comparison",
+        AllocatorReliefSource::AllRootsIdle => "all_roots_idle",
+        AllocatorReliefSource::Explicit => "explicit",
+    };
+    // Serialize publication, not the relief itself: a census must not pair
+    // one request's byte count or drops with a different request's source.
+    let mut last = LAST_MAC_RELIEF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *last = LastAllocatorRelief {
+        at_ms: Some(allocator_slack_elapsed_ms(std::time::Instant::now())),
+        source: Some(source),
+        accounting_bytes,
+        accounting_source: Some(RELIEF_ACCOUNTING_SOURCE_MACOS),
+        rss_drop_bytes,
+        phys_footprint_drop_bytes,
+    };
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn relieve_allocator_pressure_after_idle_sweep() -> AllocatorPressureRelief {
     #[cfg(target_os = "macos")]
     {
-        Some(RELIEF_ACCOUNTING_SOURCE_MACOS)
+        relieve_mac_allocator_pressure(AllocatorReliefSource::AllRootsIdle)
     }
     #[cfg(target_os = "linux")]
     {
-        Some(RELIEF_ACCOUNTING_SOURCE_JEMALLOC)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
+        relieve_allocator_pressure()
     }
 }
 
@@ -1418,9 +1438,8 @@ pub fn spawn_allocator_slack_relief_if_due(_now: std::time::Instant) -> bool {
 /// gate. Callers own that gate because allocator pressure relief can add
 /// latency. Linux purges all jemalloc arenas; macOS asks libmalloc for relief.
 #[cfg(target_os = "macos")]
-fn relieve_allocator_pressure_from_snapshot(
-    allocator_before: AllocatorMemorySnapshot,
-) -> AllocatorPressureRelief {
+fn relieve_mac_allocator_pressure(source: AllocatorReliefSource) -> AllocatorPressureRelief {
+    let allocator_before = allocator_memory_snapshot();
     let resident_before = ResidentReading::read();
     // The return value is libmalloc's own count of bytes it handed back. It is
     // reported as the allocator's claim; the footprint and RSS drops recorded
@@ -1428,33 +1447,41 @@ fn relieve_allocator_pressure_from_snapshot(
     let reported = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
     let allocator_after = allocator_memory_snapshot();
     let resident_after = ResidentReading::read();
-    AllocatorPressureRelief::from_observations(
+    let relief = AllocatorPressureRelief::from_observations(
         usize_to_u64(reported),
         RELIEF_ACCOUNTING_SOURCE_MACOS,
         resident_before,
         resident_after,
         allocator_before,
         allocator_after,
-    )
+    );
+    record_mac_relief(
+        source,
+        relief.allocator_accounting_bytes,
+        relief.rss_drop_bytes,
+        relief.phys_footprint_drop_bytes,
+    );
+    relief
 }
 
 #[cfg(target_os = "macos")]
 pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
-    relieve_allocator_pressure_from_snapshot(allocator_memory_snapshot())
+    relieve_mac_allocator_pressure(AllocatorReliefSource::Explicit)
 }
 
-/// Hands the allocator's free pages back to the system without measuring
-/// anything, for callers that would throw the measurement away. On macOS the
+/// Hands the allocator's free pages back without taking before/after readings.
+/// Records only the byte count returned by libmalloc. On macOS the
 /// measured `relieve_allocator_pressure` reads zone statistics before and after
 /// the relief, which takes every allocator-zone lock and stalls every thread
 /// that allocates meanwhile; a call-graph build calls this between stages.
 #[cfg(target_os = "macos")]
-pub fn return_free_pages() {
-    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+pub fn return_free_pages(source: AllocatorReliefSource) {
+    let reported = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    record_mac_relief(source, usize_to_u64(reported), None, None);
 }
 
 #[cfg(target_os = "linux")]
-pub fn return_free_pages() {
+pub fn return_free_pages(_source: AllocatorReliefSource) {
     let _ = purge_allocator();
 }
 
@@ -1916,6 +1943,41 @@ mod tests {
             allocator.not_estimated,
             Some("platform_allocator_statistics_unavailable")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn memory_census_records_mac_allocator_relief_without_extra_walks() {
+        let observed = relieve_allocator_pressure_after_idle_sweep();
+        let measured = last_allocator_relief();
+        assert_eq!(measured.source, Some("all_roots_idle"));
+        assert_eq!(
+            measured.accounting_bytes,
+            observed.allocator_accounting_bytes
+        );
+        assert_eq!(measured.rss_drop_bytes, observed.rss_drop_bytes);
+        assert_eq!(
+            measured.phys_footprint_drop_bytes,
+            observed.phys_footprint_drop_bytes
+        );
+
+        let walks = allocator_snapshot_calls_for_test();
+        let before = allocator_slack_elapsed_ms(std::time::Instant::now());
+        return_free_pages(AllocatorReliefSource::ColdBuildStage);
+        let stats_free = last_allocator_relief();
+        let after = allocator_slack_elapsed_ms(std::time::Instant::now());
+        assert!((before..=after).contains(&stats_free.at_ms.unwrap()));
+        assert_eq!(stats_free.source, Some("cold_build_stage"));
+        assert_eq!(
+            stats_free.accounting_source,
+            Some("malloc_zone_pressure_relief_return")
+        );
+        assert_eq!(stats_free.rss_drop_bytes, None);
+        assert_eq!(stats_free.phys_footprint_drop_bytes, None);
+        assert_eq!(allocator_snapshot_calls_for_test(), walks);
+
+        return_free_pages(AllocatorReliefSource::BuildPoolJob);
+        assert_eq!(last_allocator_relief().source, Some("build_pool_job"));
     }
 
     #[cfg(target_os = "macos")]

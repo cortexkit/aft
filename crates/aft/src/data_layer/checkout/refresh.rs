@@ -237,11 +237,11 @@ impl Checkout {
                 }
                 let started = Instant::now();
                 let rebuilt = if let Some(reservation) = reservation {
-                    self.build_reserved(false, reservation)?
+                    self.build_reserved_as(false, reservation, BuildCause::RefreshFallback)?
                 } else {
                     // The outer build is reusing another checkout's publication
                     // and already holds the reservation.
-                    self.build_inner(false)?
+                    self.build_inner(false, BuildCause::RefreshFallback)?
                 };
                 return Ok(Some(UpdateStats {
                     cold_build: true,

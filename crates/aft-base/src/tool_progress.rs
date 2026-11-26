@@ -240,6 +240,7 @@ impl WaitingOn {
 pub struct ToolCallPhaseDurations {
     pub cpu: ToolCallPhaseCpu,
     pub queue: Duration,
+    pub queue_observation: Option<crate::executor::QueueObservation>,
     /// From executor admission to the start of argument translation: the
     /// route's call policy (confinement admission, access-policy scope, the
     /// formatter launch-policy handle) and repeat-breaker capture. Kept apart

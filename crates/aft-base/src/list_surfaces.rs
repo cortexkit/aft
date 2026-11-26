@@ -144,6 +144,11 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
                 kind: ReasonKind::Bounding,
                 predicate_name: "depth_cut_inside_requested, truncated",
             },
+            ReasonEntry {
+                reason: Reason::Budget,
+                kind: ReasonKind::Bounding,
+                predicate_name: "MACRO_VIA_ENTRY_LIMIT, macro_via_entries",
+            },
         ],
     },
     SurfaceEntry {
@@ -349,12 +354,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, glob_from_view, discover_glob_root, named_ignored_glob_walk_stops_at_cap_and_deadline, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, glob_from_view, discover_glob_root, named_ignored_glob_walk_stops_at_cap_and_deadline, walk_failed, walk_truncated, skipped_foreign_mounts",
             },
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DIRECTORY_SECTIONS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, format_glob_output, format_glob_selected, rendered_glob_file_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DIRECTORY_SECTIONS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, bounded_indexed_glob, presence_stat_budget, account_for_unretained_glob_candidates, format_glob_text, format_glob_output, format_glob_selected, rendered_glob_file_count",
             },
         ],
     },
@@ -394,12 +399,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "handle_directory",
+                predicate_name: "handle_directory_entries",
             },
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "handle_directory",
+                predicate_name: "handle_directory_entries",
             },
         ],
     },
@@ -602,6 +607,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Process-local display pull copies have bounded count, bytes and retention; early pressure eviction is counted in bus health and missing records return the protocol's unknown refusal, not a truncated tool result.",
     },
     ExclusionEntry {
+        file: "subc/rich_ui/session_reads.rs",
+        enclosing_item: "versions::remember",
+        location_or_primitive: "MAX_VERSIONS, pop_back",
+        reason: "Internal file classification cache only; evicted versions are revalidated in full and no file result is shortened.",
+    },
+    ExclusionEntry {
         file: "subc/rich_ui/display.rs",
         enclosing_item: "register",
         location_or_primitive: "calls.len() >= 64",
@@ -711,7 +722,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "db/call_ledger.rs",
-        enclosing_item: "enforce_retention_bounds",
+        enclosing_item: "enforce_retention_bounds, drop_expired_entries_over_bound",
         location_or_primitive: "UNACKED_RESULTS_MAX (1000), EXPIRED_ENTRIES_MAX (1000), SQL OFFSET",
         reason: "durable protocol retention quotas bound stored terminal answers and non-terminal update payloads rather than shortening a command result list; acknowledged updates keep deduplication keys until their admitted call is removed",
     },
@@ -1184,6 +1195,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "diagnostic changed-path previews and sequential diff line pages integrate their list envelope trailers into content through the authorized NDJSON text builder",
     },
     ExclusionEntry {
+        file: "commands/glob.rs",
+        enclosing_item: "glob_root_files_for_test, review_search_glob_lower_bound_only_counts_checked_files, review_search_indexed_glob_retains_only_the_page_and_refill_window",
+        location_or_primitive: "DEFAULT_MAX_RESULTS",
+        reason: "test-only fixtures and assertions reuse the production page size; they do not cut a reply list",
+    },
+    ExclusionEntry {
         file: "grep_executor.rs",
         enclosing_item: "diagnose_scope_counts, diagnose_scope_counts_unbounded, bounded_fallback_walk_files_with_limits_target, walk_files_unbounded, walk_each_file_unbounded",
         location_or_primitive: "MAX_FALLBACK_WALK_FILES / FALLBACK_WALK_BUDGET",
@@ -1343,7 +1360,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // response text; every missing file is listed in the JSON `semantic_gap`
     // field, and the text says how many more there are.
     ExclusionEntry {
-        file: "commands/semantic_search/mod.rs",
+        file: "commands/semantic_search/checkout_gaps.rs",
         enclosing_item: "disclose",
         location_or_primitive: "semantic gap note take",
         reason: "summary line naming the first few files a views-on semantic answer is missing, with its own '(+N more)' count; the full list is in the semantic_gap JSON field",
@@ -1508,9 +1525,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/read.rs",
-        enclosing_item: "handle_streaming_range_read",
+        enclosing_item: "handle_streaming_range_read, render_text_read",
         location_or_primitive: "bounded streamed line window",
         reason: "limits bytes retained while reading a selected text line; truncated content and scan gaps are disclosed by the read response, not a cut to a list of files or result records",
+    },
+    ExclusionEntry {
+        file: "commands/read/unranged.rs",
+        enclosing_item: "scan, push",
+        location_or_primitive: "bounded unranged text window",
+        reason: "retains only the text prefix needed to render the output window; the read response discloses content truncation and reports the exact line count",
     },
     ExclusionEntry {
         file: "commands/lsp_diagnostics.rs",
@@ -1645,9 +1668,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // results page is the search surface's, registered under its cap reason.
     ExclusionEntry {
         file: "commands/semantic_search/external_exact.rs",
-        enclosing_item: "sweep_after_metadata",
-        location_or_primitive: "commands::semantic_search::external_exact::sweep skipped_foreign_mounts",
-        reason: "counts mount points of other filesystems that the walk does not enter; no list is cut here, and a walk the deadline stops is reported through the sweep's enumeration_stopped and the reply's coverage line",
+        enclosing_item: "SweepOutcome, sweep_after_metadata",
+        location_or_primitive: "fallback_walk_limit / skipped_foreign_mounts",
+        reason: "bounds the internal corpus, not the displayed hit list; the sweep reports incomplete coverage and an unknown total after a file limit, deadline or skipped mount",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/external_disk_check.rs",
+        enclosing_item: "collect_bounded_corpus",
+        location_or_primitive: "fallback_walk_limit",
+        reason: "bounds the unpublished pattern corpus, not a response list; reaching the limit makes unindexed_scan.walk_complete false" ,
     },
     ExclusionEntry {
         file: "commands/semantic_search/mod.rs",
@@ -1710,7 +1739,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "parse-coverage preview; skipped_parses and skipped_parses_omitted retain full counts; parse_gaps_list and its standard trailer disclose the preview cap",
     },
     ExclusionEntry {
-        file: "commands/semantic_search/mod.rs",
+        file: "commands/semantic_search/checkout_gaps.rs",
         enclosing_item: "CheckoutSemanticGaps::disclose",
         location_or_primitive: ".take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)",
         reason: "semantic Luau coverage previews; skipped_files_count/omitted and failed_files_count/omitted retain full counts; each list envelope and its standard trailer disclose the preview cap",

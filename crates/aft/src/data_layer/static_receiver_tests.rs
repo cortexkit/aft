@@ -130,13 +130,13 @@ public class SampleReflection {
 
 #[test]
 fn duplicate_static_receiver_ordinals_round_trip_typescript_nested_callback() {
+    // The stored variable and its callable member have overlapping ranges;
+    // no enclosing callable is needed to witness a repeated ordinal.
     let source = r#"import path from './path';
-function createCheckoutReaders() {
-    const root = '/checkout';
-    return {
-        lf: relativePath => readFileSync(path.join(root, relativePath)),
-    };
-}"#;
+const root = '/checkout';
+const readers = {
+    lf: relativePath => readFileSync(path.join(root, relativePath)),
+};"#;
     let file = "detect.ts";
     let parse = round_trip(source, "typescript");
     let _ = retained_static_call(&parse, "path", "join");

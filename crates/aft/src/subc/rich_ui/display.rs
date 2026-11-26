@@ -33,8 +33,8 @@ struct Writer {
     store: store::Store,
 }
 static SENDER: OnceLock<Writer> = OnceLock::new();
-static CALLS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Capture>>>>> =
-    LazyLock::new(Default::default);
+type Captures = Mutex<HashMap<String, Arc<Mutex<Capture>>>>;
+static CALLS: LazyLock<Captures> = LazyLock::new(Default::default);
 thread_local! { static ACTIVE: RefCell<Option<Arc<Mutex<Capture>>>> = const { RefCell::new(None) }; }
 
 pub(crate) fn key(key: &crate::db::call_ledger::Key) -> String {
@@ -46,15 +46,17 @@ pub(crate) struct Capture {
     capture_key: String,
     tool: String,
     root: PathBuf,
+    write_input_path: Option<PathBuf>,
     began: Option<Instant>,
     processing_ms: u64,
     held_at: Option<Instant>,
     held_ms: Option<u64>,
     record_sent: bool,
+    launch_admitted: bool,
+    deferred_persisted: bool,
     finished: bool,
     files: Vec<FileChange>,
     file_snapshot: Option<(Value, Option<Value>)>,
-    masker: Option<crate::log_redact::SecretValues>,
     bash: Option<BashBodies>,
     terminal_bash: Option<BashBodies>,
     deferred: bool,
@@ -71,6 +73,8 @@ struct FileChange {
     path: PathBuf,
     initial_path: PathBuf,
     old_path: Option<PathBuf>,
+    input_path: Option<PathBuf>,
+    initial_input_path: Option<PathBuf>,
     before: Option<String>,
     after: Option<String>,
     change: &'static str,
@@ -136,6 +140,15 @@ pub(crate) fn health() -> Value {
 }
 
 pub(in crate::subc) fn register(
+    ledger_key: &crate::db::call_ledger::Key,
+    route: &crate::subc::RouteIdentity,
+    call: &subc_protocol::tool_call::ToolCallRequest,
+) {
+    register_in(&CALLS, ledger_key, route, call);
+}
+
+fn register_in(
+    registry: &Captures,
     ledger_key: &crate::db::call_ledger::Key,
     route: &crate::subc::RouteIdentity,
     call: &subc_protocol::tool_call::ToolCallRequest,
@@ -217,7 +230,7 @@ pub(in crate::subc) fn register(
         call_key,
         schema_pin,
     };
-    if let Ok(mut calls) = CALLS.lock() {
+    if let Ok(mut calls) = registry.lock() {
         calls.retain(|_, capture| capture.try_lock().map_or(true, |capture| !capture.finished));
         if calls.len() >= 64 {
             count(RegisterCallCap);
@@ -234,15 +247,21 @@ pub(in crate::subc) fn register(
                 capture_key: key(ledger_key),
                 tool: call.name.clone(),
                 root: route.project_root.clone(),
+                write_input_path: if call.name == "write" {
+                    absolute_input_path(call.arguments.get("path").and_then(Value::as_str))
+                } else {
+                    None
+                },
                 began: None,
                 processing_ms: 0,
                 held_at: None,
                 held_ms: None,
                 record_sent: false,
+                launch_admitted: false,
+                deferred_persisted: false,
                 finished: false,
                 files: Vec::new(),
                 file_snapshot: None,
-                masker: None,
                 bash: None,
                 terminal_bash: None,
                 deferred: false,
@@ -282,6 +301,7 @@ pub(crate) fn file(
     before: Option<&str>,
     after: Option<&str>,
     change: &'static str,
+    input_paths: Option<(&str, Option<&str>)>,
 ) {
     ACTIVE.with(|slot| {
         let active = slot.borrow();
@@ -290,6 +310,10 @@ pub(crate) fn file(
         };
         let Ok(mut capture) = capture.lock() else {
             return;
+        };
+        let (input_path, old_input_path) = match input_paths {
+            Some((path, old)) => (absolute_input_path(Some(path)), absolute_input_path(old)),
+            None => (capture.write_input_path.clone(), None),
         };
         let path = PathBuf::from(file);
         let path = if path.is_absolute() {
@@ -312,6 +336,7 @@ pub(crate) fn file(
             entry.after = after.map(str::to_owned);
             entry.exists_after = change != "deleted";
             entry.path = path;
+            entry.input_path = input_path;
             if change != "modified" {
                 entry.change = change;
                 if entry.old_path.is_none() {
@@ -321,6 +346,12 @@ pub(crate) fn file(
         } else {
             capture.files.push(FileChange {
                 initial_path: old_path.as_ref().unwrap_or(&path).clone(),
+                initial_input_path: if old_path.is_some() {
+                    old_input_path
+                } else {
+                    input_path.clone()
+                },
+                input_path,
                 path,
                 old_path,
                 before: before.map(str::to_owned),
@@ -331,6 +362,10 @@ pub(crate) fn file(
             });
         }
     });
+}
+
+fn absolute_input_path(path: Option<&str>) -> Option<PathBuf> {
+    path.map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
 fn relative(root: &Path, path: &Path) -> Option<String> {
@@ -393,66 +428,32 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
             .as_ref()
             .map(|path| relative(&capture.root, path));
         let mut entry = json!({"change":change.change});
+        let outside = path.is_none() || old_path.as_ref().is_some_and(Option::is_none);
+        let old_path = old_path.flatten().filter(|_| change.change == "moved");
+        if outside {
+            record["location"] = json!("outside_project");
+            entry["location"] = json!("outside_project");
+        } else {
+            entry["path"] = json!(path);
+            if let Some(old_path) = &old_path {
+                entry["oldPath"] = json!(old_path);
+            }
+        }
         if let (Some(before), Some(after)) = (change.before.as_deref(), change.after.as_deref()) {
             let counts = crate::edit::compute_diff_counts(before, after);
             added += counts["additions"].as_u64().unwrap_or(0);
             removed += counts["deletions"].as_u64().unwrap_or(0);
+            if capture.tool == "edit" {
+                edit_hunks::diff(&mut hunks, before, after);
+            } else {
+                let relative_paths = path
+                    .as_deref()
+                    .filter(|_| !outside)
+                    .map(|path| (old_path.as_deref().unwrap_or(path), path));
+                entry["diff"] = json!(unified_diff(&change, before, after, relative_paths));
+            }
         } else {
             known = false;
-        }
-        if path.is_none() || old_path.as_ref().is_some_and(Option::is_none) {
-            record["location"] = json!("outside_project");
-            entry["location"] = json!("outside_project");
-            entry["diffOmitted"] = json!(true);
-        } else {
-            entry["path"] = json!(path);
-            if change.change == "moved" {
-                if let Some(old_path) = old_path {
-                    entry["oldPath"] = json!(old_path);
-                }
-            }
-            if let (Some(masker), Some(before), Some(after)) = (
-                &capture.masker,
-                change.before.as_deref(),
-                change.after.as_deref(),
-            ) {
-                if capture.tool == "edit" {
-                    edit_hunks::diff(&mut hunks, masker, before, after);
-                } else {
-                    let path = entry["path"].as_str().unwrap();
-                    let diff = if change.change == "moved" && before == after {
-                        format!(
-                            "rename from {}\nrename to {path}\n",
-                            entry["oldPath"].as_str().unwrap()
-                        )
-                    } else {
-                        let old = if change.change == "created" {
-                            "/dev/null".into()
-                        } else {
-                            format!(
-                                "a/{}",
-                                entry.get("oldPath").and_then(Value::as_str).unwrap_or(path)
-                            )
-                        };
-                        let new = if change.change == "deleted" {
-                            "/dev/null".into()
-                        } else {
-                            format!("b/{path}")
-                        };
-                        similar::TextDiff::from_lines(before, after)
-                            .unified_diff()
-                            .header(&old, &new)
-                            .to_string()
-                    };
-                    entry["diff"] = json!(masker.redact(&diff));
-                }
-            } else {
-                // Diffs are masked with the secret values this agent has
-                // resolved (`capture.masker`). Without that list, generic
-                // credential patterns could miss a secret pasted into the
-                // file, so the diff is left out and only counts are kept.
-                entry["diffOmitted"] = json!(true);
-            }
         }
         files.push(entry);
     }
@@ -482,21 +483,60 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
     (record, detail)
 }
 
+fn unified_diff(
+    change: &FileChange,
+    before: &str,
+    after: &str,
+    relative_paths: Option<(&str, &str)>,
+) -> String {
+    // Use the call's absolute spellings for display, not the resolved paths
+    // used to track mutations. A relative input has no absolute spelling.
+    let old_abs = change
+        .initial_input_path
+        .as_ref()
+        .unwrap_or(&change.initial_path);
+    let new_abs = change.input_path.as_ref().unwrap_or(&change.path);
+    if change.change == "moved" && before == after {
+        return match relative_paths {
+            Some((old, new)) => format!("rename from {old}\nrename to {new}\n"),
+            None => format!(
+                "rename from {}\nrename to {}\n",
+                old_abs.display(),
+                new_abs.display()
+            ),
+        };
+    }
+    let old = match (change.change, relative_paths) {
+        ("created", _) => "/dev/null".into(),
+        (_, Some((old, _))) => format!("a/{old}").into(),
+        (_, None) => old_abs.to_string_lossy(),
+    };
+    let new = match (change.change, relative_paths) {
+        ("deleted", _) => "/dev/null".into(),
+        (_, Some((_, new))) => format!("b/{new}").into(),
+        (_, None) => new_abs.to_string_lossy(),
+    };
+    similar::TextDiff::from_lines(before, after)
+        .unified_diff()
+        .header(&old, &new)
+        .to_string()
+}
+
 pub(crate) use edit_hunks::capture_no_match as edit_no_match;
 
-fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
+fn emit(capture: &Capture, kind: DisplayKind, body: Value) -> bool {
     let Some(view) = crate::subc::tool_views::view(&capture.identity.schema_pin) else {
         count(EmitUnknownView);
-        return;
+        return false;
     };
-    let schema = view.record_schema;
+    let schema = &view.record_schema;
     let Some(map) = body.as_object() else {
         count(EmitNotObject);
-        return;
+        return false;
     };
     let valid = match kind {
-        DisplayKind::Record => validate_record(map, &schema),
-        DisplayKind::Completion => validate_completion(map, &schema),
+        DisplayKind::Record => validate_record(map, schema),
+        DisplayKind::Completion => validate_completion(map, schema),
         _ => cortexkit_role_tool_display::schema::validate_detail(map),
     };
     if valid.is_err() {
@@ -505,7 +545,7 @@ fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
             DisplayKind::Completion => EmitInvalidCompletion,
             _ => EmitInvalidDetail,
         });
-        return;
+        return false;
     }
     #[cfg(test)]
     if TEST_SINK.with(|sink| {
@@ -521,15 +561,17 @@ fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
         }
     }) {
         count(Emitted);
-        return;
+        return true;
     }
     let Some(writer) = SENDER.get() else {
         count(EmitNoSender);
-        return;
+        return false;
     };
-    if enqueue_snapshot(writer, capture.identity.clone(), kind, body) {
+    let admitted = enqueue_snapshot(writer, capture.identity.clone(), kind, body);
+    if admitted {
         count(Emitted);
     }
+    admitted
 }
 
 fn enqueue_snapshot(
@@ -574,16 +616,36 @@ pub(crate) fn reply(
     error: bool,
     reason: Option<&str>,
 ) {
-    let capture = CALLS
+    reply_in(&CALLS, ledger_key, held, error, reason);
+}
+
+fn reply_in(
+    registry: &Captures,
+    ledger_key: &crate::db::call_ledger::Key,
+    held: bool,
+    error: bool,
+    reason: Option<&str>,
+) {
+    let capture_key = key(ledger_key);
+    let capture = registry
         .lock()
         .ok()
-        .and_then(|calls| calls.get(&key(ledger_key)).cloned());
+        .and_then(|calls| calls.get(&capture_key).cloned());
     let Some(capture) = capture else {
         return;
     };
-    let Ok(mut capture) = capture.lock() else {
-        return;
+    let may_retire = if let Ok(mut capture) = capture.lock() {
+        publish_reply(&mut capture, held, error, reason);
+        capture.can_retire()
+    } else {
+        false
     };
+    if may_retire {
+        retire_capture(registry, &capture_key, false);
+    }
+}
+
+fn publish_reply(capture: &mut Capture, held: bool, error: bool, reason: Option<&str>) {
     if capture.finished {
         return;
     }
@@ -625,7 +687,8 @@ pub(crate) fn reply(
                     fields.remove("runDurationMs");
                 }
             }
-            emit(&capture, DisplayKind::Record, body);
+            let admitted = emit(capture, DisplayKind::Record, body);
+            capture.launch_admitted = running && admitted;
             capture.record_sent = true;
             capture.processing_ms = duration;
             capture.began = None;
@@ -636,11 +699,11 @@ pub(crate) fn reply(
             capture.held_at = Some(Instant::now());
         }
         if capture.deferred && capture.terminal {
-            emit_bash_completion(&mut capture);
+            emit_bash_completion(capture);
         }
         return;
     }
-    end_person_wait(&mut capture);
+    end_person_wait(capture);
     let completion = capture.record_sent;
     let mut tail = None;
     let (mut body, detail) = if capture.tool == "bash" {
@@ -667,7 +730,7 @@ pub(crate) fn reply(
     } else {
         capture.file_snapshot.clone().unwrap_or_else(|| {
             if capture.files.is_empty() {
-                file_bodies(&capture, !error)
+                file_bodies(capture, !error)
             } else {
                 (
                     json!({"outcome": if error { "error" } else { "success" }}),
@@ -679,7 +742,7 @@ pub(crate) fn reply(
     if capture.tool == "bash" && capture.deferred {
         if completion {
             if capture.terminal {
-                emit_bash_completion(&mut capture);
+                emit_bash_completion(capture);
             }
             return;
         }
@@ -727,8 +790,8 @@ pub(crate) fn reply(
             }
         }
     }
-    emit(
-        &capture,
+    let admitted = emit(
+        capture,
         if completion {
             DisplayKind::Completion
         } else {
@@ -736,25 +799,22 @@ pub(crate) fn reply(
         },
         body,
     );
+    capture.launch_admitted = capture.deferred && !completion && admitted;
     capture.record_sent = true;
     if capture.deferred && capture.terminal {
-        emit_bash_completion(&mut capture);
+        emit_bash_completion(capture);
     }
     if !capture.deferred {
         if let Some(mut detail) = detail {
             if capture.tool == "bash" {
                 detail.as_object_mut().unwrap().remove("taskId");
             }
-            emit(&capture, DisplayKind::Detail, detail);
+            emit(capture, DisplayKind::Detail, detail);
         }
         if let Some(body) = foreground_completion {
-            emit(&capture, DisplayKind::Completion, body);
+            emit(capture, DisplayKind::Completion, body);
         }
         capture.finished = true;
-        drop(capture);
-        if let Ok(mut calls) = CALLS.lock() {
-            calls.remove(&key(ledger_key));
-        }
     }
 }
 
@@ -794,26 +854,7 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
     use subc_protocol::BindIdentity;
     let writer = SENDER.get().expect("display writer started");
     let mut consumer = None;
-    loop {
-        tokio::select! {
-            wake = receiver.recv() => {
-                if wake.is_none() {
-                    count(WriterStopped);
-                    return;
-                }
-            },
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
-        }
-        let entry = match writer.outbox.lock() {
-            Ok(mut outbox) => outbox.pop_due(Instant::now()),
-            Err(_) => {
-                count(WriterOutboxLock);
-                continue;
-            }
-        };
-        let Some(entry) = entry else {
-            continue;
-        };
+    while let Some(entry) = next_display_entry(&writer.outbox, &mut receiver).await {
         if consumer.is_none() {
             let options = ConsumerOptions {
                 call_timeout: std::time::Duration::from_secs(5),
@@ -940,6 +981,39 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
     }
 }
 
+async fn next_display_entry(
+    outbox: &Mutex<Outbox>,
+    receiver: &mut tokio::sync::mpsc::Receiver<()>,
+) -> Option<outbox::Entry> {
+    loop {
+        let next = match outbox.lock() {
+            Ok(mut outbox) => {
+                if let Some(entry) = outbox.pop_due(tokio::time::Instant::now().into_std()) {
+                    return Some(entry);
+                }
+                outbox.next_wake_at()
+            }
+            Err(_) => {
+                count(WriterOutboxLock);
+                return None;
+            }
+        };
+        // Adding entries to the outbox signals the channel even during the
+        // scan above. One wake is enough to drain all currently due entries.
+        let wake = match next {
+            Some(next) => tokio::select! {
+                wake = receiver.recv() => wake,
+                _ = tokio::time::sleep_until(next.into()) => continue,
+            },
+            None => receiver.recv().await,
+        };
+        if wake.is_none() {
+            count(WriterStopped);
+            return None;
+        }
+    }
+}
+
 fn display_limits(bytes: &[u8]) -> Option<cortexkit_role_tool_display::DisplayLimits> {
     let value: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
@@ -1029,7 +1103,11 @@ pub(in crate::subc) fn bash_tail(
 }
 
 pub(crate) fn bash_reply(display: &mut TaskDisplay, body: BashBodies, deferred: bool) {
-    let capture = CALLS
+    bash_reply_in(&CALLS, display, body, deferred);
+}
+
+fn bash_reply_in(registry: &Captures, display: &mut TaskDisplay, body: BashBodies, deferred: bool) {
+    let capture = registry
         .lock()
         .ok()
         .and_then(|calls| calls.get(&display.capture_key).cloned());
@@ -1052,6 +1130,44 @@ pub(crate) fn bash_reply(display: &mut TaskDisplay, body: BashBodies, deferred: 
         capture.processing_ms = capture
             .processing_ms
             .saturating_add(began.elapsed().as_millis() as u64);
+    }
+}
+
+pub(crate) fn bash_reply_persisted(display: &TaskDisplay) {
+    bash_reply_persisted_in(&CALLS, display);
+}
+
+fn bash_reply_persisted_in(registry: &Captures, display: &TaskDisplay) {
+    if display.reply_produced && display.deferred {
+        retire_capture(registry, &display.capture_key, true);
+    }
+}
+
+impl Capture {
+    fn can_retire(&self) -> bool {
+        if self.deferred {
+            // A terminal result seen before the launch record stays in memory
+            // until its completion is claimed and emitted.
+            self.launch_admitted && self.deferred_persisted && !self.terminal
+        } else {
+            self.finished
+        }
+    }
+}
+
+fn retire_capture(registry: &Captures, key: &str, deferred_persisted: bool) {
+    let Ok(mut calls) = registry.lock() else {
+        return;
+    };
+    let retire = calls
+        .get(key)
+        .and_then(|capture| capture.lock().ok())
+        .is_some_and(|mut capture| {
+            capture.deferred_persisted |= deferred_persisted;
+            capture.can_retire()
+        });
+    if retire {
+        calls.remove(key);
     }
 }
 
@@ -1129,15 +1245,17 @@ pub(crate) fn bash_terminal(
             capture_key: display.capture_key.clone(),
             tool: "bash".into(),
             root: PathBuf::new(),
+            write_input_path: None,
             began: None,
             processing_ms: 0,
             held_at: None,
             held_ms: display.held_ms,
             record_sent: true,
+            launch_admitted: true,
+            deferred_persisted: true,
             finished: false,
             files: Vec::new(),
             file_snapshot: None,
-            masker: None,
             bash: None,
             terminal_bash: Some(bodies),
             deferred: true,
@@ -1278,6 +1396,9 @@ fn read_request(
     Ok(request)
 }
 
+#[cfg(test)]
+#[path = "display/scheduler_tests.rs"]
+mod scheduler_tests;
 #[cfg(test)]
 #[path = "display/tests.rs"]
 mod tests;

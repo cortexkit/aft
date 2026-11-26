@@ -67,6 +67,7 @@ pub(crate) struct BudgetExceeded {
 pub(crate) enum CollectError {
     Io(std::io::Error),
     OverBudget(BudgetExceeded),
+    DeniedFloor(String),
 }
 
 impl From<std::io::Error> for CollectError {
@@ -187,10 +188,12 @@ pub(crate) fn walk_tree(
     root: &Path,
     boundary: &crate::walk_boundary::DeviceBoundary,
     budget: &RecursiveDeleteBackupBudget,
+    entry_denial: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<TreeManifest, CollectError> {
     let mut walk = Walk {
         boundary,
         budget,
+        entry_denial,
         manifest: TreeManifest::default(),
         seen_files: HashSet::new(),
     };
@@ -208,6 +211,7 @@ pub(crate) fn walk_tree(
 struct Walk<'a> {
     boundary: &'a crate::walk_boundary::DeviceBoundary,
     budget: &'a RecursiveDeleteBackupBudget,
+    entry_denial: &'a dyn Fn(&Path) -> Option<String>,
     manifest: TreeManifest,
     /// Files already counted toward the byte budget, so hard links to the
     /// same file are copied, and counted, once.
@@ -249,10 +253,13 @@ impl Walk<'_> {
             }
             let entry = entry?;
             let path = entry.path();
+            self.count_entry()?;
+            if let Some(message) = (self.entry_denial)(&path) {
+                return Err(CollectError::DeniedFloor(message));
+            }
             // Neither `DirEntry::file_type` nor `DirEntry::metadata` follows
             // symlinks, so a link is recorded as a link and never entered.
             let file_type = entry.file_type()?;
-            self.count_entry()?;
             // `DirEntry::metadata` does not follow a symlink either.
             let identity = recorded_identity(&entry.metadata()?);
             crate::tool_progress::report();
@@ -1171,7 +1178,7 @@ mod tests {
     ) -> Result<TreeManifest, CollectError> {
         let boundary = DeviceBoundary::for_root(root).unwrap();
         let budget = RecursiveDeleteBackupBudget::new(policy, max_files, max_bytes);
-        walk_tree(root, &boundary, &budget)
+        walk_tree(root, &boundary, &budget, &|_| None)
     }
 
     fn files(manifest: &TreeManifest) -> usize {

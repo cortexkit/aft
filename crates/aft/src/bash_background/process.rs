@@ -211,6 +211,20 @@ pub(crate) mod test_hooks {
             .insert(pgid);
     }
 
+    #[cfg(unix)]
+    pub(crate) fn scoped_listing_failure(pgid: i32) -> impl Drop {
+        struct RestoreListing(i32);
+
+        impl Drop for RestoreListing {
+            fn drop(&mut self) {
+                LISTING_FAILS.get().unwrap().lock().unwrap().remove(&self.0);
+            }
+        }
+
+        fail_listing(pgid);
+        RestoreListing(pgid)
+    }
+
     pub(super) fn listing_fails(pgid: i32) -> bool {
         LISTING_FAILS
             .get()
@@ -924,28 +938,60 @@ pub(crate) fn terminate_pgid_with(pgid: i32, mut reap_leader: impl FnMut() -> bo
         // exit alone says nothing about the command's descendants, which need
         // the rest of the grace period to finish their TERM handlers.
         reap_leader();
-        termination_group_exited(pgid)
+        if termination_group_exited(pgid) {
+            GraceCheck::GroupGone
+        } else {
+            GraceCheck::Running
+        }
     });
 }
 
+/// What one check during the SIGTERM grace period found.
 #[cfg(unix)]
-pub(crate) fn terminate_pgid_leader_grace(pgid: i32, child: &mut Child) {
-    terminate_pgid_until(pgid, || matches!(child.try_wait(), Ok(Some(_))));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraceCheck {
+    /// Keep waiting.
+    Running,
+    /// The whole group was confirmed gone. Its id is free for the kernel to
+    /// hand to an unrelated process group, so it must not be signalled again.
+    GroupGone,
+}
+
+/// Whether the grace period's last check still calls for a group SIGKILL.
+#[cfg(unix)]
+fn group_kill_needed(last_check: GraceCheck) -> bool {
+    last_check != GraceCheck::GroupGone
+}
+
+#[cfg(all(test, unix))]
+mod grace_tests {
+    use super::*;
+
+    #[test]
+    fn group_kill_is_skipped_only_once_the_group_is_confirmed_gone() {
+        assert!(group_kill_needed(GraceCheck::Running));
+        assert!(!group_kill_needed(GraceCheck::GroupGone));
+    }
 }
 
 #[cfg(unix)]
-fn terminate_pgid_until(pgid: i32, mut exited: impl FnMut() -> bool) {
+fn terminate_pgid_until(pgid: i32, mut check: impl FnMut() -> GraceCheck) {
     #[cfg(all(test, target_os = "linux"))]
     test_hooks::signal_event(pgid, "group-term");
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
     }
     let grace_started = Instant::now();
+    let mut last_check = GraceCheck::Running;
     while grace_started.elapsed() < TERMINATE_GRACE {
-        if exited() {
+        last_check = check();
+        if last_check != GraceCheck::Running {
             break;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+    if !group_kill_needed(last_check) {
+        return;
     }
     #[cfg(test)]
     if test_hooks::sigkill_denied(pgid) {
@@ -1576,6 +1622,27 @@ mod tests {
             !is_process_alive(descendant),
             "LSP cleanup must still kill descendants"
         );
+    }
+
+    /// A group whose members all exit on SIGTERM is confirmed gone during the
+    /// grace period. Its id may then belong to an unrelated group, so it must
+    /// not receive the follow-up SIGKILL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_pgid_sends_no_kill_after_group_is_confirmed_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "touch ready; while :; do sleep 0.05; done"])
+            .current_dir(root.path());
+        start_new_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        wait_for_termination_file(&root.path().join("ready"));
+        let pgid = child.id() as i32;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_hooks::with_signal_events(pgid, events.clone(), || terminate_process(&mut child));
+        assert_eq!(*events.lock().unwrap(), vec!["group-term"]);
+        let _ = child.wait();
     }
 }
 

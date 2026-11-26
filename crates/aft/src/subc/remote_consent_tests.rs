@@ -258,6 +258,29 @@ async fn non_user_answer_denies_all_waiters_and_fresh_card_uses_remote_scope_and
 }
 
 #[tokio::test]
+async fn daemon_edge_allow_once_stays_with_cancelled_card_owner() {
+    let mut f = Fixture::new();
+    let one = f.request(f.call("read", Mode::Read)).await;
+    let (first, answer) = f.card().await;
+    let mut two = f.request(f.call("grep", Mode::Read)).await;
+    drop(one);
+
+    allow(answer, false);
+    f.finish().await;
+    assert!(
+        matches!(two.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the first card must not authorize the queued call"
+    );
+
+    let (second, answer) = f.card().await;
+    assert_eq!(second.params["tool"], "grep");
+    assert_ne!(second.params["call_key"], first.params["call_key"]);
+    allow(answer, false);
+    f.finish().await;
+    assert_eq!(authority(two).await, Authorization::Once);
+}
+
+#[tokio::test]
 async fn allow_once_is_fifo_then_always_allow_lists_filters_upgrades_and_revokes() {
     let mut f = Fixture::new();
     let one = f.request(f.call("read", Mode::Read)).await;
@@ -409,6 +432,47 @@ async fn remapped_write_grant_covers_nothing_until_replaced_by_a_new_read_answer
     );
     let _edit = f.request(f.call("edit", Mode::ReadWrite)).await;
     assert_eq!(f.card().await.0.params["operation"], "write");
+}
+
+#[tokio::test]
+async fn approved_worker_run_retains_remote_probe_only_until_grant_ends() {
+    use scope_describe::remote::{test_answer, test_tracker, TEST_POLL_INTERVAL};
+    use subc_protocol::scope::ScopeStatus;
+    let mut f = Fixture::new();
+    let call = f.worker("retained-run", Mode::Read);
+    let stamp = call.scope.clone();
+    let period = Duration::from_secs(60);
+    let (mut tracker, pending, mut frames) = TEST_POLL_INTERVAL
+        .scope(period, async { test_tracker() })
+        .await;
+    let lifetime = tracker.begin_work(&stamp);
+    let frame = frames.recv().await.unwrap();
+    test_answer(&pending, &frame, ScopeStatus::Live, Some(stamp.scope_epoch));
+    assert!(lifetime.wait_for_live().await);
+
+    let registry = f.registry.clone();
+    let decision = TEST_REGISTRY
+        .scope(Arc::new(move || registry.lock().unwrap().clone()), async {
+            f.auth.request_with_lifetime(call, true, lifetime)
+        })
+        .await;
+    let (_, answer) = f.card().await;
+    allow(answer, false);
+    f.finish().await;
+    assert_eq!(authority(decision).await, Authorization::WorkerRun);
+
+    tokio::time::pause();
+    tokio::time::advance(period).await;
+    let probe = tokio::time::timeout(Duration::from_secs(1), frames.recv())
+        .await
+        .expect("worker-run grant must keep polling after call settlement")
+        .unwrap();
+    test_answer(&pending, &probe, ScopeStatus::Live, Some(stamp.scope_epoch));
+    f.auth.end_scope(PAIRING, &stamp);
+    tokio::time::timeout(Duration::from_secs(1), tracker.await_idle_probe_for_test())
+        .await
+        .expect("the probe retires when the last grant is gone");
+    assert!(frames.try_recv().is_err());
 }
 
 #[tokio::test]

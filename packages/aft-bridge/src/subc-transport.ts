@@ -2080,8 +2080,13 @@ export class SubcTransportPool implements AftTransportPool {
         now - record.lastUsedAt < 15 * 60_000
       )
         continue;
-      const owner = this.detachSession(key, "session_closed");
-      if (owner) detached.push(owner);
+      const owner = this.detachSession(key, "session_closed", true);
+      if (owner) {
+        if (this.observedStarts.size >= 256)
+          this.observedStarts.delete(this.observedStarts.values().next().value as IdentityKey);
+        this.observedStarts.add(key);
+        detached.push(owner);
+      }
     }
     if (this.sessions.size === 0 && this.sessionSweep) {
       clearInterval(this.sessionSweep);
@@ -2143,6 +2148,13 @@ export class SubcTransportPool implements AftTransportPool {
       ].includes(name);
     if (!data || data.success !== true) {
       if (affectsBackground) {
+        // This invalid_request refusal occurs before bash or powershell launches work.
+        if (
+          data?.code === "invalid_request" &&
+          (name === "bash" || name === "powershell") &&
+          typeof args.task_id !== "string"
+        )
+          return;
         if (typeof args.task_id === "string") {
           if (!record.backgroundTasks.has(args.task_id))
             record.backgroundTasks.set(args.task_id, "unknown");
@@ -2312,7 +2324,9 @@ export class SubcTransportPool implements AftTransportPool {
   private detachSession(
     key: IdentityKey,
     reason: "root_reaped" | "session_closed" | "shutdown",
+    preserveObservedStart = false,
   ): DetachedSession | null {
+    if (!preserveObservedStart) this.observedStarts.delete(key);
     const record = this.sessions.get(key);
     if (!record || record.closed) return null;
     record.closed = true;
@@ -2406,6 +2420,7 @@ export class SubcTransportPool implements AftTransportPool {
     expectedGeneration?: RootGeneration,
     abortSignal?: AbortSignal,
   ): Promise<unknown> {
+    if (abortSignal?.aborted) throw abortedRequestError();
     const callStartedAt = this.waitClock.now();
     const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
     const deadline = new RequestDeadline(this.waitClock, callDeadlineMs);
@@ -2414,6 +2429,23 @@ export class SubcTransportPool implements AftTransportPool {
     const spentMs = (): number => Math.max(this.waitClock.now() - callStartedAt, scheduledDelayMs);
     const remainingMs = (): number =>
       deadline.remaining() - Math.max(0, scheduledDelayMs - (this.waitClock.now() - callStartedAt));
+    // Connection and route opens are shared with sibling callers. Abort only
+    // this caller's wait; the operation still settles into shared state.
+    const waitForAdmission = async <T>(pending: Promise<T>): Promise<T> => {
+      if (!abortSignal) return pending;
+      if (abortSignal.aborted) throw abortedRequestError();
+      let rejectAbort!: (error: Error) => void;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        rejectAbort = reject;
+      });
+      const onAbort = (): void => rejectAbort(abortedRequestError());
+      abortSignal.addEventListener("abort", onAbort, { once: true });
+      try {
+        return await Promise.race([pending, aborted]);
+      } finally {
+        abortSignal.removeEventListener("abort", onAbort);
+      }
+    };
     const root = asCanonicalRootPath(identity.project_root);
     let generation = expectedGeneration;
     if (this.lifecycleEnabled()) {
@@ -2425,6 +2457,7 @@ export class SubcTransportPool implements AftTransportPool {
     const key = identityKey(identity);
     const record = this.getOrCreateSession(identity, generation);
     record.inflight += 1;
+    let requestDispatched = false;
 
     try {
       let client: SubcClientLike;
@@ -2437,14 +2470,16 @@ export class SubcTransportPool implements AftTransportPool {
           let cancelTimer: (() => void) | undefined;
           try {
             // Each attempt calls SubcClient.connect anew, which re-reads the connection file.
-            const acquired = await Promise.race([
-              this.ensureClient(),
-              new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
-                cancelTimer = deadlineTimer(this.clock, remainingMs, () =>
-                  resolve(CALL_DEADLINE_EXPIRED),
-                );
-              }),
-            ]);
+            const acquired = await waitForAdmission(
+              Promise.race([
+                this.ensureClient(),
+                new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
+                  cancelTimer = deadlineTimer(this.clock, remainingMs, () =>
+                    resolve(CALL_DEADLINE_EXPIRED),
+                  );
+                }),
+              ]),
+            );
             if (acquired === CALL_DEADLINE_EXPIRED) {
               throw keyChanged ?? callDeadlinePassedError(undefined, callDeadlineMs);
             }
@@ -2462,14 +2497,16 @@ export class SubcTransportPool implements AftTransportPool {
           // A shared retry sleeper may outlive this caller's remaining budget.
           let cancelRetryTimer: (() => void) | undefined;
           try {
-            const waited = await Promise.race([
-              wait,
-              new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
-                cancelRetryTimer = deadlineTimer(this.clock, remainingMs, () =>
-                  resolve(CALL_DEADLINE_EXPIRED),
-                );
-              }),
-            ]);
+            const waited = await waitForAdmission(
+              Promise.race([
+                wait,
+                new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
+                  cancelRetryTimer = deadlineTimer(this.clock, remainingMs, () =>
+                    resolve(CALL_DEADLINE_EXPIRED),
+                  );
+                }),
+              ]),
+            );
             if (waited === CALL_DEADLINE_EXPIRED) throw keyChanged;
           } finally {
             cancelRetryTimer?.();
@@ -2543,7 +2580,7 @@ export class SubcTransportPool implements AftTransportPool {
           );
         });
         try {
-          const opened = await Promise.race([openRoute(), expired]);
+          const opened = await waitForAdmission(Promise.race([openRoute(), expired]));
           if (opened === CALL_DEADLINE_EXPIRED) {
             throw callDeadlinePassedError(lastRefusal, callDeadlineMs);
           }
@@ -2570,7 +2607,7 @@ export class SubcTransportPool implements AftTransportPool {
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
             scheduledDelayMs = spentMs() + delayMs;
-            await wait;
+            await waitForAdmission(wait);
           }
         }
       };
@@ -2653,6 +2690,7 @@ export class SubcTransportPool implements AftTransportPool {
           try {
             // The SDK re-arms an expired request once across sleep, retaining
             // its correlation while a wake-delayed reply is delivered.
+            requestDispatched = true;
             request = client.request(route, body, {
               timeoutMs: Math.ceil(requestTimeoutMs),
               // Disable SDK sleep grace if admission already granted the call
@@ -2735,7 +2773,7 @@ export class SubcTransportPool implements AftTransportPool {
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
             scheduledDelayMs = spentMs() + delayMs;
-            await wait;
+            await waitForAdmission(wait);
             routeAndEntry = await openRouteAfterReloadWindow();
             reopened = true;
             continue;
@@ -2751,7 +2789,7 @@ export class SubcTransportPool implements AftTransportPool {
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
             scheduledDelayMs = spentMs() + delayMs;
-            await wait;
+            await waitForAdmission(wait);
             routeAndEntry = await openRouteAfterReloadWindow();
             reopened = true;
             continue;
@@ -2763,7 +2801,9 @@ export class SubcTransportPool implements AftTransportPool {
       }
     } catch (error) {
       if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
-      this.observeBackgroundReply(record, body, null);
+      if (!(error instanceof Error && error.name === "AbortError" && !requestDispatched)) {
+        this.observeBackgroundReply(record, body, null);
+      }
       if (record.backgroundTasks.size > 0 || record.unknownBackgroundWork)
         this.ensureBgSubscription(identity, record);
       throw error;

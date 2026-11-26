@@ -131,11 +131,12 @@ impl SessionStores for NativeStores {
             return Err("session ownership is not bound".into());
         }
         let (mut backups, mut checkpoints) = self.stores(session);
+        let mut paths = super::registry::ExportPaths::new(self.registry.as_ref());
         let mut groups =
-            backups.export_portable_undo(&session.session, self.registry.as_ref(), drops)?;
-        groups.extend(checkpoints.export_portable_checkpoints(
+            backups.export_portable_undo_with_paths(&session.session, &mut paths, drops)?;
+        groups.extend(checkpoints.export_portable_checkpoints_with_paths(
             &session.session,
-            self.registry.as_ref(),
+            &mut paths,
             drops,
         )?);
         Ok(SessionSnapshot { groups })

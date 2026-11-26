@@ -2984,7 +2984,7 @@ fn jail_target_allowed(
     let target = crate::policy_path::policy_path(target);
     !home.starts_with(&target)
         && !project_roots.iter().any(|root| root.starts_with(&target))
-        && policy.decide_tree_write(&target) != AccessDecision::Deny(AccessDenial::Floor)
+        && policy.decide_shell_tree_write(&target) != AccessDecision::Deny(AccessDenial::Floor)
 }
 
 #[cfg(unix)]

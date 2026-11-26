@@ -5,8 +5,14 @@
 
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
-pub(crate) type FileReporter = fn(&str, Option<&str>, Option<&str>, Option<&str>, &'static str);
+pub(crate) type FileReporter =
+    fn(&str, Option<&str>, Option<&str>, Option<&str>, &'static str, Option<(&str, Option<&str>)>);
 static FILE_REPORTER: std::sync::OnceLock<FileReporter> = std::sync::OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REPORTED_FILES: std::cell::RefCell<Option<Vec<(String, &'static str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
 pub(crate) fn register_file_reporter(reporter: FileReporter) {
     let _ = FILE_REPORTER.set(reporter);
 }
@@ -21,8 +27,25 @@ pub(crate) fn report_file(
     after: Option<&str>,
     change: &'static str,
 ) {
+    report_file_with_input_paths(file, old_path, before, after, change, None);
+}
+
+pub(crate) fn report_file_with_input_paths(
+    file: &str,
+    old_path: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
+    change: &'static str,
+    input_paths: Option<(&str, Option<&str>)>,
+) {
+    #[cfg(test)]
+    REPORTED_FILES.with(|capture| {
+        if let Some(files) = capture.borrow_mut().as_mut() {
+            files.push((file.to_string(), change));
+        }
+    });
     if let Some(reporter) = FILE_REPORTER.get() {
-        reporter(file, old_path, before, after, change);
+        reporter(file, old_path, before, after, change, input_paths);
     }
 }
 
@@ -89,8 +112,18 @@ pub(crate) fn atomic_write_source(
     path: &Path,
     bytes: &[u8],
 ) -> std::io::Result<SourceWriteOutcome> {
+    atomic_write_source_with_mode(path, bytes, None)
+}
+
+/// Like [`atomic_write_source`], but publish the supplied Unix mode with the
+/// restored bytes. With no mode, keep the ordinary source-write permissions.
+pub(crate) fn atomic_write_source_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    restore_mode: Option<u32>,
+) -> std::io::Result<SourceWriteOutcome> {
     let started = std::time::Instant::now();
-    let result = atomic_write_source_with(path, bytes, |file, bytes| {
+    let result = atomic_write_source_with(path, bytes, restore_mode, |file, bytes| {
         use std::io::Write;
         file.write_all(bytes)
     });
@@ -108,7 +141,7 @@ pub(crate) fn atomic_write_source(
 /// [`crate::backup::latency::take`] afterwards. Not for production callers.
 #[doc(hidden)]
 pub fn write_source_for_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    atomic_write_source_with(path, bytes, |file, bytes| {
+    atomic_write_source_with(path, bytes, None, |file, bytes| {
         use std::io::Write;
         file.write_all(bytes)
     })
@@ -118,8 +151,10 @@ pub fn write_source_for_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> 
 fn atomic_write_source_with(
     path: &Path,
     bytes: &[u8],
+    restore_mode: Option<u32>,
     mut writer: impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<SourceWriteOutcome> {
+    use crate::durability::{sync_immediately, EventKind};
     use std::fs::{self, OpenOptions};
     use std::io;
     // Follow an existing symlink just as an in-place write would, rather than
@@ -144,7 +179,14 @@ fn atomic_write_source_with(
         drop(file);
         warnings.extend(source_recovery::leftover_copy_warnings(&destination));
         if !source_replacement::may_keep_access(&destination, metadata) {
-            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+            return write_source_in_place(
+                &destination,
+                metadata,
+                bytes,
+                &mut writer,
+                warnings,
+                restore_mode,
+            );
         }
     }
     let parent = destination
@@ -168,7 +210,14 @@ fn atomic_write_source_with(
             let Some(metadata) = original.as_ref() else {
                 return Err(error);
             };
-            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+            return write_source_in_place(
+                &destination,
+                metadata,
+                bytes,
+                &mut writer,
+                warnings,
+                restore_mode,
+            );
         }
         Err(error) => return Err(error),
     };
@@ -192,18 +241,38 @@ fn atomic_write_source_with(
         // replacement that cannot match the original costs nothing to abandon.
         if !source_replacement::copy_access(&destination, &temporary, file, metadata) {
             drop(cleanup);
-            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+            return write_source_in_place(
+                &destination,
+                metadata,
+                bytes,
+                &mut writer,
+                warnings,
+                restore_mode,
+            );
         }
     }
     remote_links::check_open(file, &temporary)?;
+    #[cfg(unix)]
+    if let Some(mode) = restore_mode {
+        use std::os::unix::fs::PermissionsExt;
+        // Start with only the permission bits allowed by both modes, so a
+        // more restrictive saved mode also protects the bytes while writing.
+        let current = file.metadata()?.permissions().mode();
+        if current & 0o777 & !mode != 0 {
+            set_source_mode(file, current & mode & 0o7777)?;
+        }
+    }
     writer(file, bytes)?;
-    if let Some(metadata) = original.as_ref() {
-        // Writing can clear set-id bits; restore the exact original mode.
-        file.set_permissions(metadata.permissions())?;
+    // Writing can clear set-id bits; set the mode before syncing.
+    match (restore_mode, original.as_ref()) {
+        #[cfg(unix)]
+        (Some(mode), _) => set_source_mode(file, mode)?,
+        (_, Some(metadata)) => file.set_permissions(metadata.permissions())?,
+        _ => {}
     }
     drop(write_temp);
     let write_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteSync);
-    aft_store::sync::sync_all(file, &temporary)
+    sync_immediately(file, &temporary, EventKind::FileSync)
         .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
     drop(write_sync);
     cleanup.file.take();
@@ -218,7 +287,14 @@ fn atomic_write_source_with(
         }
         drop(cleanup);
         warnings.push("non_atomic_windows_write: atomic replacement is unavailable for this file; saved in place without removing its name. Concurrent readers may see incomplete contents.".to_owned());
-        return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+        return write_source_in_place(
+            &destination,
+            metadata,
+            bytes,
+            &mut writer,
+            warnings,
+            restore_mode,
+        );
     }
     {
         let _rename = crate::backup::latency::time(crate::backup::latency::Part::WriteRename);
@@ -228,12 +304,28 @@ fn atomic_write_source_with(
     // be reported as a failed edit without implying the original still exists.
     let _dir_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteDirSync);
     if let Ok(directory) = fs::File::open(parent) {
-        let _ = aft_store::sync::sync_all(&directory, parent);
+        let _ = sync_immediately(&directory, parent, EventKind::DirectorySync);
     }
     Ok(SourceWriteOutcome {
         mode: SourceWriteMode::Replaced,
         warnings,
     })
+}
+
+#[cfg(unix)]
+fn set_source_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let wanted = mode & 0o7777;
+    if file.metadata()?.permissions().mode() & 0o7777 != wanted {
+        file.set_permissions(std::fs::Permissions::from_mode(wanted))?;
+        if file.metadata()?.permissions().mode() & 0o7777 != wanted {
+            return Err(std::io::Error::other(format!(
+                "restored mode {wanted:o} did not read back"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 32 random hex digits for sibling temporary and recovery file names.
@@ -258,6 +350,7 @@ fn write_source_in_place(
     bytes: &[u8],
     writer: &mut impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
     mut warnings: Vec<String>,
+    restore_mode: Option<u32>,
 ) -> std::io::Result<SourceWriteOutcome> {
     use std::io::{self, Read, Seek, SeekFrom, Write};
     #[cfg(windows)]
@@ -307,21 +400,39 @@ fn write_source_in_place(
         destination: &Path,
         content: &[u8],
         writer: &mut dyn FnMut(&mut std::fs::File, &[u8]) -> io::Result<()>,
+        restore_mode: Option<u32>,
     ) -> io::Result<()> {
         remote_links::check_open(file, destination)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         writer(file, content)?;
+        #[cfg(unix)]
+        if let Some(mode) = restore_mode {
+            set_source_mode(file, mode)?;
+        }
+        #[cfg(not(unix))]
+        let _ = restore_mode;
         aft_store::sync::sync_all(file, destination)
             .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))
     }
-    if let Err(error) = rewrite(&mut file, destination, bytes, writer) {
+    if let Err(error) = rewrite(&mut file, destination, bytes, writer, restore_mode) {
         let Some(saved) = saved.as_deref() else {
             return Err(error);
         };
-        let restored = rewrite(&mut file, destination, saved, &mut |file, content| {
-            file.write_all(content)
+        #[cfg(unix)]
+        let rollback_mode = restore_mode.map(|_| {
+            use std::os::unix::fs::PermissionsExt;
+            original.permissions().mode()
         });
+        #[cfg(not(unix))]
+        let rollback_mode = None;
+        let restored = rewrite(
+            &mut file,
+            destination,
+            saved,
+            &mut |file, content| file.write_all(content),
+            rollback_mode,
+        );
         return match (restored, copy) {
             (Ok(()), copy) => {
                 if let Some(copy) = copy {
@@ -347,7 +458,7 @@ fn write_source_in_place(
         };
     }
     #[cfg(unix)]
-    {
+    if restore_mode.is_none() {
         use std::os::unix::fs::PermissionsExt;
         let wanted = original.permissions().mode() & 0o7777;
         let now = file.metadata()?.permissions().mode() & 0o7777;
@@ -1379,7 +1490,7 @@ pub(crate) fn read_edit_bytes(
         None => {
             #[cfg(test)]
             A03_HANDLER_READS.with(|count| count.set(count.get() + 1));
-            (std::fs::read(path)?.into(), None)
+            (mutation::read_regular(path)?.into(), None)
         }
     };
     let version =
@@ -1455,7 +1566,7 @@ impl ObservedFinalText {
 pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
     #[cfg(test)]
     A03_HANDLER_READS.with(|count| count.set(count.get() + 1));
-    std::fs::read_to_string(path)
+    mutation::read_regular_text(path)
 }
 
 /// Render a reference patch for size-limited GitHub comment bodies and tests.
@@ -1492,7 +1603,6 @@ pub fn no_change_response(id: &str) -> crate::protocol::Response {
 
 /// Supply the unified patch consumed by host diff views, independently of diff counts.
 pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
-    crate::edit::report_file(file, None, Some(before), Some(after), "modified");
     let mut budget = DiffBudget::new(1);
     result["metadata"] = serde_json::json!({ "diff": budget.render(file, before, after) });
     budget.finish(result);
@@ -1834,6 +1944,16 @@ pub(crate) fn attach_edit_diff(
     after: &str,
 ) {
     crate::edit::report_file(file, None, Some(before), Some(after), "modified");
+    render_edit_diff(result, params, file, before, after);
+}
+
+pub(crate) fn render_edit_diff(
+    result: &mut serde_json::Value,
+    params: &serde_json::Value,
+    file: &str,
+    before: &str,
+    after: &str,
+) {
     if wants_diff(params) {
         let mut budget = DiffBudget::new(1);
         let (patch, info) = response_diff(params, file, before, after, &mut budget);
@@ -2124,6 +2244,8 @@ pub struct WriteResult {
     /// pre-write content. The on-disk file is the original; `syntax_valid`
     /// reports the would-have-been-written status (Some(false)).
     pub rolled_back: bool,
+    /// The syntax verdict did not authorize overwriting a later revision.
+    pub(crate) rollback_skipped_reason: Option<&'static str>,
     /// Per-edit LSP diagnostics outcome (v0.17.3). Carries the verified-fresh
     /// diagnostics PLUS per-server status (pending/exited) so the response
     /// can report `complete: bool` honestly.
@@ -2152,6 +2274,13 @@ pub fn format_validation_errors(errors: &[format::ValidationError]) -> String {
 }
 
 impl WriteResult {
+    pub(crate) fn append_rollback_skipped_to(&self, result: &mut serde_json::Value) {
+        if let Some(reason) = self.rollback_skipped_reason {
+            result["rollback_skipped_reason"] = serde_json::json!(reason);
+            result["rolled_back"] = serde_json::json!(false);
+        }
+    }
+
     /// Return the validated final text only while the live path still has the
     /// same identity. LSP notifications may wait, so response rendering checks
     /// again rather than assuming the file stayed unchanged during that wait.
@@ -2308,6 +2437,12 @@ pub(crate) fn created_file_syntax_error_notice(first_error_line: u64) -> String 
 thread_local! {
     static FULL_VALIDATION_START_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    pub(crate) static BEFORE_SYNTAX_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    pub(crate) static BATCH_SYNTAX_HOLD_TIMES: std::cell::RefCell<Option<Vec<std::time::Duration>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f` with a one-shot hook that fires on this thread when
@@ -2456,8 +2591,10 @@ pub(crate) fn write_format_validate_bytes_observed(
     )
 }
 
-/// The caller owns admission for all affected files. Release a completed file
-/// immediately after its write, before invoking formatters or language servers.
+/// The caller holds the writer locks for all affected files through the syntax
+/// verdict. Hard-link aliases can share a lock key, so releasing and reacquiring
+/// one while holding another would deadlock. Release the completed file before
+/// any later checks or language-server work.
 pub(crate) fn write_format_validate_admitted(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
@@ -2465,7 +2602,7 @@ pub(crate) fn write_format_validate_admitted(
     config: &Config,
     params: &serde_json::Value,
     created: bool,
-    after_write: &dyn Fn(),
+    after_syntax: &dyn Fn(),
 ) -> Result<WriteResult, AftError> {
     write_format_validate_impl(
         tool_policy,
@@ -2477,7 +2614,7 @@ pub(crate) fn write_format_validate_admitted(
         None,
         created,
         None,
-        Some(after_write),
+        Some(after_syntax),
     )
 }
 
@@ -2496,7 +2633,7 @@ fn write_format_validate_impl(
     captured_original: Option<&str>,
     syntax_checked_by_caller: bool,
     file_locks: Option<Vec<mutation::FileLock>>,
-    after_write: Option<&dyn Fn()>,
+    after_syntax: Option<&dyn Fn()>,
 ) -> Result<WriteResult, AftError> {
     // A file this call creates has no prior content: it cannot be rolled back
     // to anything, so an invalid result is kept and reported through
@@ -2530,9 +2667,8 @@ fn write_format_validate_impl(
         .warnings;
     drop(file_locks);
     crate::tool_progress::report();
-    if let Some(after_write) = after_write {
-        after_write();
-    }
+    #[cfg(test)]
+    let admission_extended = after_syntax.map(|_| std::time::Instant::now());
     drop(write_phase);
 
     // Step 2: Format (before validate so we validate the formatted content)
@@ -2577,26 +2713,61 @@ fn write_format_validate_impl(
                 )
             }
         });
+    let mut rollback_skipped_reason = None;
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
-            let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Write);
-            let rollback = atomic_write_source(path, original.as_bytes()).map_err(|e| {
-                AftError::InvalidRequest {
-                    message: format!("failed to roll back invalid edit: {}", e),
-                }
-            })?;
-            for warning in rollback.warnings {
-                if !write_warnings.contains(&warning) {
-                    write_warnings.push(warning);
+            #[cfg(test)]
+            {
+                let hook = BEFORE_SYNTAX_ROLLBACK.with(|slot| slot.replace(None));
+                if let Some(hook) = hook {
+                    hook();
                 }
             }
-            true
+            let _rollback_admission = after_syntax
+                .is_none()
+                .then(|| mutation::lock_files(&[path]));
+            let current = ObservedFinalText::read(path);
+            if !final_text
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(observed, current)| {
+                    (formatted || observed.text == content)
+                        && current.text == observed.text
+                        && current.version == observed.version
+                })
+            {
+                final_text = current;
+                rollback_skipped_reason = Some("file_changed");
+                false
+            } else {
+                let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Write);
+                let rollback = atomic_write_source(path, original.as_bytes()).map_err(|e| {
+                    AftError::InvalidRequest {
+                        message: format!("failed to roll back invalid edit: {}", e),
+                    }
+                })?;
+                for warning in rollback.warnings {
+                    if !write_warnings.contains(&warning) {
+                        write_warnings.push(warning);
+                    }
+                }
+                true
+            }
         } else {
             false
         }
     } else {
         false
     };
+    if let Some(after_syntax) = after_syntax {
+        #[cfg(test)]
+        BATCH_SYNTAX_HOLD_TIMES.with(|times| {
+            if let Some(times) = times.borrow_mut().as_mut() {
+                times.push(admission_extended.unwrap().elapsed());
+            }
+        });
+        after_syntax();
+    }
 
     // Step 4: Full validation (type checker) — only when requested
     // Explicit param overrides config. Valid values: "syntax" | "full" | "off".
@@ -2618,7 +2789,7 @@ fn write_format_validate_impl(
     } else if rolled_back {
         final_text = ObservedFinalText::read(path);
     }
-    let reformatted_excerpt = if rolled_back {
+    let reformatted_excerpt = if rolled_back || rollback_skipped_reason.is_some() {
         None
     } else {
         final_text
@@ -2640,6 +2811,7 @@ fn write_format_validate_impl(
         validation_errors,
         validate_skipped_reason,
         rolled_back,
+        rollback_skipped_reason,
         lsp_outcome: None,
         reformatted_excerpt,
         final_text,
@@ -3699,7 +3871,7 @@ mod audit11_regressions {
         let path = dir.path().join("file.txt");
         let original = b"\xef\xbb\xbfexisting\r\n\xfflast";
         std::fs::write(&path, original).unwrap();
-        let result = atomic_write_source_with(&path, b"new\r\n", |file, _| {
+        let result = atomic_write_source_with(&path, b"new\r\n", None, |file, _| {
             use std::io::Write;
             file.write_all(b"partial")?;
             Err(std::io::Error::other("injected write failure"))
@@ -4157,7 +4329,7 @@ mod in_place_write_tests {
         let original = b"\xef\xbb\xbforiginal\r\n\xfflast";
         std::fs::write(&path, original).unwrap();
         std::fs::hard_link(&path, &other_name).unwrap();
-        let result = atomic_write_source_with(&path, b"replacement\n", |file, _| {
+        let result = atomic_write_source_with(&path, b"replacement\n", None, |file, _| {
             use std::io::Write;
             file.write_all(b"partial")?;
             Err(std::io::Error::other("injected write failure"))
@@ -4185,6 +4357,31 @@ mod in_place_write_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"new\r\n");
         assert_eq!(std::fs::read(&other_name).unwrap(), b"new\r\n");
         assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_restore_applies_saved_mode_without_replacing_either_name() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked.txt");
+        let other_name = dir.path().join("other.txt");
+        fs::write(&path, b"changed\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&path, &other_name).unwrap();
+
+        let outcome = atomic_write_source_with_mode(&path, b"original\n", Some(0o400)).unwrap();
+        assert_eq!(outcome.mode, SourceWriteMode::InPlace);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        for name in [path, other_name] {
+            assert_eq!(fs::read(&name).unwrap(), b"original\n");
+            assert_eq!(
+                fs::metadata(&name).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+        }
     }
 
     #[test]
@@ -4425,7 +4622,7 @@ mod in_place_write_tests {
         );
         std::fs::remove_file(&sibling).unwrap();
         let mut seen = None;
-        let outcome = atomic_write_source_with(&path, b"new\n", |file, bytes| {
+        let outcome = atomic_write_source_with(&path, b"new\n", None, |file, bytes| {
             use std::io::Write;
             let temporaries: Vec<String> = recovery_entries(dir.path())
                 .into_iter()
@@ -4470,7 +4667,7 @@ mod in_place_write_tests {
         let before = icacls(&path);
         let mut copy_acl = None;
         let mut copy_path = None;
-        let outcome = atomic_write_source_with(&path, b"new\n", |file, bytes| {
+        let outcome = atomic_write_source_with(&path, b"new\n", None, |file, bytes| {
             use std::io::Write;
             let copies = recovery_entries(dir.path());
             assert_eq!(copies.len(), 1, "{copies:?}");

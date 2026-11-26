@@ -1680,8 +1680,11 @@ fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
     // platform's own separators, so a "/"-joined literal differs on Windows.
     for (target, floor, rule, description) in [
         (
-            home.join(".local/share/cortexkit/synapse/hy-memory"),
-            home.join(".local").join("share").join("cortexkit"),
+            home.join(".local/share/cortexkit/signing/hy-memory"),
+            home.join(".local")
+                .join("share")
+                .join("cortexkit")
+                .join("signing"),
             "cortexkit_module_data",
             "module data store under ~/.local/share/cortexkit/<module>",
         ),
@@ -1717,7 +1720,7 @@ fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
 }
 
 #[test]
-fn grants_allow_paths_staging_home_and_xdg_preserve_private_floors() {
+fn grants_allow_paths_cortexkit_data_home_and_xdg_preserve_private_floors() {
     let _lock = crate::test_env::process_env_lock();
     struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
     impl Drop for RestoreEnv {
@@ -1750,7 +1753,7 @@ fn grants_allow_paths_staging_home_and_xdg_preserve_private_floors() {
     for data in &data_roots {
         std::fs::create_dir_all(data.join("staging/nested")).unwrap();
         std::fs::create_dir_all(data.join("synapse")).unwrap();
-        std::fs::write(data.join("synapse/x"), "private").unwrap();
+        std::fs::write(data.join("synapse/caps.db"), "private").unwrap();
         config.sandbox.read_deny.push(data.join("staging/denied"));
     }
     let mut policy =
@@ -1778,6 +1781,9 @@ fn grants_allow_paths_staging_home_and_xdg_preserve_private_floors() {
             "staging",
             "staging/motor.current",
             "staging/nested/subc.current",
+            "synapse/x",
+            "staging/../synapse/x",
+            "staging-old/x",
         ] {
             let target = data.join(relative);
             for operation in [AccessOperation::Read, AccessOperation::Write] {
@@ -1807,13 +1813,17 @@ fn grants_allow_paths_staging_home_and_xdg_preserve_private_floors() {
                 );
             }
         }
+        assert_floor(
+            &policy,
+            &data.join("run/probe.json"),
+            "cortexkit_module_data",
+        );
         for relative in [
-            "synapse/x",
-            "staging/../synapse/x",
-            "staging-old/x",
-            "run/subc-connection.json",
+            "synapse/caps.db",
+            "staging/../synapse/caps.db",
+            "staging/caps.db",
         ] {
-            assert_floor(&policy, &data.join(relative), "cortexkit_module_data");
+            assert_floor(&policy, &data.join(relative), "cortexkit_database");
         }
         assert_floor(
             &policy,
@@ -1825,9 +1835,8 @@ fn grants_allow_paths_staging_home_and_xdg_preserve_private_floors() {
         {
             let alias = data.join("staging/module-link");
             std::os::unix::fs::symlink(data.join("synapse"), &alias).unwrap();
-            assert_floor(&policy, &alias.join("x"), "cortexkit_module_data");
-            assert_floor(&policy, &alias.join("missing"), "cortexkit_module_data");
-            assert_floor(&policy, &alias, "cortexkit_module_data");
+            assert_floor(&policy, &alias.join("caps.db"), "cortexkit_database");
+            assert_floor(&policy, &alias.join("missing.db"), "cortexkit_database");
         }
     }
     assert_floor(&policy, &storage.join("aft.db"), "aft_storage");
@@ -1863,8 +1872,8 @@ fn grants_allow_paths_staging_home_and_xdg_preserve_private_floors() {
             AccessPolicy::from_config(&config, &storage, vec![home.join("project")], &home);
         assert_floor(
             &redirected,
-            &data.join("staging/x"),
-            "cortexkit_module_data",
+            &data.join("staging/caps.db"),
+            "cortexkit_database",
         );
     }
 }

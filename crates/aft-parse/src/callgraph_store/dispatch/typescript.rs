@@ -11,6 +11,34 @@ pub(super) fn supported(language: &str) -> bool {
     matches!(language, "typescript" | "tsx" | "javascript")
 }
 
+pub(super) fn superclass<'tree>(
+    function: Node<'tree>,
+    source: &str,
+    language: &str,
+    nav: impl Nav<'tree>,
+) -> Option<String> {
+    let class = nav.enclosing(
+        function,
+        &["class_declaration", "abstract_class_declaration", "class"],
+    )?;
+    let heritage = class
+        .named_children(&mut class.walk())
+        .find(|child| nav.kind(*child) == "class_heritage")?;
+    // The type relationships also include interfaces and type arguments.
+    // Only the expression in `extends` names a runtime superclass.
+    let base = if language == "javascript" {
+        heritage
+            .named_children(&mut heritage.walk())
+            .find(|child| !child.is_extra())?
+    } else {
+        let extends = heritage
+            .named_children(&mut heritage.walk())
+            .find(|child| nav.kind(*child) == "extends_clause")?;
+        field(extends, &["value"])?
+    };
+    (nav.kind(base) == "identifier").then(|| text(base, source).to_string())
+}
+
 fn written_between(writes: &[(usize, usize)], start: usize, end: usize) -> bool {
     let first = writes.partition_point(|(position, _)| *position < start);
     writes

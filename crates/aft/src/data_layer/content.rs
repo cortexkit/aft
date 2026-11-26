@@ -58,7 +58,7 @@ use crate::parser::LangId;
 /// contained type of proven standard-library smart-pointer fields (for example,
 /// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods;
 /// 15 stores each distinct method-call answer once per fragment.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-23";
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-24";
 
 /// The language of a resolver configuration file the call graph reads raw,
 /// or the start of it. A configuration record also holds the TODO markers
@@ -247,7 +247,8 @@ fn markers_record(source: &[u8], language: &str) -> Result<ContentRecord, Manife
     let todos = match TodoLanguage::from_name(name) {
         Some(TodoLanguage::Lexical) => todos::markers_lexical(source),
         Some(TodoLanguage::Tree(lang))
-            if crate::parser::markdown_too_deep_to_parse(lang, parsed_text(source)) =>
+            if parsed_text(source)
+                .is_ok_and(|text| crate::parser::markdown_too_deep_to_parse(lang, text)) =>
         {
             // The Markdown grammar would abort the process on this file;
             // its markers are read without parsing it instead.
@@ -313,11 +314,8 @@ pub struct SyntaxTree {
     language: LangId,
 }
 
-/// The text the extractor parses for `source`. A source that is not valid
-/// UTF-8 cannot be parsed; like checkout assembly today, it gets the call
-/// graph of an empty file.
-fn parsed_text(source: &[u8]) -> &str {
-    std::str::from_utf8(source).unwrap_or("")
+fn parsed_text(source: &[u8]) -> Result<&str, ManifestJoinError> {
+    std::str::from_utf8(source).map_err(|_| ManifestJoinError::InvalidSourceEncoding)
 }
 
 /// Parses `source` as `lang` for extraction. Every parse of this module
@@ -325,7 +323,7 @@ fn parsed_text(source: &[u8]) -> &str {
 fn parse(source: &[u8], lang: LangId) -> Result<tree_sitter::Tree, ManifestJoinError> {
     #[cfg(test)]
     note_parsed_for_test(source);
-    join::single_walk::parse_source(parsed_text(source), lang)
+    join::single_walk::parse_source(parsed_text(source)?, lang)
 }
 
 /// The contents extraction has parsed, for tests that check what a reader
@@ -416,7 +414,7 @@ pub fn reparse(
         .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
     #[cfg(test)]
     note_parsed_for_test(source);
-    let text = parsed_text(source);
+    let text = parsed_text(source)?;
     if previous.language != lang {
         // A header can parse as another language after an edit; its old
         // tree is of no use to the new grammar.
@@ -426,7 +424,7 @@ pub fn reparse(
         }));
     }
     let tree = join::single_walk::reparse_source(
-        parsed_text(previous_source),
+        parsed_text(previous_source)?,
         &previous.tree,
         text,
         lang,
@@ -470,7 +468,7 @@ pub fn extract_parsed(
     let _macro_fragments =
         (tree.language == LangId::Rust).then(crate::calls::cache_rust_macro_fragments);
     let (blob, outline) = CallgraphBlob::extract_tree_with_outline(
-        parsed_text(source),
+        parsed_text(source)?,
         language,
         EXTRACTOR_VERSION,
         &tree.tree,

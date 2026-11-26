@@ -374,8 +374,11 @@ pub fn acknowledge_delivery(
     conn.execute("INSERT INTO bash_watch_delivery_acks(harness, session_id, task_id, watch_id, version, acknowledged_at, eviction_epoch, evicted_through) VALUES(?1,?2,?3,?4,?5,unixepoch(),?6,?7) ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET version=MAX(version,excluded.version), acknowledged_at=excluded.acknowledged_at, eviction_epoch=CASE WHEN excluded.eviction_epoch != '' THEN excluded.eviction_epoch ELSE eviction_epoch END, evicted_through=CASE WHEN eviction_epoch = excluded.eviction_epoch THEN MAX(evicted_through,excluded.evicted_through) WHEN excluded.eviction_epoch != '' THEN excluded.evicted_through ELSE evicted_through END", params![harness, session, task, watch, version as i64, epoch, through as i64])?;
     // Only prune old acknowledgements from an earlier daemon: its process-local
     // retry copies no longer exist, even if the current daemon is long-lived.
+    // The time index keeps this a range probe over expired rows, and the limit
+    // bounds the work one acknowledgement does; later acknowledgements remove
+    // the rest.
     conn.execute(
-        "DELETE FROM bash_watch_delivery_acks WHERE acknowledged_at < unixepoch() - 2592000 AND eviction_epoch != ?1",
+        "DELETE FROM bash_watch_delivery_acks WHERE rowid IN (SELECT rowid FROM bash_watch_delivery_acks WHERE acknowledged_at < unixepoch() - 2592000 AND eviction_epoch != ?1 LIMIT 64)",
         [crate::task_watch_lines::eviction_epoch()],
     )?;
     Ok(())
@@ -505,5 +508,50 @@ mod delivery_ack_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn acknowledgement_prune_probes_expired_rows_not_history() {
+        use crate::db::bash_tasks::query_plan_tests::{explain, record};
+        const HISTORY: usize = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        // A long history of fresh acknowledgements from this and an earlier
+        // daemon, plus more expired earlier-daemon rows than one prune removes.
+        let epoch = crate::task_watch_lines::eviction_epoch();
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{HISTORY})
+             INSERT INTO bash_watch_delivery_acks
+             SELECT 'opencode','s','t','w' || i,1,unixepoch(),
+                    CASE WHEN i % 2 = 0 THEN 'earlier-daemon' ELSE '{epoch}' END,0 FROM n;
+             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100)
+             INSERT INTO bash_watch_delivery_acks
+             SELECT 'opencode','s','t','old' || i,1,unixepoch()-2592001,'earlier-daemon',0 FROM n;",
+        ))
+        .unwrap();
+        let ((), statements) = record(&mut conn, |conn| {
+            acknowledge_delivery(conn, "opencode", "s", "t", "new", 1, None).unwrap()
+        });
+        let prune = statements
+            .iter()
+            .find(|s| s.sql.starts_with("DELETE FROM bash_watch_delivery_acks"))
+            .expect("no prune statement was observed");
+        let plan = explain(&conn, &prune.sql);
+        assert!(
+            prune.vm_steps > 0 && prune.vm_steps < HISTORY as i32,
+            "the prune walked the acknowledgement history: VM_STEP={} plan={plan}",
+            prune.vm_steps
+        );
+        let expired = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM bash_watch_delivery_acks WHERE acknowledged_at < unixepoch() - 2592000",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(expired(&conn), 100 - 64, "one prune is bounded");
+        acknowledge_delivery(&conn, "opencode", "s", "t", "newer", 1, None).unwrap();
+        assert_eq!(expired(&conn), 0);
     }
 }

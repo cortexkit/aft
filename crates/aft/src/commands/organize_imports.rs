@@ -255,9 +255,8 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     // restored — imports were NOT reorganized. Report that honestly with an
     // error instead of claiming `organized: true`.
     if write_result.rolled_back {
-        return Response::error(
-            &req.id,
-            "generated_invalid_syntax",
+        return super::add_import::rolled_back_import_error(
+            req, ctx, &op_id, &path, &write_result,
             format!(
                 "organize_imports: reorganizing imports in {file} would produce invalid syntax; file left unchanged"
             ),
@@ -307,6 +306,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
     write_result.append_reformatted_excerpt_to(&mut result);
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, Some(&path));
     Response::success(&req.id, result)
 }
 

@@ -1,7 +1,7 @@
 //! Logical undo-store access; never copy the path-hashed storage directories.
 
 use super::*;
-use crate::agent_data::registry::export_path;
+use crate::agent_data::registry::{export_path, ExportPaths};
 use crate::agent_data::{
     DropCounts, ExpectedState, FileRecord, ImportedGuard, ProjectRegistry, SnapshotGroup,
 };
@@ -15,6 +15,15 @@ impl BackupStore {
         &mut self,
         session: &str,
         registry: &dyn ProjectRegistry,
+        drops: &mut DropCounts,
+    ) -> Result<Vec<SnapshotGroup>, String> {
+        self.export_portable_undo_with_paths(session, &mut ExportPaths::new(registry), drops)
+    }
+
+    pub(crate) fn export_portable_undo_with_paths(
+        &mut self,
+        session: &str,
+        registry: &mut ExportPaths<'_>,
         drops: &mut DropCounts,
     ) -> Result<Vec<SnapshotGroup>, String> {
         let mut keys = HashSet::new();
@@ -95,10 +104,11 @@ impl BackupStore {
         }
         let mut keys: Vec<_> = keys.into_iter().collect();
         keys.sort();
-        let _locks = self
+        let locks = self
             .acquire_stack_disk_locks(session, &keys)
             .map_err(|error| error.to_string())?;
-        let mut groups: std::collections::BTreeMap<String, Vec<(PathBuf, BackupEntry)>> =
+        type OwnedEntry = (PathBuf, BackupEntry, Option<Result<Arc<[u8]>, String>>);
+        let mut groups: std::collections::BTreeMap<String, Vec<OwnedEntry>> =
             std::collections::BTreeMap::new();
         let mut count = 0usize;
         let mut bytes = 0u64;
@@ -121,19 +131,29 @@ impl BackupStore {
                         .op_id
                         .clone()
                         .unwrap_or_else(|| entry.backup_id.clone());
+                    // A later undo can prune the blob as soon as the stack
+                    // lock is released. Keep the bytes, not just the disk key.
+                    let before = (entry.kind == BackupEntryKind::Content
+                        && !entry.hardlink_detached
+                        && matches!(
+                            entry.post_state,
+                            Some(PathFingerprint::Absent | PathFingerprint::Content(_))
+                        ))
+                    .then(|| entry.content_bytes().map_err(|error| error.to_string()));
                     groups
                         .entry(id)
                         .or_default()
-                        .push((key.clone(), entry.clone()));
+                        .push((key.clone(), entry.clone(), before));
                 }
             }
         }
+        drop(locks);
         let mut portable = Vec::new();
         for (id, entries) in groups {
             let count = entries.len() as u64;
             let mut files = Vec::new();
             let mut reason = None;
-            for (path, entry) in entries {
+            for (path, entry, before) in entries {
                 if !matches!(
                     entry.kind,
                     BackupEntryKind::Content | BackupEntryKind::Tombstone
@@ -151,23 +171,14 @@ impl BackupStore {
                     }
                 };
                 let reply = registry.resolve(&path)?;
-                let key = match export_path(&path, &reply) {
+                let key = match export_path(&path, reply) {
                     Ok(key) => key,
                     Err(drop) => {
                         reason = Some(drop.reason());
                         break;
                     }
                 };
-                let before = if entry.kind == BackupEntryKind::Content {
-                    Some(
-                        entry
-                            .content_bytes()
-                            .map_err(|error| error.to_string())?
-                            .to_vec(),
-                    )
-                } else {
-                    None
-                };
+                let before = before.transpose()?.map(|bytes| bytes.to_vec());
                 files.push(FileRecord {
                     path: key,
                     id: entry.backup_id,

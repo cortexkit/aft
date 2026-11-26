@@ -1,9 +1,8 @@
 //! Handing back a waiting call: the tool-provider contract's `call-yield/v1`.
 //!
-//! A session runner sends `tool.yield` when a person sends a message while a
-//! tool call is still running, so the agent can read the message instead of
-//! waiting for the call. AFT hands back two kinds of call, and never cancels
-//! the work either one waits for:
+//! A session runner sends `tool.yield` when a person's message or an urgent
+//! notice is ready for the agent while a tool call is still waiting. AFT hands
+//! back two kinds of call, and never cancels the work either one waits for:
 //!
 //! - a `bash` call waiting for its command in the foreground: its command
 //!   becomes an ordinary background task, the call answers at once with the
@@ -39,8 +38,8 @@ pub(crate) use cortexkit_role_tool_provider::CALL_YIELD_TOOL_TAG;
 /// The role operation asking a waiting call to hand back.
 pub(crate) use cortexkit_role_tool_provider::ops::TOOL_YIELD;
 
-/// A person's steer uses the ordinary background handoff, not a held reply.
-pub(crate) use cortexkit_role_tool_provider::call_yield::PERSON_MESSAGE;
+/// These reasons use the ordinary background handoff, not a held reply.
+pub(crate) use cortexkit_role_tool_provider::call_yield::{PERSON_MESSAGE, URGENT_NOTICE};
 
 pub(super) const RUNNER_RESTART: &str = "runner_restart";
 
@@ -104,7 +103,7 @@ pub(super) enum NotYieldable {
     /// The route never receives a task's completion notice, so a handed-back
     /// command's result would not reach the session.
     NoNotices,
-    /// A reason other than [`PERSON_MESSAGE`].
+    /// The provider does not act on this reason.
     Reason,
 }
 
@@ -503,6 +502,7 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
                 budget,
                 false,
                 Some(signal.clone()),
+                None,
             )
         });
         if let crate::response_finalize::DispatchOutcome::Immediate(response) = outcome {

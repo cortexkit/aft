@@ -514,8 +514,8 @@ pub struct StatusBarCountValues {
     /// the background walk that decides which language servers apply to the
     /// project has not finished, `applicability_unknown` when no such walk has
     /// recorded a result (it failed or never ran), and
-    /// `producer_reports_pending` when an applicable server has not started,
-    /// is still warming up, or has not reported yet. `None` otherwise.
+    /// `producer_reports_pending` when an applicable server has not provided a
+    /// current report needed for the counts. `None` otherwise.
     pub diagnostics_reason: Option<&'static str>,
     pub diagnostics_gaps: Vec<serde_json::Value>,
 }
@@ -2900,6 +2900,7 @@ pub struct AppContext {
     /// ([`Self::pin_data_checkout`]) rather than bound by it: it is then kept
     /// whatever this context's own root and index switches say.
     data_checkout_pinned: AtomicBool,
+    watcher_gap: Arc<runtime_handles::WatcherGap>,
     /// The configure generation a standalone AFT last bound the data
     /// layer's checkout after (see
     /// [`crate::runtime_drain::follow_configure_with_data_layer`]).
@@ -3304,6 +3305,7 @@ pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
     CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst)
 }
 
+mod lsp_access;
 #[path = "context/runtime_handles.rs"]
 mod runtime_handles;
 mod watcher_matcher;
@@ -3421,6 +3423,7 @@ impl AppContext {
             .map(|provider| provider.symbol_cache())
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(SymbolCache::new())));
         let mut lsp_manager = LspManager::new();
+        let lsp_pending_change_slot = lsp_manager.pending_change_slot();
         lsp_manager.set_server_capacity(Arc::clone(&app.lsp_capacity));
         lsp_manager.set_child_registry(app.lsp_child_registry());
         lsp_manager.set_search_paths(config.lsp_paths_extra.clone());
@@ -3474,6 +3477,7 @@ impl AppContext {
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             data_checkout: parking_lot::Mutex::new(None),
             data_checkout_pinned: AtomicBool::new(false),
+            watcher_gap: Arc::default(),
             data_layer_followed_configure: AtomicU64::new(0),
             data_bind_failure: parking_lot::Mutex::new(None),
             data_children: Default::default(),
@@ -3531,7 +3535,7 @@ impl AppContext {
             lsp_watcher_forward_pause: Arc::default(),
             #[cfg(test)]
             lsp_classified_watcher_forwards: Default::default(),
-            lsp_pending_change_slot: Default::default(),
+            lsp_pending_change_slot,
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
             subc_lifecycle,
@@ -3623,6 +3627,7 @@ impl AppContext {
         &self,
         wait_for_manager: bool,
     ) -> Option<StatusBarCountValues> {
+        use crate::lsp::diagnostics::CountReadiness;
         #[cfg(test)]
         STATUS_COUNT_PROBES.with(|count| count.set(count.get() + 1));
         let todos = self
@@ -3632,9 +3637,9 @@ impl AppContext {
             .clone();
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
         let lsp = if wait_for_manager {
-            self.lsp_manager.lock()
+            self.lsp()
         } else {
-            self.lsp_manager.try_lock()?
+            self.try_lsp()?
         };
         let diagnostics_generation = lsp.diagnostics_generation();
         let (authoritative, producer_gaps) = lsp.project_diagnostics_authority();
@@ -3646,13 +3651,13 @@ impl AppContext {
             "applicability_unknown"
         };
         let mask_failed = |mut counts: StatusBarCountValues| {
-            if !authoritative {
-                counts.errors = None;
-                counts.warnings = None;
+            let pending = !authoritative || counts.diagnostics == Some("pending");
+            if pending {
+                (counts.errors, counts.warnings) = (None, None);
             }
             (counts.diagnostics, counts.diagnostics_reason) = if !producer_gaps.is_empty() {
                 (Some("producer_missing"), None)
-            } else if !authoritative {
+            } else if pending {
                 (Some("pending"), Some(pending_reason))
             } else {
                 (None, None)
@@ -3691,21 +3696,22 @@ impl AppContext {
             .counts
             .as_ref()
             .map(|counts| (counts.errors, counts.warnings));
-        let ((current_errors, current_warnings), provisional) =
-            match self.canonical_cache_root_opt() {
-                Some(root) => {
-                    // The cache root is identity-domain (bare-canonical, verbatim on
-                    // Windows) while diagnostics store keys are normalized; normalize a
-                    // comparison-local copy or the starts_with filter drops every diagnostic.
-                    let root = crate::path_identity::normalize_path(&root);
-                    let mut membership = self.tsconfig_membership.lock();
-                    lsp.filtered_error_warning_counts_with_provisional(|file| {
-                        file.starts_with(&root) && !membership.should_skip_diagnostics(file)
-                    })
-                }
-                None => lsp.warm_error_warning_counts_with_provisional(),
-            };
-        let provisional = provisional || lsp.project_analysis_progress_pending();
+        let ((current_errors, current_warnings), readiness) = match self.canonical_cache_root_opt()
+        {
+            Some(root) => {
+                // The cache root is verbatim on Windows, while diagnostic keys
+                // are normalized. Compare against a normalized copy of the root
+                // so the prefix test can find matching diagnostic keys.
+                let root = crate::path_identity::normalize_path(&root);
+                let mut membership = self.tsconfig_membership.lock();
+                lsp.filtered_error_warning_counts_with_readiness(|file| {
+                    file.starts_with(&root) && !membership.should_skip_diagnostics(file)
+                })
+            }
+            None => lsp.warm_error_warning_counts_with_readiness(),
+        };
+        let provisional =
+            readiness == CountReadiness::Provisional || lsp.project_analysis_progress_pending();
         let (errors, warnings) = if provisional {
             // A warming producer or report cannot prove current E/W values. Preserve a prior
             // authoritative pair when available; otherwise omit both categories.
@@ -3721,10 +3727,8 @@ impl AppContext {
             errors,
             warnings,
             todos: todos.todos,
-            disabled_categories: Vec::new(),
-            diagnostics: None,
-            diagnostics_reason: None,
-            diagnostics_gaps: Vec::new(),
+            diagnostics: (readiness == CountReadiness::UncertifiedReplacement).then_some("pending"),
+            ..StatusBarCountValues::default()
         });
 
         *self
@@ -6868,6 +6872,9 @@ impl AppContext {
     /// [`Self::data_checkout`]. With the text index switched off, grep and
     /// glob walk the folder instead.
     pub(crate) fn data_view(&self) -> Option<crate::data_layer::checkout::CheckoutView> {
+        if self.watcher_gap_pending() {
+            return None;
+        }
         self.data_checkout()?
             .view()
             .filter(|view| view.planes().text)
@@ -7301,44 +7308,6 @@ impl AppContext {
         self.callgraph_executor.lock().clone()
     }
 
-    /// Fence and drain standalone call-graph acquisition before process teardown.
-    /// Daemon acquisitions are also cancelled, and their executor owns the drain.
-    /// Gate every watcher-maintained artifact after the last route detaches. Files
-    /// may change before the watcher is restored, so a later bind must reconcile
-    /// from disk instead of serving retained snapshots that missed those edits.
-    pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
-        self.next_semantic_persist_epoch();
-
-        self.semantic_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // Keep semantic status reloadable when the feature is enabled: the
-        // query path's self-healing reload only fires from Ready (or Failed on
-        // read-only roots), so Disabled would strand an already-bound root
-        // with no way back short of a reconfigure. The advanced persist epoch
-        // and strict verify memo force the reload to re-verify from disk.
-        *self
-            .semantic_index_status
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = if self.config().indexes.semantic
-        {
-            SemanticIndexStatus::ready()
-        } else {
-            SemanticIndexStatus::Disabled
-        };
-
-        if let Some(root) = self
-            .canonical_cache_root_opt()
-            .or_else(|| self.config().project_root.clone())
-        {
-            crate::cache_freshness::invalidate_verify_memo_strict(&root);
-        }
-        self.inspect_manager.evict_idle_caches();
-        self.reset_symbol_cache();
-        self.clear_tsconfig_membership_cache();
-    }
-
     /// The Git checkout holding `requested_path`, resolved from the session's
     /// project root. A plain root the policy protects is refused.
     pub(crate) fn resolve_external_git_root(
@@ -7693,49 +7662,37 @@ impl AppContext {
         self.tier2_refresh_scheduler.lock().pull_demand_pending()
     }
 
-    fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
-        let generation = self.configure_generation();
-        if !self.inspect_writer()
-            || !self.heavy_root_work_allowed()
-            || !manager.automatic_tier2_refresh_allowed()
-            || !self.config().inspect.enabled
-        {
-            return;
-        }
-        let _ = self.run_if_subc_bound_generation(generation, || {
-            self.start_tier2_refresh_admitted(reason, manager);
-        });
-    }
-
     /// Refresh the status bar's TODO count, which only an explicit
     /// `aft_inspect` would otherwise compute. This is the only analysis the
     /// scheduler runs: dead code, unused exports, duplicates, cycles and
     /// complexity cost seconds and hundreds of MB on a large repository, so
     /// they run only when an agent asks for them. The completion is drained
     /// with the other inspect completions, which refreshes the bar.
-    fn start_tier2_refresh_admitted(
-        &self,
-        reason: Tier2TriggerReason,
-        manager: Arc<InspectManager>,
-    ) {
-        let Some(snapshot) = self.tier2_refresh_snapshot() else {
+    fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
+        let generation = self.configure_generation();
+        let Some(snapshot) = self.tier2_refresh_snapshot().filter(|snapshot| {
+            let inspect = &snapshot.config.inspect;
+            inspect.enabled
+                && inspect.category_enabled(InspectCategory::Todos)
+                && self.inspect_writer()
+                && self.heavy_root_work_allowed()
+                && manager.automatic_tier2_refresh_allowed()
+                // An unbound root does no work, not even listing its files.
+                && self.run_if_subc_bound_generation(generation, || ()).is_some()
+        }) else {
             return;
         };
-        if !snapshot
-            .config
-            .inspect
-            .category_enabled(InspectCategory::Todos)
-        {
-            return;
-        }
-        match manager.submit_background(
-            snapshot.clone(),
-            InspectCategory::Todos,
-            crate::inspect::JobScope::for_project(snapshot.project_root.clone()),
-        ) {
-            Ok(_) => crate::slog_info!("todos refresh scheduled: reason={}", reason.as_str()),
-            Err(error) => crate::slog_info!("todos refresh not scheduled: {}", error),
-        }
+        // The scope list may walk the repository, so it is built before
+        // admission, which holds the lifecycle lock that unbinding waits on.
+        let inventory = crate::inspect::inventory::for_background_job(&snapshot.project_root);
+        let _ = self.run_if_subc_bound_generation(generation, || {
+            let _inventory = inventory.install();
+            let scope = crate::inspect::JobScope::for_project(snapshot.project_root.clone());
+            match manager.submit_background(snapshot, InspectCategory::Todos, scope) {
+                Ok(_) => crate::slog_info!("todos refresh scheduled: reason={}", reason.as_str()),
+                Err(error) => crate::slog_info!("todos refresh not scheduled: {}", error),
+            }
+        });
     }
 
     fn tier2_refresh_snapshot(&self) -> Option<InspectSnapshot> {
@@ -8786,17 +8743,12 @@ impl AppContext {
         }
     }
 
-    /// [`Self::evict_idle_artifacts`] for the subc frame loop: the eviction
-    /// gate and the resident-handle write locks are all try-locked, and
-    /// nothing is evicted unless every one of them was free. Returns false
-    /// when eviction is unsafe or a lock was contended; the reaper retries on
-    /// its next sweep.
+    /// Try to evict without blocking the frame loop. The next sweep retries failures.
     pub(crate) fn try_evict_idle_artifacts(&self) -> bool {
         self.try_evict_idle_artifacts_for_root(None, false)
     }
 
-    /// A standing checkout's views can age out too. The caller must exclude
-    /// in-flight actor work before releasing its resident registrations.
+    /// Release only the views of a still-registered checkout, after all in-flight work has finished.
     pub(crate) fn try_release_idle_checkout_views(&self) -> bool {
         self.try_evict_idle_artifacts_for_root(None, true)
     }
@@ -8840,9 +8792,7 @@ impl AppContext {
         let Some(mut refresh_worker) = self.semantic_refresh_worker.try_lock() else {
             return false;
         };
-        // The data layer's checkout keeps its published state on disk; what it
-        // holds in memory (decoded call-graph slices, the update engine, the
-        // text overlay's index) is rebuilt from that state at its next use.
+        // The checkout rebuilds its in-memory state from disk on the next use.
         let Some(mut data_checkout) = self.data_checkout.try_lock() else {
             return false;
         };
@@ -8850,6 +8800,14 @@ impl AppContext {
             return false;
         };
         if !self.search_exact_memo.try_clear_idle() {
+            return false;
+        }
+        if !allow_standing
+            && !self.canonical_cache_root.try_lock().is_some_and(|root| {
+                root.as_deref()
+                    .is_none_or(crate::semantic_index::try_retire_root_embedding_state)
+            })
+        {
             return false;
         }
         semantic_index.take();
@@ -8873,8 +8831,7 @@ impl AppContext {
             data_checkout,
             data_external,
         ));
-        // Native session destruction can wait for ORT. Keep it, and worker
-        // channel teardown, off the daemon's frame loop.
+        // Native session and worker teardown may block; keep both off the frame loop.
         let _ = std::thread::Builder::new()
             .name("aft-embedding-release".into())
             .spawn(move || drop(released));
@@ -8984,36 +8941,6 @@ impl AppContext {
         self.lsp_manager.lock().shutdown_all();
     }
 
-    /// Access the LSP manager.
-    pub fn lsp(&self) -> parking_lot::MutexGuard<'_, LspManager> {
-        self.lsp_manager.lock()
-    }
-
-    /// Keep Cargo-driven rust-analyzer checks off for this root from the first
-    /// worker call on (see [`LspManager::disable_rust_cargo_for_worker`]).
-    ///
-    /// Every worker tool call asks for this, so the flag is read without the
-    /// manager lock first: once it is set the call returns at once instead of
-    /// waiting behind a language-server start or a diagnostics request that
-    /// holds the lock. After one call sets the flag, later calls never take
-    /// the lock; only calls racing that first one may still contend for it.
-    pub fn disable_rust_cargo_for_worker(&self) {
-        if self
-            .lsp_rust_worker_policy
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        self.lsp_manager.lock().disable_rust_cargo_for_worker();
-    }
-
-    /// The LSP manager if no other thread holds it right now. For callers on
-    /// the subc frame loop, which must not wait behind a server start or a
-    /// diagnostics request.
-    pub fn try_lsp(&self) -> Option<parking_lot::MutexGuard<'_, LspManager>> {
-        self.lsp_manager.try_lock()
-    }
-
     /// Start one inspect producer, holding the LSP manager lock only to
     /// reserve the server and to publish it; the spawn and `initialize`
     /// handshake run unlocked (see
@@ -9072,7 +8999,7 @@ impl AppContext {
     /// the LSP manager.
     #[doc(hidden)]
     pub fn lsp_pending_changes_for_test(&self) -> bool {
-        self.lsp_pending_change_slot.lock().is_some()
+        self.lsp_pending_change_slot.has_worker()
     }
 
     /// Forward paths the project file watcher saw change to the language
@@ -9972,13 +9899,14 @@ impl AppContext {
             let identity = self.check_path_access(req_id, path, &rooted, None, None, true, true)?;
             return Ok((rooted, identity));
         };
-        let normalized = normalize_path(&path_for_resolution);
-        let Some(file_name) = normalized.file_name() else {
+        let Some(file_name) = path_for_resolution.file_name() else {
             let location = self.validate_path(req_id, path)?;
             let identity = crate::policy_path::policy_path(&location);
             return Ok((location, identity));
         };
-        let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
+        let parent = path_for_resolution
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
         let id = req_id.to_string();
         let original = path.to_path_buf();
         let resolved_parent = crate::bounded_io::run(parent, None, move |parent| {
@@ -9997,7 +9925,7 @@ impl AppContext {
                 error.to_string(),
             )
         })??;
-        let resolved = normalize_path(&resolved_parent.join(file_name));
+        let resolved = resolved_parent.join(file_name);
 
         let identity = self.check_path_access(req_id, path, &resolved, None, None, true, true)?;
         Ok((resolved, identity))
@@ -10167,16 +10095,15 @@ impl AppContext {
         };
 
         // Resolve the path (follow symlinks, normalize ..). If canonicalization
-        // fails (e.g. path does not exist or traverses a broken symlink), inspect
-        // every existing component with lstat before falling back lexically so a
-        // broken in-root symlink cannot be used to write outside project_root.
+        // fails, inspect existing components without following symlinks first.
+        // Then resolve the nearest existing ancestor without letting a broken
+        // symlink escape the project root.
         let resolve = |req_id: &str, path: &Path, resolved_root: &Path, raw_root: &Path| {
             match std::fs::canonicalize(path) {
                 Ok(resolved) => Ok(resolved),
                 Err(_) => {
-                    let normalized = normalize_path(path);
-                    reject_escaping_symlink(req_id, path, &normalized, resolved_root, raw_root)?;
-                    Ok(resolve_with_existing_ancestors(&normalized))
+                    reject_escaping_symlink(req_id, path, path, resolved_root, raw_root)?;
+                    Ok(resolve_with_existing_ancestors(path))
                 }
             }
         };
@@ -11183,8 +11110,7 @@ impl AppContext {
             .unwrap_or_else(crate::memory::MemoryEstimate::busy);
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         timer.mark("memory / lsp");
-        // Parsers are created per operation rather than retained in a pool, so
-        // parser bytes remain an explicit estimation gap instead of a guess.
+        // Reusable parser pools belong to the process, not a root.
         let parser_pool = crate::memory::MemoryEstimate::not_estimated()
             .count("pooled_parsers", 0)
             .gap("tree_sitter_parser_bytes");

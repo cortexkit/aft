@@ -317,7 +317,7 @@ pub fn parse_patch(patch_text: &str) -> Result<Vec<Hunk>, String> {
     let begin_idx = lines
         .iter()
         .position(|line| line.trim() == "*** Begin Patch");
-    let end_idx = lines.iter().position(|line| line.trim() == "*** End Patch");
+    let end_idx = lines.iter().position(|line| *line == "*** End Patch");
 
     let (Some(begin_idx), Some(end_idx)) = (begin_idx, end_idx) else {
         return Err(
@@ -395,6 +395,17 @@ mod tests {
             parse_patch("*** Begin Patch\n*** End Patch").unwrap(),
             vec![]
         );
+    }
+
+    #[test]
+    fn parse_patch_keeps_end_marker_in_update_context() {
+        let patch = "*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n+new\n *** End Patch\n*** End Patch";
+        let hunks = parse_patch(patch).unwrap();
+        let [Hunk::Update { chunks, .. }] = hunks.as_slice() else {
+            panic!("expected one update: {hunks:?}");
+        };
+        assert_eq!(chunks[0].old_lines, ["old", "*** End Patch"]);
+        assert_eq!(chunks[0].new_lines, ["new", "*** End Patch"]);
     }
 
     #[test]

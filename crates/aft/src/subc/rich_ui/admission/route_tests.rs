@@ -241,7 +241,7 @@ fn custodian_snapshot(conn: &rusqlite::Connection, owner: &str) -> (i64, i64, Ve
         .unwrap();
     let count = conn
         .query_row(
-            "SELECT count(*) FROM call_ledger WHERE custodian=?1 AND state='Settled' AND acked=0",
+            "SELECT count(*) FROM call_ledger WHERE custodian=?1 AND state='Settled'",
             [owner],
             |row| row.get(0),
         )

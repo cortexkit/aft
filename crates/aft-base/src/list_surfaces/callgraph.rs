@@ -57,6 +57,11 @@ pub static CALLGRAPH_SURFACES: &[SurfaceEntry] = &[
                 kind: ReasonKind::Bounding,
                 predicate_name: "depth_cut_inside_requested, truncated",
             },
+            ReasonEntry {
+                reason: Reason::Budget,
+                kind: ReasonKind::Bounding,
+                predicate_name: "MACRO_VIA_ENTRY_LIMIT, macro_via_entries",
+            },
         ],
     },
     SurfaceEntry {
@@ -140,6 +145,29 @@ pub fn build_callgraph_envelope(
         causes,
         CALLGRAPH_NARROW,
     ))
+}
+
+/// Callers stop listing macro-template entries at a fixed limit without
+/// learning how many more exist, so the total is then only a lower bound.
+pub fn build_callers_macro_cut_envelope(
+    shown: usize,
+    post_filter_count: usize,
+    truncated: usize,
+) -> ListEnvelope {
+    let mut causes = vec![Reason::Budget];
+    if depth_cut_inside_requested(truncated) {
+        causes.push(Reason::Depth);
+    }
+    if hub_selector_activated(post_filter_count) {
+        causes.push(Reason::Cap);
+    }
+    ListEnvelope::new(
+        shown,
+        Total::AtLeast(post_filter_count),
+        Unit::Items,
+        causes,
+        CALLGRAPH_NARROW,
+    )
 }
 
 /// Impact can stop while fetching caller sites, including the depth boundary.

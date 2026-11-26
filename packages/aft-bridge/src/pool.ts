@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 
-import { error, getActiveLogger, log } from "./active-logger.js";
+import { warn as activeWarn, error, getActiveLogger, log } from "./active-logger.js";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
 import { asCanonicalRootPath, type CanonicalRootPath } from "./lifecycle-registry.js";
 import type { Logger, LogMeta } from "./logger.js";
@@ -81,6 +81,7 @@ export interface BridgeToolCallRuntime {
 }
 
 export interface PoolOptions extends BridgeOptions {
+  /** Soft cap: idle bridges are evicted to keep this size; busy bridges are never cut. */
   maxPoolSize?: number;
   idleTimeoutMs?: number;
   logger?: Logger;
@@ -125,7 +126,8 @@ export interface PoolOptions extends BridgeOptions {
  * history, named checkpoints) via the `session_id` envelope field attached by
  * the `callBridge()` helper. Sessions sharing a bridge still share the
  * latency of a single request pipeline; the trade-off is acceptable because
- * it removes the real RAM multiplier.
+ * it removes the real RAM multiplier. `maxPoolSize` is a soft cap: idle
+ * bridges are evicted to restore it, while busy bridges remain available.
  */
 export class BridgePool implements AftTransportPool {
   private readonly evictionListeners = new Set<(root: string) => void>();
@@ -256,10 +258,15 @@ export class BridgePool implements AftTransportPool {
       return existing.bridge;
     }
 
-    // Evict LRU if at capacity (one project = one slot now, so reaching the
-    // cap means the user has many distinct projects open).
+    // Evict the least-recently-used idle bridge at the soft cap. Busy bridges
+    // stay alive so opening another project cannot cancel their work.
     if (this.bridges.size >= this.maxPoolSize) {
       this.evictLRU();
+      if (this.bridges.size >= this.maxPoolSize) {
+        this.warn(
+          `bridge pool exceeded soft maxPoolSize=${this.maxPoolSize}; all existing bridges have pending requests or background tasks`,
+        );
+      }
     }
 
     // Per-project overrides ON TOP of global overrides (loader values win).
@@ -319,6 +326,12 @@ export class BridgePool implements AftTransportPool {
         entry.bridge.shutdown().catch((err) => this.error("cleanup shutdown failed:", err));
         this.removeBridge(dir);
       }
+    }
+
+    while (this.bridges.size > this.maxPoolSize) {
+      const sizeBefore = this.bridges.size;
+      this.evictLRU();
+      if (this.bridges.size === sizeBefore) break;
     }
 
     for (const bridge of this.staleBridges) {
@@ -419,6 +432,20 @@ export class BridgePool implements AftTransportPool {
         console.error(`[aft-bridge] ${message}`);
       }
     } else log(message, meta);
+  }
+
+  private warn(message: string, meta?: LogMeta): void {
+    const logger = this.logger ?? getActiveLogger();
+    if (logger) {
+      try {
+        logger.warn(message, meta);
+      } catch (err) {
+        console.error(
+          `[aft-bridge] ERROR: pool logger warn threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        console.error(`[aft-bridge] WARN: ${message}`);
+      }
+    } else activeWarn(message, meta);
   }
 
   private error(message: string, meta?: LogMeta): void {

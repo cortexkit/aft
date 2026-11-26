@@ -658,7 +658,10 @@ fn task_scope_kill_follows_group_signal_order() {
     let id = r
         .spawn(
             SpawnPlan::Unsandboxed,
-            "echo ready; sleep 60",
+            // Ignoring TERM keeps the group alive through the grace period, so
+            // the group SIGKILL is due; a group that is already gone is never
+            // signalled again.
+            "trap '' TERM; echo ready; sleep 60",
             "order".into(),
             root.path().into(),
             HashMap::new(),

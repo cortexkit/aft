@@ -115,6 +115,10 @@ pub(crate) enum Round {
     Done,
     /// Semantic search is off, or the checkout has nothing published yet.
     Idle,
+    /// Another fill of the repository holds its fill lock, so the round
+    /// stopped before reading any file; the fill starts again once that
+    /// lock is free.
+    Waiting,
     /// The round failed; the fill is tried again later.
     Failed(FillFailure),
 }
@@ -513,7 +517,9 @@ impl Meaning {
         let mut model = lock(&self.model);
         let outcome = self.fill_round(checkout, &config, &mut model);
         match &outcome {
-            Round::More => {
+            // A waiting round keeps its model for the round that follows
+            // once the other fill lets go of the lock.
+            Round::More | Round::Waiting => {
                 *lock(&self.failure) = None;
                 crate::semantic_index::clear_embedding_backend_retry_status(checkout.root());
             }
@@ -640,9 +646,10 @@ impl Meaning {
             max_batch: model.max_batch_size(),
             files_per_round: FILES_PER_ROUND,
         };
-        let filled = plane.fill_rounds(&mut |texts| model.embed(texts), budget, 1, &mut |step| {
-            self.note_progress(step);
-        });
+        let filled =
+            plane.fill_round_unless_blocked(&mut |texts| model.embed(texts), budget, &mut |step| {
+                self.note_progress(step);
+            });
         if let Ok(report) = &filled {
             let mut totals = lock(&self.totals);
             totals.files += report.files_filled;
@@ -654,6 +661,7 @@ impl Meaning {
             Err(error) => Round::Failed(FillFailure::Failed(error.to_string())),
             Ok(report) => match report.error {
                 Some(error) => Round::Failed(self.failure(checkout.root(), error, false)),
+                None if report.blocked_by_other_fill => Round::Waiting,
                 None if report.files_left > 0 => Round::More,
                 None => Round::Done,
             },

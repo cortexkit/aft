@@ -1269,6 +1269,179 @@ fn grep_explicit_gitignored_file_is_searched() {
 }
 
 #[test]
+fn review_search_grep_explicit_file_honors_request_filters() {
+    let project = setup_project(&[
+        ("captures/log.txt", "needle in a gitignored capture\n"),
+        (".gitignore", "captures/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    for path in [
+        "captures/log.txt".into(),
+        project.path().join("captures/log.txt"),
+    ] {
+        for (include, exclude, expected) in [
+            (vec!["*.txt"], vec![], 1),
+            (vec!["*.rs"], vec![], 0),
+            (vec![], vec!["*.txt"], 0),
+            (vec![], vec![], 1),
+        ] {
+            let response = send(
+                &mut aft,
+                json!({
+                    "id": "grep-explicit-request-filters",
+                    "command": "grep",
+                    "pattern": "needle",
+                    "path": path,
+                    "include": include,
+                    "exclude": exclude,
+                }),
+            );
+            assert_eq!(response["success"], true, "{response:?}");
+            assert_eq!(
+                response["total_matches"], expected,
+                "{include:?} {exclude:?}: {response:?}"
+            );
+            assert_eq!(
+                response["no_files_matched_scope"],
+                expected == 0,
+                "{response}"
+            );
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+struct DenyRead(std::path::PathBuf);
+
+#[cfg(unix)]
+impl DenyRead {
+    fn new(path: std::path::PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        Self(path)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DenyRead {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn review_search_glob_discloses_unreadable_walk_subtree() {
+    let project = setup_project(&[("visible.txt", "visible"), ("closed/hidden.txt", "hidden")]);
+    let denied = DenyRead::new(project.path().join("closed"));
+    if fs::read_dir(&denied.0).is_ok() {
+        eprintln!("permission fixture requires an unprivileged user");
+        return;
+    }
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+    let response = send(
+        &mut aft,
+        json!({"id":"glob-closed", "command":"glob", "pattern":"**/*.txt"}),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["files"].as_array().unwrap().len(), 1, "{response}");
+    assert_eq!(response["complete"], false, "{response}");
+    assert!(
+        response["skipped_files"].to_string().contains("closed"),
+        "{response}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn review_search_glob_discloses_unreadable_named_ignored_subtree() {
+    let project = setup_project(&[
+        (".gitignore", "captures/\n"),
+        ("captures/visible.txt", "visible"),
+        ("captures/closed/hidden.txt", "hidden"),
+    ]);
+    let denied = DenyRead::new(project.path().join("captures/closed"));
+    if fs::read_dir(&denied.0).is_ok() {
+        eprintln!("permission fixture requires an unprivileged user");
+        return;
+    }
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+    let response = send(
+        &mut aft,
+        json!({"id":"glob-closed-named", "command":"glob", "pattern":"captures/**/*.txt"}),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["files"].as_array().unwrap().len(), 1, "{response}");
+    assert_eq!(response["complete"], false, "{response}");
+    assert!(
+        response["skipped_files"].to_string().contains("closed"),
+        "{response}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn review_search_grep_discloses_unreadable_walk_subtree() {
+    let project = setup_project(&[("visible.txt", "needle"), ("closed/hidden.txt", "needle")]);
+    let denied = DenyRead::new(project.path().join("closed"));
+    if fs::read_dir(&denied.0).is_ok() {
+        eprintln!("permission fixture requires an unprivileged user");
+        return;
+    }
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+    let response = send(
+        &mut aft,
+        json!({"id":"grep-closed", "command":"grep", "pattern":"needle"}),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["total_matches"], 1, "{response}");
+    assert_eq!(response["complete"], false, "{response}");
+    assert!(
+        response["skipped_files"].to_string().contains("closed"),
+        "{response}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn review_search_grep_discloses_unreadable_files_in_directory_and_explicit_scopes() {
+    let project = setup_project(&[("visible.txt", "visible"), ("unreadable.txt", "needle")]);
+    let denied = DenyRead::new(project.path().join("unreadable.txt"));
+    if fs::File::open(&denied.0).is_ok() {
+        eprintln!("permission fixture requires an unprivileged user");
+        return;
+    }
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+    for path in [".", "unreadable.txt"] {
+        let response = send(
+            &mut aft,
+            json!({"id":"grep-unreadable", "command":"grep", "pattern":"needle", "path":path}),
+        );
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["total_matches"], 0, "{response}");
+        assert_eq!(response["complete"], false, "{response}");
+        assert!(
+            response["skipped_files"]
+                .to_string()
+                .contains("unreadable.txt"),
+            "{response}"
+        );
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn grep_aftignore_excludes_from_directory_search() {
     // .aftignore excludes paths from AFT's directory walk, layered on .gitignore.
     let project = setup_project(&[

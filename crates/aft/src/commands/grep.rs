@@ -301,19 +301,20 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     });
     let scope_probe_started = std::time::Instant::now();
+    let walk_incomplete = result.walk_truncated
+        || result.skipped_foreign_mounts > 0
+        || !result.index_read_gaps.is_empty();
     let scope_presence = phases
         .indexed_scope_has_files
         .or_else(|| {
             phases.walk_counts.and_then(|counts| {
-                (counts.eligible > 0
-                    || (!result.walk_truncated && result.skipped_foreign_mounts == 0))
-                    .then_some(counts.eligible > 0)
+                (counts.eligible > 0 || !walk_incomplete).then_some(counts.eligible > 0)
             })
         })
         .or_else(|| {
             // A stopped walk cannot prove absence. Probing again can consume
             // the reply budget and replace the results it already found.
-            (!result.walk_truncated)
+            (!walk_incomplete)
                 .then(|| grep_executor::scope_has_files(&scope, &filters))
                 .flatten()
         });
@@ -722,8 +723,8 @@ fn direct_read_coverage(result: &GrepResult) -> String {
             plural(files, "file")
         );
     }
-    if files == 1 {
-        return "searched 1 file directly".to_string();
+    if files == 1 || !result.index_read_gaps.is_empty() || crate::bounded_io::has_skipped_files() {
+        return format!("searched {} directly", plural(files, "file"));
     }
     format!("searched all {files} files directly")
 }

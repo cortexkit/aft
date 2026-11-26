@@ -23,7 +23,6 @@ Values below are production defaults. Paths are relative to `aft/`; a bound call
 | `MAINTENANCE_QUEUE_CAP`, `MaintenanceCoalesceKey` | 512 queued maintenance jobs **per actor**; coalesce queued WatcherDrain/LspDrain/StandingPass/ConfigReload by root and key; at cap remove duplicate drains then refuse if still full. | `crates/aft/src/executor/mod.rs:30,67-79,1452-1507` |
 | `DEFAULT_COLD_BUILD_LIMIT`, `GLOBAL_COLD_BUILD_LIMITER` | 2 concurrent cold builds **process-wide** (test build 1024); waiting maintenance/inspect/standing classes share slots, root-aware requests may share a permit. | `crates/aft/src/cold_build_limiter.rs:6-17,31-45,77-90,110-116` |
 | `WARM_SEARCH_RELOAD_LIMIT` | 4 concurrent warm search-index parses/verifications **process-wide**, isolated from cold builds. | `crates/aft/src/commands/configure.rs:4295-4302` |
-| `BuildDeathBreaker` | Per root/domain/fingerprint: trip at `ZERO_CREDIT_DEATH_LIMIT=3`, `CREDITED_DEATH_LIMIT=6`, or `IN_BUILD_BURN_LIMIT_MS=30 min`; `TRIP_TTL_MS=24 h`; marker heartbeat 5 s/recent 15 s. | `crates/aft/src/build_breaker.rs:14-23,76-83` |
 
 ## Daemon edge and bridge
 

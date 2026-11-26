@@ -249,10 +249,21 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         None
     };
 
+    // Explicit indentation replaces the old indentation. Otherwise leave the
+    // source prefix alone, whether it is indentation or neighboring code.
+    let replaced_indent = replacement_content
+        .filter(|text| text.starts_with([' ', '\t']))
+        .and_then(|_| source.get(..start_byte))
+        .and_then(|prefix| prefix.rsplit('\n').next())
+        .filter(|prefix| {
+            prefix.len() == original_range.start_col as usize
+                && prefix.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+        })
+        .map_or(0, str::len);
     let (start_byte, end_byte) = if operation == "delete" || replacement_content == Some("") {
         whole_line_removal_range(&source, start_byte, end_byte)
     } else {
-        (start_byte, end_byte)
+        (start_byte - replaced_indent, end_byte)
     };
 
     let new_source = match operation {
@@ -358,6 +369,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let new_range = match operation {
         "replace" => {
             let replacement = replacement_content.unwrap_or_default();
+            let start_col = original_range.start_col - replaced_indent as u32;
             let new_lines = replacement.lines().count() as u32;
             let last_line_len = replacement
                 .lines()
@@ -366,10 +378,10 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 .unwrap_or(0);
             Some(Range {
                 start_line: original_range.start_line,
-                start_col: original_range.start_col,
+                start_col,
                 end_line: original_range.start_line + new_lines.saturating_sub(1),
                 end_col: if new_lines <= 1 {
-                    original_range.start_col + last_line_len
+                    start_col + last_line_len
                 } else {
                     last_line_len
                 },

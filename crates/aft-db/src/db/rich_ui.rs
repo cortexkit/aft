@@ -84,11 +84,22 @@ pub fn session_presets(conn: &Connection, key: &PresetKey) -> rusqlite::Result<V
     .collect()
 }
 
+const PRESET_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+pub(crate) fn preset_retention_due(conn: &Connection, now_ms: i64) -> rusqlite::Result<bool> {
+    conn.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM rich_ui_session_presets
+         WHERE recorded_at < ?1)",
+    )?
+    .query_row([now_ms.saturating_sub(PRESET_RETENTION_MS)], |row| {
+        row.get(0)
+    })
+}
+
 pub(crate) fn prune_presets(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
-    const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
     conn.execute(
         "DELETE FROM rich_ui_session_presets WHERE recorded_at < ?1",
-        [now_ms.saturating_sub(RETENTION_MS)],
+        [now_ms.saturating_sub(PRESET_RETENTION_MS)],
     )
 }
 

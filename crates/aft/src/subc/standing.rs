@@ -357,14 +357,22 @@ impl StandingActor {
         ctx.begin_configure_ack_step("snapshot_reconcile");
         // A new bind is an explicit retry; idle maintenance uses the backoff.
         *self.reconciliation_backoff.lock() = ReconciliationBackoff::default();
-        if let Err(error) = self.roots.reconcile(&snapshot) {
-            self.record_reconciliation_failure(
-                &snapshot,
-                &error.to_string(),
-                std::time::Instant::now(),
-            );
-            return;
-        }
+        let report = match self.roots.reconcile(&snapshot) {
+            Ok(report) => report,
+            Err(error) => {
+                self.record_reconciliation_failure(
+                    &snapshot,
+                    &error.to_string(),
+                    std::time::Instant::now(),
+                );
+                return;
+            }
+        };
+        self.log_reconciliation_outcome(&report.refused);
+        // This bind may be the first to observe a root removed from
+        // configuration. The next tick will not see that removal again, so
+        // retire the root's standing actor now.
+        self.retire_removed_actors(&report.removed, Some(ctx));
         let entries = self.roots.entries();
         // With no standing family there is nothing to revoke. Deriving an
         // otherwise unused session key can spawn Git on a cold root, and must
@@ -520,15 +528,9 @@ impl StandingActor {
             }
         };
         *self.reconciliation_backoff.lock() = ReconciliationBackoff::default();
-        if let Some((previous_error, suppressed_repeats)) =
-            self.reconciliation_failures.lock().record_success()
-        {
-            log::info!(
-                "standing roots reconciliation recovered after suppressing {suppressed_repeats} repeated refusal(s): {previous_error}"
-            );
-        }
+        self.log_reconciliation_outcome(&report.refused);
 
-        self.retire_removed_actors(&report.removed);
+        self.retire_removed_actors(&report.removed, None);
         let contended = self.resume_entries_without_bound_session(&report.active_entries);
         for entry in report.active_entries {
             if !contended.iter().any(|claim| claim.covers(&entry)) {
@@ -544,6 +546,32 @@ impl StandingActor {
         now: std::time::Instant,
     ) {
         self.reconciliation_backoff.lock().failed(snapshot, now);
+        self.log_reconciliation_refusal(error);
+    }
+
+    /// Log a reconciliation that completed. Roots it refused are logged like a
+    /// failed pass, with repeats suppressed, but they set no backoff: the
+    /// other roots keep their regular maintenance.
+    fn log_reconciliation_outcome(&self, refused: &[crate::standing_roots::StandingRootRefusal]) {
+        if !refused.is_empty() {
+            let errors = refused
+                .iter()
+                .map(|refusal| refusal.error.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.log_reconciliation_refusal(&errors);
+            return;
+        }
+        if let Some((previous_error, suppressed_repeats)) =
+            self.reconciliation_failures.lock().record_success()
+        {
+            log::info!(
+                "standing roots reconciliation recovered after suppressing {suppressed_repeats} repeated refusal(s): {previous_error}"
+            );
+        }
+    }
+
+    fn log_reconciliation_refusal(&self, error: &str) {
         match self.reconciliation_failures.lock().record_failure(error) {
             ReconciliationLogAction::WarnFirst => log::warn!("standing roots reconciliation refused: {error}"),
             ReconciliationLogAction::WarnChanged { previous_error, suppressed_repeats } => log::warn!("standing roots reconciliation refused: {error} ({suppressed_repeats} repeats of previous error suppressed: {previous_error})"),
@@ -604,15 +632,23 @@ impl StandingActor {
         contended
     }
 
-    fn retire_removed_actors(&self, removed: &[String]) {
+    /// `binding` is the context of a session bind in progress, if any. When
+    /// that session binds the folder of a removed root, it has taken over the
+    /// actor standing maintenance created there, which then stays registered.
+    fn retire_removed_actors(&self, removed: &[String], binding: Option<&AppContext>) {
         let mut owned = self.owned_actors.lock();
         for literal_path in removed {
             if let Some((root_id, owned_here)) = owned.remove(literal_path) {
                 self.executor.cancel_queued_maintenance(&root_id);
-                if let Some(ctx) = self.executor.actor_context(&root_id) {
+                let ctx = self.executor.actor_context(&root_id);
+                if let Some(ctx) = &ctx {
                     ctx.set_standing_artifact_exempt(false);
                 }
-                if owned_here {
+                let taken_over = ctx
+                    .as_ref()
+                    .zip(binding)
+                    .is_some_and(|(ctx, binding)| std::ptr::eq(Arc::as_ptr(ctx), binding));
+                if owned_here && !taken_over {
                     self.executor.remove_actor(&root_id);
                 }
             }
@@ -667,6 +703,10 @@ impl StandingActor {
                 permit.admission_epoch,
                 admission.publication.admission_epoch
             );
+            // A strict mark made after this point (a session bind, a resume or
+            // an observation gap) postdates the verification below, which then
+            // must not clear it.
+            let strict_revision = admission.strict_mark_revision();
             // One data-layer bind or build covers every kind it builds.
             let mut data_layer_verified = None;
             for kind in IndexKind::ALL {
@@ -684,7 +724,7 @@ impl StandingActor {
                     // no search cache is read or written and no writer lease
                     // is taken.
                     *data_layer_verified.get_or_insert_with(|| {
-                        crate::data_layer::standing::verify_current(
+                        let verified = crate::data_layer::standing::verify_current(
                             &entry.resolved_target,
                             &ctx.storage_dir(),
                             crate::data_layer::standing::planes(&entry.indexes),
@@ -692,7 +732,10 @@ impl StandingActor {
                                 !admission.cancellation_requested()
                                     && !crate::executor::current_job_cancelled()
                             },
-                        )
+                        );
+                        #[cfg(test)]
+                        after_verify_for_test(&literal_path);
+                        verified
                     })
                 } else {
                     // Meaning search is not verified by standing passes;
@@ -700,13 +743,23 @@ impl StandingActor {
                     false
                 };
                 if verified {
-                    if let Err(error) = roots.record_strict_verification(&literal_path, kind) {
-                        log::warn!(
+                    match roots.record_strict_verification_unless_marked(
+                        &literal_path,
+                        kind,
+                        strict_revision,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => log::debug!(
+                            "standing strict verification for {} {} predates a newer strict mark; flag kept",
+                            literal_path,
+                            kind.as_str()
+                        ),
+                        Err(error) => log::warn!(
                             "standing strict verification outcome could not commit for {} {}: {}",
                             literal_path,
                             kind.as_str(),
                             error
-                        );
+                        ),
                     }
                 }
             }
@@ -738,9 +791,15 @@ impl StandingActor {
         };
         if let Some(ctx) = self.executor.actor_context(&root_id) {
             ctx.set_standing_artifact_exempt(true);
-            self.owned_actors
-                .lock()
-                .insert(entry.literal_path.clone(), (root_id.clone(), false));
+            let mut owned = self.owned_actors.lock();
+            // An actor this module created for the root stays its own across
+            // passes. A context a session bound (it carries a harness marker)
+            // is never removed by standing maintenance.
+            let owned_here = ctx.config().harness.is_none()
+                && owned
+                    .get(&entry.literal_path)
+                    .is_some_and(|(owned_root, owned_here)| *owned_here && *owned_root == root_id);
+            owned.insert(entry.literal_path.clone(), (root_id.clone(), owned_here));
             return Some(root_id);
         }
 
@@ -764,6 +823,29 @@ impl StandingActor {
             .lock()
             .insert(entry.literal_path.clone(), (root_id.clone(), true));
         Some(root_id)
+    }
+}
+
+/// A test runs `hook` inside the standing pass over `literal_path`, right
+/// after its verification and before it records the outcome.
+#[cfg(test)]
+static AFTER_VERIFY_FOR_TEST: std::sync::Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn after_verify_for_test(literal_path: &str) {
+    let hook = {
+        let mut slot = AFTER_VERIFY_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|(path, _)| path == literal_path) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, hook)) = hook {
+        hook();
     }
 }
 
@@ -1861,6 +1943,112 @@ mod tests {
         );
     }
 
+    /// A bound session whose configuration lists one standing root in a
+    /// folder no session has bound, so standing maintenance hosts that root on
+    /// an actor of its own.
+    struct OwnedActorFixture {
+        _storage: tempfile::TempDir,
+        _session_dir: tempfile::TempDir,
+        _standing_dir: tempfile::TempDir,
+        executor: Arc<Executor>,
+        session: Arc<AppContext>,
+        actor: StandingActor,
+        standing_root: ProjectRootId,
+    }
+
+    impl OwnedActorFixture {
+        fn new() -> Self {
+            use crate::config::{IndexConfig, IndexRootConfig};
+
+            let storage = tempfile::tempdir().unwrap();
+            let session_dir = tempfile::tempdir().unwrap();
+            let standing_dir = tempfile::tempdir().unwrap();
+            let session_root = std::fs::canonicalize(session_dir.path()).unwrap();
+            let standing = std::fs::canonicalize(standing_dir.path()).unwrap();
+            let session = Arc::new(AppContext::from_app(
+                App::default_shared(),
+                Config {
+                    project_root: Some(session_root.clone()),
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    index: IndexConfig {
+                        roots: vec![IndexRootConfig {
+                            path: standing.to_string_lossy().into_owned(),
+                            indexes: vec![IndexKind::Search],
+                        }],
+                    },
+                    ..Config::default()
+                },
+            ));
+            session.set_canonical_cache_root(session_root.clone());
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(
+                ProjectRootId::from_path(&session_root).unwrap(),
+                Arc::clone(&session),
+            );
+            let actor = StandingActor::new(session.app(), Arc::clone(&executor))
+                .with_startup_storage_dir(storage.path());
+            Self {
+                _storage: storage,
+                _session_dir: session_dir,
+                _standing_dir: standing_dir,
+                executor,
+                session,
+                actor,
+                standing_root: ProjectRootId::from_path(&standing).unwrap(),
+            }
+        }
+
+        fn standing_actor_registered(&self) -> bool {
+            self.executor.actor_context(&self.standing_root).is_some()
+        }
+
+        /// The user removes the standing root from configuration; the session
+        /// carries the new snapshot.
+        fn remove_standing_root_from_config(&self) {
+            self.session
+                .update_config(|config| config.index.roots.clear());
+        }
+    }
+
+    /// A session bind can be the first to observe that a standing root was
+    /// removed. The actor standing maintenance created for that root must be
+    /// retired then, because the next tick sees no removal left to process.
+    #[test]
+    fn a_session_bind_that_removes_a_standing_root_retires_its_actor() {
+        let fixture = OwnedActorFixture::new();
+        fixture.actor.tick();
+        assert!(fixture.standing_actor_registered());
+
+        fixture.remove_standing_root_from_config();
+        fixture.actor.begin_session_bind(&fixture.session);
+        assert!(fixture.actor.roots.entries().is_empty());
+        assert!(
+            !fixture.standing_actor_registered(),
+            "the bind removed the standing root but left its actor registered"
+        );
+        fixture.actor.tick();
+        assert!(!fixture.standing_actor_registered());
+    }
+
+    /// Repeated maintenance ticks reuse the actor they created. It stays
+    /// theirs: its stale configuration never stands in for the session's, and
+    /// removing the root later retires it.
+    #[test]
+    fn repeated_ticks_keep_ownership_of_the_standing_actor() {
+        let fixture = OwnedActorFixture::new();
+        fixture.actor.tick();
+        fixture.actor.tick();
+        assert!(fixture.standing_actor_registered());
+
+        fixture.remove_standing_root_from_config();
+        fixture.actor.tick();
+        assert!(fixture.actor.roots.entries().is_empty());
+        assert!(
+            !fixture.standing_actor_registered(),
+            "a removed standing root kept the actor maintenance created for it"
+        );
+    }
+
     /// A standing entry over a small Rust crate, reconciled but with no
     /// pass run yet: its first snapshot leaves every kind strict.
     struct StandingFixture {
@@ -2044,5 +2232,36 @@ mod tests {
             !fixture.search_cache().exists(),
             "a failed data layer build fell back to today's search cache"
         );
+    }
+
+    /// A session bind that marks the root strict after the pass verified it,
+    /// but before the pass records that, keeps the mark: the pass's proof
+    /// predates the bind. Without the bind the same pass clears the flags
+    /// (`with_the_data_layer_a_standing_pass_builds_and_verifies_without_cache_bin`).
+    #[test]
+    fn a_bind_between_verification_and_its_record_keeps_the_strict_flag() {
+        let fixture = StandingFixture::new(vec![IndexKind::Search, IndexKind::Callgraph]);
+        let roots = fixture.actor.roots.clone();
+        let literal_path = fixture.entry.literal_path.clone();
+        *AFTER_VERIFY_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+            literal_path.clone(),
+            Box::new(move || {
+                roots.begin_case_a_bind(&literal_path).unwrap();
+            }),
+        ));
+
+        fixture.pass();
+        assert!(
+            AFTER_VERIFY_FOR_TEST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "the pass never reached its verification"
+        );
+        assert_eq!(fixture.published(), (3, true), "the pass verified the root");
+        assert!(fixture.strict(IndexKind::Search));
+        assert!(fixture.strict(IndexKind::Callgraph));
     }
 }

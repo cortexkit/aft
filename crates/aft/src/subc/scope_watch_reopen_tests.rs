@@ -1,6 +1,61 @@
 use super::*;
 
 #[tokio::test(start_paused = true)]
+async fn daemon_edge_all_watch_replacements_wait_for_retirement() {
+    let (control, pending, mut frames) = control(&["scope.watch"]);
+    let scopes: HashMap<_, _> = (0..4096)
+        .map(stamp)
+        .map(|scope| (stamp_key(&scope), scope))
+        .collect();
+    let interval = Duration::from_secs(5);
+    let mut watches = scope_watch::Watches::new(control.metrics.clone());
+    watches.reconcile(&scopes, &control, interval);
+    let mut shards = Vec::new();
+    for _ in 0..16 {
+        let open = request(&mut frames, "scope.watch").await;
+        let selector: Value = serde_json::from_slice(&open.body).unwrap();
+        let selectors: Vec<subc_client_rs::ScopeWatchSelector> =
+            serde_json::from_value(selector["scopes"].clone()).unwrap();
+        let key = scopes
+            .keys()
+            .find(|key| key.1 == selectors[0].scope_ref.scope_ref)
+            .unwrap()
+            .clone();
+        shards.push(key);
+        snapshot(&pending, &open);
+    }
+    for _ in 0..16 {
+        let event = watches.receiver.recv().await.unwrap();
+        watches.event(event, scopes.len());
+    }
+    let resume = watches.pause_retirement_for_test();
+    assert!(watches.rebind(&shards[0], 2));
+    assert!(watches.rebind(&shards[1], 2));
+    watches.reconcile(&scopes, &control, interval);
+
+    for churn in [false, true] {
+        if churn {
+            assert!(watches.rebind(&shards[0], 3));
+            watches.reconcile(&scopes, &control, interval);
+        }
+        let early = tokio::time::timeout(
+            Duration::from_millis(1),
+            request(&mut frames, "scope.watch"),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "a replacement opened before retirement completed (churn={churn})"
+        );
+    }
+    resume.send(()).unwrap();
+    for _ in 0..2 {
+        let open = request(&mut frames, "scope.watch").await;
+        snapshot(&pending, &open);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn scope_watch_route_binds_and_live_reopens_make_zero_describes() {
     let (_dir, root) = test_support::test_root("scope-watch-bind-count");
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);

@@ -58,6 +58,7 @@ impl From<LspError> for CertificationFailure {
 }
 
 pub(crate) struct TypescriptDiagnosticsRequest {
+    watched_epoch: (super::client::ServerInstanceId, u64),
     key: ServerKey,
     file: PathBuf,
     version: Option<i32>,
@@ -66,6 +67,7 @@ pub(crate) struct TypescriptDiagnosticsRequest {
 }
 
 pub(crate) struct TypescriptDiagnosticsReply {
+    pub(crate) watched_epoch: (super::client::ServerInstanceId, u64),
     pub(crate) key: ServerKey,
     pub(crate) file: PathBuf,
     pub(crate) version: Option<i32>,
@@ -103,6 +105,7 @@ impl TypescriptDiagnosticsRequest {
             })
             .collect();
         Self {
+            watched_epoch: (client.instance, client.watched_epoch),
             key,
             file,
             version,
@@ -139,6 +142,7 @@ impl TypescriptDiagnosticsRequest {
         }
         let result = failure.map_or(Ok(diagnostics), Err);
         TypescriptDiagnosticsReply {
+            watched_epoch: self.watched_epoch,
             key: self.key,
             file: self.file,
             version: self.version,

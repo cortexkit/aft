@@ -20,7 +20,7 @@ import {
 type ToolArg = ToolDefinition["args"][string];
 type SearchPathKind = "file" | "directory";
 type SearchPathTarget = { target: string; kind: SearchPathKind };
-type SearchPathArgSplit = { paths: string[]; missing: string[] };
+type SearchPathArgSplit = { all: string[]; paths: string[]; missing: string[] };
 
 function arg(schema: unknown): ToolArg {
   return schema as ToolArg;
@@ -36,12 +36,12 @@ function searchPathExists(projectRoot: string, target: string): boolean {
 
 function splitSearchPathArg(projectRoot: string, raw: string): SearchPathArgSplit {
   if (searchPathExists(projectRoot, raw) || !/\s/.test(raw)) {
-    return { paths: [raw], missing: [] };
+    return { all: [raw], paths: [raw], missing: [] };
   }
 
   const fragments = raw.trim().split(/\s+/).filter(Boolean);
   if (fragments.length < 2) {
-    return { paths: [raw], missing: [] };
+    return { all: [raw], paths: [raw], missing: [] };
   }
 
   const existing: string[] = [];
@@ -55,10 +55,10 @@ function splitSearchPathArg(projectRoot: string, raw: string): SearchPathArgSpli
   }
 
   if (existing.length === 0) {
-    return { paths: [raw], missing: [] };
+    return { all: [raw], paths: [raw], missing: [] };
   }
 
-  return { paths: existing, missing };
+  return { all: fragments, paths: existing, missing };
 }
 
 function bridgeSearchPathArg(projectRoot: string, split: SearchPathArgSplit): string {
@@ -95,10 +95,10 @@ function searchPathKind(
 
 function searchPathTargets(
   projectRoot: string,
-  split: SearchPathArgSplit,
+  paths: string[],
   defaultKind: SearchPathKind,
 ): SearchPathTarget[] {
-  return split.paths.map((target) => {
+  return paths.map((target) => {
     const absoluteTarget = absoluteSearchPath(projectRoot, target);
     return {
       target: absoluteTarget,
@@ -176,19 +176,19 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       const includeArg = args.include ? String(args.include) : undefined;
       const pathArg = args.path ? String(args.path) : undefined;
       const pathSplit = pathArg ? splitSearchPathArg(projectRoot, pathArg) : undefined;
-      const bridgePath = pathSplit ? bridgeSearchPathArg(projectRoot, pathSplit) : undefined;
+      const bridgePaths = pathSplit?.all.map((target) => absoluteSearchPath(projectRoot, target));
 
       // Match OpenCode native ordering: grep permission first (on the raw
       // pattern + path the agent typed), then external_directory check on
       // the resolved search target if it points outside the project.
       const grepDenied = await askGrepPermission(context, pattern, {
-        path: bridgePath,
+        path: bridgePaths?.join(" "),
         include: includeArg,
       });
       if (grepDenied) return permissionDeniedResponse(grepDenied, context);
 
       if (pathSplit) {
-        for (const target of searchPathTargets(projectRoot, pathSplit, "file")) {
+        for (const target of searchPathTargets(projectRoot, pathSplit.all, "file")) {
           const externalDenied = await assertExternalDirectoryPermission(
             ctx,
             context,
@@ -204,7 +204,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
       const rawArgs: Record<string, unknown> = { pattern };
       if (includeArg !== undefined) rawArgs.include = includeArg;
-      if (bridgePath !== undefined) rawArgs.path = bridgePath;
+      if (bridgePaths !== undefined) rawArgs.path = bridgePaths;
       if (args.offset !== undefined && args.offset !== null) rawArgs.offset = args.offset;
       const response = await callToolCall(ctx, context, "grep", rawArgs);
 
@@ -297,7 +297,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       if (globDenied) return permissionDeniedResponse(globDenied, context);
 
       if (pathSplit) {
-        for (const target of searchPathTargets(projectRoot, pathSplit, "directory")) {
+        for (const target of searchPathTargets(projectRoot, pathSplit.paths, "directory")) {
           const externalDenied = await assertExternalDirectoryPermission(
             ctx,
             context,

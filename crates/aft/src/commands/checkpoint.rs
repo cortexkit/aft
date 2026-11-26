@@ -29,6 +29,122 @@ pub fn handle_checkpoint(req: &RawRequest, ctx: &AppContext) -> Response {
 mod tests {
     use super::*;
 
+    thread_local! {
+        pub(super) static BEFORE_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn edit_review_gpt_5_checkpoint_does_not_rewrite_matching_file() {
+        use std::{
+            fs,
+            time::{Duration, SystemTime},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("matching.txt");
+        let ctx = test_context(root.path());
+        fs::write(&path, b"matching").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(123_456)),
+            )
+            .unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let create: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "create", "command": "checkpoint", "name": "matching", "files": [path],
+        }))
+        .unwrap();
+        assert!(handle_checkpoint(&create, &ctx).success);
+        let restore: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "restore", "command": "restore_checkpoint", "name": "matching",
+        }))
+        .unwrap();
+        let response =
+            crate::commands::restore_checkpoint::handle_restore_checkpoint(&restore, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["changed_count"], 0);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_review_opus_5_checkpoint_and_undo_keep_open_original_bytes() {
+        use std::{fs, io::Read};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("changed.txt");
+        let ctx = test_context(root.path());
+        fs::write(&path, b"checkpoint").unwrap();
+        let create: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "create", "command": "checkpoint", "name": "before", "files": [path],
+        }))
+        .unwrap();
+        assert!(handle_checkpoint(&create, &ctx).success);
+        let restore: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "restore", "command": "restore_checkpoint", "name": "before",
+        }))
+        .unwrap();
+        let undo: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "undo", "command": "undo", "file": path,
+        }))
+        .unwrap();
+
+        for (prior, handler, req) in [
+            (
+                b"undo".as_slice(),
+                crate::commands::undo::handle_undo as fn(&RawRequest, &AppContext) -> Response,
+                &undo,
+            ),
+            (
+                b"checkpoint".as_slice(),
+                crate::commands::restore_checkpoint::handle_restore_checkpoint,
+                &restore,
+            ),
+        ] {
+            fs::write(&path, prior).unwrap();
+            if req.id == "undo" {
+                ctx.backup()
+                    .lock()
+                    .snapshot(req.session(), &path, "tracked")
+                    .unwrap();
+            }
+            fs::write(&path, b"after").unwrap();
+            ctx.backup().lock().record_post_mutation_states();
+            let mut original = fs::File::open(&path).unwrap();
+            let response = handler(req, &ctx);
+            let mut bytes = Vec::new();
+            original.read_to_end(&mut bytes).unwrap();
+            assert!(response.success, "{response:?}");
+            assert_eq!(fs::read(&path).unwrap(), prior);
+            assert_eq!(
+                bytes, b"after",
+                "{} truncated the open original",
+                req.command
+            );
+        }
+    }
+
+    fn test_context(root: &std::path::Path) -> AppContext {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                ..Default::default()
+            },
+        );
+        ctx.backup().lock().set_storage_dir(root.join("backup"), 72);
+        ctx.checkpoint().lock().set_storage_dir_for_harness(
+            root.join("checkpoints"),
+            crate::harness::Harness::Opencode,
+        );
+        ctx
+    }
+
     #[test]
     fn backup_checkpoint_command_reports_discovery_errors_without_replacing_history() {
         for released in [false, true] {
@@ -91,6 +207,56 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn edit_review_opus_12_deleted_tracked_files_make_an_empty_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tracked.txt");
+        let ctx = test_context(root.path());
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "empty", "command": "checkpoint", "name": "empty",
+        }))
+        .unwrap();
+        std::fs::write(&path, b"original").unwrap();
+        ctx.backup()
+            .lock()
+            .snapshot(request.session(), &path, "tracked")
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let explicit: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "explicit", "command": "checkpoint", "name": "explicit", "files": [path],
+        }))
+        .unwrap();
+        let response = handle_checkpoint(&explicit, &ctx);
+        assert_eq!(response.data["code"], "file_not_found", "{response:?}");
+        let response = handle_checkpoint(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["file_count"], 0);
+        assert_eq!(response.data["skipped"].as_array().unwrap().len(), 1);
+        assert!(response.data.get("requested_count").is_none());
+    }
+
+    #[test]
+    fn edit_review_opus_8_checkpoint_creation_does_not_hold_backup_mutex() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = std::sync::Arc::new(test_context(root.path()));
+        let path = root.path().join("tracked.txt");
+        std::fs::write(&path, b"tracked").unwrap();
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "create", "command": "checkpoint", "name": "unlocked", "files": [path],
+        }))
+        .unwrap();
+        BEFORE_CREATE.with(|hook| {
+            let ctx = ctx.clone();
+            hook.replace(Some(Box::new(move || {
+                assert!(ctx.backup().try_lock().is_some());
+            })));
+        });
+        let response = handle_checkpoint(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        BEFORE_CREATE.with(|hook| assert!(hook.borrow().is_none()));
+    }
 }
 
 fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response, Response> {
@@ -131,10 +297,18 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
     // like with like against the snapshot count.
     let requested_count = validated_files.len();
 
-    let backup = ctx.backup().lock();
     let mut checkpoint_store = ctx.checkpoint().lock();
 
-    match checkpoint_store.create(req.session(), name, validated_files, &backup) {
+    #[cfg(test)]
+    if let Some(hook) = tests::BEFORE_CREATE.with(|hook| hook.replace(None)) {
+        hook();
+    }
+    let checkpoint = if explicit_request {
+        checkpoint_store.create_for_files(req.session(), name, validated_files)
+    } else {
+        checkpoint_store.create_for_tracked_files(req.session(), name, validated_files)
+    };
+    match checkpoint {
         Ok(info) => {
             let storage_path = info
                 .storage_path

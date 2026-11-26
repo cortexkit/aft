@@ -1,6 +1,6 @@
 {
   "agent_args": {
-    "filePath": "src/../README.md",
+    "filePath": "README.md",
     "limit": 3,
     "offset": 2
   },

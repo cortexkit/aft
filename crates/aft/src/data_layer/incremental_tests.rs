@@ -106,6 +106,29 @@ pub(super) fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> Checko
     }
 }
 
+#[test]
+fn audit_resolution_dotted_typescript_import_refreshes_when_target_appears() {
+    let importer = (
+        "run.ts",
+        "import { work } from './user.service';\nexport function run() { work(); }\n",
+    );
+    let target = ("user.service.ts", "export function work() {}\n");
+    let rows = update_matches_cold(
+        checkout(&[importer], &[]),
+        checkout(&[importer, target], &[]),
+        &[target.0],
+        importer.0,
+    );
+    assert!(
+        rows.iter().any(|(status, path, symbol)| {
+            *status == ResolutionStatus::Resolved
+                && path.as_deref() == Some(target.0)
+                && symbol.as_deref() == Some("work")
+        }),
+        "{rows:?}"
+    );
+}
+
 /// Updates a live resolution of `before` to `after`, whose `changed` paths
 /// differ, and checks it against a cold resolution of `after`. Returns the
 /// cold resolution's rows of `caller` as (status, target path, symbol).

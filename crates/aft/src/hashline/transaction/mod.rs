@@ -123,6 +123,7 @@ pub struct TransactionEnvelope {
     pub files: Vec<FileOutcome>,
     /// Present exactly when the undo journal retained at least one record.
     pub op_id: Option<String>,
+    pub(crate) backup_skipped_reason: Option<crate::backup::BackupSkippedReason>,
     pub stop_reason: Option<&'static str>,
     pub registers_committed: bool,
     pub preview: bool,
@@ -331,6 +332,7 @@ pub fn preview_transaction(plan: TransactionPlan) -> TransactionEnvelope {
         complete: true,
         files,
         op_id: None,
+        backup_skipped_reason: None,
         stop_reason: None,
         registers_committed: false,
         preview: true,
@@ -395,12 +397,16 @@ pub fn execute_transaction(
     let success = applied > 0;
     let complete = applied == planned_primary && planned_primary > 0;
     let summary_text = summary_counts(&files);
+    let backup_skipped_reason = ctx
+        .backups
+        .skipped_reason_for_operation(ctx.session, &op_id, None);
 
     TransactionEnvelope {
         success,
         complete,
         files,
         op_id: journaled.then_some(op_id),
+        backup_skipped_reason,
         stop_reason,
         registers_committed,
         preview: false,
@@ -589,12 +595,7 @@ fn execute_mutate(
         file.remove_file,
         "hashline: pre-mutation backup",
     ) {
-        Ok(id) => {
-            if id.is_some() {
-                *journaled = true;
-            }
-            id
-        }
+        Ok(id) => id,
         Err(_) => {
             return StepExec::Stopped {
                 outcomes: vec![failed_outcome(
@@ -613,6 +614,18 @@ fn execute_mutate(
     if fault_is(ctx, ExecuteFault::BaselineDrift { step: step_index })
         || !baseline_matches(&file.canonical_path, &file.baseline_bytes)
     {
+        // A drift stop never wrote the file. Its snapshot must not become the
+        // user's next undo, or hide an earlier successful step's snapshot.
+        if backup_id.is_some() {
+            if let Err(error) = ctx.backups.try_discard_latest_operation_entry_for_path(
+                ctx.session,
+                op_id,
+                &file.canonical_path,
+            ) {
+                *journaled = true;
+                log::warn!("hashline: could not discard stale undo snapshot: {error}");
+            }
+        }
         return StepExec::Stopped {
             outcomes: vec![failed_outcome(
                 &file.canonical_path,
@@ -625,6 +638,7 @@ fn execute_mutate(
             reason: "hashline_baseline_drift",
         };
     }
+    *journaled |= backup_id.is_some();
 
     if fault_is(ctx, ExecuteFault::Write { step: step_index }) {
         return StepExec::Stopped {
@@ -1598,15 +1612,13 @@ mod tests {
         let plan = plan_transaction(&sections, &registers, true).unwrap();
 
         let mut backups = backup_store(&temp.path().join("backups"));
+        backups
+            .snapshot_with_op(SESSION, &a, "prior edit", Some("prior-op"))
+            .unwrap();
+        write_file(&a, b"external\n");
         let mut snapshots = SnapshotStore::new();
         let mut session_regs = RegisterStore::new();
-        let mut exec = ctx(
-            &mut backups,
-            &mut snapshots,
-            &mut session_regs,
-            true,
-            Some(ExecuteFault::BaselineDrift { step: 0 }),
-        );
+        let mut exec = ctx(&mut backups, &mut snapshots, &mut session_regs, true, None);
         let envelope = execute_transaction(plan, &mut exec);
         assert!(!envelope.success);
         assert!(!envelope.complete);
@@ -1622,11 +1634,14 @@ mod tests {
         assert_eq!(envelope.files[1].mutation_state, MutationState::Unmutated);
         assert_eq!(envelope.stop_reason, Some("hashline_baseline_drift"));
         assert!(envelope.summary_text.starts_with("0 of 2 files applied"));
-        // Journal runs before baseline recheck, so a drift stop after backup still
-        // yields op_id. Disk bytes remain unchanged (unmutated).
-        assert!(envelope.op_id.is_some());
-        assert_eq!(fs::read(&a).unwrap(), b"a\n");
+        assert_eq!(fs::read(&a).unwrap(), b"external\n");
         assert_eq!(fs::read(&b).unwrap(), b"b\n");
+        assert_eq!(
+            backups.restore_last_operation(SESSION).unwrap().op_id,
+            "prior-op"
+        );
+        assert!(envelope.op_id.is_none());
+        assert_eq!(fs::read(&a).unwrap(), b"a\n");
     }
 
     /// A8: partial failure keeps earlier applications under a shared op_id.
@@ -2301,12 +2316,12 @@ mod tests {
         assert_eq!(fs::read(&dest2).unwrap(), b"s2\n");
         assert!(!src2.exists());
         assert_eq!(
-            disabled.skipped_reason_after(SESSION, None),
+            envelope.backup_skipped_reason,
             Some(crate::backup::BackupSkippedReason::Disabled)
         );
     }
 
-    /// Journal entry created before a later failure still yields op_id.
+    /// A write failure after journaling keeps the entry and its undo ID.
     #[test]
     fn op_id_present_when_journal_entry_exists_before_failure() {
         let temp = tempfile::tempdir().unwrap();
@@ -2323,19 +2338,30 @@ mod tests {
         let mut backups = backup_store(&temp.path().join("backups"));
         let mut snapshots = SnapshotStore::new();
         let mut session_regs = RegisterStore::new();
-        // Drift after journal: backup succeeds, write never happens, op_id remains.
-        // Force drift by mutating after plan; backup still runs first in execute.
-        write_file(&a, b"changed\n");
-        let mut exec = ctx(&mut backups, &mut snapshots, &mut session_regs, true, None);
+        let mut exec = ctx(
+            &mut backups,
+            &mut snapshots,
+            &mut session_regs,
+            true,
+            Some(ExecuteFault::Write { step: 0 }),
+        );
         let envelope = execute_transaction(plan, &mut exec);
         assert!(!envelope.success);
         assert_eq!(
             envelope.files[0].classification,
-            FileClassification::FailedBaselineDrift
+            FileClassification::FailedWrite
         );
-        // Backup is taken before baseline recheck, so op_id must be present.
-        assert!(envelope.op_id.is_some());
-        assert_eq!(fs::read(&a).unwrap(), b"changed\n");
+        assert_eq!(fs::read(&a).unwrap(), b"a\n");
+        let op_id = envelope.op_id.expect("the write failure kept its journal");
+        let undo = backups.plan_last_operation(SESSION).unwrap();
+        assert_eq!(undo.op_id, op_id);
+        let restored = backups
+            .restore_planned_operation(SESSION, &undo, &mut |_| panic!("unexpected drift"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.op_id, op_id);
+        assert_eq!(restored.restored.len(), 1);
+        assert_eq!(fs::read(&a).unwrap(), b"a\n");
     }
 }
 

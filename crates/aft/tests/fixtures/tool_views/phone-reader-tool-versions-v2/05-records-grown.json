@@ -1,0 +1,1 @@
+{"result":{"calls":{"ck_test":{"completion":{"durationMs":61200,"exitCode":0,"outcome":"success","tail":[{"text":"test result: ok. 12 passed; 0 failed","tone":"muted"}]},"detail":false}},"loadingWindowMs":5000}}

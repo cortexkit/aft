@@ -57,13 +57,26 @@ pub fn build_text_document_position(
 /// Non-Windows absolute paths use the same RFC 3986 path-segment encoder so
 /// reserved delimiters cannot make an otherwise valid LSP URI unparsable.
 pub fn path_to_uri(path: &Path) -> Result<Url, LspError> {
-    let raw = path.to_string_lossy();
-    let normalized = normalize_windows_path_for_uri(&raw);
+    let conversion_error = || {
+        LspError::NotFound(format!(
+            "failed to convert '{}' to file URI",
+            path.display()
+        ))
+    };
+    #[cfg(unix)]
+    if path.is_absolute() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let uri = format!("file://{}", encode_uri_path(path.as_os_str().as_bytes()));
+        return Url::parse(&uri).map_err(|_| conversion_error());
+    }
+    let raw = path.to_str().ok_or_else(conversion_error)?;
+    let normalized = normalize_windows_path_for_uri(raw);
 
     if let Some((server, path)) = split_unc_path(&normalized) {
         let uri = format!(
             "file://{}/{}",
-            encode_uri_component(server),
+            encode_uri_component(server.as_bytes()),
             encode_windows_uri_path(path)
         );
         return Url::parse(&uri).map_err(|_| {
@@ -84,23 +97,13 @@ pub fn path_to_uri(path: &Path) -> Result<Url, LspError> {
         });
     }
 
+    #[cfg(not(unix))]
     if normalized.starts_with('/') {
-        // RFC 3986 brackets are authority delimiters, not path characters.
-        // Building the URI ourselves keeps every LSP payload parseable while
-        // preserving legal path punctuation such as parentheses.
-        let uri = format!("file://{}", encode_uri_path(&normalized));
-        return Url::parse(&uri).map_err(|_| {
-            LspError::NotFound(format!(
-                "failed to convert '{}' to file URI",
-                path.display()
-            ))
-        });
+        let uri = format!("file://{}", encode_uri_path(normalized.as_bytes()));
+        return Url::parse(&uri).map_err(|_| conversion_error());
     }
 
-    Err(LspError::NotFound(format!(
-        "failed to convert '{}' to file URI",
-        path.display()
-    )))
+    Err(conversion_error())
 }
 
 /// Convert a `file://` URL back into a filesystem path.
@@ -197,8 +200,8 @@ fn is_ascii_drive_prefix(path: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
-fn encode_uri_component(value: &str) -> String {
-    value.bytes().fold(String::new(), |mut encoded, byte| {
+fn encode_uri_component(value: &[u8]) -> String {
+    value.iter().fold(String::new(), |mut encoded, &byte| {
         if byte.is_ascii_alphanumeric()
             || matches!(
                 byte,
@@ -228,15 +231,17 @@ fn encode_uri_component(value: &str) -> String {
     })
 }
 
-fn encode_uri_path(path: &str) -> String {
-    path.split('/')
+fn encode_uri_path(path: &[u8]) -> String {
+    // Encode brackets and other delimiters without changing filename bytes or
+    // escaping legal path punctuation such as parentheses.
+    path.split(|&byte| byte == b'/')
         .map(encode_uri_component)
         .collect::<Vec<_>>()
         .join("/")
 }
 
 fn encode_windows_uri_path(path: &str) -> String {
-    encode_uri_path(&path.replace('\\', "/"))
+    encode_uri_path(path.replace('\\', "/").as_bytes())
 }
 
 /// Percent-decode a single URI path segment into one filesystem path component.
@@ -352,6 +357,27 @@ mod tests {
 
         assert_eq!(uri.as_str(), "file:///tmp/aft-lsp-position.rs");
         assert_eq!(url_to_path(&uri).expect("path"), PathBuf::from(path));
+    }
+
+    // macOS file systems refuse names that are not valid UTF-8 (EILSEQ), so
+    // such a file can't exist there; Linux and the BSDs allow any bytes.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn distinct_unix_filename_bytes_round_trip_through_lsp_uris() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join(OsStr::from_bytes(b"file-\xff.ts"));
+        let utf8 = dir.path().join("file-\u{fffd}.ts");
+        std::fs::write(&raw, "raw").unwrap();
+        std::fs::write(&utf8, "utf8").unwrap();
+
+        let raw_uri = uri_for_path(&raw).unwrap();
+        let utf8_uri = uri_for_path(&utf8).unwrap();
+        assert_ne!(raw_uri, utf8_uri);
+        assert_eq!(uri_to_path(&raw_uri), Some(normalize_lookup_path(&raw)));
+        assert_eq!(uri_to_path(&utf8_uri), Some(normalize_lookup_path(&utf8)));
     }
 
     // The drive-letter and UNC decode branches below run on every platform

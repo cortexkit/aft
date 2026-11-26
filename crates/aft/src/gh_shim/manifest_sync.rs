@@ -479,7 +479,7 @@ pub(crate) fn start(connection_file: PathBuf) -> Option<Worker> {
     }
     let (stop, stopped) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        if gh_shim_enabled_from_config_doc(&read_user_config_doc().unwrap_or_default())
+        if enable_gate::gh_shim_enabled_from_config_doc(&read_user_config_doc().unwrap_or_default())
             == Some(false)
         {
             return;

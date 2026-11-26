@@ -13,7 +13,7 @@ pub struct HeadingAnchor {
 
 /// Trait for language-specific symbol resolution.
 ///
-/// S02 implements this with tree-sitter parsing via `TreeSitterProvider`.
+/// `TreeSitterProvider` implements this by parsing source with Tree-sitter.
 pub trait LanguageProvider: Send + Sync {
     /// Resolve a symbol by name within a file. Returns all matches.
     fn resolve_symbol(&self, file: &Path, name: &str) -> Result<Vec<SymbolMatch>, AftError>;

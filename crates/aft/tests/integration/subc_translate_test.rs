@@ -354,14 +354,22 @@ fn file_urls_decode_to_local_paths_in_translate() {
     // decoder must agree with (decodeURIComponent would keep the whole string
     // encoded on the malformed %ZZ, diverging from this).
     let malformed = resolve_path_from_project_root(root, "file:///proj/%2e%2e/%ZZ/../secret");
-    assert!(
-        !malformed.starts_with(std::path::Path::new(if cfg!(windows) {
-            "C:\\proj"
-        } else {
-            "/proj"
-        })),
-        "malformed-escape traversal must resolve OUT of /proj: {malformed:?}"
+    // Translation leaves parent components intact so the access check can
+    // follow symlinks before deciding whether the resolved path is in scope.
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = aft::context::AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        aft::config::Config {
+            project_root: Some(root.into()),
+            restrict_to_project_root: true,
+            storage_dir: Some(temp.path().join("storage")),
+            ..Default::default()
+        },
     );
+    let denied = ctx
+        .validate_read_path("url-traversal", "test-session", &malformed)
+        .expect_err("malformed-escape traversal must be denied outside /proj");
+    assert_eq!(denied.data["code"], "path_outside_root", "{denied:?}");
 
     // A non-local authority is not a local path: left as-is on unix (becomes
     // a relative path under the root, matching the old rejected behavior)

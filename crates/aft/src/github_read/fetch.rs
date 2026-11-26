@@ -12,7 +12,11 @@ use super::resource::{GithubResource, GithubResourceKind};
 
 const ISSUE_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,url";
 const PR_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,files,reviews,baseRefName,headRefName,reviewDecision,url";
-const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100) { nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { id author { login } body createdAt updatedAt isMinimized path line originalLine } } } } } } }";
+const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!, $cursor: String) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { id author { login } body createdAt updatedAt isMinimized path line originalLine } } } } } } }";
+/// Review pages (100 reviews each) fetched for inline comments. Past this the
+/// rendered document says later reviews' inline comments are missing.
+const MAX_REVIEW_PAGES: usize = 10;
+const REVIEWS_PER_PAGE: usize = 100;
 
 /// Request context passed to a structured GitHub fetcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,25 +296,35 @@ impl<R> GhCliFetcher<R> {
 
 impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
     fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
-        let json =
-            self.structured_json(&request.working_directory, &gh_view_args(&request.resource))?;
+        let json = self.structured_json(
+            &request.working_directory,
+            &gh_view_args(&request.resource),
+            request.resource.kind.data_label(),
+        )?;
         let mut document = normalize_document(&request.resource, &json)?;
         if request.resource.kind == GithubResourceKind::PullRequest {
-            let review_json = self.structured_json(
-                &request.working_directory,
-                &gh_pr_review_comments_args(&request.resource, &document.repository)?,
-            )?;
-            let review_document = normalize_document(&request.resource, &review_json)?;
-            document.review_comment_sections = review_document.review_comment_sections;
+            let (sections, reviews_fetched) =
+                self.fetch_review_comment_sections(request, &document.repository)?;
+            document.review_comment_sections = sections;
+            document.review_pages_cut_after = reviews_fetched;
             // Thread lookup is independent: a failed lookup must not hide comments.
             document.review_threads = self
                 .fetch_review_threads(request, &document.repository)
                 .ok();
         }
-        let timeline_json = self.structured_json(
+        let (stdout, capped) = self.bounded_structured_output(
             &request.working_directory,
             &gh_timeline_args(&request.resource, &document.repository)?,
         )?;
+        let timeline_json = if capped {
+            // `gh` streams the slurped pages as one JSON array, so the pages
+            // that arrived whole before the ceiling are still usable; the
+            // rendered document names the cut.
+            document.timeline_cut_at_bytes = Some(MAX_STRUCTURED_BYTES);
+            Value::Array(complete_leading_array_elements(&stdout))
+        } else {
+            parse_structured_json(&stdout)?
+        };
         document.timeline = normalize_timeline_events(&timeline_json);
         Ok(document)
     }
@@ -324,14 +338,51 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
 }
 
 impl<R: GhCommandRunner> GhCliFetcher<R> {
-    pub(super) fn structured_json(
+    /// Inline review comments, one section per review, following the review
+    /// connection's pages up to [`MAX_REVIEW_PAGES`]. The second value is the
+    /// number of reviews fetched when more pages were left unfetched.
+    fn fetch_review_comment_sections(
+        &self,
+        request: &GithubFetchRequest,
+        repository: &str,
+    ) -> Result<(Vec<super::model::GithubReviewCommentSection>, Option<usize>), GithubReadError>
+    {
+        let mut sections = Vec::new();
+        let mut cursor: Option<String> = None;
+        for page in 0..MAX_REVIEW_PAGES {
+            let mut args = gh_pr_review_comments_args(&request.resource, repository)?;
+            if let Some(cursor) = &cursor {
+                args.extend(["-f".to_string(), format!("cursor={cursor}")]);
+            }
+            let json = self.structured_json(&request.working_directory, &args, "review comment")?;
+            sections.extend(normalize_document(&request.resource, &json)?.review_comment_sections);
+            let next = json
+                .pointer("/data/repository/pullRequest/reviews/pageInfo")
+                .filter(|info| info.get("hasNextPage").and_then(Value::as_bool) == Some(true))
+                .and_then(|info| info.get("endCursor").and_then(Value::as_str))
+                .filter(|next| !next.is_empty() && cursor.as_deref() != Some(*next));
+            match next {
+                None => break,
+                Some(_) if page + 1 == MAX_REVIEW_PAGES => {
+                    return Ok((sections, Some(MAX_REVIEW_PAGES * REVIEWS_PER_PAGE)));
+                }
+                Some(next) => cursor = Some(next.to_string()),
+            }
+        }
+        Ok((sections, None))
+    }
+
+    /// Run one structured `gh` command, reading at most
+    /// [`MAX_STRUCTURED_BYTES`] of its output. Returns the output and whether
+    /// it reached that ceiling.
+    fn bounded_structured_output(
         &self,
         working_directory: &std::path::Path,
         args: &[String],
-    ) -> Result<Value, GithubReadError> {
-        let result = self
+    ) -> Result<(Vec<u8>, bool), GithubReadError> {
+        let (result, capped) = self
             .runner
-            .run(working_directory, args)
+            .run_bounded(working_directory, args, MAX_STRUCTURED_BYTES)
             .map_err(|error| match error {
                 GhCommandError::NotFound => GithubReadError::GithubCliMissing,
                 GhCommandError::Other(message) => GithubReadError::FetchFailed(format!(
@@ -339,30 +390,83 @@ impl<R: GhCommandRunner> GhCliFetcher<R> {
                     redact_gh_error(&message)
                 )),
             })?;
-        if !result.success {
+        // A process stopped at the ceiling need not exit successfully; the
+        // caller reports the ceiling instead of a misleading `gh` failure.
+        if !result.success && !capped {
             return Err(GithubReadError::FetchFailed(redact_gh_error(
                 &best_gh_error(&result.stderr, &result.stdout),
             )));
         }
-        let json: Value = serde_json::from_slice(&result.stdout).map_err(|error| {
-            GithubReadError::InvalidStructuredResponse(format!(
-                "GitHub CLI returned invalid structured JSON: {error}"
-            ))
-        })?;
-        if json.get("success").and_then(Value::as_bool) == Some(false) {
-            let underlying = json
-                .get("error")
-                .or_else(|| json.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("GitHub declined the resource request");
-            return Err(GithubReadError::FetchFailed(redact_gh_error(underlying)));
-        }
-        if let Some(errors) = json.get("errors") {
-            return Err(GithubReadError::FetchFailed(redact_gh_error(
-                &errors.to_string(),
+        Ok((result.stdout, capped))
+    }
+
+    /// Run a structured `gh` command whose output is one JSON document.
+    /// `data_label` names the data in the error when the output is too large
+    /// to parse ("issue", "pull request", "review comment").
+    pub(super) fn structured_json(
+        &self,
+        working_directory: &std::path::Path,
+        args: &[String],
+        data_label: &str,
+    ) -> Result<Value, GithubReadError> {
+        let (stdout, capped) = self.bounded_structured_output(working_directory, args)?;
+        if capped {
+            return Err(GithubReadError::FetchFailed(format!(
+                "GitHub {data_label} data reached the {MAX_STRUCTURED_BYTES}-byte fetch ceiling; no document returned."
             )));
         }
-        Ok(json)
+        parse_structured_json(&stdout)
+    }
+}
+
+/// Most bytes AFT reads from one structured `gh` command. The read stops here
+/// and `gh` is stopped, so a long-lived issue cannot make AFT buffer and parse
+/// an unbounded response.
+pub const MAX_STRUCTURED_BYTES: usize = 4 * 1024 * 1024;
+
+fn parse_structured_json(stdout: &[u8]) -> Result<Value, GithubReadError> {
+    let json: Value = serde_json::from_slice(stdout).map_err(|error| {
+        GithubReadError::InvalidStructuredResponse(format!(
+            "GitHub CLI returned invalid structured JSON: {error}"
+        ))
+    })?;
+    if json.get("success").and_then(Value::as_bool) == Some(false) {
+        let underlying = json
+            .get("error")
+            .or_else(|| json.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("GitHub declined the resource request");
+        return Err(GithubReadError::FetchFailed(redact_gh_error(underlying)));
+    }
+    if let Some(errors) = json.get("errors") {
+        return Err(GithubReadError::FetchFailed(redact_gh_error(
+            &errors.to_string(),
+        )));
+    }
+    Ok(json)
+}
+
+/// The whole array or object elements at the start of a JSON array whose
+/// text was cut off (`[{...},{...},{..`). The element the cut fell inside is
+/// dropped. Only arrays and objects are kept: a cut scalar such as a number
+/// could still parse, as the wrong value.
+fn complete_leading_array_elements(bytes: &[u8]) -> Vec<Value> {
+    let mut elements = Vec::new();
+    let Some(mut rest) = bytes.trim_ascii_start().strip_prefix(b"[") else {
+        return elements;
+    };
+    loop {
+        rest = rest.trim_ascii_start();
+        let mut values = serde_json::Deserializer::from_slice(rest).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) if value.is_array() || value.is_object() => elements.push(value),
+            _ => return elements,
+        }
+        rest = rest[values.byte_offset()..].trim_ascii_start();
+        match rest.strip_prefix(b",") {
+            Some(after) => rest = after,
+            None => return elements,
+        }
     }
 }
 
@@ -663,6 +767,194 @@ mod tests {
         assert!(short_review_args
             .iter()
             .any(|argument| argument.starts_with("query=query AftReadPullRequestReviewComments")));
+    }
+
+    fn issue_request() -> GithubFetchRequest {
+        GithubFetchRequest {
+            resource: GithubResource {
+                kind: GithubResourceKind::Issue,
+                number: 1,
+                repository: None,
+                comment_selector: None,
+                diff_path: None,
+            },
+            working_directory: PathBuf::from("/fixture"),
+        }
+    }
+
+    fn ok_output(stdout: Vec<u8>) -> Result<GhCommandOutput, GhCommandError> {
+        Ok(GhCommandOutput {
+            success: true,
+            stdout,
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_timeline_past_the_fetch_ceiling_keeps_whole_pages_and_names_the_cut() {
+        let event = json!({
+            "event": "labeled",
+            "created_at": "2026-09-03T05:05:00Z",
+            "actor": { "login": "maintainer" },
+            "label": { "name": "bug" },
+            "padding": "p".repeat(500),
+        });
+        let page = serde_json::to_string(&vec![event; 100]).unwrap();
+        // `gh api --paginate --slurp` streams the pages as one JSON array.
+        let pages = 100;
+        let timeline = format!("[{}]", vec![page.as_str(); pages].join(","));
+        assert!(timeline.len() > MAX_STRUCTURED_BYTES);
+        let runner = FixtureRunner::default();
+        *runner.output.lock().unwrap() = vec![
+            ok_output(
+                serde_json::to_vec(&json!({
+                    "number": 1,
+                    "title": "fixture",
+                    "url": "https://github.com/owner/repo/issues/1"
+                }))
+                .unwrap(),
+            ),
+            ok_output(timeline.into_bytes()),
+        ];
+        let document = GhCliFetcher::new(runner).fetch(&issue_request()).unwrap();
+        assert_eq!(document.timeline_cut_at_bytes, Some(MAX_STRUCTURED_BYTES));
+        assert!(document.has_fetch_gap());
+        let kept = document.timeline.len();
+        assert!(kept > 0 && kept < pages * 100 && kept % 100 == 0, "{kept}");
+        assert!(crate::github_read::render_document(&document).contains(
+            "Timeline incomplete: fetched 4194304 bytes, reaching the 4194304-byte ceiling; later events are not shown."
+        ));
+    }
+
+    #[test]
+    fn issue_data_past_the_fetch_ceiling_is_refused_not_parsed() {
+        let runner = FixtureRunner::default();
+        *runner.output.lock().unwrap() = vec![ok_output(
+            serde_json::to_vec(&json!({
+                "number": 1,
+                "title": "fixture",
+                "body": "b".repeat(MAX_STRUCTURED_BYTES),
+                "url": "https://github.com/owner/repo/issues/1"
+            }))
+            .unwrap(),
+        )];
+        let error = GhCliFetcher::new(runner)
+            .fetch(&issue_request())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "GitHub issue data reached the 4194304-byte fetch ceiling; no document returned."
+        );
+    }
+
+    #[test]
+    fn cut_array_text_keeps_only_whole_leading_elements() {
+        assert_eq!(
+            complete_leading_array_elements(b" [[1],{\"a\":2}, [3, 4"),
+            vec![json!([1]), json!({"a": 2})]
+        );
+        assert!(complete_leading_array_elements(b"[12").is_empty());
+        assert!(complete_leading_array_elements(b"{}").is_empty());
+    }
+
+    fn pr_request() -> GithubFetchRequest {
+        GithubFetchRequest {
+            resource: GithubResource {
+                kind: GithubResourceKind::PullRequest,
+                ..issue_request().resource
+            },
+            working_directory: PathBuf::from("/fixture"),
+        }
+    }
+
+    /// One page of the review-comment query: one review by `author` holding
+    /// one inline comment `comment`.
+    fn review_page(author: &str, comment: &str, next: Option<&str>) -> Vec<u8> {
+        serde_json::to_vec(&json!({"data": {"repository": {
+            "nameWithOwner": "owner/repo",
+            "pullRequest": {"number": 1, "reviews": {
+                "pageInfo": {"hasNextPage": next.is_some(), "endCursor": next},
+                "nodes": [{
+                    "author": {"login": author},
+                    "body": "",
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-09-03T05:05:00Z",
+                    "comments": {"totalCount": 1, "nodes": [{
+                        "id": comment,
+                        "author": {"login": author},
+                        "body": comment,
+                        "createdAt": "2026-09-03T05:05:00Z",
+                        "isMinimized": false,
+                        "path": "src/lib.rs",
+                        "line": 1
+                    }]}
+                }]
+            }}
+        }}}))
+        .unwrap()
+    }
+
+    fn pr_outputs(review_pages: Vec<Vec<u8>>) -> FixtureRunner {
+        let runner = FixtureRunner::default();
+        let mut outputs = vec![ok_output(
+            serde_json::to_vec(&json!({
+                "number": 1,
+                "title": "fixture",
+                "url": "https://github.com/owner/repo/pull/1"
+            }))
+            .unwrap(),
+        )];
+        outputs.extend(review_pages.into_iter().map(ok_output));
+        // Thread state is optional; a failed lookup is ignored.
+        outputs.push(Err(GhCommandError::Other("no thread state".to_string())));
+        outputs.push(ok_output(b"[]".to_vec()));
+        *runner.output.lock().unwrap() = outputs;
+        runner
+    }
+
+    #[test]
+    fn inline_comments_on_later_review_pages_are_fetched() {
+        let runner = pr_outputs(vec![
+            review_page("first-reviewer", "on page one", Some("cursor-1")),
+            review_page("second-reviewer", "on page two", None),
+        ]);
+        let fetcher = GhCliFetcher::new(runner);
+        let document = fetcher.fetch(&pr_request()).unwrap();
+        let comments: Vec<_> = document
+            .review_comment_sections
+            .iter()
+            .flat_map(|section| section.comments.iter().map(|comment| comment.body.as_str()))
+            .collect();
+        assert_eq!(comments, ["on page one", "on page two"]);
+        assert_eq!(document.review_pages_cut_after, None);
+        assert!(!document.has_fetch_gap());
+        let calls = fetcher.runner.calls.lock().unwrap();
+        assert!(calls[2]
+            .1
+            .iter()
+            .any(|argument| argument == "cursor=cursor-1"));
+    }
+
+    #[test]
+    fn review_pages_past_the_page_budget_are_named_as_missing() {
+        let pages = (0..MAX_REVIEW_PAGES)
+            .map(|page| {
+                review_page(
+                    &format!("reviewer-{page}"),
+                    &format!("comment {page}"),
+                    Some(&format!("cursor-{page}")),
+                )
+            })
+            .collect();
+        let document = GhCliFetcher::new(pr_outputs(pages))
+            .fetch(&pr_request())
+            .unwrap();
+        assert_eq!(document.review_comment_sections.len(), MAX_REVIEW_PAGES);
+        assert_eq!(document.review_pages_cut_after, Some(1000));
+        assert!(document.has_fetch_gap());
+        assert!(crate::github_read::render_document(&document).contains(
+            "Review comments incomplete: only the first 1000 reviews were fetched; inline comments on later reviews are not shown."
+        ));
     }
 
     #[test]

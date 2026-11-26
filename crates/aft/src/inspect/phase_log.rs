@@ -187,6 +187,8 @@ impl InspectPhaseLog {
     }
 
     /// Reads the two formatter inputs from the single per-call record set.
+    /// Entries keep the order their phases started, not the order they
+    /// finished: completion stamps a record in place without moving it.
     pub fn terminal_inputs(&self) -> (Vec<InspectPhaseEntry>, bool) {
         let state = self.state.lock();
         let entries = state
@@ -291,7 +293,8 @@ pub fn inspect_phase_log_for_request(request_id: &str) -> Option<InspectPhaseLog
 ///
 /// Phases are counted, not listed: a project with two dozen language servers
 /// completes `lsp_start` two dozen times, and naming each one buried the
-/// line. Each phase appears once, in first-completed order, with its count
+/// line. Each phase appears once, in the order it first started (see
+/// [`InspectPhaseLog::terminal_inputs`]), with its count
 /// and a per-producer (or per-category) breakdown, largest first:
 /// `lsp_start ×25 (typescript 12, bash 6, rust 4, python 2, biome 1)`.
 pub fn format_wait_text(entries: &[InspectPhaseEntry], blocking_waited: bool) -> String {
@@ -331,7 +334,7 @@ pub fn collapse_phase_entries(entries: &[InspectPhaseEntry]) -> Vec<String> {
         .into_iter()
         .map(|(id, mut labels, count)| {
             // `sort_by` is stable, so labels with equal counts keep the
-            // order in which their phases first completed.
+            // order in which their phases first started.
             labels.sort_by(|left, right| right.1.cmp(&left.1));
             let id = id.as_str();
             match (count, labels.as_slice()) {
@@ -409,6 +412,26 @@ mod tests {
             format_wait_text(&entries, true),
             "waited: yes; completed: lsp_start ×7 (typescript 3, bash 2, rust 1, biome 1), \
              lsp_quiescence (rust), tier2_rescan ×2 (dead_code 1, duplicates 1)"
+        );
+    }
+
+    #[test]
+    fn wait_text_lists_phases_in_start_order_whatever_order_they_finish() {
+        let log = InspectPhaseLog::for_request("inspect-log-start-order");
+        let first = log.start(InspectPhaseEntry::category(
+            InspectPhaseId::StatVerification,
+            InspectCategory::DeadCode,
+        ));
+        let second = log.start(InspectPhaseEntry::category(
+            InspectPhaseId::Tier2Rescan,
+            InspectCategory::Duplicates,
+        ));
+        second.complete();
+        first.complete();
+        let (entries, waited) = log.terminal_inputs();
+        assert_eq!(
+            format_wait_text(&entries, waited),
+            "waited: no; completed: stat_verification (dead_code), tier2_rescan (duplicates)"
         );
     }
 

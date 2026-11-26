@@ -2433,14 +2433,18 @@ pub fn note_tool_call_trace(
             detail.push_str(" edit_phases=");
             detail.push_str(edit_phases);
         }
+        let queue_detail = phases
+            .queue_observation
+            .map_or_else(String::new, |observation| format!(" {observation}"));
         let message = format!(
-            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={} setup={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={}{} root={}",
+            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={}{} setup={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={}{} root={}",
             name,
             session,
             channel,
             corr,
             duration_millis_u64(phases.total),
             slow_phase_time(phases.queue, None),
+            queue_detail,
             slow_phase_time(phases.setup, phases.cpu.setup),
             slow_phase_time(phases.translate, phases.cpu.translate),
             slow_phase_time(phases.execute, phases.cpu.execute),
@@ -3551,6 +3555,7 @@ pub mod tests {
         ToolCallPhaseDurations {
             cpu: crate::tool_progress::ToolCallPhaseCpu::default(),
             queue: Duration::ZERO,
+            queue_observation: None,
             setup: Duration::ZERO,
             translate: Duration::ZERO,
             execute: Duration::from_millis(120),

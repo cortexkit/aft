@@ -633,7 +633,15 @@ impl CheckpointStore {
         files: Vec<PathBuf>,
         backup_store: &BackupStore,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, Some(backup_store), None)
+        let explicit_request = !files.is_empty();
+        self.create_impl(
+            session,
+            name,
+            files,
+            Some(backup_store),
+            None,
+            explicit_request,
+        )
     }
 
     /// Checkpoint exactly `files`, with no fallback to the backup store's
@@ -645,7 +653,19 @@ impl CheckpointStore {
         name: &str,
         files: Vec<PathBuf>,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, None, None)
+        let explicit_request = !files.is_empty();
+        self.create_impl(session, name, files, None, None, explicit_request)
+    }
+
+    /// Snapshot a previously authorized tracked set without reacquiring the
+    /// backup store. An all-unreadable tracked set still makes an empty checkpoint.
+    pub(crate) fn create_for_tracked_files(
+        &mut self,
+        session: &str,
+        name: &str,
+        files: Vec<PathBuf>,
+    ) -> Result<CheckpointInfo, AftError> {
+        self.create_impl(session, name, files, None, None, false)
     }
 
     pub(crate) fn create_from_captures(
@@ -656,7 +676,15 @@ impl CheckpointStore {
         backup_store: &BackupStore,
         captures: &mut HashMap<PathBuf, CapturedRegularFile>,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, Some(backup_store), Some(captures))
+        let explicit_request = !files.is_empty();
+        self.create_impl(
+            session,
+            name,
+            files,
+            Some(backup_store),
+            Some(captures),
+            explicit_request,
+        )
     }
 
     fn create_impl(
@@ -666,12 +694,12 @@ impl CheckpointStore {
         files: Vec<PathBuf>,
         backup_store: Option<&BackupStore>,
         mut captures: Option<&mut HashMap<PathBuf, CapturedRegularFile>>,
+        explicit_request: bool,
     ) -> Result<CheckpointInfo, AftError> {
         let _mutation_lock = self.acquire_mutation_lock()?;
         validate_checkpoint_name(name)?;
         self.run_process_maintenance_once_locked()?;
         self.hydrate_session_locked(session)?;
-        let explicit_request = !files.is_empty();
         let file_list = match backup_store {
             Some(backup_store) if files.is_empty() => backup_store.try_tracked_files(session)?,
             _ => files,
@@ -2325,6 +2353,8 @@ fn restore_paths_atomically(
         {
             if current.matches(stored) {
                 unchanged.push(path.clone());
+                crate::tool_progress::report();
+                continue;
             }
         }
         pre_restore_snapshot.insert(path.clone(), current);
@@ -2333,7 +2363,10 @@ fn restore_paths_atomically(
 
     let mut restored_paths: Vec<PathBuf> = Vec::new();
     let mut created_dirs: Vec<PathBuf> = Vec::new();
-    for path in paths {
+    for path in paths
+        .iter()
+        .filter(|path| pre_restore_snapshot.contains_key(*path))
+    {
         let snapshot =
             checkpoint
                 .file_contents
@@ -2412,14 +2445,31 @@ fn write_restored_file(
                     message: format!("failed to replace symlink with regular file: {error}"),
                 })?;
             }
-            fs::write(path, bytes).map_err(|error| AftError::IoError {
-                path: path.display().to_string(),
-                message: format!("failed to restore checkpoint file contents: {error}"),
-            })?;
-            restore_checkpoint_permissions(path, snapshot).map_err(|error| AftError::IoError {
-                path: path.display().to_string(),
-                message: format!("failed to restore checkpoint file permissions: {error}"),
-            })
+            let mode = snapshot
+                .metadata
+                .as_ref()
+                .and_then(checkpoint_mode)
+                .or(snapshot.mode);
+            let write =
+                crate::edit::atomic_write_source_with_mode(path, bytes, mode).map_err(|error| {
+                    AftError::IoError {
+                        path: path.display().to_string(),
+                        message: format!("failed to restore checkpoint file: {error}"),
+                    }
+                })?;
+            for warning in write.warnings {
+                crate::slog_warn!("checkpoint restore {}: {warning}", path.display());
+            }
+            #[cfg(not(unix))]
+            if let Some(metadata) = &snapshot.metadata {
+                fs::set_permissions(path, metadata.permissions()).map_err(|error| {
+                    AftError::IoError {
+                        path: path.display().to_string(),
+                        message: format!("failed to restore checkpoint file permissions: {error}"),
+                    }
+                })?;
+            }
+            Ok(())
         }
         CheckpointFileKind::Symlink {
             target,
@@ -2435,27 +2485,6 @@ fn write_restored_file(
             })
         }
     }
-}
-
-fn restore_checkpoint_permissions(path: &Path, snapshot: &CheckpointFile) -> io::Result<()> {
-    if let Some(metadata) = &snapshot.metadata {
-        return fs::set_permissions(path, metadata.permissions());
-    }
-    restore_checkpoint_mode(path, snapshot.mode)
-}
-
-#[cfg(unix)]
-fn restore_checkpoint_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(mode) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restore_checkpoint_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
-    Ok(())
 }
 
 fn create_parent_dirs(path: &Path, created_dirs: &mut Vec<PathBuf>) -> Result<(), AftError> {
@@ -2771,7 +2800,14 @@ mod tests {
         assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
         fs::write(&path, "edited").unwrap();
         store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
-        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
+        let events = crate::durability::take();
+        // Sync the restored source temp file and, on Unix, its parent
+        // directory after the rename. Restore does not sync checkpoint storage.
+        assert_eq!(
+            crate::durability::sync_count(&events),
+            if cfg!(unix) { 2 } else { 1 },
+            "{events:?}"
+        );
         assert_eq!(fs::read_to_string(path).unwrap(), "original");
     }
 

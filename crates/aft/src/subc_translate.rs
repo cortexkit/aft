@@ -267,6 +267,17 @@ pub(crate) fn normalize_path_arguments(
             normalize_path_alias_pair(&mut map, "toPath", "toFile", false)?;
         }
         "safety" => normalize_path_alias_pair(&mut map, "path", "filePath", false)?,
+        "grep" if map.get("path").is_some_and(Value::is_array) => {
+            let paths = map["path"].as_array().expect("checked by the guard");
+            if paths.is_empty() {
+                return Err(invalid_request(
+                    "grep: 'path' must contain at least one root",
+                ));
+            }
+            for path in paths {
+                path_string(Some(path), "path")?;
+            }
+        }
         "grep" | "search" | "conflicts" => {
             // An empty-string or null `path` on these optional-path tools means
             // the field was not supplied; strip it so it cannot trip the
@@ -1016,37 +1027,14 @@ pub fn resolve_path_from_project_root(project_root: &Path, target: &str) -> Path
         .unwrap_or(std::borrow::Cow::Borrowed(target));
     let expanded = expand_tilde(&target);
     let path = Path::new(expanded.as_ref());
-    let joined = if path.is_absolute() {
+    // Keep parent components for filesystem resolution after following symlinks.
+    // Revision reads normalize their path separately for the Git tree lookup.
+    if path.is_absolute() {
         path.to_path_buf()
     } else {
-        project_root.join(path)
-    };
-    normalize_lexically(&joined)
-}
-
-fn normalize_lexically(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                    out.pop();
-                } else if !out.has_root() {
-                    out.push(component.as_os_str());
-                }
-            }
-            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
-                out.push(component.as_os_str());
-            }
-        }
-    }
-    if out.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        out
+        // Missing files may never be canonicalized. Build the relative tail
+        // with native separators without resolving its parent components.
+        project_root.join(path.components().collect::<PathBuf>())
     }
 }
 
@@ -2005,12 +1993,28 @@ fn translate_grep(args: Value, project_root: &Path) -> Result<Translated, Transl
     }
     if let Some(path_val) = map_in.get("path") {
         if !is_empty_param(path_val) {
-            if let Some(path_str) = path_val.as_str() {
-                out.insert(
-                    "path".to_string(),
-                    Value::String(resolve_grep_path_arg(project_root, path_str)),
-                );
-            }
+            let path = if let Some(path_str) = path_val.as_str() {
+                resolve_grep_path_arg(project_root, path_str)
+            } else if let Some(paths) = path_val.as_array() {
+                Value::Array(
+                    paths
+                        .iter()
+                        .map(|path| {
+                            let path = path_string(Some(path), "path")?;
+                            Ok(Value::String(
+                                resolve_path_from_project_root(project_root, path)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, TranslateError>>()?,
+                )
+            } else {
+                return Err(invalid_request(
+                    "grep: 'path' must be a string or an array of strings",
+                ));
+            };
+            out.insert("path".to_string(), path);
         }
     }
     // No `max_results`: the grep command sizes its own pages (a 40-line
@@ -2437,28 +2441,32 @@ pub(crate) fn split_search_path_arg(project_root: &Path, raw: &str) -> Vec<Strin
         return vec![raw.to_string()];
     }
 
-    let existing = fragments
+    if fragments
         .iter()
-        .filter(|fragment| search_path_exists(project_root, fragment))
-        .map(|fragment| (*fragment).to_string())
-        .collect::<Vec<_>>();
-    if existing.is_empty() {
-        vec![raw.to_string()]
+        .any(|fragment| search_path_exists(project_root, fragment))
+    {
+        // Reaching one root is not a complete search if another is missing.
+        fragments.into_iter().map(str::to_owned).collect()
     } else {
-        existing
+        vec![raw.to_string()]
     }
 }
 
-fn resolve_grep_path_arg(project_root: &Path, raw: &str) -> String {
-    split_search_path_arg(project_root, raw)
-        .iter()
-        .map(|target| {
-            resolve_path_from_project_root(project_root, target)
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn resolve_grep_path_arg(project_root: &Path, raw: &str) -> Value {
+    // Native grep accepts an array, so spaces in resolved root names cannot
+    // be confused with the separators in the original argument.
+    Value::Array(
+        split_search_path_arg(project_root, raw)
+            .into_iter()
+            .map(|target| {
+                Value::String(
+                    resolve_path_from_project_root(project_root, &target)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn translate_search(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
@@ -5152,9 +5160,7 @@ mod audit_regressions {
 }
 
 #[cfg(test)]
-mod lexical_parent_tests {
-    use super::*;
-
+mod hashline_translation_tests {
     #[test]
     fn hashline_native_arguments_are_consumed_without_a_temporary_map_clone() {
         let source = include_str!("subc_translate.rs");
@@ -5167,23 +5173,6 @@ mod lexical_parent_tests {
             .unwrap();
         assert!(branch.contains("let Value::Object(mut args) = translation.to_native_args()"));
         assert!(!branch.contains(".cloned()"));
-    }
-
-    #[test]
-    fn lexical_normalization_preserves_leading_parents() {
-        assert_eq!(
-            normalize_lexically(Path::new("../../x")),
-            PathBuf::from("../../x")
-        );
-        assert_eq!(
-            normalize_lexically(Path::new("a/../../../x")),
-            PathBuf::from("../../x")
-        );
-        assert_eq!(normalize_lexically(Path::new("a/../x")), PathBuf::from("x"));
-        assert_eq!(
-            normalize_lexically(Path::new("/../../x")),
-            PathBuf::from("/x")
-        );
     }
 }
 

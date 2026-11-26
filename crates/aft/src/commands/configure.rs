@@ -17,7 +17,7 @@ use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{
     resolve_lsp_binary, resolve_server_binary, servers_for_file_in_pass, BiomeSelectionMemo,
-    ServerKind,
+    ServerDef, ServerKind,
 };
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
@@ -353,8 +353,7 @@ fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBu
 /// Nothing then ever builds the matcher, and the backend keeps the only plan
 /// it can make without one: `.git` alone.
 ///
-/// `ensure_project_watcher` runs on the subc frame loop, which must never walk
-/// a project tree, so it does not call this. Its callers queue this as a
+/// The subc bind loop must never walk a project tree. It queues this as a
 /// maintenance job on the root's actor instead (see
 /// `ignore_rules_load_pending`); publishing the matcher bumps the generation
 /// and the running backend re-derives from it.
@@ -383,9 +382,10 @@ pub(crate) fn load_ignore_rules_if_unpublished(ctx: &AppContext) -> bool {
 /// never loaded, so the caller must queue [`load_ignore_rules_if_unpublished`]
 /// off its own thread.
 pub(crate) fn ignore_rules_load_pending(ctx: &AppContext) -> bool {
-    ctx.watcher_runtime_active() && !ctx.gitignore_published()
+    (ctx.watcher_runtime_active() || ctx.watcher_gap_pending()) && !ctx.gitignore_published()
 }
 
+#[cfg(test)]
 fn start_project_watcher_with<W, E, F>(
     ctx: &AppContext,
     root_path: &Path,
@@ -394,7 +394,7 @@ fn start_project_watcher_with<W, E, F>(
 ) where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
         + Send
         + 'static,
 {
@@ -403,6 +403,7 @@ fn start_project_watcher_with<W, E, F>(
     });
 }
 
+#[cfg(test)]
 fn start_project_watcher_with_spawn<W, E, F, S>(
     ctx: &AppContext,
     root_path: &Path,
@@ -412,7 +413,107 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
 ) where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
+        + Send
+        + 'static,
+    S: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+{
+    if let Some(prepared) =
+        prepare_project_watcher_runtime(ctx, root_path, extra_watch_paths, attach, spawn, false)
+    {
+        prepared.publish(ctx);
+    }
+}
+
+struct PreparedWatcher {
+    dispatch: crossbeam_channel::Receiver<watcher_filter::WatcherDispatchEvent>,
+    runtime: WatcherThreadHandle,
+    thread_id: thread::ThreadId,
+    sees_config: Option<bool>,
+}
+
+#[cfg(test)]
+#[test]
+fn watcher_preparation_does_not_hold_admission_or_publish_into_a_closed_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.path().to_path_buf()),
+            storage_dir: Some(root.path().join("state")),
+            ..Config::default()
+        },
+    );
+    ctx.set_canonical_cache_root(root.path().to_path_buf());
+    ctx.mark_subc_bound();
+    let generation = ctx.configure_generation();
+    std::thread::scope(|scope| {
+        let (entered, wait) = mpsc::channel();
+        let (ready, release) = mpsc::channel();
+        let ctx = &ctx;
+        let path = root.path();
+        let restore = scope.spawn(move || {
+            let prepared = prepare_project_watcher_runtime(
+                ctx,
+                path,
+                Vec::new(),
+                move |_, _, tx| {
+                    entered.send(()).unwrap();
+                    release.recv().unwrap();
+                    Ok::<_, &'static str>(tx)
+                },
+                |builder, job| builder.spawn(job),
+                true,
+            )
+            .unwrap();
+            prepared.publish_if_current(ctx, generation, 0, true)
+        });
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        ctx.mark_subc_unbound();
+        ready.send(()).unwrap();
+        assert_eq!(restore.join().unwrap(), None);
+        assert!(!ctx.watcher_runtime_active());
+    });
+}
+
+impl PreparedWatcher {
+    fn publish(self, ctx: &AppContext) {
+        if let Some(sees_config) = self.sees_config {
+            ctx.config_live()
+                .set_project_watcher_sees_config(sees_config);
+        }
+        ctx.install_watcher_runtime_with_thread_id(self.dispatch, self.runtime, self.thread_id);
+    }
+
+    fn publish_if_current(
+        self,
+        ctx: &AppContext,
+        generation: u64,
+        gap_epoch: u64,
+        replace: bool,
+    ) -> Option<bool> {
+        ctx.run_if_subc_bound_generation(generation, || {
+            if ctx.watcher_gap_epoch() != gap_epoch || (!replace && ctx.watcher_runtime_active()) {
+                return false;
+            }
+            self.publish(ctx);
+            true
+        })
+    }
+}
+
+fn prepare_project_watcher_runtime<W, E, F, S>(
+    ctx: &AppContext,
+    root_path: &Path,
+    extra_watch_paths: Vec<PathBuf>,
+    attach: F,
+    spawn: S,
+    await_backend: bool,
+) -> Option<PreparedWatcher>
+where
+    W: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
         + Send
         + 'static,
     S: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
@@ -434,7 +535,7 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
     let shared_gitignore = ctx.shared_gitignore();
     let gitignore_generation = ctx.gitignore_generation();
     let session_id_for_bg = log_ctx::current_session();
-    let sync_start = file_watcher_sync_start_for_test();
+    let sync_start = await_backend || file_watcher_sync_start_for_test();
     let (start_tx, start_rx) = mpsc::channel::<Result<(), String>>();
     let start_tx = sync_start.then_some(start_tx);
 
@@ -445,7 +546,7 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
                 let attach_with_start =
                     move |root: PathBuf,
                           extra_watch_paths: Vec<PathBuf>,
-                          tx: mpsc::Sender<notify::Result<notify::Event>>| {
+                          tx: crate::watcher_filter::RawEventSender| {
                         let result = attach(root, extra_watch_paths, tx);
                         if let Some(start_tx) = start_tx {
                             let _ = start_tx.send(
@@ -475,26 +576,35 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
             slog_warn!(
                 "watcher filter thread could not start for generation {generation}: {error}"
             );
-            return;
+            return None;
         }
     };
 
-    let watcher_thread_id = join.thread().id();
-    ctx.install_watcher_runtime_with_thread_id(
-        dispatch_rx,
-        WatcherThreadHandle::new(shutdown, join),
-        watcher_thread_id,
-    );
-
+    let prepared = PreparedWatcher {
+        dispatch: dispatch_rx,
+        thread_id: join.thread().id(),
+        runtime: WatcherThreadHandle::new(shutdown, join),
+        sees_config: None,
+    };
     if sync_start {
-        match start_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => slog_warn!("{error}"),
-            Err(error) => slog_warn!(
-                "timed out waiting for watcher startup for generation {generation}: {error}"
-            ),
+        let ready = match start_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                slog_warn!("{error}");
+                false
+            }
+            Err(error) => {
+                slog_warn!(
+                    "timed out waiting for watcher startup for generation {generation}: {error}"
+                );
+                false
+            }
+        };
+        if await_backend && !ready {
+            return None;
         }
     }
+    Some(prepared)
 }
 
 #[cfg(test)]
@@ -506,7 +616,7 @@ fn install_project_watcher_with<W, E, F>(
 ) where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
         + Send
         + 'static,
 {
@@ -534,9 +644,13 @@ fn file_watcher_disabled_for_test() -> bool {
     std::env::var("AFT_TEST_DISABLE_FILE_WATCHER").is_ok_and(|value| value == "1")
 }
 
-fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
+fn prepare_project_watcher(
+    ctx: &AppContext,
+    root_path: &Path,
+    await_backend: bool,
+) -> Option<PreparedWatcher> {
     if ctx.root_too_broad() || file_watcher_disabled_for_test() {
-        return;
+        return None;
     }
     let mut extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
     // Watch `<root>/.cortexkit/` directly as well, so an edit to the project
@@ -548,11 +662,9 @@ fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
     if sees_config {
         extra_watch_paths.push(config_dir);
     }
-    ctx.config_live()
-        .set_project_watcher_sees_config(sees_config);
     let matcher = ctx.shared_gitignore();
     let matcher_generation = ctx.gitignore_generation();
-    start_project_watcher_with(
+    let mut prepared = prepare_project_watcher_runtime(
         ctx,
         root_path,
         extra_watch_paths,
@@ -565,44 +677,75 @@ fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
                 matcher_generation,
             )
         },
-    );
+        |builder, job| builder.spawn(job),
+        await_backend,
+    )?;
+    prepared.sees_config = Some(sees_config);
+    Some(prepared)
 }
 
-fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
-    ctx.stop_watcher_runtime();
-    start_project_watcher(ctx, root_path);
-}
-
-/// Restore the watcher after an idle root released its runtime. Artifact stores
-/// are lazy by design, so the first request is the natural point to reattach
-/// external-change invalidation as well.
-#[doc(hidden)]
-pub fn ensure_project_watcher(ctx: &AppContext) {
+fn begin_watcher_restore(ctx: &AppContext) -> Option<(u64, u64)> {
     if ctx.root_too_broad() || ctx.subc_unbound_quiesced() {
         ctx.stop_watcher_runtime();
-        return;
+        return None;
     }
-    if ctx.watcher_runtime_active() {
-        return;
+    if ctx.watcher_runtime_active() || file_watcher_disabled_for_test() {
+        return None;
     }
-    // A dead-but-installed runtime means the watcher failed while drains were
-    // suppressed (unbound root): events since the failure are lost, so the
-    // retained warm state must not be trusted. Clean up the corpse and apply
-    // the same gap invalidation a deliberate watcher stop applies. Roots
-    // whose watcher was stopped deliberately (idle eviction, root deletion)
-    // have no installed handle here and were already invalidated at the stop.
     if ctx.take_finished_watcher_runtime() {
+        // A dead but installed watcher lost events before quiescence could
+        // clear the cached artifacts. Fence them before exposing the route.
         ctx.invalidate_artifacts_after_watcher_gap();
+    } else if !ctx.watcher_gap_pending() {
+        ctx.mark_watcher_gap_pending();
     }
+    Some((ctx.configure_generation(), ctx.watcher_gap_epoch()))
+}
+
+fn restore_watcher(ctx: &AppContext, generation: u64, gap_epoch: u64) {
     let Some(root_path) = ctx.canonical_cache_root_opt() else {
         return;
     };
-    if root_path.exists() {
-        install_project_watcher(ctx, &root_path);
+    if !root_path.is_dir() {
+        return;
+    }
+    let Some(prepared) = prepare_project_watcher(ctx, &root_path, true) else {
+        return;
+    };
+    if prepared.publish_if_current(ctx, generation, gap_epoch, false) == Some(true) {
+        ctx.rescan_after_watcher_gap(generation, gap_epoch);
         // Config edits made while nothing watched the files are picked up
         // now; the reload compares file contents, so it is a no-op otherwise.
         crate::config_live::sync_config_watches(ctx);
         ctx.config_live().signal().request_now();
+    }
+}
+
+/// Fence cached views before acknowledging a rebind, without any filesystem
+/// or database work on the daemon frame loop.
+pub(crate) fn fence_subc_watcher_gap(ctx: &AppContext) {
+    let _ = begin_watcher_restore(ctx);
+}
+
+/// Restore after the route is installed: only a bound root may rescan its
+/// indexes. Filesystem and SQLite work never runs on the frame loop.
+pub(crate) fn restore_subc_watcher(ctx: Arc<AppContext>) {
+    let Some((generation, epoch)) = begin_watcher_restore(&ctx) else {
+        return;
+    };
+    if let Err(error) = thread::Builder::new()
+        .name("aft-watcher-restore".into())
+        .spawn(move || restore_watcher(&ctx, generation, epoch))
+    {
+        slog_warn!("watcher restoration could not start: {error}");
+    }
+}
+
+/// Synchronous watcher restoration for callers outside the daemon frame loop.
+#[doc(hidden)]
+pub fn ensure_project_watcher(ctx: &AppContext) {
+    if let Some((generation, epoch)) = begin_watcher_restore(ctx) {
+        restore_watcher(ctx, generation, epoch);
     }
 }
 
@@ -886,32 +1029,6 @@ fn parse_string_set(
 
 fn is_custom_server(kind: &ServerKind) -> bool {
     matches!(kind, ServerKind::Custom(_))
-}
-
-fn configured_lsp_binary_resolves(
-    configured: &crate::config::UserServerDef,
-    files: &[PathBuf],
-    config: &crate::config::Config,
-    memo: &mut BiomeSelectionMemo,
-) -> bool {
-    let project_root = config.project_root.as_deref();
-    for file in files {
-        if let Some(server) = servers_for_file_in_pass(file, config, memo)
-            .into_iter()
-            .find(|server| {
-                server.kind.id_str() == configured.id && server.binary == configured.binary
-            })
-        {
-            let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
-                server.workspace_root_for_file_with_project_root(file, project_root)
-            } else {
-                project_root.map(Path::to_path_buf)
-            };
-            return resolve_server_binary(&server, workspace_root.as_deref(), config).is_some();
-        }
-    }
-
-    resolve_lsp_binary(&configured.binary, project_root, &config.lsp_paths_extra).is_some()
 }
 
 fn lsp_missing_hint(binary: &str) -> String {
@@ -1398,38 +1515,81 @@ fn audit01_python_warning_collection_uses_one_snapshot() {
     );
 }
 
-fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config) -> Vec<Value> {
-    let mut warnings = Vec::new();
-    let mut seen_resolutions = HashSet::new();
-    let mut file_driven_servers = HashSet::new();
-    let mut seen_explicit_servers = HashSet::new();
-    let mut warned_binaries = HashSet::new();
+type LspWarningIdentity = (String, String);
+type LspWarningWorkspace = Option<PathBuf>;
 
-    let project_root = config.project_root.as_deref();
-    // One memo for the whole pass: files that share folders share their Biome
-    // root and configuration lookups. A fresh one each pass sees config edits.
-    let mut biome_memo = BiomeSelectionMemo::default();
+#[derive(Default)]
+struct LspWarningCandidates {
+    builtins: HashMap<LspWarningIdentity, HashMap<LspWarningWorkspace, ServerDef>>,
+    custom: HashMap<LspWarningIdentity, (ServerDef, LspWarningWorkspace)>,
+    biome_memo: BiomeSelectionMemo,
+}
 
-    for file in files {
-        for server in servers_for_file_in_pass(file, config, &mut biome_memo) {
+impl LspWarningCandidates {
+    fn observe(&mut self, file: &Path, config: &Config) {
+        let project_root = config.project_root.as_deref();
+        for server in servers_for_file_in_pass(file, config, &mut self.biome_memo) {
             let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
                 server.workspace_root_for_file_with_project_root(file, project_root)
             } else {
                 project_root.map(Path::to_path_buf)
             };
             let identity = (server.kind.id_str().to_string(), server.binary.clone());
-            if is_custom_server(&server.kind)
-                || !seen_resolutions.insert((
-                    server.kind.id_str().to_string(),
-                    server.binary.clone(),
-                    workspace_root.clone(),
-                ))
+            if is_custom_server(&server.kind) {
+                // Explicit servers use their first matching configuration.
+                self.custom
+                    .entry(identity)
+                    .or_insert((server, workspace_root));
+            } else {
+                self.builtins
+                    .entry(identity)
+                    .or_default()
+                    .entry(workspace_root)
+                    .or_insert(server);
+            }
+        }
+    }
+
+    fn warnings(&self, config: &Config) -> Vec<Value> {
+        let mut warnings = Vec::new();
+        let mut seen_explicit_servers = HashSet::new();
+        let mut warned_binaries = HashSet::new();
+        let project_root = config.project_root.as_deref();
+
+        for ((_, binary), workspaces) in &self.builtins {
+            if !config.lsp_auto_install_binaries.contains(binary)
+                || config.lsp_inflight_installs.contains(binary)
+                || warned_binaries.contains(binary)
             {
                 continue;
             }
-            file_driven_servers.insert(identity);
 
-            if !config.lsp_auto_install_binaries.contains(&server.binary) {
+            if workspaces.iter().any(|(workspace, server)| {
+                resolve_server_binary(server, workspace.as_deref(), config).is_none()
+            }) {
+                warned_binaries.insert(binary.clone());
+                warnings.push(json!({
+                    "kind": "lsp_binary_missing",
+                    "server": binary,
+                    "binary": binary,
+                    "hint": lsp_missing_hint(binary),
+                }));
+            }
+        }
+        for server in &config.lsp_servers {
+            // A blank binary means "partial built-in override, inherit the built-in
+            // binary" — the resolvable binary is already covered by the built-in
+            // pass above, so skip the missing-binary probe here (probing "" never
+            // resolves and would emit a bogus warning).
+            if server.binary.is_empty() {
+                continue;
+            }
+
+            let identity = (server.id.clone(), server.binary.clone());
+            if server.disabled
+                || self.builtins.contains_key(&identity)
+                || !seen_explicit_servers.insert(identity.clone())
+            {
                 continue;
             }
 
@@ -1437,54 +1597,33 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
                 continue;
             }
 
-            if resolve_server_binary(&server, workspace_root.as_deref(), config).is_none()
-                && warned_binaries.insert(server.binary.clone())
-            {
+            let resolves = if let Some((selected, workspace)) = self.custom.get(&identity) {
+                resolve_server_binary(selected, workspace.as_deref(), config).is_some()
+            } else {
+                resolve_lsp_binary(&server.binary, project_root, &config.lsp_paths_extra).is_some()
+            };
+            if !resolves && warned_binaries.insert(server.binary.clone()) {
                 warnings.push(json!({
                     "kind": "lsp_binary_missing",
-                    "server": server.binary,
+                    "server": server.id,
                     "binary": server.binary,
                     "hint": lsp_missing_hint(&server.binary),
                 }));
             }
         }
+
+        warnings.sort_by_key(|warning| warning.to_string());
+        warnings
     }
+}
 
-    for server in &config.lsp_servers {
-        // A blank binary means "partial built-in override, inherit the built-in
-        // binary" — the resolvable binary is already covered by the built-in
-        // pass above, so skip the missing-binary probe here (probing "" never
-        // resolves and would emit a bogus warning).
-        if server.binary.is_empty() {
-            continue;
-        }
-
-        let identity = (server.id.clone(), server.binary.clone());
-        if server.disabled
-            || file_driven_servers.contains(&identity)
-            || !seen_explicit_servers.insert(identity)
-        {
-            continue;
-        }
-
-        if config.lsp_inflight_installs.contains(&server.binary) {
-            continue;
-        }
-
-        if !configured_lsp_binary_resolves(server, files, config, &mut biome_memo)
-            && warned_binaries.insert(server.binary.clone())
-        {
-            warnings.push(json!({
-                "kind": "lsp_binary_missing",
-                "server": server.id,
-                "binary": server.binary,
-                "hint": lsp_missing_hint(&server.binary),
-            }));
-        }
+#[cfg(test)]
+fn detect_missing_lsp_binaries(files: &[PathBuf], config: &Config) -> Vec<Value> {
+    let mut lsp = LspWarningCandidates::default();
+    for file in files {
+        lsp.observe(file, config);
     }
-
-    warnings.sort_by_key(|warning| warning.to_string());
-    warnings
+    lsp.warnings(config)
 }
 
 #[cfg(test)]
@@ -1547,7 +1686,7 @@ fn configure_warnings_canonicalize_biome_directories_not_each_file() {
     ConfigureWarningWork {
         root: root.clone(),
         config: Arc::new(Config {
-            project_root: Some(root),
+            project_root: Some(root.clone()),
             ..Default::default()
         }),
         generation_flag: Arc::new(AtomicU64::new(1)),
@@ -1557,23 +1696,22 @@ fn configure_warnings_canonicalize_biome_directories_not_each_file() {
     }
     .run(|boundary| {
         crate::path_identity::CANONICALIZE_CALLS.with(|counter| match boundary {
-            WarningBoundary::ResolvingLsp => *counter.borrow_mut() = Some(Vec::new()),
+            WarningBoundary::Walking => *counter.borrow_mut() = Some(Vec::new()),
             WarningBoundary::Publication => calls = counter.borrow_mut().take().unwrap(),
             _ => {}
         });
     });
     assert!(rx.try_recv().is_ok(), "the warning pass must publish");
-    assert!(
-        calls.len() <= DIRECTORIES + 1,
-        "{} files should resolve at most {} directories, not {} paths: {:?}",
-        DIRECTORIES * FILES_PER_DIRECTORY,
-        DIRECTORIES + 1,
-        calls.len(),
-        &calls[..calls.len().min(12)]
-    );
-    assert!(
-        calls.len() >= DIRECTORIES,
-        "each source directory was visited"
+    // The streaming pass interleaves Biome discovery with the walk. Root
+    // lookups also include walk setup, which is independent of file count.
+    calls.retain(|path| path != &root);
+    calls.sort();
+    assert_eq!(
+        calls,
+        (0..DIRECTORIES)
+            .map(|directory| root.join(format!("src/nested{directory}")))
+            .collect::<Vec<_>>(),
+        "Biome discovery should canonicalize each source directory once, not each file"
     );
 }
 
@@ -1633,6 +1771,8 @@ fn configure_warnings_cpu_measurement() {
 enum WarningBoundary {
     Discovery,
     Walking,
+    #[cfg(test)]
+    BufferedSourcePaths(usize),
     Tools,
     ParsingTools,
     Lsp,
@@ -1660,16 +1800,23 @@ impl ConfigureWarningWork {
         }
         boundary(WarningBoundary::Walking);
         signal_configure_deferred_walk_start_for_test();
-        let source_files = self.source_files();
+        let mut languages = HashSet::new();
+        let mut lsp = LspWarningCandidates::default();
+        self.visit_source_paths(
+            |path| {
+                if let Some(language) = detect_language(path) {
+                    languages.insert(language);
+                }
+                lsp.observe(path, &self.config);
+            },
+            #[cfg(test)]
+            &mut boundary,
+        );
         boundary(WarningBoundary::Tools);
         if !current() {
             return;
         }
         boundary(WarningBoundary::ParsingTools);
-        let languages: HashSet<LangId> = source_files
-            .iter()
-            .filter_map(|path| detect_language(path))
-            .collect();
         let mut warnings = detect_missing_tools_for_languages(&languages, &self.config)
             .into_iter()
             .map(|warning| json!(warning))
@@ -1679,7 +1826,7 @@ impl ConfigureWarningWork {
             return;
         }
         boundary(WarningBoundary::ResolvingLsp);
-        warnings.extend(detect_missing_lsp_binaries(&source_files, &self.config));
+        warnings.extend(lsp.warnings(&self.config));
         boundary(WarningBoundary::Publication);
         // The consumer still filters the check/send race; obsolete discovery
         // must not knowingly queue a frame.
@@ -1700,15 +1847,29 @@ impl ConfigureWarningWork {
     /// otherwise the root is walked, until a newer configure supersedes this
     /// one. Configure can run before the checkout publishes, so the first
     /// configure of a new root usually walks.
-    fn source_files(&self) -> Vec<PathBuf> {
+    fn visit_source_paths(
+        &self,
+        mut visit: impl FnMut(&Path),
+        #[cfg(test)] boundary: &mut impl FnMut(WarningBoundary),
+    ) {
         let miss = match crate::inspect::data_sources::bound_inventory(&self.root) {
-            Ok(inventory) => return inventory.sources,
+            Ok(inventory) => {
+                #[cfg(test)]
+                boundary(WarningBoundary::BufferedSourcePaths(
+                    inventory.sources.len(),
+                ));
+                for path in inventory.sources {
+                    visit(&path);
+                }
+                return;
+            }
             Err(miss) => miss,
         };
         let started = Instant::now();
         let flag = self.generation_flag.clone();
         let generation = self.generation;
-        let files: Vec<PathBuf> = crate::callgraph::walk_project_files_while(
+        let mut files = 0;
+        for path in crate::callgraph::walk_project_files_while(
             &self.root,
             if crate::data_layer::read_fence::active() {
                 crate::project_walk::IgnoreFileAccess::Fenced
@@ -1716,16 +1877,19 @@ impl ConfigureWarningWork {
                 crate::project_walk::IgnoreFileAccess::Allowed
             },
             move || flag.load(Ordering::SeqCst) == generation,
-        )
-        .collect();
+        ) {
+            files += 1;
+            visit(&path);
+        }
+        #[cfg(test)]
+        boundary(WarningBoundary::BufferedSourcePaths(0));
         slog_info!(
             "configure warning files walked: reason={} files={} ms={} root={}",
             miss.as_str(),
-            files.len(),
+            files,
             started.elapsed().as_millis(),
             crate::logging::normalize_index_root(&self.root)
         );
-        files
     }
 }
 
@@ -1809,6 +1973,32 @@ fn audit01_warning_current_generation_publishes() {
     }
     .run(|_| {});
     assert_eq!(rx.try_recv().unwrap().0, 2);
+}
+
+#[cfg(test)]
+#[test]
+fn configure_warning_walk_does_not_buffer_source_paths() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..100 {
+        std::fs::write(root.path().join(format!("unit-{index}.rs")), "fn f() {}\n").unwrap();
+    }
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut retained = None;
+    ConfigureWarningWork {
+        root: root.path().to_path_buf(),
+        config: Arc::new(Config::default()),
+        generation_flag: Arc::new(AtomicU64::new(1)),
+        generation: 1,
+        tx,
+        session_id: None,
+    }
+    .run(|at| {
+        if let WarningBoundary::BufferedSourcePaths(paths) = at {
+            retained = Some(paths);
+        }
+    });
+    assert!(rx.try_recv().is_ok());
+    assert_eq!(retained, Some(0));
 }
 
 /// Once the root's index-store checkout has published, the warning pass
@@ -2529,17 +2719,8 @@ fn handle_configure_inner(
         }));
     }
 
-    // NO configure-time SSRF guard on semantic.base_url — deliberate (config
-    // relocation posture). The original guard existed to stop UNTRUSTED *project*
-    // config from pointing the embedding backend at an internal IP (SSRF). The tier
-    // resolver now drops project-tier `semantic.base_url` outright (SEMANTIC_SECRET_REASON),
-    // so the only base_url that can reach `next_config` is USER-tier — the same trust
-    // level as the binary itself. A user pointing AFT at their own self-hosted
-    // embedding server on the LAN/WAN (homelab Ollama/LMStudio at 192.168.x / 10.x, or
-    // a remote box) is legitimate and must be allowed; the SSRF threat model (attacker-
-    // controlled URL) does not apply to user-trusted config. The `validate_base_url_no_ssrf`
-    // primitive remains for any future less-trusted source. See semantic_test::
-    // configure_accepts_user_private_base_url.
+    // The resolver drops project-tier semantic.base_url; users may point their
+    // own embedding configuration at a local, LAN, or remote server.
 
     // Parse and validate process-state configure fields into a temporary config first.
     // AppContext is mutated only after this phase succeeds, so an invalid late
@@ -4472,24 +4653,34 @@ fn run_configure_maintenance_unit_inner(
                         return ConfigureMaintenanceUnitResult::Complete;
                     }
 
-                    // Joining a prior FSEvents thread can block in the OS. Do that
-                    // outside lifecycle admission, then reacquire admission only for
-                    // the atomic watcher start. An unbind or superseding configure that
-                    // wins during the join prevents the replacement from being started.
-                    ctx.stop_watcher_runtime();
-                    if ctx
-                        .run_if_subc_bound_generation(job.generation, || {
-                            if !job.root_too_broad {
-                                start_project_watcher(ctx, &job.canonical_cache_root);
+                    let gap_epoch = ctx.watcher_gap_epoch();
+                    let prepared = if job.root_too_broad {
+                        None
+                    } else {
+                        prepare_project_watcher(ctx, &job.canonical_cache_root, gap_epoch & 1 != 0)
+                    };
+                    // The lifecycle gate covers publication, not the SQLite
+                    // read, file probes, or the backend's startup handshake.
+                    let published = match prepared {
+                        Some(prepared) => {
+                            prepared.publish_if_current(ctx, job.generation, gap_epoch, true)
+                        }
+                        None => ctx.run_if_subc_bound_generation(job.generation, || {
+                            if job.root_too_broad {
+                                ctx.stop_watcher_runtime();
                             }
-                        })
-                        .is_none()
-                    {
+                            false
+                        }),
+                    };
+                    let Some(published) = published else {
                         if ctx.subc_unbound_quiesced() {
                             return ConfigureMaintenanceUnitResult::CancelAll;
                         }
                         forget_configure_job_binding(ctx, job);
                         return ConfigureMaintenanceUnitResult::Complete;
+                    };
+                    if published {
+                        ctx.rescan_after_watcher_gap(job.generation, gap_epoch);
                     }
                 }
             }
@@ -8817,7 +9008,7 @@ mod tests {
         struct FakeBackend {
             stop: Arc<AtomicBool>,
             join: Option<std::thread::JoinHandle<()>>,
-            _tx: mpsc::Sender<notify::Result<notify::Event>>,
+            _tx: crate::watcher_filter::RawEventSender,
         }
         impl Drop for FakeBackend {
             fn drop(&mut self) {
@@ -9018,7 +9209,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         struct FakeWatcher {
-            _tx: mpsc::Sender<notify::Result<notify::Event>>,
+            _tx: crate::watcher_filter::RawEventSender,
             drops: Arc<std::sync::atomic::AtomicUsize>,
         }
 

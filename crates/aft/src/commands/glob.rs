@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -9,7 +10,8 @@ use crate::grep_executor::{
 };
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    build_path_filters, resolve_search_scope, sort_paths_by_cached_mtime_desc,
+    build_path_filters, normalized_display_sort_key, presence_stat_budget, resolve_search_scope,
+    sort_paths_by_cached_mtime_desc, IndexedGlobMatcher, PresentOnDisk,
 };
 
 use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
@@ -18,6 +20,8 @@ use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResoluti
 struct GlobDiscovery {
     files: Vec<PathBuf>,
     indexed_mtimes: HashMap<PathBuf, SystemTime>,
+    unretained_candidates: usize,
+    walk_failed: bool,
     walk_truncated: bool,
     walk_time_limit_reached: bool,
     source: &'static str,
@@ -41,8 +45,10 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
     let _pin = false.then(|| ctx.pin_config_to(config));
     ctx.with_read_policy_snapshot(&req.id, || {
-        crate::context::confinement::with_floor_disclosure(|| {
-            crate::bounded_io_command::command(req, ctx, handle_glob_inner)
+        crate::bounded_io::with_skip_disclosure(|| {
+            crate::context::confinement::with_floor_disclosure(|| {
+                crate::bounded_io_command::command(req, ctx, handle_glob_inner)
+            })
         })
     })
 }
@@ -151,8 +157,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         crate::parent_search::glob_fan_out(ctx, &search_roots, pattern)
     };
+    // A parent folder's ready children are answered from their indexes even
+    // when another child is walked, so their skipped folders still count.
+    let answered_by_parent = parent_answer.is_some();
     let (
         mut files,
+        unretained_candidates,
+        walk_failed,
         walk_truncated,
         walk_time_limit_reached,
         source,
@@ -167,6 +178,8 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         indexed_mtimes = answer.indexed_mtimes;
         (
             answer.files,
+            0,
+            false,
             answer.walk_truncated,
             answer.walk_time_limit_reached,
             if answer.walked { "fallback" } else { "index" },
@@ -184,6 +197,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             &search_roots[0],
             pattern,
             DEFAULT_MAX_RESULTS + 1,
+            Some(presence_stat_budget(DEFAULT_MAX_RESULTS)),
             ignored_targets[0],
             req.params
                 .get("path")
@@ -199,6 +213,8 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         indexed_mtimes = discovery.indexed_mtimes;
         (
             discovery.files,
+            discovery.unretained_candidates,
+            discovery.walk_failed,
             discovery.walk_truncated,
             discovery.walk_time_limit_reached,
             discovery.source,
@@ -222,6 +238,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 root,
                 pattern,
                 DEFAULT_MAX_RESULTS + 1,
+                None,
                 *ignored,
                 req.params
                     .get("path")
@@ -234,6 +251,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 Err(error) => return crate::context::view_load_error_response(&req.id, error),
             }
         }
+        let walk_failed = discoveries.iter().any(|d| d.walk_failed);
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
         let walk_time_limit_reached = discoveries.iter().any(|d| d.walk_time_limit_reached);
         let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
@@ -257,6 +275,8 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
         (
             files,
+            0,
+            walk_failed,
             walk_truncated,
             walk_time_limit_reached,
             source,
@@ -285,8 +305,8 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // still lists another checkout's files): only paths present on disk in this
     // checkout are returned. Only the page is checked, and the page is refilled
     // from the following matches, so present files keep their order.
-    let candidate_count = files.len();
-    let (presence, _) = match crate::search_index::take_present_on_disk_with_admission(
+    let candidate_count = files.len().saturating_add(unretained_candidates);
+    let (mut presence, _) = match crate::search_index::take_present_on_disk_with_admission(
         files,
         DEFAULT_MAX_RESULTS,
         |path| path.as_path(),
@@ -303,13 +323,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(presence) => presence,
         Err(response) => return response,
     };
+    account_for_unretained_glob_candidates(&mut presence, unretained_candidates);
     let missing_on_disk = presence.dropped;
     let presence_budget_exhausted = presence.budget_exhausted;
     let files = presence.present;
     let admitted_count = files.len();
-    // The public count includes discovered candidates beyond the returned page.
-    // Missing or denied candidates checked in this window are already excluded.
-    let total = admitted_count.saturating_add(presence.unexamined);
+    // Unchecked candidates may be stale or denied and do not establish a lower bound.
+    let total = admitted_count;
     let all_candidates_checked = presence.unexamined == 0;
     let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
 
@@ -318,8 +338,8 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut body = serde_json::json!({
         "text": text,
         "rendered_files": rendered_files,
-        "complete": all_candidates_checked && !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
-        "no_files_matched_scope": !scope_has_files,
+        "complete": all_candidates_checked && !walk_failed && !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
+        "no_files_matched_scope": !walk_failed && !scope_has_files,
         "skipped_foreign_mounts": skipped_foreign_mounts,
         "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "total": all_candidates_checked.then_some(total),
@@ -344,14 +364,14 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             body["text"].as_str().unwrap_or_default(),
         ));
     }
-    if !scope_has_files && has_named_ignored_root {
+    if !walk_failed && !scope_has_files && has_named_ignored_root {
         // The prefix walk already examined this scope. Probing the original
         // root would count the overridden ignore rule instead of those entries.
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n(0 files searched: no files matched the pattern in the named folder scope; nothing was searched.)",
             body["text"].as_str().unwrap_or_default(),
         ));
-    } else if !scope_has_files {
+    } else if !walk_failed && !scope_has_files {
         let counts = {
             let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
             search_roots.iter().zip(&ignored_targets).try_fold(
@@ -409,7 +429,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         rendered_count,
         total,
         result_truncated,
-        walk_truncated,
+        walk_failed || walk_truncated,
         walk_time_limit_reached,
         skipped_foreign_mounts,
     );
@@ -441,7 +461,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let mut response = Response::success(&req.id, body);
-    if source == "index" {
+    if source == "index" || answered_by_parent {
         crate::data_layer::surfaces::disclose_index_gaps(ctx, &search_roots, &mut response);
     }
     response
@@ -520,6 +540,7 @@ fn discover_glob_root(
     search_root: &Path,
     pattern: &str,
     max_results: usize,
+    indexed_window: Option<usize>,
     ignored_target: bool,
     explicit_session: Option<&str>,
 ) -> Result<GlobDiscovery, String> {
@@ -537,6 +558,8 @@ fn discover_glob_root(
                 || outcome.skipped_foreign_mounts > 0,
             files: outcome.files,
             indexed_mtimes: HashMap::new(),
+            unretained_candidates: 0,
+            walk_failed: outcome.error.is_some(),
             walk_truncated: outcome.walk_truncated,
             walk_time_limit_reached: outcome.walk_time_limit_reached,
             source: "fallback",
@@ -552,6 +575,7 @@ fn discover_glob_root(
         search_root,
         pattern,
         max_results,
+        indexed_window,
         ignored_target,
         explicit_session,
     )
@@ -575,6 +599,7 @@ fn glob_root(
     search_root: &Path,
     pattern: &str,
     max_results: usize,
+    indexed_window: Option<usize>,
     ignored_target: bool,
     explicit_session: Option<&str>,
 ) -> Result<GlobDiscovery, String> {
@@ -605,6 +630,8 @@ fn glob_root(
             scope_has_files: !files.is_empty(),
             files,
             indexed_mtimes: HashMap::new(),
+            unretained_candidates: 0,
+            walk_failed: false,
             walk_truncated: false,
             walk_time_limit_reached: false,
             source: "task-output",
@@ -618,8 +645,13 @@ fn glob_root(
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
     if search_scope.use_index && !ignored_target {
         if let Some(view) = crate::data_layer::text_scope::ready_view(ctx) {
-            if let Some(discovery) = glob_from_view(view, project_root, &search_scope.root, pattern)
-            {
+            if let Some(discovery) = glob_from_view(
+                view,
+                project_root,
+                &search_scope.root,
+                pattern,
+                indexed_window,
+            ) {
                 return Ok(discovery);
             }
         }
@@ -633,6 +665,8 @@ fn glob_root(
             return Ok(GlobDiscovery {
                 files: outcome.files,
                 indexed_mtimes: HashMap::new(),
+                unretained_candidates: 0,
+                walk_failed: outcome.error.is_some(),
                 walk_truncated: outcome.walk_truncated,
                 walk_time_limit_reached: outcome.walk_time_limit_reached,
                 source: "fallback",
@@ -661,12 +695,22 @@ fn glob_from_view(
     project_root: &Path,
     search_root: &Path,
     pattern: &str,
+    indexed_window: Option<usize>,
 ) -> Option<GlobDiscovery> {
     let scope = crate::data_layer::text_scope::ViewScope::of(view, search_root)?;
     if !scope.is_whole_checkout() && !scope.has_files() {
         // The checkout holds no file under this explicitly named directory,
         // so walk it, as today's path does when its index lacks the directory.
         return Some(fallback_glob(project_root, search_root, pattern, false));
+    }
+    if let Some(window) = indexed_window {
+        return Some(bounded_indexed_glob(
+            &scope,
+            project_root,
+            search_root,
+            pattern,
+            window,
+        ));
     }
     let snapshot = scope.listing();
     let (files, scope_has_files, entries_visited) =
@@ -683,6 +727,8 @@ fn glob_from_view(
         entries_visited,
         files,
         indexed_mtimes,
+        unretained_candidates: 0,
+        walk_failed: false,
         walk_truncated: false,
         walk_time_limit_reached: false,
         source: "index",
@@ -691,6 +737,76 @@ fn glob_from_view(
         scope_probe: Duration::ZERO,
         skipped_foreign_mounts: 0,
     })
+}
+
+/// Keep only the newest rows the presence check could examine. Use this only
+/// for a single root: if any filesystem root times out in a multi-root glob,
+/// the whole reply keeps discovery order instead of sorting.
+fn bounded_indexed_glob(
+    scope: &crate::data_layer::text_scope::ViewScope,
+    project_root: &Path,
+    search_root: &Path,
+    pattern: &str,
+    window: usize,
+) -> GlobDiscovery {
+    let matcher = IndexedGlobMatcher::new(pattern, search_root);
+    let stable_root = crate::path_identity::canonicalize_normalized(project_root);
+    let mut newest = BinaryHeap::new();
+    let mut entries_visited = 0;
+    let mut matched = 0usize;
+    if let Some(matcher) = matcher {
+        for (path, modified) in scope.listing_rows() {
+            crate::run_tool_call::progress::report();
+            entries_visited += 1;
+            if !matcher.matches(&path) {
+                continue;
+            }
+            matched += 1;
+            // The public order is newest first, then normalized display bytes,
+            // then the original path. The heap puts the worst kept row on top.
+            let display_key = normalized_display_sort_key(
+                Some(&stable_root),
+                &crate::path_identity::normalize_path(&path),
+            );
+            let row = (Reverse(modified), display_key, path);
+            if newest.len() < window {
+                newest.push(row);
+            } else if newest.peek().is_some_and(|worst| &row < worst) {
+                *newest.peek_mut().unwrap() = row;
+            }
+        }
+    }
+    let unretained_candidates = matched - newest.len();
+    let mut files = Vec::with_capacity(newest.len());
+    let mut indexed_mtimes = HashMap::with_capacity(newest.len());
+    for (Reverse(modified), _, path) in newest.into_sorted_vec() {
+        indexed_mtimes.insert(path.clone(), modified);
+        files.push(path);
+    }
+    GlobDiscovery {
+        files,
+        indexed_mtimes,
+        unretained_candidates,
+        entries_visited,
+        walk_failed: false,
+        walk_truncated: false,
+        walk_time_limit_reached: false,
+        source: "index",
+        walk_time: Duration::ZERO,
+        scope_has_files: matched > 0,
+        scope_probe: Duration::ZERO,
+        skipped_foreign_mounts: 0,
+    }
+}
+
+fn account_for_unretained_glob_candidates(
+    presence: &mut PresentOnDisk<PathBuf>,
+    unretained: usize,
+) {
+    presence.unexamined = presence.unexamined.saturating_add(unretained);
+    // The heap kept as many rows as the presence check can stat. If the
+    // page is still short and more candidates exist, the checks hit that limit.
+    presence.budget_exhausted |= unretained > 0 && presence.present.len() < DEFAULT_MAX_RESULTS;
 }
 
 /// Runs one `glob_root` discovery and returns the files it found, the source
@@ -711,6 +827,7 @@ pub(crate) fn glob_root_files_for_test(
         search_root,
         pattern,
         max_results,
+        Some(presence_stat_budget(DEFAULT_MAX_RESULTS)),
         false,
         explicit_session,
     )
@@ -758,6 +875,8 @@ fn fallback_glob(
     GlobDiscovery {
         files: outcome.files,
         indexed_mtimes: HashMap::new(),
+        unretained_candidates: 0,
+        walk_failed: outcome.error.is_some(),
         walk_truncated: outcome.walk_truncated,
         walk_time_limit_reached: outcome.walk_time_limit_reached,
         source: "fallback",
@@ -1056,6 +1175,105 @@ mod tests {
         let rendered = crate::subc_format::format_response("glob", &response, false);
         assert!(rendered.ends_with(trailer), "{rendered}");
         assert_eq!(rendered.matches(trailer).count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn review_search_glob_lower_bound_only_counts_checked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        for index in 0..=DEFAULT_MAX_RESULTS {
+            std::fs::write(project.join(format!("file-{index:03}.txt")), "text").unwrap();
+        }
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(project),
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "glob-lower-bound",
+            "command": "glob",
+            "pattern": "*.txt",
+        }))
+        .unwrap();
+        let response = handle_glob(&request, &ctx);
+        let body = &response.data;
+        assert_eq!(body["complete"], false, "{body}");
+        assert_eq!(body["candidate_count"], DEFAULT_MAX_RESULTS + 1, "{body}");
+        assert_eq!(body["unexamined_files"], 1, "{body}");
+        assert_eq!(body["total_lower_bound"], DEFAULT_MAX_RESULTS, "{body}");
+        let envelope: crate::list_envelope::ListEnvelope =
+            serde_json::from_value(body["files_list_envelope"].clone()).unwrap();
+        assert_eq!(
+            envelope.total,
+            crate::list_envelope::Total::AtLeast(DEFAULT_MAX_RESULTS)
+        );
+    }
+
+    #[test]
+    fn review_search_indexed_glob_retains_only_the_page_and_refill_window() {
+        use crate::data_layer::checkout::{Checkout, DataLayer};
+        use aft_store::ids::{Digest128, FamilyId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("checkout");
+        std::fs::create_dir(&root).unwrap();
+        let window = DEFAULT_MAX_RESULTS + crate::search_index::MISSING_ON_DISK_REFILL_BUDGET;
+        let count = window * 2;
+        for index in 0..count {
+            let path = root.join(format!("file-{index:04}.txt"));
+            std::fs::write(&path, "text").unwrap();
+            let mtime = filetime::FileTime::from_unix_time(1_700_000_000 + index as i64 / 3, 0);
+            filetime::set_file_mtime(path, mtime).unwrap();
+        }
+        let layer = std::sync::Arc::new(DataLayer::new(8 << 20, 2));
+        let family = FamilyId::from_digest(Digest128::of(b"glob-refill-test"));
+        let checkout = Checkout::bind(layer, &dir.path().join("store"), family, &root).unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        let mut expected = glob_from_view(view.clone(), &root, &root, "*.txt", None).unwrap();
+        sort_paths_by_cached_mtime_desc(&mut expected.files, &root, &expected.indexed_mtimes);
+        assert_eq!(expected.files.len(), count);
+        for path in expected.files[..12]
+            .iter()
+            .chain(&expected.files[window..window + 20])
+        {
+            std::fs::remove_file(path).unwrap();
+        }
+        let actual = glob_from_view(view, &root, &root, "*.txt", Some(window)).unwrap();
+        assert_eq!(actual.entries_visited, count);
+        assert_eq!(actual.files.len(), window);
+        assert_eq!(actual.files, expected.files[..window]);
+        let present = |paths| {
+            crate::search_index::take_present_on_disk_with_admission(
+                paths,
+                DEFAULT_MAX_RESULTS,
+                |path: &PathBuf| path.as_path(),
+                "glob",
+                |_| Ok::<_, ()>(true),
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(actual.unretained_candidates, count - window);
+        let compare_refill = |stale: usize, exhausted: bool| {
+            let reference = present(expected.files.clone());
+            let mut selected = present(actual.files.clone());
+            account_for_unretained_glob_candidates(&mut selected, actual.unretained_candidates);
+            assert_eq!(selected.present, reference.present);
+            assert_eq!(selected.dropped, stale);
+            assert_eq!(selected.dropped, reference.dropped);
+            assert_eq!(selected.unexamined, reference.unexamined);
+            assert_eq!(selected.budget_exhausted, exhausted);
+            assert_eq!(selected.budget_exhausted, reference.budget_exhausted);
+        };
+        compare_refill(12, false);
+        let exhausted = crate::search_index::MISSING_ON_DISK_REFILL_BUDGET + 1;
+        for path in &expected.files[12..exhausted] {
+            std::fs::remove_file(path).unwrap();
+        }
+        compare_refill(exhausted, true);
     }
 
     #[test]

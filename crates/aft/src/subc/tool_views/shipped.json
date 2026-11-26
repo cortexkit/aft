@@ -59,6 +59,90 @@
             "source": "<TextContent text=\"AFT apply_patch\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
           }
         }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 4,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const count = view.completion.fileCount ?? view.record.fileCount ?? 0\nexport const path = view.completion.path ?? view.record.path ?? \"\"\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const added = view.completion.addedLines ?? view.record.addedLines\nexport const removed = view.completion.removedLines ?? view.record.removedLines\n\n<Slot width=\"fill\">\n<ToolHeader icon=\"edit\" title={count > 1 ? Text(count) + \" files\" : count == 1 && path != \"\" ? FileName(path) : \"Patch\"} subtitle={count == 1 && path != \"\" ? Folder(path) : null} truncate=\"middle\" failed={outcome == \"error\"}>\n<Slot width=\"medium\">\n{outcome == \"error\" && count == 0 ? <ToolText text=\"Not applied\" size=\"small\" tone=\"danger\" />\n : outcome == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : added != null && removed != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(added)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(removed)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n</Slot>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const outcome = view.completion.outcome ?? view.record.outcome\n\n{outcome == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : outcome == \"error\" && (view.completion.fileCount ?? view.record.fileCount ?? 0) == 0\n ? <ToolText text=\"Not applied\" tone=\"danger\" /> : null}\n\n{Each(view.detail.files ?? [], \"file\", [\n  file.path != null ? <ToolText size=\"large\" text={FileName(file.path ?? \"\")} /> : null,\n  file.diff != null && file.diff != \"\" ? <Diff hunks={[{lines:\n    Each(Slice(Split(EndsWith(file.diff, \"\\n\") ? file.diff : (file.diff ?? \"\") + \"\\n\", \"\\n\"), StartsWith(file.diff, \"--- \") ? 2 : 0, -1), \"line\", {\n      kind: StartsWith(line, \"+\") ? \"add\" : StartsWith(line, \"-\") ? \"delete\" : StartsWith(line, \" \") ? \"context\" : \"plain\",\n      text: StartsWith(line, \"+\") || StartsWith(line, \"-\") || StartsWith(line, \" \") ? Slice(line, 1) : line\n    })\n  }]} /> : null\n])}\n"
+          }
+        }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 5,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const count = view.completion.fileCount ?? view.record.fileCount ?? 0\nexport const path = view.completion.path ?? view.record.path ?? \"\"\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const added = view.completion.addedLines ?? view.record.addedLines\nexport const removed = view.completion.removedLines ?? view.record.removedLines\n\n<Slot width=\"fill\">\n<ToolHeader icon=\"edit\" title={count > 1 ? Text(count) + \" files\" : count == 1 && path != \"\" ? FileName(path) : \"Patch\"} subtitle={count == 1 && path != \"\" ? Folder(path) : null} truncate=\"middle\" failed={outcome == \"error\"}>\n<Slot width=\"short\">\n{outcome == \"error\" && count == 0 ? <ToolText text=\"Not applied\" size=\"small\" tone=\"danger\" />\n : outcome == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : added != null && removed != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(added)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(removed)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n</Slot>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const outcome = view.completion.outcome ?? view.record.outcome\n\n{outcome == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : outcome == \"error\" && (view.completion.fileCount ?? view.record.fileCount ?? 0) == 0\n ? <ToolText text=\"Not applied\" tone=\"danger\" /> : null}\n\n{Each(view.detail.files ?? [], \"file\", [\n  file.path != null ? <ToolText size=\"large\" text={FileName(file.path ?? \"\")} /> : null,\n  file.diff != null && file.diff != \"\" ? <Diff hunks={[{lines:\n    Each(Slice(Split(EndsWith(file.diff, \"\\n\") ? file.diff : (file.diff ?? \"\") + \"\\n\", \"\\n\"), StartsWith(file.diff, \"--- \") ? 2 : 0, -1), \"line\", {\n      kind: StartsWith(line, \"+\") ? \"add\" : StartsWith(line, \"-\") ? \"delete\" : StartsWith(line, \" \") ? \"context\" : \"plain\",\n      text: StartsWith(line, \"+\") || StartsWith(line, \"-\") || StartsWith(line, \" \") ? Slice(line, 1) : line\n    })\n  }]} /> : null\n])}\n"
+          }
+        }
       }
     ]
   },
@@ -181,6 +265,173 @@
             "source": "<TextContent text=\"AFT bash\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
           }
         }
+      },
+      {
+        "record_schema": {
+          "name": "aft/bash/1",
+          "revision": 1,
+          "fields": {
+            "taskId": "id",
+            "phase": "code",
+            "exitCode": "integer",
+            "outputBytes": "integer",
+            "endReason": "code",
+            "runDurationMs": "integer",
+            "execution": "code",
+            "target": "code"
+          }
+        },
+        "reads": [],
+        "template_revision": 3,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"terminal\" title={input.description ?? input.command} failed={(view.completion.endReason ?? view.record.endReason) == \"timed_out\" || (view.completion.endReason ?? view.record.endReason) == \"killed\" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true} />\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<CardHeader title={input.description ?? input.command} />\n\n<ToolText text=\"Command\" />\n\n<CodeBlock codeString={input.command} />\n\n{(view.completion.endReason ?? view.record.endReason) == \"timed_out\" ? <ToolText text=\"Timed out\" tone=\"danger\" />\n : (view.completion.endReason ?? view.record.endReason) == \"killed\" ? <ToolText text=\"Stopped\" tone=\"danger\" />\n : (view.completion.exitCode ?? view.record.exitCode) != null ? <ToolText text={\"Exit \" + Text(view.completion.exitCode ?? view.record.exitCode)} tone={(view.completion.exitCode ?? view.record.exitCode) == 0 ? \"muted\" : \"danger\"} />\n : view.record.phase == \"background_started\" && view.completion == null ? <ToolText text=\"In background\" tone=\"muted\" />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" />\n : view.call.isError == true ? <ToolText text=\"Failed\" tone=\"danger\" /> : null}\n\n{view.record.phase == \"background_started\" && view.completion == null\n ? <ToolText text=\"Running in the background.\" tone=\"muted\" />\n : view.call.phase == \"running\" ? <ToolText text=\"Waiting for output…\" tone=\"muted\" /> : null}\n\n{view.call.phase == \"running\" || (view.record.phase == \"background_started\" && view.completion == null)\n ? null : <ToolText text={view.output == null ? \"Output\" : \"Output · \" + Text(Count(Lines(view.output ?? \"\"))) + \" lines\"} />}\n\n{view.call.phase == \"running\" || (view.record.phase == \"background_started\" && view.completion == null)\n ? null : view.output == null ? <ToolText text=\"No output was kept.\" tone=\"muted\" /> : <CodeBlock codeString={view.output ?? \"\"} maxLines={40} />}\n"
+          }
+        }
+      }
+    ]
+  },
+  "tp1:bash:019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f:3": {
+    "tool": {
+      "name": "bash",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "command": {
+            "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "workdir": {
+            "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+            "type": "string"
+          },
+          "description": {
+            "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+            "type": "string"
+          },
+          "wait": {
+            "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+            "type": "boolean"
+          },
+          "sandbox": {
+            "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+            "type": "string",
+            "const": "host"
+          },
+          "background": {
+            "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+            "type": "boolean"
+          },
+          "compressed": {
+            "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+            "type": "boolean"
+          },
+          "pty": {
+            "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write \u2014 its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+            "type": "boolean"
+          },
+          "ptyRows": {
+            "description": "PTY terminal height in rows \u2014 ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60
+          },
+          "ptyCols": {
+            "description": "PTY terminal width in columns \u2014 ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 140
+          },
+          "runon": {
+            "type": "string",
+            "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options)."
+          },
+          "return_paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "semantics": 3
+    },
+    "history": [
+      {
+        "record_schema": {
+          "name": "aft/bash/1",
+          "revision": 2,
+          "fields": {
+            "taskId": "id",
+            "phase": "code",
+            "exitCode": "integer",
+            "outputBytes": "integer",
+            "endReason": "code",
+            "runDurationMs": "integer",
+            "execution": "code",
+            "target": "code"
+          },
+          "completion_fields": {
+            "tail": "text_lines"
+          }
+        },
+        "reads": [],
+        "template_revision": 2,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"terminal\" title={input.description ?? input.command} failed={(view.completion.endReason ?? view.record.endReason) == \"timed_out\" || (view.completion.endReason ?? view.record.endReason) == \"killed\" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true} />\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<CardHeader title={input.description ?? input.command} />\n\n<ToolText text=\"Command\" />\n\n<CodeBlock codeString={input.command} />\n\n{(view.completion.endReason ?? view.record.endReason) == \"timed_out\" ? <ToolText text=\"Timed out\" tone=\"danger\" />\n : (view.completion.endReason ?? view.record.endReason) == \"killed\" ? <ToolText text=\"Stopped\" tone=\"danger\" />\n : (view.completion.exitCode ?? view.record.exitCode) != null ? <ToolText text={\"Exit \" + Text(view.completion.exitCode ?? view.record.exitCode)} tone={(view.completion.exitCode ?? view.record.exitCode) == 0 ? \"muted\" : \"danger\"} />\n : view.record.phase == \"background_started\" && view.completion == null ? <ToolText text=\"In background\" tone=\"muted\" />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" />\n : view.call.isError == true ? <ToolText text=\"Failed\" tone=\"danger\" /> : null}\n\n{view.record.phase == \"background_started\" && view.completion == null\n ? <ToolText text=\"Running in the background.\" tone=\"muted\" />\n : view.call.phase == \"running\" ? <ToolText text=\"Waiting for output…\" tone=\"muted\" /> : null}\n\n{Each(view.completion.tail ?? [], \"line\", <ToolText font=\"mono\" maxLines={1} tone={line.tone ?? \"neutral\"} text={line.text} />)}\n\n{view.call.phase == \"running\" || (view.record.phase == \"background_started\" && view.completion == null)\n ? null : <ToolText text={view.output == null ? \"Output\" : \"Output · \" + Text(Count(Lines(view.output ?? \"\"))) + \" lines\"} />}\n\n{view.call.phase == \"running\" || (view.record.phase == \"background_started\" && view.completion == null)\n ? null : view.output == null ? <ToolText text=\"No output was kept.\" tone=\"muted\" /> : <CodeBlock codeString={view.output ?? \"\"} maxLines={40} />}\n"
+          }
+        }
       }
     ]
   },
@@ -289,6 +540,161 @@
             },
             "reads": [],
             "source": "<TextContent text=\"AFT bash\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
+          }
+        }
+      },
+      {
+        "record_schema": {
+          "name": "aft/bash/1",
+          "revision": 1,
+          "fields": {
+            "taskId": "id",
+            "phase": "code",
+            "exitCode": "integer",
+            "outputBytes": "integer",
+            "endReason": "code",
+            "runDurationMs": "integer",
+            "execution": "code",
+            "target": "code"
+          }
+        },
+        "reads": [],
+        "template_revision": 3,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"terminal\" title={input.description ?? input.command} failed={(view.completion.endReason ?? view.record.endReason) == \"timed_out\" || (view.completion.endReason ?? view.record.endReason) == \"killed\" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true} />\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<CardHeader title={input.description ?? input.command} />\n\n<ToolText text=\"Command\" />\n\n<CodeBlock codeString={input.command} />\n\n{(view.completion.endReason ?? view.record.endReason) == \"timed_out\" ? <ToolText text=\"Timed out\" tone=\"danger\" />\n : (view.completion.endReason ?? view.record.endReason) == \"killed\" ? <ToolText text=\"Stopped\" tone=\"danger\" />\n : (view.completion.exitCode ?? view.record.exitCode) != null ? <ToolText text={\"Exit \" + Text(view.completion.exitCode ?? view.record.exitCode)} tone={(view.completion.exitCode ?? view.record.exitCode) == 0 ? \"muted\" : \"danger\"} />\n : view.record.phase == \"background_started\" && view.completion == null ? <ToolText text=\"In background\" tone=\"muted\" />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" />\n : view.call.isError == true ? <ToolText text=\"Failed\" tone=\"danger\" /> : null}\n\n{view.record.phase == \"background_started\" && view.completion == null\n ? <ToolText text=\"Running in the background.\" tone=\"muted\" />\n : view.call.phase == \"running\" ? <ToolText text=\"Waiting for output…\" tone=\"muted\" /> : null}\n\n{view.call.phase == \"running\" || (view.record.phase == \"background_started\" && view.completion == null)\n ? null : <ToolText text={view.output == null ? \"Output\" : \"Output · \" + Text(Count(Lines(view.output ?? \"\"))) + \" lines\"} />}\n\n{view.call.phase == \"running\" || (view.record.phase == \"background_started\" && view.completion == null)\n ? null : view.output == null ? <ToolText text=\"No output was kept.\" tone=\"muted\" /> : <CodeBlock codeString={view.output ?? \"\"} maxLines={40} />}\n"
+          }
+        }
+      }
+    ]
+  },
+  "tp1:bash:da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a:3": {
+    "tool": {
+      "name": "bash",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "command": {
+            "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "workdir": {
+            "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+            "type": "string"
+          },
+          "description": {
+            "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+            "type": "string"
+          },
+          "wait": {
+            "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+            "type": "boolean"
+          },
+          "sandbox": {
+            "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+            "type": "string",
+            "const": "host"
+          },
+          "background": {
+            "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+            "type": "boolean"
+          },
+          "compressed": {
+            "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+            "type": "boolean"
+          },
+          "pty": {
+            "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write \u2014 its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+            "type": "boolean"
+          },
+          "ptyRows": {
+            "description": "PTY terminal height in rows \u2014 ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60
+          },
+          "ptyCols": {
+            "description": "PTY terminal width in columns \u2014 ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 140
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "semantics": 3
+    },
+    "history": [
+      {
+        "record_schema": {
+          "name": "aft/bash/1",
+          "revision": 2,
+          "fields": {
+            "taskId": "id",
+            "phase": "code",
+            "exitCode": "integer",
+            "outputBytes": "integer",
+            "endReason": "code",
+            "runDurationMs": "integer",
+            "execution": "code",
+            "target": "code"
+          },
+          "completion_fields": {
+            "tail": "text_lines"
+          }
+        },
+        "reads": [],
+        "template_revision": 2,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"terminal\" title={input.description ?? input.command} failed={(view.completion.endReason ?? view.record.endReason) == \"timed_out\" || (view.completion.endReason ?? view.record.endReason) == \"killed\" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true} />\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<CardHeader title={input.description ?? input.command} />\n\n<ToolText text=\"Command\" />\n\n<CodeBlock codeString={input.command} />\n\n{(view.completion.endReason ?? view.record.endReason) == \"timed_out\" ? <ToolText text=\"Timed out\" tone=\"danger\" />\n : (view.completion.endReason ?? view.record.endReason) == \"killed\" ? <ToolText text=\"Stopped\" tone=\"danger\" />\n : (view.completion.exitCode ?? view.record.exitCode) != null ? <ToolText text={\"Exit \" + Text(view.completion.exitCode ?? view.record.exitCode)} tone={(view.completion.exitCode ?? view.record.exitCode) == 0 ? \"muted\" : \"danger\"} />\n : view.record.phase == \"background_started\" && view.completion == null ? <ToolText text=\"In background\" tone=\"muted\" />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" />\n : view.call.isError == true ? <ToolText text=\"Failed\" tone=\"danger\" /> : null}\n\n{view.record.phase == \"background_started\" && view.completion == null\n ? <ToolText text=\"Running in the background.\" tone=\"muted\" />\n : view.call.phase == \"running\" ? <ToolText text=\"Waiting for output…\" tone=\"muted\" /> : null}\n\n{Each(view.completion.tail ?? [], \"line\", <ToolText font=\"mono\" maxLines={1} tone={line.tone ?? \"neutral\"} text={line.text} />)}\n\n{view.call.phase == \"running\" || (view.record.phase == \"background_started\" && view.completion == null)\n ? null : <ToolText text={view.output == null ? \"Output\" : \"Output · \" + Text(Count(Lines(view.output ?? \"\"))) + \" lines\"} />}\n\n{view.call.phase == \"running\" || (view.record.phase == \"background_started\" && view.completion == null)\n ? null : view.output == null ? <ToolText text=\"No output was kept.\" tone=\"muted\" /> : <CodeBlock codeString={view.output ?? \"\"} maxLines={40} />}\n"
           }
         }
       }
@@ -410,6 +816,90 @@
             "source": "<TextContent text=\"AFT edit\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
           }
         }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 4,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"edit\" title={FileName(input.path)} subtitle={Folder(input.path)} truncate=\"middle\">\n<Slot width=\"medium\">\n{view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : (view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text=\"No match\" size=\"small\" tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" size=\"small\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" size=\"small\" tone=\"danger\" />\n : (view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(view.completion.addedLines ?? view.record.addedLines)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(view.completion.removedLines ?? view.record.removedLines)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<CardHeader title=\"Edit\" />\n\n<ToolText size=\"large\" text={FileName(input.path)} />\n\n<ToolText tone=\"muted\" text={Folder(input.path)} />\n\n{(view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text={\"No match · \" + (Count(input.edits ?? []) > 1 ? Text(Count(input.edits ?? [])) + \" changes\" : \"1 change\")} tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"success\" ? <ToolText text={\"Applied · \" + (Count(input.edits ?? []) > 1 ? Text(Count(input.edits ?? [])) + \" changes\" : \"1 change\") + ((view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null ? \" · +\" + Text(view.completion.addedLines ?? view.record.addedLines) + \" −\" + Text(view.completion.removedLines ?? view.record.removedLines) : \"\")} />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" /> : null}\n\n{view.detail.noMatchChange != null ? <ToolText text={\"Change \" + Text(view.detail.noMatchChange) + \" · No match\"} tone=\"danger\" /> : null}\n\n{view.detail.truncated == true ? <ToolText text=\"Only part of the diff was kept.\" tone=\"warning\" /> : null}\n\n{Count(view.detail.hunks ?? []) > 0 ? <Diff hunks={view.detail.hunks} /> : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0\n ? <ToolText text=\"The full diff is no longer kept. This shows the changes the agent asked for.\" tone=\"warning\" /> : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0\n ? Each(input.edits ?? [], \"edit\", <CodeBlock codeString={(edit.oldString ?? \"\") + \"\\n→\\n\" + (edit.newString ?? edit.content ?? \"\")} maxLines={40} />)\n : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0 && (input.appendContent != null || input.content != null)\n ? <CodeBlock codeString={\"→\\n\" + (input.appendContent ?? input.content ?? \"\")} maxLines={40} /> : null}\n"
+          }
+        }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 5,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"edit\" title={FileName(input.path)} subtitle={Folder(input.path)} truncate=\"middle\">\n<Slot width=\"short\">\n{view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : (view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text=\"No match\" size=\"small\" tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" size=\"small\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" size=\"small\" tone=\"danger\" />\n : (view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(view.completion.addedLines ?? view.record.addedLines)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(view.completion.removedLines ?? view.record.removedLines)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<CardHeader title=\"Edit\" />\n\n<ToolText size=\"large\" text={FileName(input.path)} />\n\n<ToolText tone=\"muted\" text={Folder(input.path)} />\n\n{(view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text={\"No match · \" + (Count(input.edits ?? []) > 1 ? Text(Count(input.edits ?? [])) + \" changes\" : \"1 change\")} tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"success\" ? <ToolText text={\"Applied · \" + (Count(input.edits ?? []) > 1 ? Text(Count(input.edits ?? [])) + \" changes\" : \"1 change\") + ((view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null ? \" · +\" + Text(view.completion.addedLines ?? view.record.addedLines) + \" −\" + Text(view.completion.removedLines ?? view.record.removedLines) : \"\")} />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" /> : null}\n\n{view.detail.noMatchChange != null ? <ToolText text={\"Change \" + Text(view.detail.noMatchChange) + \" · No match\"} tone=\"danger\" /> : null}\n\n{view.detail.truncated == true ? <ToolText text=\"Only part of the diff was kept.\" tone=\"warning\" /> : null}\n\n{Count(view.detail.hunks ?? []) > 0 ? <Diff hunks={view.detail.hunks} /> : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0\n ? <ToolText text=\"The full diff is no longer kept. This shows the changes the agent asked for.\" tone=\"warning\" /> : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0\n ? Each(input.edits ?? [], \"edit\", <CodeBlock codeString={(edit.oldString ?? \"\") + \"\\n→\\n\" + (edit.newString ?? edit.content ?? \"\")} maxLines={40} />)\n : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0 && (input.appendContent != null || input.content != null)\n ? <CodeBlock codeString={\"→\\n\" + (input.appendContent ?? input.content ?? \"\")} maxLines={40} /> : null}\n"
+          }
+        }
       }
     ]
   },
@@ -476,6 +966,90 @@
             },
             "reads": [],
             "source": "<TextContent text=\"AFT write\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
+          }
+        }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 4,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"edit\" title={FileName(input.path)} subtitle={Folder(input.path)} truncate=\"middle\">\n<Slot width=\"medium\">\n{view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : (view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text=\"No match\" size=\"small\" tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" size=\"small\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" size=\"small\" tone=\"danger\" />\n : (view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(view.completion.addedLines ?? view.record.addedLines)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(view.completion.removedLines ?? view.record.removedLines)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.reason ?? view.record.reason\nexport const added = view.completion.addedLines ?? view.record.addedLines\nexport const removed = view.completion.removedLines ?? view.record.removedLines\n\n<CardHeader title=\"Write\" />\n\n<ToolText size=\"large\" text={FileName(input.path)} />\n\n<ToolText tone=\"muted\" text={Folder(input.path)} />\n\n{reason == \"invalid_syntax\" || reason == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" tone=\"danger\" />\n : outcome == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : outcome == \"error\" ? <ToolText text=\"Failed\" tone=\"danger\" />\n : outcome == \"success\" ? <ToolText text={\"Applied · 1 change\" + (added != null && removed != null ? \" · +\" + Text(added) + \" −\" + Text(removed) : \"\")} />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" /> : null}\n\n<CodeBlock codeString={input.content} maxLines={40} />\n"
+          }
+        }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 5,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"edit\" title={FileName(input.path)} subtitle={Folder(input.path)} truncate=\"middle\">\n<Slot width=\"short\">\n{view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : (view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text=\"No match\" size=\"small\" tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" size=\"small\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" size=\"small\" tone=\"danger\" />\n : (view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(view.completion.addedLines ?? view.record.addedLines)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(view.completion.removedLines ?? view.record.removedLines)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.reason ?? view.record.reason\nexport const added = view.completion.addedLines ?? view.record.addedLines\nexport const removed = view.completion.removedLines ?? view.record.removedLines\n\n<CardHeader title=\"Write\" />\n\n<ToolText size=\"large\" text={FileName(input.path)} />\n\n<ToolText tone=\"muted\" text={Folder(input.path)} />\n\n{reason == \"invalid_syntax\" || reason == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" tone=\"danger\" />\n : outcome == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : outcome == \"error\" ? <ToolText text=\"Failed\" tone=\"danger\" />\n : outcome == \"success\" ? <ToolText text={\"Applied · 1 change\" + (added != null && removed != null ? \" · +\" + Text(added) + \" −\" + Text(removed) : \"\")} />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" /> : null}\n\n<CodeBlock codeString={input.content} maxLines={40} />\n"
           }
         }
       }

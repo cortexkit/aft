@@ -1,5 +1,6 @@
 pub mod anchored_lane;
 pub mod blocks;
+mod checkout_gaps;
 pub mod comparator;
 pub mod confidence;
 pub mod data_file;
@@ -35,8 +36,7 @@ pub use evidence_descriptor::{
 };
 pub use generation_token::GenerationToken;
 pub use plan_table::{
-    verify_pinned_plan_table_at_startup, LanePlanEntry, PlanTable, PlanTableError, SearchLaneKind,
-    SearchShape, PINNED_PLAN_TABLE_JSON,
+    LanePlanEntry, PlanTable, PlanTableError, SearchLaneKind, SearchShape, PINNED_PLAN_TABLE_JSON,
 };
 
 /// Immutable request input passed to a registered lane callback.
@@ -139,6 +139,7 @@ use crate::semantic_index::{
     SemanticResult,
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
+use checkout_gaps::CheckoutSemanticGaps;
 
 const DEFAULT_TOP_K: usize = 10;
 
@@ -1472,10 +1473,8 @@ fn file_cosines(
         .iter()
         .filter_map(|path| {
             index
-                .search_filtered(query_vector, 1, &|file| file == path.as_path())
-                .ok()?
-                .first()
-                .map(|result| (path.clone(), result.score))
+                .best_file_score(query_vector, path)
+                .map(|score| (path.clone(), score))
         })
         .collect()
 }
@@ -1514,7 +1513,7 @@ fn handle_split_search<'a>(
     let lexical_ready = if external.is_some() {
         true
     } else {
-        search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
+        search_index_ready(ctx)
     };
     let patterns = match external {
         Some(corpus) => match corpus.collect(compiled, include_tests) {
@@ -2344,7 +2343,7 @@ fn handle_semantic_search_inner(
     let semantic_status_snapshot = sampled.unwrap_or(semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    let lexical_ready = search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET);
+    let lexical_ready = search_index_ready(ctx);
     // Ordinary roots retain the index-lane refusal policy. Parent children
     // may still be warming their first indexes, so their reader engines use
     // the existing bounded exact/lexical fallback instead.
@@ -3278,218 +3277,6 @@ fn auto_regex_literal_fallback_warning(reason: impl AsRef<str>) -> String {
         "Query looked like a regex but failed to compile ({}); searched literally instead. Use grep when explicit regex lane control is required.",
         reason.as_ref()
     )
-}
-
-/// What an index-store semantic answer could not cover, named so an incomplete
-/// answer says which files it is missing instead of looking complete.
-struct CheckoutSemanticGaps {
-    /// Files excluded by grammar availability or parsing policy, with typed
-    /// reasons. They are not waiting for a fill and are not fill failures.
-    skipped: Vec<serde_json::Value>,
-    /// Files whose current content has no vectors yet (awaiting a fill, or
-    /// edited since the last one).
-    pending: Vec<PathBuf>,
-    /// Terminal failures extracting a file's outline or embedding its chunks.
-    failed: Vec<(PathBuf, String)>,
-    /// The watcher could not vouch for membership, so the checkout was
-    /// re-walked and vectors may lag the disk.
-    unvouched: bool,
-    /// The checkout view could not be read at all.
-    unavailable: Option<String>,
-    /// Why the data layer's last fill stopped, while files still wait for
-    /// vectors; it is tried again later. Never set for a views-on answer.
-    fill_failure: Option<String>,
-}
-
-/// How many gap paths the response text names before summarizing the rest.
-const CHECKOUT_SEMANTIC_GAP_NAMES: usize = 5;
-
-impl CheckoutSemanticGaps {
-    fn status(&self) -> &'static str {
-        if self.unavailable.is_some() {
-            "unavailable"
-        } else if self.pending.is_empty()
-            && !self.skipped.iter().any(|gap| {
-                matches!(
-                    gap["state"].as_str(),
-                    Some("not_downloaded" | "downloading" | "network_retry" | "storage_retry")
-                )
-            })
-            && !self.unvouched
-            && self.fill_failure.is_none()
-        {
-            "ready"
-        } else {
-            "refreshing"
-        }
-    }
-
-    /// Pending work and recorded exclusions from data-layer semantic search.
-    fn from_data(meaning: &crate::commands::data_search::DataMeaning) -> Self {
-        let mut gaps = Self::from_coverage(meaning.coverage());
-        gaps.fill_failure = meaning.failure().map(str::to_string);
-        gaps
-    }
-
-    fn from_coverage(coverage: &crate::data_layer::vectors::Coverage) -> Self {
-        let reply = if coverage.skipped_parses.is_empty() {
-            crate::data_layer::grammar::GapReply::default()
-        } else {
-            crate::data_layer::grammar::GapReply::capture()
-        };
-        Self {
-            skipped: coverage
-                .skipped_parses
-                .iter()
-                .filter_map(|(path, reason)| reply.value(reason, path))
-                .collect(),
-            pending: coverage.pending.clone(),
-            failed: coverage.grammar_outline_failures().cloned().collect(),
-            unvouched: false,
-            unavailable: None,
-            fill_failure: None,
-        }
-    }
-
-    fn unavailable(reason: String) -> Self {
-        Self {
-            skipped: Vec::new(),
-            pending: Vec::new(),
-            failed: Vec::new(),
-            unvouched: false,
-            unavailable: Some(reason),
-            fill_failure: None,
-        }
-    }
-
-    fn disclose(
-        &self,
-        project_root: &Path,
-        text: &mut String,
-        extras: &mut serde_json::Map<String, serde_json::Value>,
-    ) {
-        let relative = |paths: &[PathBuf]| {
-            paths
-                .iter()
-                .map(|path| {
-                    project_relative_path(path, project_root)
-                        .display()
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
-        };
-        let pending = relative(&self.pending);
-        let failed = relative(
-            &self
-                .failed
-                .iter()
-                .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<_>>(),
-        );
-        let named = |label: &str, paths: &[String]| {
-            let shown = paths
-                .iter()
-                .take(CHECKOUT_SEMANTIC_GAP_NAMES)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            let more = paths.len().saturating_sub(CHECKOUT_SEMANTIC_GAP_NAMES);
-            if more > 0 {
-                format!(
-                    "semantic: {} file(s) {label}: {shown} (+{more} more)",
-                    paths.len()
-                )
-            } else {
-                format!("semantic: {} file(s) {label}: {shown}", paths.len())
-            }
-        };
-        let mut lines = Vec::new();
-        let skipped = self
-            .skipped
-            .iter()
-            .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
-            .map(|gap| {
-                let mut gap = gap.clone();
-                if let Some(path) = gap["path"].as_str() {
-                    gap["path"] =
-                        serde_json::json!(project_relative_path(Path::new(path), project_root));
-                }
-                gap
-            })
-            .collect::<Vec<_>>();
-        for gap in &skipped {
-            lines.push(format!(
-                "{}: {}",
-                gap["path"].as_str().unwrap_or_default(),
-                gap["message"].as_str().unwrap_or_default()
-            ));
-        }
-        let preview =
-            crate::data_layer::surfaces::parse_gap_preview(skipped.len(), self.skipped.len());
-        if let Some(trailer) = crate::subc_format::render_envelope_trailer(&preview) {
-            lines.push(trailer);
-        }
-        if let Some(reason) = &self.unavailable {
-            lines.push(format!("semantic: unavailable: {reason}"));
-        }
-        if !pending.is_empty() {
-            lines.push(named("not yet embedded", &pending));
-        }
-        for (path, (_, reason)) in failed.iter().zip(&self.failed) {
-            lines.push(format!("{path}: {reason}"));
-        }
-        let failed_preview =
-            crate::data_layer::surfaces::parse_gap_preview(failed.len(), self.failed.len());
-        if let Some(trailer) = crate::subc_format::render_envelope_trailer(&failed_preview) {
-            lines.push(trailer);
-        }
-        if self.unvouched {
-            lines.push(
-                "semantic: file membership was re-walked because changes may have been missed; vectors can lag the disk"
-                    .to_string(),
-            );
-        }
-        if let Some(error) = &self.fill_failure {
-            lines.push(format!(
-                "semantic: embedding the waiting files stopped and is retried later: {error}"
-            ));
-        }
-        extras.insert("complete".into(), serde_json::json!(false));
-        let mut gap = serde_json::json!({
-            "pending": pending,
-            "failed": failed,
-            "unvouched": self.unvouched,
-            "unavailable": self.unavailable,
-        });
-        if !failed.is_empty() {
-            gap["failed_files"] = serde_json::json!(self
-                .failed
-                .iter()
-                .zip(&failed)
-                .map(|((_, reason), path)| serde_json::json!({"path":path,"reason":reason}))
-                .collect::<Vec<_>>());
-            gap["failed_files_count"] = serde_json::json!(self.failed.len());
-            gap["failed_files_omitted"] = serde_json::json!(self.failed.len() - failed.len());
-            gap["failed_files_list"] = serde_json::json!(failed_preview);
-        }
-        if !skipped.is_empty() {
-            gap["skipped_files"] = serde_json::json!(skipped);
-            gap["skipped_files_count"] = serde_json::json!(self.skipped.len());
-            let omitted =
-                self.skipped.len() - gap["skipped_files"].as_array().expect("skip preview").len();
-            gap["skipped_files_omitted"] = serde_json::json!(omitted);
-            gap["skipped_files_list"] = serde_json::json!(preview);
-        }
-        if let Some(error) = &self.fill_failure {
-            gap["fill_failure"] = serde_json::json!(error);
-        }
-        extras.insert("semantic_gap".into(), gap);
-        for line in lines {
-            text.push('\n');
-            text.push_str(&line);
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -6636,7 +6423,7 @@ fn handle_semantic_or_hybrid_search(
                 gap.semantic_status,
                 gap.status,
                 gap.detail,
-                gap.footer_reason,
+                gap.footer_reason.as_ref(),
                 false,
                 warnings,
                 project_root,
@@ -6748,7 +6535,7 @@ fn handle_semantic_or_hybrid_search(
             gap.semantic_status,
             gap.status,
             gap.detail,
-            gap.footer_reason,
+            gap.footer_reason.as_ref(),
             false,
             warnings,
             project_root,
@@ -6770,7 +6557,7 @@ fn handle_semantic_or_hybrid_search(
                 return cancelled_search_response(req);
             }
             let gap = semantic_embed_gap(&error);
-            let reason = query_embedding_failure_reason(&error, gap.footer_reason);
+            let reason = query_embedding_failure_reason(&error, gap.footer_reason.as_ref());
             let response = semantic_unavailable_or_fallback_response(
                 req,
                 ctx,
@@ -6780,7 +6567,7 @@ fn handle_semantic_or_hybrid_search(
                 gap.semantic_status,
                 gap.status,
                 gap.detail,
-                gap.footer_reason,
+                gap.footer_reason.as_ref(),
                 true,
                 warnings,
                 project_root,
@@ -6833,7 +6620,7 @@ fn handle_semantic_or_hybrid_search(
                     gap.semantic_status,
                     gap.status,
                     gap.detail,
-                    gap.footer_reason,
+                    gap.footer_reason.as_ref(),
                     true,
                     warnings,
                     project_root,
@@ -8507,14 +8294,6 @@ fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
     Ok(semantic_index.is_some())
 }
 
-fn search_index_ready_with_budget(ctx: &AppContext, _wait_budget: Duration) -> bool {
-    if crate::commands::data_search::DataText::ready(ctx).is_some() {
-        return true;
-    }
-
-    false
-}
-
 /// Ranks every semantic chunk against `query_vector` with no enumeration
 /// limit, for the recall audit's per-target semantic coverage. It applies the
 /// same test-file filter as the live lane so ranks are comparable with it.
@@ -8602,7 +8381,9 @@ fn data_meaning_search(
     ) {
         Ok(results) => (
             results,
-            (!meaning.complete() || !meaning.coverage().skipped_parses.is_empty())
+            (!meaning.complete()
+                || !meaning.coverage().skipped_parses.is_empty()
+                || meaning.coverage().past_cap > 0)
                 .then(|| CheckoutSemanticGaps::from_data(meaning)),
         ),
         Err(error) => (
@@ -8613,7 +8394,7 @@ fn data_meaning_search(
 }
 
 fn search_index_ready(ctx: &AppContext) -> bool {
-    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
+    crate::commands::data_search::DataText::ready(ctx).is_some()
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
@@ -8687,7 +8468,8 @@ fn embed_query_for_dimension(
     index_dimension: Option<usize>,
 ) -> Result<Vec<f32>, String> {
     if let Some(query_vector) = precomputed_query_vector(query) {
-        return check_query_dimension(query_vector, index_dimension);
+        check_query_dimension(&query_vector, index_dimension)?;
+        return Ok(query_vector);
     }
     let semantic_config = ctx.config().semantic.clone();
     let query_budget = QueryBudget::from_config(&semantic_config);
@@ -8734,22 +8516,18 @@ fn embed_query_for_dimension(
     let model = model_ref
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
-    // Embed through a handle on the installed model rather than under its
-    // mutex: the backend round trip of one query must not hold up another
-    // query whose vector is already cached. The handle keeps the
-    // serialization the backend itself needs (see `share_for_query`).
+    // Cached queries should not wait behind another query's backend round trip.
     let mut query_model = model.share_for_query();
     drop(model_ref);
     let known_dimension = query_model.known_dimension();
-    // Preserve the raw error so the timeout marker injected by
-    // `send_embedding_request` survives — `classify_embed_query_error` reads it
-    // to decide whether the configured query budget fired.
+    // Preserve the backend's timeout marker for `classify_embed_query_error`.
     let query_vector = waits::timed(waits::SearchWait::Embed, || {
         query_model.embed_query_cached(query, query_budget)
     })
     .map_err(|error| format!("failed to embed query: {error}"))?;
-    // A backend that reported its dimension with this query tells the
-    // installed model too, as it did when the query ran on that model.
+    check_query_dimension(&query_vector, index_dimension)
+        .inspect_err(|_| query_model.discard_rejected_query(query, &query_vector))?;
+    // Update the installed model after accepting the backend's dimension.
     if query_model.known_dimension() != known_dimension {
         if let Some(model) = waits::timed(waits::SearchWait::ModelLock, || {
             ctx.semantic_embedding_model().lock()
@@ -8760,13 +8538,13 @@ fn embed_query_for_dimension(
         }
     }
 
-    check_query_dimension(query_vector, index_dimension)
+    Ok(query_vector)
 }
 
 fn check_query_dimension(
-    query_vector: Vec<f32>,
+    query_vector: &[f32],
     index_dimension: Option<usize>,
-) -> Result<Vec<f32>, String> {
+) -> Result<(), String> {
     if let Some(index_dimension) = index_dimension {
         if index_dimension != query_vector.len() {
             return Err(format!(
@@ -8777,7 +8555,7 @@ fn check_query_dimension(
         }
     }
 
-    Ok(query_vector)
+    Ok(())
 }
 
 /// Classified query-embedding failure: the user-facing `detail` line that names
@@ -8792,7 +8570,7 @@ fn check_query_dimension(
 /// substring-matching reqwest's rendered text, which varies by backend/locale.
 struct ClassifiedEmbedQueryError {
     detail: String,
-    footer_reason: &'static str,
+    footer_reason: std::borrow::Cow<'static, str>,
 }
 
 const PAUSED_EMBEDDING_DETAIL: &str =
@@ -8845,12 +8623,12 @@ fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
         if pause.cause == crate::synapse_embed::PauseCause::WarmingUp {
             return ClassifiedEmbedQueryError {
                 detail: warming_up_embedding_detail(pause.retry_after_ms),
-                footer_reason: WARMING_UP_FOOTER_REASON,
+                footer_reason: WARMING_UP_FOOTER_REASON.into(),
             };
         }
         ClassifiedEmbedQueryError {
             detail: PAUSED_EMBEDDING_DETAIL.to_string(),
-            footer_reason: "unavailable",
+            footer_reason: "unavailable".into(),
         }
     } else if let Some(timeout_ms) = query_embedding_timeout_budget(error) {
         let clean = strip_query_embedding_timeout_marker(error);
@@ -8859,8 +8637,7 @@ fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
         let detail = format!(
             "Semantic search unavailable: query embedding timed out after {timeout_ms}ms (semantic.query_timeout_ms; raise it for slow providers). {clean}"
         );
-        let footer_reason =
-            Box::leak(format!("query embed timeout ({timeout_ms}ms)").into_boxed_str());
+        let footer_reason = format!("query embed timeout ({timeout_ms}ms)").into();
         ClassifiedEmbedQueryError {
             detail,
             footer_reason,
@@ -8871,12 +8648,12 @@ fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
             detail: format!(
                 "Semantic search unavailable: local query embedder is busy finishing an earlier inference; using lexical search only. {clean}"
             ),
-            footer_reason: "query embed busy",
+            footer_reason: "query embed busy".into(),
         }
     } else {
         ClassifiedEmbedQueryError {
             detail: format!("Semantic search unavailable: {error}"),
-            footer_reason: "unavailable",
+            footer_reason: "unavailable".into(),
         }
     }
 }
@@ -9168,7 +8945,7 @@ struct SemanticLaneGap {
     /// The line that opens the reply text.
     detail: String,
     /// Reason shown in the reply footer's `[semantic: ...]` tag.
-    footer_reason: &'static str,
+    footer_reason: std::borrow::Cow<'static, str>,
 }
 
 /// The gap for an index configured off or failed; `None` for a ready or
@@ -9180,7 +8957,7 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
             semantic_status: "disabled",
             status: "disabled",
             detail: "Semantic search is not enabled.".to_string(),
-            footer_reason: "disabled",
+            footer_reason: "disabled".into(),
         }),
         SemanticIndexStatus::Failed(error) => {
             // A read-only root can lose its snapshot to idle eviction and get
@@ -9198,14 +8975,14 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
                     semantic_status: "building",
                     status: "reloading",
                     detail: "Semantic index is reloading from the shared read-only snapshot; retry shortly.".to_string(),
-                    footer_reason: "reloading",
+                    footer_reason: "reloading".into(),
                 }
             } else {
                 SemanticLaneGap {
                     semantic_status: "unavailable",
                     status: "unavailable",
                     detail: format!("Semantic search unavailable: {error}"),
-                    footer_reason: "unavailable",
+                    footer_reason: "unavailable".into(),
                 }
             })
         }
@@ -9226,7 +9003,7 @@ fn semantic_not_loaded_gap(_ctx: &AppContext) -> SemanticLaneGap {
             "Semantic index is not ready yet."
         }
         .to_string(),
-        footer_reason: "not_ready",
+        footer_reason: "not_ready".into(),
     }
 }
 
@@ -9299,7 +9076,7 @@ fn semantic_artifacts_busy_gap() -> SemanticLaneGap {
             "Semantic search artifacts remained busy beyond {}ms.",
             INTERACTIVE_ARTIFACT_READ_BUDGET.as_millis()
         ),
-        footer_reason: "artifact contention",
+        footer_reason: "artifact contention".into(),
     }
 }
 
@@ -12020,6 +11797,35 @@ mod tests {
     }
 
     #[test]
+    fn query_retries_after_a_cached_embedding_with_the_wrong_dimension() {
+        struct WrongDimensionOnce(Arc<AtomicUsize>);
+        impl crate::semantic_index::LocalEmbeddingProvider for WrongDimensionOnce {
+            fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+                let call = self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![if call == 0 {
+                    vec![1.0; 3]
+                } else {
+                    vec![1.0; 2]
+                }])
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_context(project.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        *ctx.semantic_embedding_model().lock() =
+            Some(SemanticEmbeddingModel::from_local_provider_for_test(
+                Box::new(WrongDimensionOnce(calls.clone())),
+                project.path().to_path_buf(),
+            ));
+
+        let query = || embed_query_for_dimension("same query", &ctx, Some(2));
+        assert!(query().unwrap_err().contains("returned 3, index expects 2"));
+        assert_eq!(query().unwrap(), vec![1.0; 2]);
+        assert_eq!(query().unwrap(), vec![1.0; 2]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn blocked_local_query_times_out_falls_back_and_late_result_populates_cache() {
         let project = tempfile::tempdir().expect("create project dir");
         std::fs::write(
@@ -12422,6 +12228,10 @@ mod tests {
             classified.detail
         );
         assert_eq!(classified.footer_reason, "query embed timeout (3000ms)");
+        assert!(matches!(
+            classified.footer_reason,
+            std::borrow::Cow::Owned(_)
+        ));
     }
 
     #[test]
@@ -12640,6 +12450,46 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A file past `semantic.max_files` has no vectors, so the search cannot
+    /// find it. Once every admitted file is embedded the reply still names
+    /// that gap instead of reading as complete.
+    #[test]
+    fn files_past_semantic_max_files_are_a_named_gap() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(
+            project.path().join("src/other.rs"),
+            "pub fn other_symbol() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
+        ctx.update_config(|config| config.semantic.max_files = 1);
+        let _fill = crate::data_layer::meaning::fill_with_constant_vectors_for_test(&root, 2);
+        wait_for_data_semantic(&ctx, |data| {
+            data.serving().is_some_and(|meaning| {
+                meaning.coverage().pending.is_empty() && meaning.coverage().past_cap == 1
+            })
+        });
+
+        // The fill used constant two-dimensional vectors; the query gets
+        // one too, as no embedding model runs in this test.
+        let query = "where is the needle symbol implemented";
+        let response = with_precomputed_query_vector(query, vec![1.0, 0.0], || {
+            response_value(handle_semantic_search(&semantic_request(query, 5), &ctx))
+        });
+        assert_eq!(response["semantic_status"], "ready", "{response}");
+        assert_eq!(response["complete"], false, "{response}");
+        assert_eq!(response["semantic_gap"]["past_cap"], 1, "{response}");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.contains(
+                "semantic: left 1 file(s) past semantic.max_files without vectors; they are not searched"
+            ),
+            "{text}"
+        );
     }
 
     /// A fill whose embedding model cannot load leaves the meaning plane

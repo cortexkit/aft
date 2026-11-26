@@ -62,6 +62,7 @@ pub enum ManifestJoinError {
     GrammarUnavailable(crate::grammar::GrammarUnavailable),
     Cancelled,
     UnsupportedLanguage(String),
+    InvalidSourceEncoding,
     Parse(String),
     InvalidBlob(String),
 }
@@ -80,6 +81,7 @@ impl fmt::Display for ManifestJoinError {
             Self::UnsupportedLanguage(language) => {
                 write!(formatter, "unsupported callgraph blob language {language}")
             }
+            Self::InvalidSourceEncoding => formatter.write_str("not valid UTF-8"),
             Self::Parse(reason) => write!(formatter, "callgraph blob parse failed: {reason}"),
             Self::InvalidBlob(reason) => write!(formatter, "invalid callgraph blob: {reason}"),
         }
@@ -1157,7 +1159,7 @@ impl ParseBlob {
                     facts,
                 )
                 .and_then(|p| facts.canonical(&p))
-                .map(|p| super::relative_path(facts.root, &p))
+                .and_then(|p| super::relative_path(facts.root, &p))
                 .into_iter()
                 .collect()
             } else if let Some(module) = &raw.module_path {

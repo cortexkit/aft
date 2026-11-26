@@ -6,7 +6,7 @@ export const removed = view.completion.removedLines ?? view.record.removedLines
 
 <Slot width="fill">
 <ToolHeader icon="edit" title={count > 1 ? Text(count) + " files" : count == 1 && path != "" ? FileName(path) : "Patch"} subtitle={count == 1 && path != "" ? Folder(path) : null} truncate="middle" failed={outcome == "error"}>
-<Slot width="medium">
+<Slot width="short">
 {outcome == "error" && count == 0 ? <ToolText text="Not applied" size="small" tone="danger" />
  : outcome == "partial" ? <ToolText text="Partly applied" size="small" tone="warning" />
  : view.call.phase == "unanswered" ? <ToolText text="Not run" size="small" tone="muted" />

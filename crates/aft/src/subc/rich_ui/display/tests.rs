@@ -1,4 +1,5 @@
 use super::*;
+use crate::edit::report_file as file;
 
 #[test]
 fn display_read_authorizes_only_the_single_attested_display_module() {
@@ -73,6 +74,74 @@ use crate::bash_background::{persistence::PersistedTask, BgTaskStatus};
 use crate::db::call_ledger::Key;
 use std::time::Duration;
 
+#[test]
+fn pipeline_review_durable_background_displays_do_not_block_new_foreground_capture() {
+    TEST_SINK.with(|sink| sink.replace(Some(Vec::new())));
+    let registry = Captures::default();
+    let (_dir, root) = crate::subc::test_support::test_root("deferred-display-cap");
+    let mut route = crate::subc::test_support::route_identity(&root, "deferred-display-cap");
+    let data = Arc::get_mut(&mut route.0).unwrap();
+    data.role = crate::subc::tool_provider::RouteRole::ToolProviderV1;
+    if let crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+        &mut data.spawn_principal
+    {
+        *principal_id = Some("reserved:broca".into());
+    }
+    let bash_pin = crate::subc::tool_views::SHIPPED
+        .keys()
+        .find(|pin| crate::subc::tool_views::has_bash_tail(pin))
+        .unwrap();
+    for index in 0..64 {
+        let name = format!("background-{index}");
+        let mut call = subc_protocol::tool_call::ToolCallRequest::new("bash", json!({}));
+        call.call_key = Some(name.clone());
+        call.schema_pin = Some(bash_pin.clone());
+        let ledger = crate::subc::tool_provider::LedgerEdge::key(&route, &name);
+        register_in(&registry, &ledger, &route, &call);
+        let capture_key = key(&ledger);
+        let identity = registry.lock().unwrap()[&capture_key]
+            .lock()
+            .unwrap()
+            .identity
+            .clone();
+        let mut display = TaskDisplay {
+            identity,
+            capture_key,
+            reply_produced: false,
+            deferred: false,
+            held_ms: None,
+            attempted: false,
+        };
+        let mut running = task();
+        running.status = BgTaskStatus::Running;
+        let bodies = bash_bodies(&running, Some(0), None);
+        bash_reply_in(&registry, &mut display, bodies, true);
+        assert!(display.reply_produced && display.deferred);
+        bash_reply_persisted_in(&registry, &display);
+        reply_in(&registry, &ledger, true, false, Some("running"));
+    }
+    assert_eq!(
+        TEST_SINK.with(|sink| sink
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.kind == DisplayKind::Record)
+            .count()),
+        64
+    );
+    let mut call = subc_protocol::tool_call::ToolCallRequest::new("edit", json!({}));
+    call.call_key = Some("foreground".into());
+    call.schema_pin = crate::subc::tool_views::SHIPPED
+        .keys()
+        .find(|pin| pin.starts_with("tp1:edit:"))
+        .cloned();
+    let ledger = crate::subc::tool_provider::LedgerEdge::key(&route, "foreground");
+    register_in(&registry, &ledger, &route, &call);
+    TEST_SINK.with(|sink| sink.replace(None));
+    assert!(registry.lock().unwrap().contains_key(&key(&ledger)));
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     key: Key,
@@ -91,6 +160,10 @@ fn fixture(tool: &str, name: &str) -> Fixture {
 }
 
 fn fixture_with_pin(tool: &str, name: &str, pin: Option<String>) -> Fixture {
+    fixture_with_call(tool, name, pin, json!({}))
+}
+
+fn fixture_with_call(tool: &str, name: &str, pin: Option<String>, arguments: Value) -> Fixture {
     TEST_SINK.with(|sink| {
         sink.replace(Some(Vec::new()));
     });
@@ -103,7 +176,7 @@ fn fixture_with_pin(tool: &str, name: &str, pin: Option<String>) -> Fixture {
     {
         *principal_id = Some("reserved:broca".into());
     }
-    let mut call = subc_protocol::tool_call::ToolCallRequest::new(tool, json!({}));
+    let mut call = subc_protocol::tool_call::ToolCallRequest::new(tool, arguments);
     call.call_key = Some(name.into());
     call.schema_pin = Some(pin.unwrap_or_else(|| {
         crate::subc::tool_views::SHIPPED
@@ -169,6 +242,96 @@ fn terminal(f: &Fixture, display: &mut TaskDisplay, status: BgTaskStatus, exit: 
     bash_terminal(&snapshot, bodies, "bash-demo1", Some(2400));
     let capture = f.capture.lock().unwrap();
     assert!(capture.terminal || capture.finished);
+}
+
+fn prepare_durable_bash_reply(
+    f: &Fixture,
+) -> (
+    PersistedTask,
+    crate::bash_background::persistence::ResolvedTask,
+) {
+    let _capture = enter(Some(&f.key));
+    let mut display = current_task().unwrap();
+    let mut running = task();
+    running.task_id = "bash-0123456789abcdef".into();
+    running.status = BgTaskStatus::Running;
+    bash_reply(&mut display, bash_bodies(&running, Some(0), None), true);
+    running.display = Some(display);
+    let layout = crate::bash_background::persistence::create_task_layout(
+        f._dir.path(),
+        &running.session_id,
+        &running.task_id,
+    )
+    .unwrap();
+    crate::bash_background::persistence::write_task_at(&layout, &running).unwrap();
+    let persisted = crate::bash_background::persistence::read_task(&layout.paths.json).unwrap();
+    (persisted, layout)
+}
+
+fn complete_durable_bash_reply(
+    mut metadata: PersistedTask,
+    layout: &crate::bash_background::persistence::ResolvedTask,
+) {
+    metadata.status = BgTaskStatus::Completed;
+    metadata.exit_code = Some(0);
+    let snapshot = metadata.display.clone().unwrap();
+    assert!(snapshot.reply_produced && snapshot.deferred && !snapshot.attempted);
+    metadata.display.as_mut().unwrap().attempted = true;
+    crate::bash_background::persistence::write_task_at(layout, &metadata).unwrap();
+    let bodies = terminal_bodies(&metadata, "ok\n", "");
+    bash_terminal(&snapshot, bodies, &metadata.task_id, Some(2400));
+}
+
+#[test]
+fn pipeline_review_bash_handoff_preserves_completion_record_and_detail() {
+    let publish = |name, detach| {
+        let f = fixture("bash", name);
+        let (persisted, layout) = prepare_durable_bash_reply(&f);
+        if detach {
+            bash_reply_persisted(persisted.display.as_ref().unwrap());
+            assert!(
+                CALLS.lock().unwrap().contains_key(&key(&f.key)),
+                "launch not yet queued"
+            );
+        }
+        reply(&f.key, false, false, None);
+        assert_eq!(CALLS.lock().unwrap().contains_key(&key(&f.key)), !detach);
+        assert_eq!(publications().len(), 1);
+        complete_durable_bash_reply(persisted, &layout);
+        let records = publications();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].kind, DisplayKind::Detail);
+        assert_eq!(records[2].kind, DisplayKind::Completion);
+        [records[1].body.clone(), records[2].body.clone()]
+    };
+    assert_eq!(
+        publish("bash-durable-handoff", true),
+        publish("bash-retained-capture", false)
+    );
+}
+
+#[test]
+fn pipeline_review_bash_terminal_between_launch_and_handoff_completes_once() {
+    let f = fixture("bash", "bash-terminal-during-handoff");
+    let (persisted, layout) = prepare_durable_bash_reply(&f);
+    let display = persisted.display.clone().unwrap();
+    reply(&f.key, false, false, None);
+    assert!(CALLS.lock().unwrap().contains_key(&key(&f.key)));
+    complete_durable_bash_reply(persisted, &layout);
+    bash_reply_persisted(&display);
+    reply(&f.key, false, false, None);
+    let kinds: Vec<_> = publications()
+        .into_iter()
+        .map(|record| record.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            DisplayKind::Record,
+            DisplayKind::Detail,
+            DisplayKind::Completion
+        ]
+    );
 }
 
 #[test]
@@ -247,7 +410,7 @@ fn display_versioned_bash_pin_publishes_the_legacy_rich_record_and_tail() {
 #[test]
 fn bash_tail_matches_occipital_line_bytes_without_inferring_tone_from_text() {
     let fixture = include_bytes!(
-        "../../../../tests/fixtures/tool_views/phone-reader-tool-tail-v1/03-records.json"
+        "../../../../tests/fixtures/tool_views/phone-reader-tool-tail-v3/03-records.json"
     );
     let mut expected: Value = serde_json::from_slice(fixture).unwrap();
     let mut metadata = task();
@@ -516,72 +679,29 @@ fn exactly_one_capability_declaration_including_warming_is_required() {
     .is_none());
 }
 
+#[cfg(unix)]
 #[test]
-fn outside_project_and_symlink_escapes_never_disclose_paths_or_content() {
+fn symlink_targets_outside_the_project_are_not_project_relative() {
     let f = fixture("write", "display-outside");
     let external = tempfile::tempdir().unwrap();
-    let path = external.path().join("private.txt");
-    std::fs::write(&path, "secret").unwrap();
-    let _active = enter(Some(&f.key));
-    file(
-        path.to_str().unwrap(),
-        None,
-        Some("old\n"),
-        Some("secret\n"),
-        "modified",
-    );
-    let capture = f.capture.lock().unwrap();
-    let (record, detail) = file_bodies(&capture, true);
-    assert_eq!(record["location"], "outside_project");
-    let detail = detail.unwrap();
-    assert!(record.get("path").is_none());
-    assert_eq!(
-        detail["files"][0],
-        json!({"change":"modified","location":"outside_project","diffOmitted":true})
-    );
-    assert!(!serde_json::to_string(&detail)
-        .unwrap()
-        .contains("private.txt"));
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(external.path(), f._dir.path().join("escape")).unwrap();
-        assert!(relative(f._dir.path(), &f._dir.path().join("escape/private.txt")).is_none());
-    }
+    std::os::unix::fs::symlink(external.path(), f._dir.path().join("escape")).unwrap();
+    assert!(relative(f._dir.path(), &f._dir.path().join("escape/a.txt")).is_none());
 }
 
 #[test]
-fn per_call_masker_runs_before_detail_sizing_and_unavailable_masker_withholds() {
-    use std::ffi::OsStr;
-    let f = fixture("edit", "display-masker");
-    let path = f._dir.path().join("a.rs");
-    std::fs::write(&path, "new\n").unwrap();
+fn a_file_change_without_a_text_baseline_has_no_diff_or_line_counts() {
+    let f = fixture("write", "display-non-text");
     let _active = enter(Some(&f.key));
-    file(
-        path.to_str().unwrap(),
-        None,
-        Some("old\n"),
-        Some("agent-opaque-value\n"),
-        "modified",
-    );
-    let mut capture = f.capture.lock().unwrap();
-    let (_, unavailable) = file_bodies(&capture, true);
-    assert_eq!(unavailable.unwrap()["files"][0]["diffOmitted"], true);
-    capture.masker = Some(crate::log_redact::SecretValues::from_environment([(
-        OsStr::new("TOKEN"),
-        OsStr::new("agent-opaque-value"),
-    )]));
-    let (_, detail) = file_bodies(&capture, true);
+    file("a.txt", None, None, Some("new\n"), "modified");
+    let (record, detail) = file_bodies(&f.capture.lock().unwrap(), true);
     let detail = detail.unwrap();
-    let encoded = serde_json::to_string(&detail).unwrap();
-    assert!(!encoded.contains("agent-opaque-value"));
-    assert!(detail["hunks"][0]["lines"][1]["text"]
-        .as_str()
-        .unwrap()
-        .contains("REDACTED"));
-    let size = cortexkit_role_tool_display::canonical_body(detail.as_object().unwrap())
-        .unwrap()
-        .len();
-    assert_eq!(records::cut_detail(detail.clone(), size), Some(detail));
+    assert_eq!(record["modifiedCount"], 1);
+    assert!(record.get("addedLines").is_none());
+    assert!(record.get("removedLines").is_none());
+    assert_eq!(
+        detail["files"],
+        json!([{"change":"modified","path":"a.txt"}])
+    );
 }
 
 #[test]
@@ -653,9 +773,7 @@ fn exact_file_producer_matches_frozen_example_before_the_canonical_limit() {
             Some("new\n"),
             "modified",
         );
-        let mut capture = f.capture.lock().unwrap();
-        capture.masker = Some(crate::log_redact::SecretValues::default());
-        let (mut record, detail) = file_bodies(&capture, true);
+        let (mut record, detail) = file_bodies(&f.capture.lock().unwrap(), true);
         record["durationMs"] = json!(12);
         assert_eq!(
             record,
@@ -751,28 +869,53 @@ fn blocked_display_and_full_wake_queue_never_delay_a_reply() {
 }
 
 #[test]
-fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
+fn native_edit_write_and_patch_publish_unmasked_diffs_inside_and_outside_the_project() {
     use crate::protocol::RawRequest;
-    for tool in ["write", "edit", "apply_patch"] {
-        let f = fixture(tool, &format!("display-native-{tool}"));
+    let external = tempfile::tempdir().unwrap();
+    let new_line = "password=synthetic-test-value";
+    for (tool, outside) in ["write", "edit", "apply_patch"]
+        .into_iter()
+        .flat_map(|tool| [(tool, false), (tool, true)])
+    {
+        let input = if outside {
+            // The native write target and the patch result path have been
+            // normalized; the diff must keep the input's absolute spelling.
+            external.path().join("./a.txt").to_str().unwrap().to_owned()
+        } else {
+            "a.txt".to_owned()
+        };
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {input}\n@@\n-old\n+{new_line}\n*** End Patch"
+        );
+        let f = fixture_with_call(
+            tool,
+            &format!("display-native-{tool}-{outside}"),
+            None,
+            match tool {
+                "write" => json!({"path":input,"content":format!("{new_line}\n")}),
+                "edit" => json!({"path":input,"edits":[{"oldString":"old","newString":new_line}]}),
+                _ => json!({"patchText":patch}),
+            },
+        );
         let ctx = crate::subc::test_support::test_ctx();
         ctx.update_config(|config| {
             config.project_root = Some(f._dir.path().into());
             config.storage_dir = Some(f._dir.path().join("storage"));
             config.format_on_edit = false;
+            config.restrict_to_project_root = false;
         });
-        let path = f._dir.path().join("a.txt");
-        if tool != "write" {
-            std::fs::write(&path, "old\n").unwrap();
-        }
-        let params = match tool {
-            "write" => json!({"file":path,"content":"new\n"}),
-            "edit" => json!({"file":path,"match":"old","replacement":"new"}),
-            _ => {
-                json!({"patch_text":format!("*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch", path.display())})
-            }
+        let dir = if outside {
+            external.path()
+        } else {
+            f._dir.path()
         };
-        let mut request = params;
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut request = match tool {
+            "write" => json!({"file":path,"content":format!("{new_line}\n")}),
+            "edit" => json!({"file":path,"match":"old","replacement":new_line}),
+            _ => json!({"patch_text":patch}),
+        };
         request["id"] = json!("native");
         request["command"] = json!(tool);
         let request: RawRequest = serde_json::from_value(request).unwrap();
@@ -783,7 +926,10 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
             _ => crate::commands::apply_patch::handle_apply_patch(&request, &ctx),
         };
         assert!(response.success, "{tool}: {response:?}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{new_line}\n")
+        );
         assert!(response.data.get("view").is_none());
         assert!(response.data.get("record").is_none());
         handler_ready(Some(&f.key), &response);
@@ -792,14 +938,35 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
         let record = &writes[0].body;
         assert_eq!(record["outcome"], "success", "{tool}: {record}");
         assert_eq!(record["fileCount"], 1, "{tool}: {record}");
-        assert_eq!(
-            record[if tool == "write" {
-                "createdCount"
+        assert_eq!(record["modifiedCount"], 1);
+        let detail = &writes[1].body;
+        let mut file = if outside {
+            assert_eq!(record["location"], "outside_project");
+            assert_eq!(detail["location"], "outside_project");
+            assert!(record.get("path").is_none());
+            json!({"change":"modified","location":"outside_project"})
+        } else {
+            assert_eq!(record["path"], "a.txt");
+            json!({"change":"modified","path":"a.txt"})
+        };
+        if tool == "edit" {
+            assert_eq!(
+                detail["hunks"][0]["lines"],
+                json!([
+                    {"kind":"delete","text":"old"}, {"kind":"add","text":new_line}
+                ])
+            );
+        } else {
+            let (old, new) = if outside {
+                (input.as_str(), input.as_str())
             } else {
-                "modifiedCount"
-            }],
-            1
-        );
+                ("a/a.txt", "b/a.txt")
+            };
+            file["diff"] = json!(format!(
+                "--- {old}\n+++ {new}\n@@ -1 +1 @@\n-old\n+{new_line}\n"
+            ));
+        }
+        assert_eq!(detail["files"], json!([file]), "{tool}, outside={outside}");
     }
 }
 
@@ -860,7 +1027,6 @@ fn batch_edit_no_match_publishes_plain_hunks_with_scalar_marks() {
     let looked = "héllo 🙂 a value at the end";
     let closest = "héllo 🙂 a value at the best end";
     std::fs::write(&path, format!("unrelated\n{closest}\n")).unwrap();
-    f.capture.lock().unwrap().masker = Some(crate::log_redact::SecretValues::from_environment([]));
     let request = serde_json::from_value(json!({
         "id":"miss","command":"batch","file":path,
         "edits":[{"oldString":looked,"newString":"new"}]

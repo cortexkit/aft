@@ -243,6 +243,8 @@ dependencies = [
  "cortexkit-bus-client",
  "cortexkit-bus-naming",
  "cortexkit-exec-remote-types",
+ "cortexkit-occipital-lang",
+ "cortexkit-occipital-registry",
  "cortexkit-paths",
  "cortexkit-persona",
  "cortexkit-project-identity",
@@ -1279,6 +1281,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-occipital-lang"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb6da5d4babf1a8cd86d7d7c7dcd2a12eeab6d4450343a613b07d3b7134bbbd3"
+dependencies = [
+ "cortexkit-rich-ui-syntax",
+ "hmac-sha256",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-occipital-registry"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc77f669a928d1d642a2ebba22812d8c2b3bac3b6752d49fb41de7ab8391d5e1"
+dependencies = [
+ "cortexkit-occipital-lang",
+ "cortexkit-role-tool-display",
+ "hmac-sha256",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cortexkit-paths"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1367,9 +1394,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.15.17"
+version = "0.15.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e095ca06056932225c809a14de198fdac3cbd3567667e5cdcc35a19dac04a00"
+checksum = "885e17314cc76d5f317abfff451176f487e712ed6a1029bca6c3924c0f56c60d"
 dependencies = [
  "cortexkit-bus-naming",
  "cortexkit-role-tool-display",
@@ -1382,9 +1409,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider-conformance"
-version = "0.15.18"
+version = "0.15.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d07840f8c22ac6f07c9d2eb705652f2e5d684853397b5e00a615725e1b5b7a09"
+checksum = "37437e95aa2d1cf1649d0cf789da6f01268e92653b37a445a5a01d3e1d5def28"
 dependencies = [
  "async-trait",
  "cortexkit-role-harness",
@@ -2576,6 +2603,12 @@ checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
 ]
+
+[[package]]
+name = "hmac-sha256"
+version = "1.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad320b3b96fb2a455a0726d16efe0a5afdbd34b71dea5bc53b05ea057714d4e"
 
 [[package]]
 name = "htmd"

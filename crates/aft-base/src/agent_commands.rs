@@ -501,10 +501,32 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
+    async fn receive_after_persist(
+        rx: &mut mpsc::UnboundedReceiver<(Batch, Reply)>,
+        phase: &str,
+    ) -> (Batch, Reply) {
+        // The sender waits for the file and directory to sync. The deadline
+        // guards against a hang, not slow filesystem I/O on a shared runner.
+        tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{phase}: no batch received within 30 seconds"))
+            .unwrap_or_else(|| panic!("{phase}: sender closed"))
+    }
+
     fn root(pid: u32) -> AgentCommandRoot {
         AgentCommandRoot {
             pid,
             start_time_ms: 1_700_000_000_000 + u64::from(pid),
+        }
+    }
+
+    #[cfg(unix)]
+    fn current_root() -> AgentCommandRoot {
+        let pid = std::process::id();
+        AgentCommandRoot {
+            pid,
+            start_time_ms: subc_os::process_start_time_ms(pid).unwrap(),
         }
     }
 
@@ -630,19 +652,12 @@ mod tests {
     #[tokio::test]
     async fn agent_commands_persists_before_send_and_recovers_without_a_project_bind() {
         let storage = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let root = AgentCommandRoot {
-            pid: child.id(),
-            start_time_ms: subc_os::process_start_time_ms(child.id()).unwrap(),
-        };
+        let root = current_root();
         let first = Arc::new(Declarations::default());
         first.load(storage.path());
         first.started(root);
         let (connection, mut rx) = sender(&first);
-        let (_, reply) = receive(&mut rx).await;
+        let (_, reply) = receive_after_persist(&mut rx, "first send before restart").await;
         let saved: Vec<AgentCommandRoot> = serde_json::from_slice(
             &std::fs::read(storage.path().join("agent-command-roots.json")).unwrap(),
         )
@@ -654,13 +669,78 @@ mod tests {
         let recovered = Arc::new(Declarations::default());
         recovered.load(storage.path());
         let (connection, mut rx) = sender(&recovered);
-        let (batch, reply) = receive(&mut rx).await;
+        let (batch, reply) = receive_after_persist(&mut rx, "first send after restart").await;
         assert_eq!(batch.known, Some(vec![root]));
         assert!(batch.started.is_empty());
         reply.send(Ok(())).unwrap();
         connection.stop().await;
-        child.kill().unwrap();
-        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_commands_waits_for_slow_persistence_before_and_after_restart() {
+        // Use one blocking thread so the atomic write runs on the thread
+        // where the durability hook is installed.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let storage = tempfile::tempdir().unwrap();
+                let root = current_root();
+                let first = Arc::new(Declarations::default());
+                first.load(storage.path());
+                first.started(root);
+                assert_slow_write_blocks_send(&first, root, "first send before restart").await;
+
+                let recovered = Arc::new(Declarations::default());
+                recovered.load(storage.path());
+                assert_slow_write_blocks_send(&recovered, root, "first send after restart").await;
+            });
+    }
+
+    #[cfg(unix)]
+    async fn assert_slow_write_blocks_send(
+        hub: &Arc<Declarations>,
+        root: AgentCommandRoot,
+        phase: &str,
+    ) {
+        let (entered, writing) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            crate::durability::BEFORE_TEMP_CREATE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    entered.send(()).unwrap();
+                    let _ = blocked.recv();
+                }));
+            });
+        })
+        .await
+        .unwrap();
+
+        let (connection, mut rx) = sender(hub);
+        let receive = receive_after_persist(&mut rx, phase);
+        tokio::pin!(receive);
+        tokio::select! {
+            biased;
+            _ = &mut receive => panic!("{phase}: batch arrived before persistence"),
+            entered = writing => entered.unwrap(),
+        }
+        // The old two-second receive deadline expired while the write was held.
+        tokio::time::advance(Duration::from_millis(2_001)).await;
+        tokio::select! {
+            biased;
+            _ = &mut receive => panic!("{phase}: batch arrived before persistence"),
+            () = std::future::ready(()) => {},
+        }
+        drop(release);
+
+        let (batch, reply) = receive.await;
+        assert_eq!(batch.known, Some(vec![root]));
+        reply.send(Ok(())).unwrap();
+        connection.stop().await;
     }
 
     #[cfg(unix)]

@@ -51,6 +51,7 @@ mod compression_events_test;
 mod config_parity_test;
 mod configure_test;
 mod conflicts_discovery_test;
+mod cortexkit_data_policy_test;
 mod crash_diagnostics;
 mod created_file_syntax_test;
 mod cuda_test;

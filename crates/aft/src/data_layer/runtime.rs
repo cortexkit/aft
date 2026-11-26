@@ -128,6 +128,31 @@ impl Drop for ClearOnDrop {
     }
 }
 
+/// [`ClearOnDrop`] for work a fresh-view reader waits on (a build, refresh
+/// or fold): clearing the flag also wakes readers waiting on the checkout's
+/// readiness, since a reader that saw a failure reports it only once
+/// nothing runs any more.
+struct EndOnDrop {
+    flag: Arc<AtomicBool>,
+    checkout: Arc<Checkout>,
+}
+
+impl EndOnDrop {
+    fn new(flag: &Arc<AtomicBool>, checkout: &Arc<Checkout>) -> Self {
+        Self {
+            flag: Arc::clone(flag),
+            checkout: Arc::clone(checkout),
+        }
+    }
+}
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+        self.checkout.notify_readiness_change();
+    }
+}
+
 /// Keeps test waits aware of a build until its follow-up work has been queued,
 /// including the handoff after the production `building` flag is cleared.
 #[cfg(test)]
@@ -163,6 +188,10 @@ pub(crate) enum Fresh {
 /// How many changed paths warrant a publication after edits settle,
 /// rather than waiting for the longer quiet period.
 const PUBLISH_AT: usize = 64;
+
+/// How long a fresh-view reader sleeps on the checkout's readiness before it
+/// checks again even without a notification.
+const FRESH_VIEW_RECHECK: Duration = Duration::from_secs(1);
 
 /// Also schedule a publication once the call graph has resolved this many
 /// files again since the publication. An edit to a widely used type re-resolves
@@ -264,14 +293,30 @@ impl Pool {
             .spawn(move || {
                 let mut next = Some(job);
                 while let Some(job) = next.take() {
-                    crate::memory::profile::admitted(profile, job);
+                    // A job that panics must still give its place back:
+                    // otherwise each panic holds one of the pool's few
+                    // places until the daemon restarts, and every job queued
+                    // behind them never runs.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::memory::profile::admitted(profile, job)
+                    }));
+                    if let Err(panic) = outcome {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                        crate::slog_warn!("data layer {self:?} job panicked: {message}");
+                    }
                     if matches!(self, Pool::Build) {
                         // A build frees most of what it allocated when it
                         // ends. Hand those pages back now, as dead code does
                         // after a run, rather than holding them until the
                         // daemon's periodic relief comes round.
                         #[cfg(any(target_os = "linux", target_os = "macos"))]
-                        crate::memory::return_free_pages();
+                        crate::memory::return_free_pages(
+                            crate::memory::AllocatorReliefSource::BuildPoolJob,
+                        );
                     }
                     let mut state = self.state().lock();
                     state.running -= 1;
@@ -512,6 +557,9 @@ struct Work {
     refreshing: Arc<AtomicBool>,
     #[cfg(test)]
     refreshes_started: std::sync::atomic::AtomicUsize,
+    /// How many times fresh-view readers checked for a ready view.
+    #[cfg(test)]
+    fresh_view_checks: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     refresh_hold: Arc<AtomicBool>,
     /// Timer requests survive a refresh already running when they arrive.
@@ -600,7 +648,7 @@ impl Work {
         }
         #[cfg(test)]
         let build_task = BuildTaskGuard::new(&self.build_tasks);
-        let flag = ClearOnDrop(Arc::clone(&self.building));
+        let flag = EndOnDrop::new(&self.building, &self.checkout);
         let Some(reservation) = self.checkout.reserve_build() else {
             return false;
         };
@@ -745,7 +793,7 @@ impl Work {
         if self.refreshing.swap(true, Ordering::AcqRel) {
             return;
         }
-        let flag = ClearOnDrop(Arc::clone(&self.refreshing));
+        let flag = EndOnDrop::new(&self.refreshing, &self.checkout);
         let work = Arc::clone(self);
         // A refresh changes only the checkout, behind its own lock, so it
         // runs beside the root's reads and edits, one at a time per root
@@ -829,7 +877,7 @@ impl Work {
                 {
                     return;
                 }
-                flag = Some(ClearOnDrop(Arc::clone(&work.refreshing)));
+                flag = Some(EndOnDrop::new(&work.refreshing, &work.checkout));
             }
         });
     }
@@ -955,7 +1003,7 @@ impl Work {
         if self.folding.swap(true, Ordering::AcqRel) {
             return;
         }
-        let flag = ClearOnDrop(Arc::clone(&self.folding));
+        let flag = EndOnDrop::new(&self.folding, &self.checkout);
         let work = Arc::clone(self);
         self.runner.run(FOLD_REQUEST, Pool::Build, move || {
             if work.building.load(Ordering::Acquire) {
@@ -1016,7 +1064,7 @@ impl Work {
         if self.folding.swap(true, Ordering::AcqRel) {
             return;
         }
-        let flag = ClearOnDrop(Arc::clone(&self.folding));
+        let flag = EndOnDrop::new(&self.folding, &self.checkout);
         let work = Arc::clone(self);
         self.runner.run(FOLD_REQUEST, Pool::Build, move || {
             if work.building.load(Ordering::Acquire) {
@@ -1196,6 +1244,7 @@ impl Work {
             fn drop(&mut self) {
                 self.0.checkout.end_rescan();
                 self.0.rescanning.store(false, Ordering::Release);
+                self.0.checkout.notify_readiness_change();
             }
         }
         let ended = Ended(Arc::clone(self));
@@ -1284,12 +1333,33 @@ impl Work {
                     );
                 }
                 Round::Idle => {}
+                Round::Waiting => work.wake_fill_when_family_free(),
                 Round::Failed(failure) => work.retry_fill_later(failure.message()),
             }
             if more || work.fill_requested.load(Ordering::Acquire) != requested {
                 work.start_fill();
             }
         });
+    }
+
+    /// After a fill round found another fill of the repository holding its
+    /// lock: starts the fill again once that lock is free, waiting on the
+    /// family's one waiting thread rather than in a fill-pool place.
+    /// `start_fill` admits the new round through the root's executor, so a
+    /// root unbound in the meantime runs none.
+    fn wake_fill_when_family_free(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let waiting = super::fill_waiters::wake_when_free(
+            self.checkout.family_dir(),
+            Box::new(move || {
+                if let Some(work) = weak.upgrade() {
+                    work.start_fill();
+                }
+            }),
+        );
+        if !waiting {
+            self.retry_fill_later("another fill of this repository holds its fill lock");
+        }
     }
 
     fn retry_fill_later(self: &Arc<Self>, error: &str) {
@@ -1601,6 +1671,8 @@ impl DataCheckout {
             #[cfg(test)]
             refreshes_started: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            fresh_view_checks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             refresh_hold: Arc::new(AtomicBool::new(false)),
             publish_requested: parking_lot::Mutex::new(Publish::WhenMany),
             settle: Arc::new(QuietTimer::new(settle_period, {
@@ -1734,6 +1806,27 @@ impl DataCheckout {
         self.work.start_rescan(false);
     }
 
+    /// A new watcher is already live. Compare disk on the owning maintenance
+    /// lane before telling its caller the unobserved interval is covered.
+    pub(crate) fn rescan_watcher_gap(&self, done: impl FnOnce(bool) + Send + 'static) {
+        let work = Arc::clone(&self.work);
+        self.work
+            .runner
+            .run("data-watcher-gap-rescan", Pool::Refresh, move || {
+                let scanned = work.checkout.rescan();
+                if scanned.is_ok() {
+                    work.settle.note_change();
+                    work.catch_up(Publish::WhenMany, false);
+                } else if let Err(error) = &scanned {
+                    crate::slog_warn!(
+                        "watcher gap rescan did not cover {}: {error}",
+                        work.checkout.root().display()
+                    );
+                }
+                done(scanned.is_ok());
+            });
+    }
+
     /// Updates automatic maintenance when bound routes change. A non-worker
     /// route starts a quiet window for edits left pending by worker-only routes.
     pub(crate) fn set_background_refresh(&self, allowed: bool) {
@@ -1772,24 +1865,36 @@ impl DataCheckout {
     pub(crate) fn fresh_view(&self, wait: Duration) -> Fresh {
         self.request_refresh();
         let deadline = Instant::now() + wait;
+        let checkout = &self.work.checkout;
         loop {
-            if let Some(view) = self
-                .work
-                .checkout
+            // Take the generation before checking, so a change between the
+            // check and the wait below still ends the wait.
+            let mut generation = checkout.readiness_generation();
+            #[cfg(test)]
+            self.work.fresh_view_checks.fetch_add(1, Ordering::Relaxed);
+            if let Some(view) = checkout
                 .view()
                 .filter(|view| view.status().callgraph == super::checkout::PlaneStatus::Ready)
             {
                 return Fresh::Ready(view);
             }
             if !self.work.running() {
-                if let Some(failure) = self.work.checkout.failure() {
+                if let Some(failure) = checkout.failure() {
                     return Fresh::Failed(failure);
                 }
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Fresh::Building;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            // Builds, refreshes, folds, rescans and failures each notify the
+            // checkout's readiness when they end or change what it serves.
+            // The bounded slice only limits what a missed notification
+            // could cost.
+            checkout.wait_for_readiness_change(
+                &mut generation,
+                (deadline - now).min(FRESH_VIEW_RECHECK),
+            );
         }
     }
 }
@@ -2086,8 +2191,9 @@ pub(crate) fn root_bound(ctx: &dyn crate::data_layer::host::IndexHost) {
 
 /// Records changed absolute `paths` under `root`. The checkout scans each
 /// one again, a folder with everything under it, under the same rules as a
-/// build, so this only turns the paths into checkout-relative form.
-fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) {
+/// build, so this only turns the paths into checkout-relative form. Returns
+/// how many paths lie under `root`.
+fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) -> usize {
     let mut relative_paths = Vec::with_capacity(paths.len());
     for path in paths {
         let canonical_parent = path
@@ -2106,12 +2212,16 @@ fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) {
         }
         relative_paths.push(relative.into_bytes());
     }
+    if relative_paths.is_empty() {
+        return 0;
+    }
     if let Err(error) = checkout.record_paths(&relative_paths) {
         crate::slog_warn!(
             "data layer could not record changes under {}: {error}",
             checkout.root().display()
         );
     }
+    relative_paths.len()
 }
 
 /// Hears AFT's own edits.
@@ -2132,12 +2242,17 @@ impl WriteIntentListener for EditListener {
         let Some(checkout) = self.checkout.upgrade() else {
             return;
         };
-        match change {
+        let recorded = match change {
             WriteIntent::Paths(paths) => record(&checkout, &self.root, paths),
             // A folder is scanned again whole, under the scan's rules.
             WriteIntent::Directory(path) => {
                 record(&checkout, &self.root, std::slice::from_ref(path))
             }
+        };
+        // Every bound checkout hears every AFT edit. Only the checkout that
+        // holds an edited path moves its deadlines; the others stay idle.
+        if recorded == 0 {
+            return;
         }
         self.settle.note_change();
         self.quiet.changed();
@@ -2552,6 +2667,22 @@ mod tests {
         memory_profile::admitted(next, job);
         ctx.set_config(published);
         assert_eq!(Pool::Build.cap(), 2);
+    }
+
+    /// A pool job that panics gives its place back. Before, the worker thread
+    /// unwound past the place's release, so as many panics as the pool has
+    /// places stopped every later job of that kind for the life of the
+    /// process.
+    #[test]
+    fn a_panicking_pool_job_frees_its_place_for_the_next_job() {
+        for _ in 0..Pool::Fill.cap() {
+            Pool::Fill.submit(Box::new(|| panic!("pool job panics on purpose")));
+        }
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        Pool::Fill.submit(Box::new(move || ran_tx.send(()).unwrap()));
+        ran_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a job queued behind panicking jobs never ran");
     }
 
     fn planned_pause(until: u64) -> crate::synapse_embed::LanePause {
@@ -2995,6 +3126,61 @@ mod tests {
         ));
     }
 
+    /// Every bound checkout hears every AFT edit. An edit outside a checkout's
+    /// root must leave its quiet and settle deadlines alone.
+    #[test]
+    fn an_edit_in_another_root_leaves_this_checkouts_timers_idle() {
+        let quiet = Duration::from_secs(120);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = std::fs::canonicalize(elsewhere.path())
+            .unwrap()
+            .join("edited.rs");
+        std::fs::write(&outside, "pub fn elsewhere() {}\n").unwrap();
+        assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+        // A sentinel no clock reading produces.
+        let sentinel = u64::MAX;
+        fixture
+            .handle
+            .work
+            .settle
+            .last_change_ms
+            .store(sentinel, Ordering::Release);
+
+        fixture
+            .handle
+            ._listener
+            .record_change(&WriteIntent::Paths(vec![outside]), WritePhase::After);
+        assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+        assert_eq!(
+            fixture
+                .handle
+                .work
+                .settle
+                .last_change_ms
+                .load(Ordering::Acquire),
+            sentinel
+        );
+
+        // The same listener still arms both for an edit under its own root.
+        let inside = fixture.handle.root().join("src/lib.rs");
+        std::fs::write(&inside, "pub fn edited() {}\n").unwrap();
+        fixture
+            .handle
+            ._listener
+            .record_change(&WriteIntent::Paths(vec![inside]), WritePhase::After);
+        assert!(fixture.handle.quiet.armed.load(Ordering::Acquire));
+        assert_ne!(
+            fixture
+                .handle
+                .work
+                .settle
+                .last_change_ms
+                .load(Ordering::Acquire),
+            sentinel
+        );
+    }
+
     #[test]
     fn worker_only_edits_wait_for_callers_then_refresh_once() {
         let quiet = Duration::from_millis(100);
@@ -3086,6 +3272,38 @@ mod tests {
         assert_eq!(fixture.refreshes(), before + 1);
         assert!(pending(fixture.handle.checkout()));
         assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+    }
+
+    /// A reader waiting for a fresh view sleeps on the checkout's readiness
+    /// rather than checking the view every 20 ms, and the refresh it waits
+    /// for still wakes it when it ends.
+    #[test]
+    fn fresh_view_waits_on_readiness_instead_of_polling() {
+        let fixture = PublicationFixture::new(QUIET, QUIET);
+        let work = &fixture.handle.work;
+        work.refresh_hold.store(true, Ordering::Release);
+        let release = ClearOnDrop(Arc::clone(&work.refresh_hold));
+        let before = fixture.refreshes();
+        fixture.add("held_edit", 1);
+        fixture.handle.request_refresh();
+        wait_until(|| fixture.refreshes() > before);
+
+        work.fresh_view_checks.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            fixture.handle.fresh_view(Duration::from_secs(2)),
+            Fresh::Building
+        ));
+        let checks = work.fresh_view_checks.load(Ordering::Relaxed);
+        assert!(
+            checks <= 6,
+            "a 2 s wait on a held refresh checked the view {checks} times"
+        );
+
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| fixture.handle.fresh_view(Duration::from_secs(60)));
+            drop(release);
+            assert!(matches!(reader.join().unwrap(), Fresh::Ready(_)));
+        });
     }
 
     #[test]

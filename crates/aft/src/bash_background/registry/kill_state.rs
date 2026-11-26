@@ -28,11 +28,21 @@ impl KillStateSave {
 }
 
 impl BgTaskRegistry {
-    pub(super) fn pty_kill_observed(task: &BgTask) -> bool {
-        task.lock_state().is_ok_and(|state| {
-            matches!(&state.runtime, TaskRuntime::Pty(Some(pty))
-                if pty.was_killed.load(Ordering::SeqCst) && pty.exit_observed.load(Ordering::SeqCst))
-        })
+    /// The outcome a PTY's waiter observed, once it has reaped the process:
+    /// a kill's outcome is decided, and otherwise the waiter's exit status
+    /// stands in for an exit marker it could not save (a full disk, say).
+    pub(super) fn pty_waiter_exit(task: &BgTask) -> Option<ExitMarker> {
+        let state = task.lock_state().ok()?;
+        let TaskRuntime::Pty(Some(pty)) = &state.runtime else {
+            return None;
+        };
+        if !pty.exit_observed.load(Ordering::SeqCst) {
+            return None;
+        }
+        if pty.was_killed.load(Ordering::SeqCst) {
+            return Some(ExitMarker::Killed);
+        }
+        pty.coordinator.observed_exit.get().cloned()
     }
 
     pub(in crate::bash_background) fn output_limit_exceeded(&self, task: &BgTask) -> bool {

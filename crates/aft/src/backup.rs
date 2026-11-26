@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -668,7 +667,7 @@ fn read_captured_content(path: &Path, metadata: &std::fs::Metadata) -> std::io::
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         *CAPTURE_READ_COUNTS.lock().unwrap().entry(key).or_default() += 1;
     }
-    std::fs::read(path)
+    crate::edit::mutation::read_regular(path)
 }
 
 #[cfg(test)]
@@ -4530,27 +4529,6 @@ impl BackupStore {
             .map(|skip| skip.reason)
     }
 
-    pub fn latest_skipped_order(&self, session: &str) -> Option<u128> {
-        self.skipped_backups
-            .get(session)?
-            .iter()
-            .map(|skip| skip.order)
-            .max()
-    }
-
-    pub fn skipped_reason_after(
-        &self,
-        session: &str,
-        order: Option<u128>,
-    ) -> Option<BackupSkippedReason> {
-        self.skipped_backups
-            .get(session)?
-            .iter()
-            .filter(|skip| order.is_none_or(|order| skip.order > order))
-            .max_by_key(|skip| skip.order)
-            .map(|skip| skip.reason)
-    }
-
     pub fn latest_skipped_reason_for_undo(
         &self,
         session: &str,
@@ -6294,10 +6272,8 @@ fn restore_regular_file(
     mode: Option<u32>,
 ) -> std::io::Result<()> {
     refuse_storage_path(path).map_err(std::io::Error::other)?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
     }
     if std::fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
@@ -6305,17 +6281,16 @@ fn restore_regular_file(
     {
         std::fs::remove_file(path)?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(content_bytes)?;
-    set_file_mode(path, mode)?;
-    // Do not pop the undo stack while restored bytes exist only in page cache.
-    // Keep the writer handle through mode restoration: reopening for write
-    // would fail if the backup's original permissions were read-only.
-    crate::durability::sync_file(&file, path)
+    let write = crate::edit::atomic_write_source_with_mode(path, content_bytes, mode)?;
+    for warning in write.warnings {
+        crate::slog_warn!("undo restore {}: {warning}", path.display());
+    }
+    #[cfg(not(unix))]
+    if mode.is_some() {
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        crate::durability::sync_file(&file, path)?;
+    }
+    Ok(())
 }
 
 fn restore_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
@@ -7958,7 +7933,7 @@ mod tests {
 
     #[test]
     fn durability_undo_count_and_file_before_metadata() {
-        let (mut store, _storage, _project, path) = durability_store();
+        let (mut store, _storage, project, path) = durability_store();
         for text in ["original", "edited"] {
             fs::write(&path, text).unwrap();
             store.snapshot("durability", &path, "edit").unwrap();
@@ -7967,20 +7942,38 @@ mod tests {
         take();
         store.restore_latest("durability", &path).unwrap();
         let events = take();
+        // Sync the source temp file and the temp file for meta.json. On Unix,
+        // also sync the source and backup directories after their renames.
         assert_eq!(
             sync_count(&events),
-            if cfg!(unix) { 3 } else { 2 },
+            if cfg!(unix) { 4 } else { 2 },
             "{events:?}"
         );
         let restored = events
             .iter()
-            .position(|e| *e == (EventKind::FileSync, path.clone()))
-            .expect("restored user file must be synced");
+            .position(|(kind, path)| {
+                *kind == EventKind::FileSync
+                    && path.parent() == Some(project.path())
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".aft-source-"))
+            })
+            .expect("restored source temp file must be synced");
         let meta = events
             .iter()
             .position(|e| e.0 == EventKind::FileSync && e.1.file_name().unwrap() == "meta.json")
             .unwrap();
         assert!(restored < meta, "{events:?}");
+        #[cfg(unix)]
+        {
+            let parent = events
+                .iter()
+                .position(|(kind, path)| {
+                    *kind == EventKind::DirectorySync && path == project.path()
+                })
+                .expect("restored source parent directory must be synced");
+            assert!(restored < parent && parent < meta, "{events:?}");
+        }
         assert_eq!(fs::read_to_string(path).unwrap(), "edited");
     }
 

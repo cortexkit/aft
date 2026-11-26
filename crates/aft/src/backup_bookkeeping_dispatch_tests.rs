@@ -99,6 +99,36 @@ fn standalone_version_and_ping_skip_backup_bookkeeping() {
 }
 
 #[test]
+fn backup_bookkeeping_tier2_run_cannot_stamp_an_in_flight_write() {
+    let (root, ctx) = fixture();
+    let path = root.path().join("small.rs");
+    ctx.backup()
+        .lock()
+        .snapshot_with_op("backup-bookkeeping", &path, "writing", Some("in-flight"))
+        .unwrap()
+        .expect("a real undo snapshot");
+
+    let reader = dispatch(request("inspect_tier2_run", serde_json::json!({})), &ctx);
+    assert!(reader.success, "{reader:?}");
+    std::fs::write(&path, "pub fn updated() {}\n").unwrap();
+    ctx.backup().lock().record_post_mutation_states();
+
+    let undo = dispatch(
+        request("undo", serde_json::json!({"file": "small.rs"})),
+        &ctx,
+    );
+    assert!(undo.success, "{undo:?}");
+    assert!(
+        undo.data["external_change_checkpoint"].is_null(),
+        "{undo:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "pub fn small() {}\n"
+    );
+}
+
+#[test]
 fn backup_bookkeeping_wrapped_write_keeps_undo_entry_and_post_state() {
     let (root, ctx) = fixture();
     let path = root.path().join("small.rs");

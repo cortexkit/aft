@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use super::applicability_cache::observe_path;
 use crate::lsp::registry::ServerKind;
 
+#[path = "roots/cargo_members.rs"]
+mod cargo_members;
+
 /// Walk entries below a canonical root already have resolved parents: the
 /// applicability walker never descends through directory symlinks. Other callers
 /// must resolve arbitrary paths before comparing workspace boundaries.
@@ -220,9 +223,7 @@ fn cargo_workspace_contains_crate(workspace_root: &Path, crate_root: &Path) -> b
     let Ok(crate_relative_path) = crate_root.strip_prefix(workspace_root) else {
         return false;
     };
-    // Cargo gives literal members precedence over excludes. This only models
-    // declared members; implicit membership through path dependencies is not
-    // inferred here.
+    // Cargo gives literal members precedence over excludes.
     if workspace
         .get("members")
         .and_then(toml::Value::as_array)
@@ -235,7 +236,34 @@ fn cargo_workspace_contains_crate(workspace_root: &Path, crate_root: &Path) -> b
     {
         return true;
     }
-    if workspace
+    if cargo_workspace_excludes(workspace, crate_relative_path) {
+        return false;
+    }
+
+    match workspace.get("members").and_then(toml::Value::as_array) {
+        Some(patterns) => {
+            patterns
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .any(|pattern| cargo_member_pattern_matches(pattern, crate_relative_path))
+                || cargo_members::is_implicit_member(
+                    workspace_root,
+                    crate_root,
+                    &manifest,
+                    workspace,
+                    patterns,
+                )
+        }
+        // Cargo permits a package to be colocated with a `[workspace]` table
+        // without listing the package in `members`. Prefer the nearest ancestor
+        // manifest that defines a workspace because it still describes the
+        // broader Cargo workspace for the analyzer.
+        None => true,
+    }
+}
+
+fn cargo_workspace_excludes(workspace: &toml::Table, crate_relative_path: &Path) -> bool {
+    workspace
         .get("exclude")
         .and_then(toml::Value::as_array)
         .is_some_and(|patterns| {
@@ -244,21 +272,6 @@ fn cargo_workspace_contains_crate(workspace_root: &Path, crate_root: &Path) -> b
                 .filter_map(toml::Value::as_str)
                 .any(|pattern| crate_relative_path.starts_with(pattern.trim()))
         })
-    {
-        return false;
-    }
-
-    match workspace.get("members").and_then(toml::Value::as_array) {
-        Some(patterns) => patterns
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .any(|pattern| cargo_member_pattern_matches(pattern, crate_relative_path)),
-        // Cargo permits a package to be colocated with a `[workspace]` table
-        // without listing the package in `members`. Prefer the nearest ancestor
-        // manifest that defines a workspace because it still describes the
-        // broader Cargo workspace for the analyzer.
-        None => true,
-    }
 }
 
 fn cargo_member_pattern_matches(pattern: &str, crate_relative_path: &Path) -> bool {
@@ -349,6 +362,45 @@ mod tests {
     };
     use crate::lsp::registry::ServerKind;
     use crate::path_identity::canonicalize_normalized;
+
+    #[test]
+    fn rust_workspace_root_includes_implicit_path_dependency_members() {
+        let workspace = tempdir().unwrap();
+        let root = canonicalize_normalized(workspace.path());
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = ['app']\nexclude = ['standalone']\n",
+        )
+        .unwrap();
+        let crate_file = |name: &str, dependencies: &str| {
+            let path = root.join(name);
+            fs::create_dir_all(path.join("src")).unwrap();
+            fs::write(
+                path.join("Cargo.toml"),
+                format!("[package]\nname = '{name}'\nversion = '0.0.0'\n{dependencies}"),
+            )
+            .unwrap();
+            let source = path.join("src/lib.rs");
+            fs::write(&source, "pub fn f() {}\n").unwrap();
+            source
+        };
+        let app = crate_file(
+            "app",
+            "[dependencies]\ndependency = { path = '../dependency' }\nstandalone = { path = '../standalone' }\n",
+        );
+        let dependency = crate_file("dependency", "");
+        let standalone = crate_file("standalone", "");
+
+        assert_eq!(
+            find_rust_workspace_root(&app, Some(&root)),
+            Some(root.clone())
+        );
+        assert_eq!(
+            find_rust_workspace_root(&dependency, Some(&root)),
+            Some(root.clone())
+        );
+        assert_eq!(find_rust_workspace_root(&standalone, Some(&root)), None);
+    }
 
     #[test]
     fn test_find_root_with_cargo_toml() {

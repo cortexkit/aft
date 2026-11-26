@@ -117,8 +117,13 @@ impl Corpus<'_> {
             let coverage = if self.check.verified() {
                 format!("checked all {checked} files on disk")
             } else {
+                let time_limit = if self.check.time_limit_reached {
+                    " before its time limit"
+                } else {
+                    ""
+                };
                 format!(
-                    "reached {} files on disk and resolved {checked} before its time limit ({} not read; walk complete: {})",
+                    "reached {} files on disk and resolved {checked}{time_limit} ({} not read; walk complete: {})",
                     self.check.files_examined, self.check.not_reread, self.check.walk_complete,
                 )
             };

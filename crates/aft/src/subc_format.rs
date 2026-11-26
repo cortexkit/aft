@@ -2024,7 +2024,7 @@ fn format_grep(data: &Value) -> String {
     let base = if let Some(text) = data.get("text").and_then(Value::as_str) {
         let text = crate::bounded_io::strip_skipped_files_text(text, data);
         if envelope.is_some() {
-            text.replace(" (capped)", "")
+            strip_grep_footer_cap(&text)
         } else {
             text.to_string()
         }
@@ -2097,6 +2097,28 @@ fn format_grep(data: &Value) -> String {
     } else {
         base
     }
+}
+
+fn strip_grep_footer_cap(text: &str) -> String {
+    const MARKER: &str = " (capped)";
+    let mut end = text.len();
+    for section in text.rsplit("\n\n") {
+        let start = end - section.len();
+        if section.starts_with("Found ") && !section.contains('\n') {
+            if let Some((counts, suffix)) = section.split_once(MARKER) {
+                if (counts.ends_with(" file") || counts.ends_with(" files"))
+                    && (suffix.is_empty() || suffix.starts_with(" [index: "))
+                {
+                    let marker = start + counts.len();
+                    let mut rendered = text.to_owned();
+                    rendered.replace_range(marker..marker + MARKER.len(), "");
+                    return rendered;
+                }
+            }
+        }
+        end = start.saturating_sub(2);
+    }
+    text.to_owned()
 }
 
 fn format_ast_search(data: &Value) -> String {

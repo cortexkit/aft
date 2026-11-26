@@ -287,9 +287,6 @@ impl Service {
         };
         let scope = identity.scope.clone();
         let is_admitted = admitted_scope.is_some();
-        let lifetime = admitted_scope
-            .map(|stamp| self.scopes.lifetime(stamp))
-            .unwrap_or_default();
         let principal = principal_label(&identity.principal);
         let binding = binding.clone();
         let route_cancel = identity.shells_cancel.0.clone();
@@ -302,6 +299,10 @@ impl Service {
             self.connection_file.clone(),
         );
         let capacity = self.jobs.len() < MAX_PENDING_LOOKUPS;
+        let lifetime = admitted_scope
+            .filter(|_| capacity)
+            .map(|stamp| self.scopes.begin_work(stamp))
+            .unwrap_or_default();
         let received_at = ledger::now_ms();
         let tool = body.get("name").and_then(Value::as_str).map(str::to_owned);
         // Start the insert at ingress so a connection teardown that drops the
@@ -343,6 +344,14 @@ impl Service {
                 let (project, _) = admit_scope(scope.as_ref())?;
                 if lifetime.ended() {
                     return Err(authorization::denied());
+                }
+                tokio::select! {
+                    biased;
+                    _ = request_cancel.token.cancelled() => return Err(cancelled()),
+                    _ = route_cancel.cancelled() => return Err(admission_refusal()),
+                    live = lifetime.wait_for_live() => if !live {
+                        return Err(if lifetime.ended() { authorization::denied() } else { admission_refusal() });
+                    },
                 }
                 tokio::select! {
                     biased;
@@ -447,10 +456,11 @@ impl Service {
                     && !ready.call.route_cancel.is_cancelled()
                     && !ready.call.request_cancel.token.is_cancelled()
                 {
-                    Some(
-                        self.authorizer
-                            .request_with_lifetime(consent, ready.call.lifetime.can_ask()),
-                    )
+                    Some(self.authorizer.request_with_lifetime(
+                        consent,
+                        ready.call.lifetime.can_ask(),
+                        ready.call.lifetime.clone(),
+                    ))
                 } else {
                     None
                 };

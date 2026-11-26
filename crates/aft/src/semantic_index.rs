@@ -27,7 +27,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use url::Url;
@@ -600,15 +600,11 @@ fn root_backend_probes() -> &'static Mutex<HashMap<PathBuf, RootBackendProbe>> {
     PROBES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Check that a remote embedding backend accepts connections while the
-/// semantic index is still building, without ever waiting on the network.
-///
-/// The outage state that search replies and the status sidebar report
-/// ("Semantic backend unavailable (<url>): <reason>") used to come only from a
-/// build attempt that had reached the backend and failed. Before that attempt
-/// (the artifact-load gate, the file walk, the cold-build queue, a large
-/// corpus's chunking) nothing was recorded, so a backend that was never
-/// listening read as "Semantic index is rebuilding" for as long as that took.
+mod root_state;
+pub(crate) use root_state::{try_lock_root_state, try_retire_root_embedding_state};
+
+/// Check the backend while the index builds, including before a build reaches
+/// the backend, without waiting on the network.
 ///
 /// `status` is polled by the sidebar and must stay cheap, and a backend behind
 /// a blackholed address or a hanging DNS lookup can take seconds to fail. So
@@ -702,6 +698,7 @@ fn check_remote_backend_for_root(
     if !fresh && !entry.in_flight {
         entry.in_flight = true;
         entry.started = Instant::now();
+        let started = entry.started;
         let root = root.to_path_buf();
         let url = base_url.to_string();
         let spawned = std::thread::Builder::new()
@@ -714,7 +711,7 @@ fn check_remote_backend_for_root(
                 let Some(entry) = probes.get_mut(&root) else {
                     return;
                 };
-                if entry.base_url != url {
+                if entry.base_url != url || entry.started != started {
                     return;
                 }
                 entry.in_flight = false;
@@ -1710,88 +1707,8 @@ impl QueryEmbeddingCache {
     }
 }
 
-struct LocalQueryEmbedRequest {
-    texts: Vec<String>,
-    cache_key: String,
-    response: crossbeam_channel::Sender<Result<Vec<Vec<f32>>, String>>,
-}
-
-struct LocalQueryEmbedWorker {
-    requests: crossbeam_channel::Sender<LocalQueryEmbedRequest>,
-    busy: Arc<AtomicBool>,
-    /// Held by a query from its submission until its reply or its timeout.
-    /// Query embeddings run outside the context's model mutex, so this is
-    /// what still makes a second query wait for the worker instead of being
-    /// refused as busy while an earlier inference it could have waited for
-    /// finishes.
-    submissions: Mutex<()>,
-}
-
-impl LocalQueryEmbedWorker {
-    fn start(
-        model: SharedLocalEmbeddingProvider,
-        query_cache: Arc<Mutex<QueryEmbeddingCache>>,
-    ) -> Result<Self, String> {
-        let (requests, receiver) = crossbeam_channel::unbounded::<LocalQueryEmbedRequest>();
-        let busy = Arc::new(AtomicBool::new(false));
-        let worker_busy = Arc::clone(&busy);
-        std::thread::Builder::new()
-            .name("aft-local-query-embed".to_string())
-            .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    let result = model
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .embed(&request.texts)
-                        .map_err(|error| format!("failed to embed batch: {error}"));
-                    if let Ok(vectors) = &result {
-                        if let Some(vector) = vectors.first() {
-                            query_cache
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(request.cache_key, vector.clone());
-                        }
-                    }
-                    worker_busy.store(false, Ordering::Release);
-                    let _ = request.response.send(result);
-                }
-            })
-            .map_err(|error| format!("failed to start local query embed worker: {error}"))?;
-        Ok(Self {
-            requests,
-            busy,
-            submissions: Mutex::new(()),
-        })
-    }
-
-    fn try_submit(
-        &self,
-        texts: Vec<String>,
-        cache_key: String,
-    ) -> Option<crossbeam_channel::Receiver<Result<Vec<Vec<f32>>, String>>> {
-        if self
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return None;
-        }
-        let (response, receiver) = crossbeam_channel::bounded(1);
-        if self
-            .requests
-            .send(LocalQueryEmbedRequest {
-                texts,
-                cache_key,
-                response,
-            })
-            .is_err()
-        {
-            self.busy.store(false, Ordering::Release);
-            return None;
-        }
-        Some(receiver)
-    }
-}
+mod query_worker;
+use query_worker::LocalQueryEmbedWorker;
 
 struct LocalEmbeddingEngine {
     model: SharedLocalEmbeddingProvider,
@@ -2081,9 +1998,7 @@ fn validate_embedding_dimension(dimension: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Normalize a base URL: validate scheme and strip trailing slash.
-/// Does NOT perform SSRF/private-IP validation — call
-/// `validate_base_url_no_ssrf` separately when processing user-supplied config.
+/// Normalize a user-trusted base URL: validate scheme and strip its trailing slash.
 fn normalize_base_url(raw: &str) -> Result<String, String> {
     let parsed = Url::parse(raw).map_err(|error| format!("invalid base_url '{raw}': {error}"))?;
     let scheme = parsed.scheme();
@@ -2094,83 +2009,6 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
         ));
     }
     Ok(parsed.to_string().trim_end_matches('/').to_string())
-}
-
-/// Validate that a base URL does not point to a private/loopback address.
-/// Call this on user-supplied config (at configure time) to prevent SSRF.
-/// Not called for programmatically constructed configs (e.g. tests).
-///
-/// **Loopback is allowed.** Self-hosted embedding backends (e.g. Ollama at
-/// `http://127.0.0.1:11434`) are a primary use case for `aft_search`. Loopback
-/// addresses by definition cannot be exploited as SSRF targets — they only
-/// reach services on the same machine. Allowing loopback unblocks Ollama at its
-/// default config without opening up SSRF to LAN/intranet services, which
-/// remain rejected.
-///
-/// **mDNS `.local` is rejected.** mDNS hostnames typically resolve to LAN
-/// devices (printers, homelab servers); rejecting them before DNS lookup keeps
-/// the SSRF guard meaningful for non-loopback private networks.
-pub fn validate_base_url_no_ssrf(raw: &str) -> Result<(), String> {
-    use std::net::{IpAddr, ToSocketAddrs};
-
-    let parsed = Url::parse(raw).map_err(|error| format!("invalid base_url '{raw}': {error}"))?;
-
-    let host = parsed.host_str().unwrap_or("");
-
-    // Loopback hostnames are explicitly allowed. RFC 6761 mandates that
-    // `localhost` and `*.localhost` resolve to loopback;
-    // `localhost.localdomain` is a historical alias used on some Linux
-    // distros. Self-hosted backends like Ollama use these by default.
-    let is_loopback_host =
-        host == "localhost" || host == "localhost.localdomain" || host.ends_with(".localhost");
-    if is_loopback_host {
-        return Ok(());
-    }
-
-    // mDNS hostnames are typically LAN devices, not loopback. Reject before
-    // DNS lookup so users get a clear error rather than a private-IP error.
-    if host.ends_with(".local") {
-        return Err(format!(
-            "base_url host '{host}' is an mDNS name — only loopback (localhost / 127.0.0.1) and public endpoints are allowed"
-        ));
-    }
-
-    // Resolve the hostname. Reject private/link-local/CGNAT IPs but NOT
-    // loopback (which is by definition same-machine and not an SSRF target).
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let addr_str = format!("{host}:{port}");
-    let addrs: Vec<IpAddr> = addr_str
-        .to_socket_addrs()
-        .map(|iter| iter.map(|sa| sa.ip()).collect())
-        .unwrap_or_default();
-    for ip in &addrs {
-        if is_private_non_loopback_ip(ip) {
-            return Err(format!(
-                "base_url '{raw}' resolves to a private/reserved IP — only loopback (127.0.0.1) and public endpoints are allowed"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Returns true for IPv4/IPv6 addresses in private/link-local/CGNAT/benchmark/
-/// multicast/reserved ranges, EXCLUDING loopback (127.0.0.0/8 and ::1). Loopback
-/// is considered safe for SSRF purposes (same-machine, e.g. a local Ollama
-/// endpoint) — see [`validate_base_url_no_ssrf`] for rationale.
-///
-/// Delegates to [`crate::url_fetch::is_private_or_reserved_ip`] so there is one
-/// authoritative reserved-range list (the url_fetch copy is the maintained one;
-/// this used to be a drifting subset that missed e.g. 198.18.0.0/15 and the
-/// multicast/reserved blocks). We only re-add the loopback carve-out the
-/// url_fetch guard deliberately does not make.
-fn is_private_non_loopback_ip(ip: &std::net::IpAddr) -> bool {
-    // Canonicalize so an IPv4-mapped loopback (`::ffff:127.0.0.1`) is also
-    // recognized as loopback, matching the prior carve-out.
-    if ip.to_canonical().is_loopback() {
-        return false;
-    }
-    crate::url_fetch::is_private_or_reserved_ip(*ip)
 }
 
 /// Prefix that multimodal embedding deployments parse as an image payload.
@@ -3647,6 +3485,27 @@ impl SemanticEmbeddingModel {
         }
     }
 
+    pub(crate) fn discard_rejected_query(&self, query: &str, vector: &[f32]) {
+        let key = query_embedding_text(query, self.query_instruction.as_deref());
+        let mut cache = self
+            .query_embedding_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Another caller may already have replaced the rejected vector.
+        if cache.query_embedding_cache.get(&key).is_some_and(|cached| {
+            cached.len() == vector.len()
+                && cached
+                    .iter()
+                    .zip(vector)
+                    .all(|(left, right)| left.to_bits() == right.to_bits())
+        }) {
+            cache.query_embedding_cache.remove(&key);
+            cache
+                .query_embedding_cache_order
+                .retain(|entry| entry != &key);
+        }
+    }
+
     pub fn embed_query_cached(
         &mut self,
         query: &str,
@@ -4266,30 +4125,28 @@ fn find_managed_onnx_runtime(storage_dir: &Path) -> Option<PathBuf> {
         // ORT_DYLIB_PATH short-circuits the resolver without touching the tree.
         MANAGED_ORT_PROBE_READS.fetch_add(1, Ordering::Relaxed);
     }
-    let mut best: Option<(u32, u32, PathBuf)> = None;
+    let mut best = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let Some((major, minor)) = parse_managed_ort_version(&entry.file_name().to_string_lossy())
-        else {
+        let Some(version) = parse_managed_ort_version(&entry.file_name().to_string_lossy()) else {
             continue;
         };
-        if major != 1 || minor < MANAGED_ORT_MIN_MINOR {
+        if version.0 != 1 || version.1 < MANAGED_ORT_MIN_MINOR {
             continue;
         }
         let Some(lib_path) = managed_ort_lib_in_version_dir(&path) else {
             continue;
         };
-        if best
-            .as_ref()
-            .is_none_or(|(best_major, best_minor, _)| (major, minor) > (*best_major, *best_minor))
-        {
-            best = Some((major, minor, lib_path));
+        let candidate = (version, lib_path);
+        // Break ties between different directory spellings of the same version.
+        if best.as_ref().is_none_or(|previous| candidate > *previous) {
+            best = Some(candidate);
         }
     }
-    best.map(|(_, _, path)| path)
+    best.map(|(_, path)| path)
 }
 
 /// Locate the library file inside one `<version>` directory, preferring the
@@ -4309,16 +4166,16 @@ fn managed_ort_lib_in_version_dir(version_dir: &Path) -> Option<PathBuf> {
 /// Parse a `major.minor.patch` triple from a version directory name. Returns
 /// None for anything that is not exactly a three-part numeric version (so
 /// non-version dirs and malformed names are ignored).
-fn parse_managed_ort_version(name: &str) -> Option<(u32, u32)> {
+fn parse_managed_ort_version(name: &str) -> Option<(u32, u32, u32)> {
     let mut parts = name.split('.');
     let major = parts.next()?.parse::<u32>().ok()?;
     let minor = parts.next()?.parse::<u32>().ok()?;
-    let _patch = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next()?.parse::<u32>().ok()?;
     // Reject trailing junk like "1.24.4.tmp" or "1.24.4.5".
     if parts.next().is_some() {
         return None;
     }
-    Some((major, minor))
+    Some((major, minor, patch))
 }
 
 /// Serializes ONNX Runtime loading, and remembers the outcome once `ort` has
@@ -10768,6 +10625,35 @@ pub(crate) mod tests {
     const RUST_QUERY_BASELINE_OUTPUT_HASH: &str =
         "36315439db74ed8e186076f79ed261079b2b13a4443ed4272861a2518c78d98b";
 
+    #[test]
+    fn root_eviction_retires_query_embed_health_and_backend_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        record_query_embed_observation(Some(&root), 73, true);
+        root_backend_probes().lock().unwrap().insert(
+            root.clone(),
+            RootBackendProbe {
+                base_url: "http://localhost".to_string(),
+                started: Instant::now(),
+                in_flight: false,
+                finished: Some((Instant::now(), Ok(()))),
+            },
+        );
+        assert_eq!(query_embed_health_snapshot(&root).query_embed_timeouts, 1);
+
+        assert!(ctx.try_evict_idle_artifacts());
+        assert_eq!(
+            query_embed_health_snapshot(&root),
+            QueryEmbedHealthSnapshot::default()
+        );
+        assert!(!root_backend_probes().lock().unwrap().contains_key(&root));
+    }
+
     struct CountingLocalProvider {
         calls: Arc<AtomicUsize>,
         threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
@@ -10782,6 +10668,28 @@ pub(crate) mod tests {
                 .push(std::thread::current().id());
             Ok(vec![vec![0.25, 0.5, 0.75]; texts.len()])
         }
+    }
+
+    #[test]
+    fn local_query_worker_accepts_another_request_after_provider_panic() {
+        struct PanicOnce(bool);
+        impl LocalEmbeddingProvider for PanicOnce {
+            fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+                assert!(!std::mem::take(&mut self.0), "injected provider panic");
+                Ok(vec![vec![1.0, 0.0]])
+            }
+        }
+        let mut model = SemanticEmbeddingModel::from_local_provider_for_test(
+            Box::new(PanicOnce(true)),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+        );
+        let budget = QueryBudget::from_config(&SemanticBackendConfig::default());
+
+        assert!(model.embed_query_cached("panics", budget).is_err());
+        assert_eq!(
+            model.embed_query_cached("recovers", budget).unwrap(),
+            vec![1.0, 0.0]
+        );
     }
 
     struct SleepingLocalProvider {
@@ -16204,122 +16112,10 @@ public class Greeter {
     }
 
     #[test]
-    fn validate_ssrf_allows_loopback_hostnames() {
-        // Loopback hostnames are explicitly allowed so self-hosted backends
-        // (Ollama at http://localhost:11434) work at their default config.
-        for host in &[
-            "http://localhost",
-            "http://localhost:8080",
-            "http://localhost:11434", // Ollama default
-            "http://localhost.localdomain",
-            "http://foo.localhost",
-        ] {
-            assert!(
-                validate_base_url_no_ssrf(host).is_ok(),
-                "Expected {host} to be allowed (loopback), got: {:?}",
-                validate_base_url_no_ssrf(host)
-            );
-        }
-    }
-
-    #[test]
-    fn validate_ssrf_allows_loopback_ips() {
-        // 127.0.0.0/8 is loopback — by definition same-machine and not an
-        // SSRF target. Allow it so Ollama at http://127.0.0.1:11434 works.
-        for url in &[
-            "http://127.0.0.1",
-            "http://127.0.0.1:11434", // Ollama default
-            "http://127.0.0.1:8080",
-            "http://127.1.2.3",
-        ] {
-            let result = validate_base_url_no_ssrf(url);
-            assert!(
-                result.is_ok(),
-                "Expected {url} to be allowed (loopback), got: {:?}",
-                result
-            );
-        }
-    }
-
-    #[test]
-    fn validate_ssrf_rejects_private_non_loopback_ips() {
-        // Non-loopback private/reserved IPs remain rejected — homelab/intranet
-        // services on LAN IPs are real SSRF targets even though the user
-        // configured them. Users who want this can opt in by binding the
-        // service to a public-routable address.
-        for url in &[
-            "http://192.168.1.1",
-            "http://10.0.0.1",
-            "http://172.16.0.1",
-            "http://169.254.169.254",
-            "http://100.64.0.1",
-        ] {
-            let result = validate_base_url_no_ssrf(url);
-            assert!(
-                result.is_err(),
-                "Expected {url} to be rejected (non-loopback private), got: {:?}",
-                result
-            );
-        }
-    }
-
-    #[test]
-    fn validate_ssrf_rejects_mdns_local_hostnames() {
-        // mDNS .local hostnames typically resolve to LAN devices, not
-        // loopback. Rejecting them before DNS lookup gives a clearer error.
-        for host in &[
-            "http://printer.local",
-            "http://nas.local:8080",
-            "http://homelab.local",
-        ] {
-            let result = validate_base_url_no_ssrf(host);
-            assert!(
-                result.is_err(),
-                "Expected {host} to be rejected (mDNS), got: {:?}",
-                result
-            );
-        }
-    }
-
-    #[test]
-    fn normalize_base_url_allows_localhost_for_tests() {
-        // normalize_base_url itself should NOT block localhost — only
-        // validate_base_url_no_ssrf does. Tests construct backends directly.
+    fn normalize_base_url_allows_loopback() {
         assert!(normalize_base_url("http://127.0.0.1:9999").is_ok());
         assert!(normalize_base_url("http://localhost:8080").is_ok());
     }
-
-    #[test]
-    fn ssrf_guard_blocks_reserved_ranges_but_allows_loopback() {
-        use std::net::IpAddr;
-        let blocked = |s: &str| is_private_non_loopback_ip(&s.parse::<IpAddr>().unwrap());
-
-        // Private / link-local / CGNAT — blocked (unchanged behavior).
-        assert!(blocked("10.0.0.1"));
-        assert!(blocked("192.168.1.1"));
-        assert!(blocked("169.254.0.1"));
-        assert!(blocked("100.64.0.1"));
-        // Newly covered by delegating to url_fetch's complete list:
-        assert!(
-            blocked("198.18.0.1"),
-            "RFC2544 benchmark range must be blocked"
-        );
-        assert!(blocked("224.0.0.1"), "multicast must be blocked");
-        assert!(blocked("fc00::1"), "IPv6 ULA must be blocked");
-        assert!(blocked("fe80::1"), "IPv6 link-local must be blocked");
-
-        // Loopback — allowed (local Ollama endpoint), incl. IPv4-mapped form.
-        assert!(!blocked("127.0.0.1"), "loopback must stay allowed");
-        assert!(!blocked("::1"), "IPv6 loopback must stay allowed");
-        assert!(
-            !blocked("::ffff:127.0.0.1"),
-            "IPv4-mapped loopback must stay allowed (matches prior carve-out)"
-        );
-
-        // A public address must NOT be flagged.
-        assert!(!blocked("8.8.8.8"));
-    }
-
     /// Pin the user-facing wording of the ONNX version-mismatch error.
     /// The auto-fix path MUST be listed first because it's the only safe
     /// option that doesn't require sudo or risk breaking other apps that
@@ -16412,6 +16208,11 @@ public class Greeter {
     }
 
     #[test]
+    fn managed_ort_resolver_orders_compatible_versions_by_patch() {
+        assert!(parse_managed_ort_version("1.24.4") > parse_managed_ort_version("1.24.0"));
+    }
+
+    #[test]
     fn managed_ort_resolver_picks_highest_compatible_version() {
         let _env_lock = crate::test_env::process_env_lock();
         let storage = tempfile::tempdir().unwrap();
@@ -16421,6 +16222,7 @@ public class Greeter {
             &[
                 ("1.19.0", true), // below the 1.20 floor — must be ignored
                 ("1.20.1", true),
+                ("1.24.0", true),
                 ("1.24.4", true), // highest compatible — must win
                 ("1.23.0", true),
             ],

@@ -117,9 +117,11 @@ pub(crate) struct TableStats {
     pub(crate) tables: u64,
     /// Their estimated bytes, with the bookkeeping that lists them.
     pub(crate) bytes: u64,
-    /// The bytes of tables held for later binds.
-    pub(crate) kept_bytes: u64,
-    pub(crate) budget_bytes: u64,
+    pub(crate) keep_set_payload_bytes: u64,
+    pub(crate) keep_set_budget_bytes: u64,
+    /// Payload alive only because a cache or an in-flight reader holds it.
+    pub(crate) live_outside_keep_set_payload_bytes: u64,
+    pub(crate) registry_bookkeeping_bytes: u64,
     pub(crate) hits: u64,
     pub(crate) misses: u64,
 }
@@ -230,8 +232,12 @@ impl Tables {
         Some(TableStats {
             tables,
             bytes: table_bytes.saturating_add(bookkeeping as u64),
-            kept_bytes: state.kept_bytes,
-            budget_bytes: self.budget,
+            keep_set_payload_bytes: state.kept_bytes,
+            keep_set_budget_bytes: self.budget,
+            // A kept table always has a strong reference. Subtract its
+            // payload even when a reader also holds it, to count it once.
+            live_outside_keep_set_payload_bytes: table_bytes.saturating_sub(state.kept_bytes),
+            registry_bookkeeping_bytes: bookkeeping as u64,
             hits: state.hits,
             misses: state.misses,
         })
@@ -315,6 +321,34 @@ mod tests {
         assert!(tables.get(key(4)).is_some());
         let stats = tables.stats().unwrap();
         assert_eq!(stats.tables, 2);
-        assert_eq!(stats.kept_bytes, 2 * one);
+        assert_eq!(stats.keep_set_payload_bytes, 2 * one);
+    }
+
+    #[test]
+    fn memory_census_separates_symbol_table_payload_and_bookkeeping() {
+        let one = crate::parser::symbols_estimated_bytes(&table(0));
+        let tables = Tables::new(one);
+        let hash = blake3::hash(b"bytes");
+        let (reader_hold, _) = tables.share(key(0), table(0), hash);
+        tables.share(key(1), table(1), hash);
+
+        let stats = tables.stats().unwrap();
+        assert_eq!(stats.tables, 2);
+        assert_eq!(stats.keep_set_budget_bytes, one);
+        assert_eq!(stats.keep_set_payload_bytes, one);
+        assert_eq!(stats.live_outside_keep_set_payload_bytes, one);
+        assert!(stats.registry_bookkeeping_bytes > 0);
+        assert_eq!(stats.bytes, 2 * one + stats.registry_bookkeeping_bytes);
+
+        drop(reader_hold);
+        let dropped = tables.stats().unwrap();
+        assert_eq!(dropped.tables, 1);
+        assert_eq!(dropped.keep_set_payload_bytes, one);
+        assert_eq!(dropped.live_outside_keep_set_payload_bytes, 0);
+        assert_eq!(
+            dropped.registry_bookkeeping_bytes,
+            stats.registry_bookkeeping_bytes
+        );
+        assert_eq!(dropped.bytes, stats.bytes - one);
     }
 }

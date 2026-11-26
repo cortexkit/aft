@@ -2533,8 +2533,8 @@ fn post_edit_rejects_publish_with_stale_version() {
     }
 
     // Pre-warm: do one regular write so the server is up. Use the first
-    // call (which sends didOpen with version 0) to seed state — but with
-    // STALE_VERSION on, the fake publishes version=-1 which won't match
+    // call (which sends didOpen with version 1) to seed state — but with
+    // STALE_VERSION on, the fake publishes version=0 which won't match
     // any wait. Use a long enough timeout that the wait actually drains.
     let outcome =
         ctx.lsp_notify_and_collect_diagnostics(file, "fn main() {}\n", Duration::from_millis(800));
@@ -2565,14 +2565,11 @@ fn post_edit_rejects_publish_with_stale_version() {
 
 #[test]
 fn post_edit_wait_rejects_stale_pre_edit_publish() {
-    use aft::lsp::diagnostics::{DiagnosticEntry, StoredDiagnostic};
     use aft::lsp::manager::{post_edit_entry_is_fresh, PreEditSnapshot};
 
     let file = PathBuf::from("/tmp/aft-stale.rs");
-    let stale = DiagnosticEntry {
-        from_receive_order: false,
-        content_hash: None,
-        diagnostics: vec![StoredDiagnostic {
+    let stale = post_edit_entry_fixture(
+        StoredDiagnostic {
             file,
             line: 1,
             column: 1,
@@ -2582,14 +2579,11 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
             message: "stale pre-edit".into(),
             code: None,
             source: Some("fake".into()),
-        }],
-        epoch: 7,
-        result_id: None,
-        version: Some(4),
-        stale: false,
-        provisional: false,
-        from_document_pull: false,
-    };
+        },
+        7,
+        Some(4),
+        false,
+    );
 
     let pre_edit = PreEditSnapshot {
         epoch: 6,
@@ -2604,14 +2598,11 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
 
 #[test]
 fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
-    use aft::lsp::diagnostics::{DiagnosticEntry, StoredDiagnostic};
     use aft::lsp::manager::{post_edit_entry_is_fresh, PreEditSnapshot};
 
     let file = PathBuf::from("/tmp/aft-unversioned.rs");
-    let unversioned = DiagnosticEntry {
-        from_receive_order: false,
-        content_hash: None,
-        diagnostics: vec![StoredDiagnostic {
+    let unversioned = post_edit_entry_fixture(
+        StoredDiagnostic {
             file,
             line: 1,
             column: 1,
@@ -2621,14 +2612,11 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
             message: "unversioned".into(),
             code: None,
             source: Some("fake".into()),
-        }],
-        epoch: 8,
-        result_id: None,
-        version: None,
-        stale: false,
-        provisional: false,
-        from_document_pull: false,
-    };
+        },
+        8,
+        None,
+        false,
+    );
 
     let pre_edit = PreEditSnapshot {
         epoch: 7,
@@ -2639,6 +2627,31 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
         !post_edit_entry_is_fresh(&unversioned, 5, pre_edit),
         "epoch advancement alone must not prove freshness for unversioned publishes"
     );
+}
+
+fn post_edit_entry_fixture(
+    diagnostic: StoredDiagnostic,
+    epoch: u64,
+    version: Option<i32>,
+    provisional: bool,
+) -> aft::lsp::diagnostics::DiagnosticEntry {
+    let mut store = aft::lsp::diagnostics::DiagnosticsStore::new();
+    let file = diagnostic.file.clone();
+    let key = ServerKey {
+        kind: ServerKind::Rust,
+        root: file.parent().unwrap().to_path_buf(),
+    };
+    store.publish_full_with_provisional(
+        key,
+        file.clone(),
+        vec![diagnostic],
+        None,
+        version,
+        provisional,
+    );
+    let mut entry = store.entries_for_file(&file)[0].1.clone();
+    entry.epoch = epoch;
+    entry
 }
 
 #[test]
@@ -2918,7 +2931,6 @@ fn rust_analyzer_warming_diagnostics_are_provisional_until_quiescent() {
 
 #[test]
 fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
-    use aft::lsp::diagnostics::DiagnosticEntry;
     use aft::lsp::manager::PreEditSnapshot;
 
     let file = PathBuf::from("/workspace/src/main.rs");
@@ -2926,10 +2938,8 @@ fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
         kind: ServerKind::Rust,
         root: PathBuf::from("/workspace"),
     };
-    let entry = DiagnosticEntry {
-        from_receive_order: false,
-        content_hash: None,
-        diagnostics: vec![StoredDiagnostic {
+    let entry = post_edit_entry_fixture(
+        StoredDiagnostic {
             file,
             line: 1,
             column: 1,
@@ -2939,14 +2949,11 @@ fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
             message: "warming diagnostic".to_string(),
             code: Some("E-WARM".to_string()),
             source: Some("rust-analyzer".to_string()),
-        }],
-        epoch: 2,
-        result_id: None,
-        version: Some(1),
-        stale: false,
-        provisional: true,
-        from_document_pull: false,
-    };
+        },
+        2,
+        Some(1),
+        true,
+    );
 
     let outcome = LspManager::post_edit_outcome_for_entry_for_test(
         key,
@@ -3202,7 +3209,7 @@ fn lsp_diagnostics_reports_cargo_check_after_an_aft_write_with_real_rust_analyze
     fs::create_dir_all(root.join("src")).expect("create src");
     fs::write(
         root.join("Cargo.toml"),
-        "[package]\nname = \"field-removal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "[package]\nname = \"field-removal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
     )
     .expect("write manifest");
     fs::write(root.join("src/lib.rs"), "pub mod s;\npub mod user;\n").expect("write lib");
@@ -3940,6 +3947,8 @@ fn workspace_unchanged_reply_does_not_relabel_an_interleaved_report() {
 
 #[test]
 fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
+    use aft::lsp::document::FIRST_VERSION_FOR_TEST as FIRST_VERSION;
+
     let (_temp, root, files) = rust_workspace_with_files(&["main.rs", "probe.rs"]);
     fs::write(root.join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();
     let python = root.join("main.py");
@@ -3984,7 +3993,7 @@ fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
                 .get(&versions[0].0)
                 .expect("owning store must be captured")
                 .document_version_at_capture,
-            Some(0)
+            Some(FIRST_VERSION)
         );
         before.push(snapshot);
     }
@@ -4019,7 +4028,7 @@ fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
             .next()
             .expect("probe must remain open")
             .document_version_at_capture,
-        Some(1),
+        Some(FIRST_VERSION + 1),
         "the unqueued disk change must prove an overflow resync ran"
     );
     for ((file, _, _), previous) in documents.iter().zip(&before) {

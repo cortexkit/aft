@@ -242,7 +242,7 @@
           "call_id": "glob-t6-glob-payload-files-incomplete",
           "fixture": "incomplete",
           "triggered_reason": "cap",
-          "expected_trailer": "shown 5 of ≥140 files (cap) · narrow: path"
+          "expected_trailer": "shown 5 of ≥100 files (cap) · narrow: path"
         }
       }
     }

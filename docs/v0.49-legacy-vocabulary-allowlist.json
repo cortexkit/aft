@@ -4231,22 +4231,11 @@
     },
     {
       "path": "packages/aft-cli/src/lib/sessions.ts",
-      "line": 127,
+      "line": 136,
       "column": 27,
       "token": "filePath",
-      "text": "readFileSync(file.filePath, \"utf8\"),",
-      "location": "line 127, column 27",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-cli/src/lib/sessions.ts",
-      "line": 128,
-      "column": 23,
-      "token": "filePath",
-      "text": "basename(file.filePath),",
-      "location": "line 128, column 23",
+      "text": "const path = file.filePath;",
+      "location": "line 136, column 27",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -7053,11 +7042,11 @@
     },
     {
       "path": "scripts/capture-subc-parity.ts",
-      "line": 484,
+      "line": 504,
       "column": 65,
       "token": "filePath",
-      "text": "{ name: \"read_offset_limit\", tool_name: \"read\", agent_args: { filePath: \"src/../README.md\", offset: 2, limit: 3 } },",
-      "location": "line 484, column 65",
+      "text": "{ name: \"read_offset_limit\", tool_name: \"read\", agent_args: { filePath: \"README.md\", offset: 2, limit: 3 } },",
+      "location": "line 504, column 65",
       "ordinal": 1,
       "class": "audit-implementation",
       "reason": "The audit or capture implementation names the vocabulary it checks."

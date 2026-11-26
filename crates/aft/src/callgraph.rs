@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn module_resolution_hits_do_not_allocate_owned_compound_keys() {
         let temp = TempDir::new().unwrap();
-        let root = canonicalize_path(temp.path());
+        let root = fs::canonicalize(temp.path()).unwrap();
         fs::write(root.join("target.ts"), "export function target() {}\n").unwrap();
         let disk = DiskFacts::new(&root);
         let facts = FactPaths {
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn rust_crate_root_memo_bounds_one_thousand_per_reference_lookups() {
         let temp = TempDir::new().unwrap();
-        let root = canonicalize_path(temp.path());
+        let root = fs::canonicalize(temp.path()).unwrap();
         let root = root.as_path();
         fs::create_dir_all(root.join("src/bin/support")).unwrap();
         fs::write(
@@ -227,7 +227,7 @@ mod tests {
         for index in 0..1_000 {
             assert_eq!(
                 memo.root_file(root, &callers[index % callers.len()], &paths),
-                Some(canonicalize_path(&root.join("src/bin/tool.rs")))
+                Some(fs::canonicalize(root.join("src/bin/tool.rs")).unwrap())
             );
         }
 
@@ -242,12 +242,35 @@ mod tests {
         symbols: &[Symbol],
     ) -> HashMap<String, Vec<CallSite>> {
         let mut calls_by_symbol = HashMap::new();
+        let symbol_range = |symbol: &Symbol| {
+            line_col_to_byte(source, symbol.range.start_line, symbol.range.start_col)
+                ..line_col_to_byte(source, symbol.range.end_line, symbol.range.end_col)
+        };
+        let is_callable =
+            |symbol: &Symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method);
         for symbol in symbols {
-            let byte_start =
-                line_col_to_byte(source, symbol.range.start_line, symbol.range.start_col);
-            let byte_end = line_col_to_byte(source, symbol.range.end_line, symbol.range.end_col);
-            let sites = extract_calls_full(source, root, byte_start, byte_end, lang)
+            let range = symbol_range(symbol);
+            let nested_bodies = symbols
+                .iter()
+                .filter(|inner| is_callable(symbol) && is_callable(inner))
+                .map(symbol_range)
+                .filter(|inner| {
+                    range.start <= inner.start && inner.end <= range.end && *inner != range
+                })
+                .map(|inner| {
+                    root.descendant_for_byte_range(inner.start, inner.end)
+                        .and_then(|node| node.child_by_field_name("body"))
+                        .map(|body| body.byte_range())
+                        .unwrap_or(inner)
+                })
+                .collect::<Vec<_>>();
+            let sites = extract_calls_full(source, root, range.start, range.end, lang)
                 .into_iter()
+                .filter(|(_, _, _, start, end)| {
+                    !nested_bodies
+                        .iter()
+                        .any(|body| body.start <= *start && *end <= body.end)
+                })
                 .map(
                     |(full, short, line, call_byte_start, call_byte_end)| CallSite {
                         kind: CallSiteKind::Call,
@@ -264,21 +287,13 @@ mod tests {
             }
         }
 
-        let symbol_ranges = symbols
-            .iter()
-            .map(|symbol| {
-                (
-                    line_col_to_byte(source, symbol.range.start_line, symbol.range.start_col),
-                    line_col_to_byte(source, symbol.range.end_line, symbol.range.end_col),
-                )
-            })
-            .collect::<Vec<_>>();
+        let symbol_ranges = symbols.iter().map(symbol_range).collect::<Vec<_>>();
         let top_level_sites = collect_calls_full_with_ranges(root, source, 0, source.len(), lang)
             .into_iter()
             .filter(|site| {
                 !symbol_ranges
                     .iter()
-                    .any(|(start, end)| site.byte_start >= *start && site.byte_end <= *end)
+                    .any(|range| site.byte_start >= range.start && site.byte_end <= range.end)
             })
             .map(|site| CallSite {
                 kind: CallSiteKind::Call,
@@ -507,13 +522,7 @@ def right():
             Direct,
         );
         assert_eq!(actual, reference, "overlapping and adjacent ranges changed");
-        assert_eq!(
-            actual["outer"]
-                .iter()
-                .map(|site| site.callee_name.as_str())
-                .collect::<Vec<_>>(),
-            ["first", "second"]
-        );
+        assert!(!actual.contains_key("outer"));
         assert_eq!(actual["left"][0].callee_name, "first");
         assert_eq!(actual["right"][0].callee_name, "second");
         assert_eq!(actual[TOP_LEVEL_SYMBOL][0].callee_name, "third");
@@ -638,41 +647,13 @@ export function subtract(a: number, b: number): number {
         dir
     }
 
-    /// Create a project with import aliasing.
-    fn setup_alias_project() -> TempDir {
-        let dir = TempDir::new().unwrap();
-
-        fs::write(
-            dir.path().join("main.ts"),
-            r#"import { helper as h } from './utils';
-
-export function main() {
-    return h(42);
-}
-"#,
-        )
-        .unwrap();
-
-        fs::write(
-            dir.path().join("utils.ts"),
-            r#"export function helper(x: number): number {
-    return x + 1;
-}
-"#,
-        )
-        .unwrap();
-
-        dir
-    }
-
     // --- Single-file call extraction ---
 
     #[test]
     fn callgraph_single_file_call_extraction() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
-        let file_data = graph.build_file(&dir.path().join("main.ts")).unwrap();
+        let file_data = build_file_data(&dir.path().join("main.ts")).unwrap();
         let main_calls = &file_data.calls_by_symbol["main"];
 
         let callee_names: Vec<&str> = main_calls.iter().map(|c| c.callee_name.as_str()).collect();
@@ -696,9 +677,8 @@ export function main() {
     #[test]
     fn callgraph_file_data_has_exports() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
-        let file_data = graph.build_file(&dir.path().join("utils.ts")).unwrap();
+        let file_data = build_file_data(&dir.path().join("utils.ts")).unwrap();
         assert!(
             file_data.exported_symbols.contains(&"helper".to_string()),
             "utils.ts should export helper, got: {:?}",
@@ -708,103 +688,6 @@ export function main() {
             file_data.exported_symbols.contains(&"compute".to_string()),
             "utils.ts should export compute, got: {:?}",
             file_data.exported_symbols
-        );
-    }
-
-    // --- Cross-file resolution ---
-
-    #[test]
-    fn callgraph_resolve_direct_import() {
-        let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
-
-        let main_path = dir.path().join("main.ts");
-        let file_data = graph.build_file(&main_path).unwrap();
-        let import_block = file_data.import_block.clone();
-
-        let edge = graph.resolve_cross_file_edge("helper", "helper", &main_path, &import_block);
-        match edge {
-            EdgeResolution::Resolved { file, symbol } => {
-                assert!(
-                    file.ends_with("utils.ts"),
-                    "helper should resolve to utils.ts, got: {:?}",
-                    file
-                );
-                assert_eq!(symbol, "helper");
-            }
-            EdgeResolution::Unresolved { callee_name } => {
-                panic!("Expected resolved, got unresolved: {}", callee_name);
-            }
-        }
-    }
-
-    #[test]
-    fn callgraph_resolve_namespace_import() {
-        let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
-
-        let main_path = dir.path().join("main.ts");
-        let file_data = graph.build_file(&main_path).unwrap();
-        let import_block = file_data.import_block.clone();
-
-        let edge = graph.resolve_cross_file_edge("math.add", "add", &main_path, &import_block);
-        match edge {
-            EdgeResolution::Resolved { file, symbol } => {
-                assert!(
-                    file.ends_with("math.ts"),
-                    "math.add should resolve to math.ts, got: {:?}",
-                    file
-                );
-                assert_eq!(symbol, "add");
-            }
-            EdgeResolution::Unresolved { callee_name } => {
-                panic!("Expected resolved, got unresolved: {}", callee_name);
-            }
-        }
-    }
-
-    #[test]
-    fn callgraph_resolve_aliased_import() {
-        let dir = setup_alias_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
-
-        let main_path = dir.path().join("main.ts");
-        let file_data = graph.build_file(&main_path).unwrap();
-        let import_block = file_data.import_block.clone();
-
-        let edge = graph.resolve_cross_file_edge("h", "h", &main_path, &import_block);
-        match edge {
-            EdgeResolution::Resolved { file, symbol } => {
-                assert!(
-                    file.ends_with("utils.ts"),
-                    "h (alias for helper) should resolve to utils.ts, got: {:?}",
-                    file
-                );
-                assert_eq!(symbol, "helper");
-            }
-            EdgeResolution::Unresolved { callee_name } => {
-                panic!("Expected resolved, got unresolved: {}", callee_name);
-            }
-        }
-    }
-
-    #[test]
-    fn callgraph_unresolved_edge_marked() {
-        let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
-
-        let main_path = dir.path().join("main.ts");
-        let file_data = graph.build_file(&main_path).unwrap();
-        let import_block = file_data.import_block.clone();
-
-        let edge =
-            graph.resolve_cross_file_edge("unknownFunc", "unknownFunc", &main_path, &import_block);
-        assert_eq!(
-            edge,
-            EdgeResolution::Unresolved {
-                callee_name: "unknownFunc".to_string()
-            },
-            "Unknown callee should be unresolved"
         );
     }
 
@@ -1010,27 +893,6 @@ export function main() {
         );
     }
 
-    // --- find_alias_original ---
-
-    #[test]
-    fn callgraph_find_alias_original_simple() {
-        let raw = "import { foo as bar } from './utils';";
-        assert_eq!(find_alias_original(raw, "bar"), Some("foo".to_string()));
-    }
-
-    #[test]
-    fn callgraph_find_alias_original_multiple() {
-        let raw = "import { foo as bar, baz as qux } from './utils';";
-        assert_eq!(find_alias_original(raw, "bar"), Some("foo".to_string()));
-        assert_eq!(find_alias_original(raw, "qux"), Some("baz".to_string()));
-    }
-
-    #[test]
-    fn callgraph_find_alias_no_match() {
-        let raw = "import { foo } from './utils';";
-        assert_eq!(find_alias_original(raw, "foo"), None);
-    }
-
     // --- Reverse callers ---
 
     #[test]
@@ -1176,9 +1038,8 @@ export function main() {
     #[test]
     fn callgraph_symbol_metadata_populated() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
-        let file_data = graph.build_file(&dir.path().join("utils.ts")).unwrap();
+        let file_data = build_file_data(&dir.path().join("utils.ts")).unwrap();
         assert!(
             file_data.symbol_metadata.contains_key("helper"),
             "symbol_metadata should contain helper"
@@ -1189,57 +1050,82 @@ export function main() {
     }
 
     #[test]
-    fn namespace_import_follows_barrel_reexport_and_rejects_private_member() {
+    fn review_opus6_tsconfig_wildcard_rejects_overlap() {
         let dir = TempDir::new().unwrap();
         fs::write(
-            dir.path().join("main.ts"),
-            r#"import * as lib from './index';
-
-export function main() {
-    lib.helper();
-    lib.hidden();
-}
-"#,
+            dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*/":["src/*"]}}}"#,
         )
         .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/ok.ts"), "export {};\n").unwrap();
+        assert!(resolve_module_path(dir.path(), "@/").is_none());
+        assert!(resolve_module_path(dir.path(), "@/ok/")
+            .unwrap()
+            .ends_with("src/ok.ts"));
+    }
+
+    #[test]
+    fn review_opus6_package_export_wildcard_rejects_overlap() {
+        let dir = TempDir::new().unwrap();
         fs::write(
-            dir.path().join("index.ts"),
-            "export { helper } from './utils';\n",
+            dir.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
         )
         .unwrap();
+        let package = dir.path().join("packages/lib");
+        fs::create_dir_all(&package).unwrap();
         fs::write(
-            dir.path().join("utils.ts"),
-            r#"export function helper() {}
-function hidden() {}
-"#,
+            package.join("package.json"),
+            r#"{"name":"@scope/lib","exports":{"./a*a":"./entry-*.ts"}}"#,
         )
         .unwrap();
+        fs::write(package.join("entry-.ts"), "export {};\n").unwrap();
+        assert!(resolve_module_path(dir.path(), "@scope/lib/a").is_none());
+        assert!(resolve_module_path(dir.path(), "@scope/lib/aa")
+            .unwrap()
+            .ends_with("entry-.ts"));
+    }
 
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
-        let main_path = dir.path().join("main.ts");
-        let import_block = graph.build_file(&main_path).unwrap().import_block.clone();
-
-        let helper =
-            graph.resolve_cross_file_edge("lib.helper", "helper", &main_path, &import_block);
-        match helper {
-            EdgeResolution::Resolved { file, symbol } => {
-                assert!(
-                    file.ends_with("utils.ts"),
-                    "helper should resolve through barrel: {file:?}"
-                );
-                assert_eq!(symbol, "helper");
-            }
-            other => panic!("expected helper to resolve through barrel, got {other:?}"),
-        }
-
-        let hidden =
-            graph.resolve_cross_file_edge("lib.hidden", "hidden", &main_path, &import_block);
+    #[test]
+    fn review_opus7_workspace_cache_notices_new_packages() {
+        let dir = TempDir::new().unwrap();
+        let root = &fs::canonicalize(dir.path()).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let create_package = |member: &str| {
+            let path = root.join("packages").join(member);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(
+                path.join("package.json"),
+                format!(r#"{{"name":"@scope/{member}","main":"index.ts"}}"#),
+            )
+            .unwrap();
+            fs::write(path.join("index.ts"), "export {};\n").unwrap();
+        };
+        create_package("first");
+        crate::callgraph_store::work_counts::reset_under(root);
+        assert!(resolve_module_path(root, "@scope/first").is_some());
+        let (_, _, cold_walks, _) = crate::callgraph_store::work_counts::filesystem_counts(root);
+        assert!(cold_walks > 0);
+        assert!(resolve_module_path(root, "@scope/first").is_some());
+        let (_, _, warm_walks, _) = crate::callgraph_store::work_counts::filesystem_counts(root);
         assert_eq!(
-            hidden,
-            EdgeResolution::Unresolved {
-                callee_name: "hidden".to_string()
-            }
+            warm_walks, cold_walks,
+            "a warm hit should not repeat the workspace walk"
         );
+        eprintln!(
+            "workspace directories visited: {cold_walks} cold, {} warm",
+            warm_walks - cold_walks
+        );
+        assert!(resolve_module_path(root, "@scope/new").is_none());
+        create_package("new");
+        assert!(resolve_module_path(root, "@scope/new")
+            .unwrap()
+            .ends_with("packages/new/index.ts"));
     }
 
     #[test]
@@ -1399,9 +1285,8 @@ function helperB() {}
         )
         .unwrap();
 
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
         let path = dir.path().join("classes.ts");
-        let data = graph.build_file(&path).unwrap();
+        let data = build_file_data(&path).unwrap();
 
         assert!(
             data.symbol_metadata.contains_key("A::run"),
@@ -1426,6 +1311,38 @@ function helperB() {}
     }
 
     // --- extract_parameters ---
+
+    #[test]
+    fn audit_resolution_nested_callback_keeps_later_parameters() {
+        assert_eq!(
+            extract_parameters("fn run(cb: fn(i32) -> i32, count: i32)", LangId::Rust),
+            ["cb", "count"]
+        );
+        assert_eq!(
+            extract_parameters(r#"def run(text=") ,", count=0):"#, LangId::Python),
+            ["text", "count"]
+        );
+    }
+
+    #[test]
+    fn audit_resolution_dotted_typescript_import_keeps_its_stem() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = directory.path().join("user.service.ts");
+        std::fs::write(&service, "").unwrap();
+        let service = service.canonicalize().unwrap();
+        assert_eq!(
+            resolve_module_path(directory.path(), "./user.service"),
+            Some(service.clone())
+        );
+        std::fs::write(directory.path().join("user.ts"), "").unwrap();
+        for specifier in ["./user.service", "./user.service.js"] {
+            assert_eq!(
+                resolve_module_path(directory.path(), specifier),
+                Some(service.clone()),
+                "{specifier}"
+            );
+        }
+    }
 
     #[test]
     fn extract_parameters_typescript() {

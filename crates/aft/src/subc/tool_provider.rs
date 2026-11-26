@@ -3188,7 +3188,7 @@ impl LedgerEdge {
     }
 
     /// Answers a `tool.yield` on a v1 route (see `call_yield` for the
-    /// contract it follows). Person-message handoffs need only in-memory state.
+    /// contract it follows). Ordinary handoffs need only in-memory state.
     /// Restart holds are persisted off the frame loop before the final frame
     /// and acceptance are sent, so losing the runner cannot lose the result.
     fn call_yield(
@@ -3282,6 +3282,10 @@ impl LedgerEdge {
         // finds only the caller's own calls.
         let key = Self::key(identity, &yielded.call_key);
         let restart = yielded.reason == super::call_yield::RUNNER_RESTART;
+        let handoff = matches!(
+            yielded.reason.as_str(),
+            super::call_yield::PERSON_MESSAGE | super::call_yield::URGENT_NOTICE
+        );
         let mut handed_back = None;
         let mut held_watch = None;
         let answer = {
@@ -3299,10 +3303,7 @@ impl LedgerEdge {
                 // The contract never accepts a yield twice.
                 Some((_, call)) if call.yielded => YieldAnswer::UnknownCall,
                 Some((&(_, corr), call)) => {
-                    let refusal = if identity.call_yield
-                        && !restart
-                        && yielded.reason != super::call_yield::PERSON_MESSAGE
-                    {
+                    let refusal = if identity.call_yield && !restart && !handoff {
                         Some(NotYieldable::Reason)
                     } else if restart {
                         super::call_yield::restart_route_refusal(identity)
@@ -3311,8 +3312,6 @@ impl LedgerEdge {
                     };
                     let decision = if let Some(refusal) = refusal {
                         Err(refusal)
-                    } else if !restart && yielded.reason != super::call_yield::PERSON_MESSAGE {
-                        Err(NotYieldable::Reason)
                     } else {
                         match call.yieldable {
                             None => Err(NotYieldable::Tool),
@@ -3778,6 +3777,7 @@ impl LedgerEdge {
                         body.get("held").is_some() && body.get("isError").is_none()
                     });
                 if permission_hold {
+                    outgoing.held_reply = true;
                     if let Some(call) = edge
                         .calls
                         .lock()

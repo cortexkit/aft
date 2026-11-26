@@ -53,7 +53,6 @@ pub mod alloc_trace;
 pub mod atomic_replace;
 pub mod bash_env;
 pub mod bounded_io;
-pub mod build_state;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod clock;
@@ -114,6 +113,7 @@ pub mod memory;
 pub mod memory_profile;
 pub mod registration;
 
+pub mod cortexkit_data;
 pub mod native_stat;
 pub mod ndjson_text;
 pub mod no_follow_file;

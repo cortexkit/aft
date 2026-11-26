@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/tests/integration/grep_glob_test.rs",
+    "crates/aft/src/commands/glob.rs",
+    "crates/aft/src/commands/semantic_search/external_exact.rs",
+    "crates/aft/src/commands/semantic_search/external_disk_check.rs"
+  ],
+  "note": "Disclose unreadable filesystem coverage, count only admitted glob paths, honor request filters on named grep files, and cap unpublished external enumeration. Indexed glob keeps the same newest-first page and refill window without materializing all matching paths. Exact sweeps also scan ASCII identifiers in non-UTF-8 text. No ranking formulas, routing policies, or ranked-row differences are waived. Engine-unwired is used because the coverage fixes touch fenced search files."
+}

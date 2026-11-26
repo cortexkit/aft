@@ -646,8 +646,7 @@ describe("a route the plugin closes under an in-flight call (real SubcClient, fa
     const bash = bridge.send("bash", { session_id: "lost" }).catch((error: unknown) => error);
     const tool = bridge.send("read", { session_id: "lost" }).catch((error: unknown) => error);
     await waitFor(() => daemon.requests.length === 3, "all loss requests to reach the daemon");
-    expect(daemon.requests[1]?.name).toBe("bash");
-    expect(daemon.requests[2]?.name).toBe("read");
+    expect(daemon.requests.map(({ name }) => name).sort()).toEqual(["bash", "read", "read"]);
 
     abort.abort();
     expect(((await cancelled) as Error).name).toBe("AbortError");

@@ -1,6 +1,82 @@
 use super::super::{carrier, operations};
 use super::*;
 
+thread_local! {
+    static ROW_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+pub(super) fn record_work(generated: usize, measured: usize) {
+    let (made, budgeted) = ROW_WORK.get();
+    ROW_WORK.set((made + generated, budgeted + measured));
+}
+
+#[test]
+fn output_budget_measures_each_visited_row_once_and_generation_stops_at_limit() {
+    let cursor = cursor("session", "task");
+    let bytes = vec![b'a'; 65_536];
+    let offsets = Offsets::default();
+    let data = backend(&bytes, &bytes, offsets, true, false);
+    let mut work = Vec::new();
+    for limit in [16, 1] {
+        ROW_WORK.set((0, 0));
+        let result = page(&cursor, offsets, &data, limit).unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), limit);
+        work.push(ROW_WORK.get());
+    }
+    assert_eq!(
+        work,
+        [(16, 16), (1, 1)],
+        "(generated rows, budgeted row-equivalents)"
+    );
+}
+
+#[test]
+fn output_budget_preserves_exact_page_and_cursor_bytes_at_cap() {
+    let cursor = cursor("session", "task");
+    let offsets = Offsets::default();
+    let expected = |bytes: &[u8], drained| {
+        let items = bytes.chunks(ITEM_BYTES).map(|chunk| json!({
+            "stream":"stdout", "text":std::str::from_utf8(chunk).unwrap(), "bytes":chunk.len(),
+            "continued":false, "firstAvailableOffset":null, "prefixDropped":true,
+        })).collect();
+        let end = Offsets {
+            stdout: bytes.len() as u64,
+            ..offsets
+        };
+        serde_json::to_vec(&envelope(&cursor, end, items, drained)).unwrap()
+    };
+    for terminal in [false, true] {
+        let prefix = 5 * ITEM_BYTES;
+        let mut bytes = vec![b'a'; 6 * ITEM_BYTES];
+        bytes[..prefix].fill(0);
+        let extra = PAGE_BYTES - expected(&bytes, terminal).len();
+        let quoted = prefix + extra / 5;
+        let next = quoted + extra % 5;
+        bytes[prefix..quoted].fill(0);
+        bytes[quoted..next].fill(b'"');
+
+        let exactly = expected(&bytes, terminal);
+        assert_eq!(exactly.len(), PAGE_BYTES);
+        let read = |bytes: &[u8]| {
+            page(
+                &cursor,
+                offsets,
+                &backend(bytes, b"", offsets, terminal, false),
+                16,
+            )
+            .unwrap()
+        };
+        assert_eq!(serde_json::to_vec(&read(&bytes)).unwrap(), exactly);
+
+        bytes[next] = b'"';
+        assert_eq!(expected(&bytes, terminal).len(), PAGE_BYTES + 1);
+        assert_eq!(
+            serde_json::to_vec(&read(&bytes)).unwrap(),
+            expected(&bytes[..prefix], false)
+        );
+    }
+}
+
 fn cursor<'a>(session: &'a str, task: &'a str) -> Cursor<'a> {
     Cursor {
         key: [0x42; 32],

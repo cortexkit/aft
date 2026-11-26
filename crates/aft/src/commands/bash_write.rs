@@ -83,27 +83,38 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    use crate::bash_background::pty_input::{PtyWriteError, INPUT_DEADLINE};
     match ctx
         .bash_background()
-        .write_pty(&params.task_id, req.session(), &bytes)
+        .write_pty_input(&params.task_id, req.session(), &bytes)
     {
         Ok(bytes_written) => Response::success(&req.id, json!({ "bytes_written": bytes_written })),
-        Err(code) if code == "task_not_found" => Response::error(
+        Err(PtyWriteError::TaskNotFound) => Response::error(
             &req.id,
             "task_not_found",
             format_unknown_write_task_message(&params.task_id, req.host_tool_names().shell()),
         ),
-        Err(code) if code == "task_not_pty" => Response::error(
+        Err(PtyWriteError::TaskNotPty) => Response::error(
             &req.id,
             "task_not_pty",
             format!("background task is not a PTY task: {}", params.task_id),
         ),
-        Err(code) if code == "task_exited" => Response::error(
+        Err(PtyWriteError::TaskExited) => Response::error(
             &req.id,
             "task_exited",
             format!("PTY task is no longer running: {}", params.task_id),
         ),
-        Err(message) => Response::error(&req.id, "write_failed", message),
+        Err(PtyWriteError::InputTimeout { written, pending }) => Response::error_with_data(
+            &req.id,
+            "input_timeout",
+            format!(
+                "The program didn't read its terminal input within {}s: wrote {written} of {} bytes; the remaining {pending} bytes were not sent.",
+                INPUT_DEADLINE.as_secs(),
+                bytes.len()
+            ),
+            json!({ "bytes_written": written, "bytes_pending": pending }),
+        ),
+        Err(PtyWriteError::Failed(message)) => Response::error(&req.id, "write_failed", message),
     }
 }
 

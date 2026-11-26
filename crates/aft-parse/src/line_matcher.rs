@@ -544,14 +544,6 @@ pub fn seek_sequence_tiered_checked(
             return Ok(matched(found, tier));
         }
     }
-    let indent = |a: &str, b: &str| a.trim() == b.trim();
-    let found = unique_match(
-        normalized_sequence_match(lines, pattern, start_index, eof, indent),
-        |next| normalized_sequence_match(lines, pattern, next, eof, indent),
-    )?;
-    if let Some(found) = found {
-        return Ok(matched(found, MatchTier::Indent));
-    }
     let unicode = |a: &str, b: &str| unicode_characters(a.trim()).eq(unicode_characters(b.trim()));
     let found = unique_match(
         normalized_sequence_match(lines, pattern, start_index, eof, unicode),
@@ -1761,6 +1753,20 @@ mod line_tiers {
     #[test]
     fn trim_tier_matches_the_start_by_start_scan() {
         assert_tier_matches_scan(0x11ae_0003, |a, b| a.trim() == b.trim());
+    }
+
+    #[test]
+    fn line_tier_miss_scans_once_per_distinct_comparator() {
+        let lines = ["a"; 128];
+        LINE_MATCH_WORK.with(|work| work.set(0));
+        assert_eq!(
+            seek_sequence_tiered_checked(&lines, &["b"], 0, false),
+            Ok(None)
+        );
+        assert_eq!(
+            LINE_MATCH_WORK.with(std::cell::Cell::get),
+            4 * lines.len() * 2
+        );
     }
 
     // BEGIN line-tier work-bound test

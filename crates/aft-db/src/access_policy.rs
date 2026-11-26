@@ -5,6 +5,8 @@ pub mod directory_scope;
 pub use directory_scope::directory_scope;
 pub mod environment;
 
+use aft_base::cortexkit_data::{self, Floor as DataFloor};
+
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -501,6 +503,9 @@ pub enum HeadPolicy {
 pub enum FloorRule {
     CredentialPath,
     CortexkitModuleData,
+    CortexkitBusDataWrite,
+    CortexkitDatabase,
+    CortexkitCredential,
     CortexkitModuleState,
     AftStorage,
     #[cfg(unix)]
@@ -516,6 +521,9 @@ impl FloorRule {
         match self {
             Self::CredentialPath => "credential_path",
             Self::CortexkitModuleData => "cortexkit_module_data",
+            Self::CortexkitBusDataWrite => "cortexkit_bus_data_write",
+            Self::CortexkitDatabase => "cortexkit_database",
+            Self::CortexkitCredential => "cortexkit_credential",
             Self::CortexkitModuleState => "cortexkit_module_state",
             Self::AftStorage => "aft_storage",
             #[cfg(unix)]
@@ -533,6 +541,9 @@ impl FloorRule {
             Self::CortexkitModuleData => {
                 "module data store under ~/.local/share/cortexkit/<module>"
             }
+            Self::CortexkitBusDataWrite => "read-only CortexKit message-bus data",
+            Self::CortexkitDatabase => "CortexKit database file",
+            Self::CortexkitCredential => "CortexKit credential file",
             Self::CortexkitModuleState => {
                 "module state store under ~/.local/state/cortexkit/<module>"
             }
@@ -551,6 +562,12 @@ impl FloorRule {
 pub struct PolicyFloor {
     pub path: PathBuf,
     pub rule: FloorRule,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloorView {
+    FileTools,
+    Shell,
 }
 
 pub(crate) use crate::error::aft_storage_denial_message;
@@ -575,7 +592,8 @@ pub struct AccessPolicy {
     /// Checkouts that live inside a private store but hold project code, not
     /// private data: Alfonso's worker worktrees. They leave the private-store
     /// floor and fall back to the ordinary outside-root rules, so a head can
-    /// review a worker's files. The rest of the store stays denied.
+    /// review a worker's files without applying data-folder filename rules
+    /// to repository fixtures.
     pub private_store_carveouts: Vec<PathBuf>,
     /// Standalone scratch allowances; never override floors or hard restriction.
     pub standalone_temp_roots: Vec<PathBuf>,
@@ -647,7 +665,7 @@ impl AccessPolicy {
         }));
         let mut deny: Vec<_> = [
             (
-                home.join(".local/share/cortexkit"),
+                home.join(cortexkit_data::HOME_DATA_DIR),
                 FloorRule::CortexkitModuleData,
             ),
             (
@@ -695,12 +713,14 @@ impl AccessPolicy {
             deny.push(floor.path.clone());
             floor_rules.push(floor);
         }
-        let mut private_store_carveouts =
-            vec![home.join(".local/share/cortexkit/alfonso/worktrees")];
+        let mut private_store_carveouts = vec![home
+            .join(cortexkit_data::HOME_DATA_DIR)
+            .join(cortexkit_data::WORKTREES)];
         if let Some(path) = crate::environment::non_empty_os_var("XDG_DATA_HOME") {
             let path = PathBuf::from(path);
             if path.is_absolute() {
-                private_store_carveouts.push(path.join("cortexkit/alfonso/worktrees"));
+                private_store_carveouts
+                    .push(path.join("cortexkit").join(cortexkit_data::WORKTREES));
             }
         }
         let mut read_allow = roots.clone();
@@ -790,6 +810,7 @@ impl AccessPolicy {
             owned_artifact,
             false,
             self.linked_worktrees.as_ref(),
+            FloorView::FileTools,
         )
     }
 
@@ -805,6 +826,7 @@ impl AccessPolicy {
             owned_artifact,
             true,
             self.linked_worktrees.as_ref(),
+            FloorView::FileTools,
         )
     }
 
@@ -815,12 +837,14 @@ impl AccessPolicy {
         owned_artifact: bool,
         resolved: bool,
         linked_worktrees: Option<&linked_worktree::Project>,
+        view: FloorView,
     ) -> AccessDecision {
-        let floor = if resolved {
-            self.floor_for_path_using(operation, path, owned_artifact, floor_contains_resolved)
+        let contains = if resolved {
+            floor_contains_resolved
         } else {
-            self.floor_for_path(operation, path, owned_artifact)
+            floor_contains
         };
+        let floor = self.floor_for_path_using(operation, path, owned_artifact, contains, view);
         if floor.is_some() {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
@@ -934,20 +958,19 @@ impl AccessPolicy {
             }) {
                 floor.rule = FloorRule::SubcConnection;
             }
+            if let Some(message) = cortexkit_data_denial_message(floor.rule, original) {
+                return message;
+            }
             match floor.rule {
                 FloorRule::AftStorage => return aft_storage_denial_message(original.display()),
-                FloorRule::CortexkitModuleData | FloorRule::CortexkitModuleState => {
-                    // The resolved identity names the target module even through an alias.
-                    // Shared CortexKit roots have no module name and keep the generic refusal.
+                FloorRule::CortexkitModuleState => {
+                    // The state-folder name comes from the resolved path, even through an alias.
                     if let Some(std::path::Component::Normal(module)) =
                         identity.components().nth(floor.path.components().count())
                     {
                         let module = module.to_string_lossy();
                         let path = original.display();
-                        return match floor.rule {
-                            FloorRule::CortexkitModuleData => format!("path '{path}' is in the {module} module's data folder. AFT's file tools never open it, because it can hold live databases. Use the {module} module's own commands, or ask the agent that owns it."),
-                            _ => format!("path '{path}' is in the {module} module's state folder. AFT's file tools never open it. Use the {module} module's own commands, or ask the agent that owns it."),
-                        };
+                        return format!("path '{path}' is in the {module} module's state folder. AFT's file tools never open it. Use the {module} module's own commands, or ask the agent that owns it.");
                     }
                 }
                 _ => {}
@@ -974,7 +997,13 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> Option<PolicyFloor> {
-        self.floor_for_path_using(operation, path, owned_artifact, floor_contains)
+        self.floor_for_path_using(
+            operation,
+            path,
+            owned_artifact,
+            floor_contains,
+            FloorView::FileTools,
+        )
     }
 
     fn floor_for_path_using(
@@ -983,6 +1012,7 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
         contains: fn(&Path, &Path) -> bool,
+        view: FloorView,
     ) -> Option<PolicyFloor> {
         if crate::task_temp_reads::is_task_environment(path) {
             return Some(PolicyFloor {
@@ -1018,27 +1048,33 @@ impl AccessPolicy {
                 rule: FloorRule::AftStorage,
             });
         }
+        let in_worktree = self
+            .private_store_carveouts
+            .iter()
+            .any(|carveout| path.starts_with(carveout));
+        if view == FloorView::FileTools && !in_worktree {
+            if let Some(floor) = self.cortexkit_file_floor(operation, path) {
+                return Some(floor);
+            }
+        }
         let exceptions = match operation {
             AccessOperation::Read => &self.private_stores.read_allow,
             AccessOperation::Write => &self.private_stores.write_allow,
         };
         if !exceptions.iter().any(|root| path.starts_with(root))
             && !(operation == AccessOperation::Read && owned_artifact)
-            && !self
-                .private_store_carveouts
-                .iter()
-                .any(|carveout| path.starts_with(carveout))
+            && !in_worktree
         {
             return self.private_stores.deny.iter().find_map(|floor| {
                 if !contains(path, floor) {
                     return None;
                 }
                 let matched = self.describe_floor(floor);
-                // Exempt staging only from module-data floors. Keep the
-                // prefix unresolved so a staging symlink cannot exempt its
-                // target elsewhere in a private store.
+                // File tools check the narrower data-folder floor above. For
+                // shells, keep the staging prefix unresolved so a staging
+                // symlink cannot exempt its target from the broad floor.
                 if matches!(matched.rule, FloorRule::CortexkitModuleData)
-                    && path.starts_with(&floor.join("staging"))
+                    && (view == FloorView::FileTools || path.starts_with(&floor.join("staging")))
                 {
                     return self
                         .floor_rules
@@ -1055,6 +1091,42 @@ impl AccessPolicy {
         None
     }
 
+    /// Check an entry in the delete manifest by location, without following its final link.
+    pub fn cortexkit_tree_entry_denial(&self, path: &Path) -> Option<String> {
+        if self
+            .private_store_carveouts
+            .iter()
+            .any(|root| path.starts_with(root))
+        {
+            return None;
+        }
+        let floor = self.cortexkit_file_floor(AccessOperation::Write, path)?;
+        cortexkit_data_denial_message(floor.rule, path)
+    }
+
+    fn cortexkit_file_floor(&self, operation: AccessOperation, path: &Path) -> Option<PolicyFloor> {
+        self.floor_rules
+            .iter()
+            .filter(|floor| matches!(floor.rule, FloorRule::CortexkitModuleData))
+            .find_map(|floor| {
+                let (path, rule) = match cortexkit_data::floor(
+                    &floor.path,
+                    path,
+                    operation == AccessOperation::Write,
+                )? {
+                    DataFloor::Closed(folder) => {
+                        (floor.path.join(folder), FloorRule::CortexkitModuleData)
+                    }
+                    DataFloor::ReadOnly(folder) => {
+                        (floor.path.join(folder), FloorRule::CortexkitBusDataWrite)
+                    }
+                    DataFloor::Database => (path.to_path_buf(), FloorRule::CortexkitDatabase),
+                    DataFloor::Credential => (path.to_path_buf(), FloorRule::CortexkitCredential),
+                };
+                Some(PolicyFloor { path, rule })
+            })
+    }
+
     /// Report the same floor that rejects a capability, including a protected
     /// descendant of a subtree. Provenance is recorded when the floor is built.
     pub fn capability_floor(
@@ -1063,23 +1135,43 @@ impl AccessPolicy {
         kind: GrantKind,
         path: &Path,
     ) -> Option<PolicyFloor> {
+        self.capability_floor_using(operation, kind, path, FloorView::FileTools)
+    }
+
+    fn capability_floor_using(
+        &self,
+        operation: AccessOperation,
+        kind: GrantKind,
+        path: &Path,
+        view: FloorView,
+    ) -> Option<PolicyFloor> {
         if kind == GrantKind::Subtree {
             for floor in self.absolute_floor.iter().chain(&self.private_stores.deny) {
                 if floor_contains(floor, path) {
-                    if let Some(matched) = self.floor_for_path(operation, floor, false) {
+                    if let Some(matched) =
+                        self.floor_for_path_using(operation, floor, false, floor_contains, view)
+                    {
                         return Some(matched);
                     }
                 }
             }
         }
-        self.floor_for_path(operation, path, false)
+        self.floor_for_path_using(operation, path, false, floor_contains, view)
     }
 
     /// A tree replacement/unlink must not indirectly remove a denied descendant.
     /// Exact location checks still preserve final symlinks instead of following them.
     pub fn decide_tree_write(&self, path: &Path) -> AccessDecision {
+        self.decide_tree_write_using(path, FloorView::FileTools)
+    }
+
+    pub fn decide_shell_tree_write(&self, path: &Path) -> AccessDecision {
+        self.decide_tree_write_using(path, FloorView::Shell)
+    }
+
+    fn decide_tree_write_using(&self, path: &Path, view: FloorView) -> AccessDecision {
         if self
-            .capability_floor(AccessOperation::Write, GrantKind::Subtree, path)
+            .capability_floor_using(AccessOperation::Write, GrantKind::Subtree, path, view)
             .is_some()
         {
             return AccessDecision::Deny(AccessDenial::Floor);
@@ -1124,7 +1216,14 @@ impl AccessPolicy {
                 }
             }
         }
-        self.decide(AccessOperation::Write, path, false)
+        self.decide_inner(
+            AccessOperation::Write,
+            path,
+            false,
+            false,
+            self.linked_worktrees.as_ref(),
+            view,
+        )
     }
 
     /// A subtree capability includes future descendants, not just the paths that
@@ -1136,17 +1235,30 @@ impl AccessPolicy {
         kind: GrantKind,
         path: &Path,
     ) -> AccessDecision {
+        self.decide_capability_using(operation, kind, path, FloorView::FileTools)
+    }
+
+    fn decide_capability_using(
+        &self,
+        operation: AccessOperation,
+        kind: GrantKind,
+        path: &Path,
+        view: FloorView,
+    ) -> AccessDecision {
         if kind == GrantKind::File {
-            return self.decide_inner(operation, path, false, false, None);
+            return self.decide_inner(operation, path, false, false, None, view);
         }
-        if self.capability_floor(operation, kind, path).is_some() {
+        if self
+            .capability_floor_using(operation, kind, path, view)
+            .is_some()
+        {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
         let mut tree_policy = self.clone();
         tree_policy
             .grants
             .retain(|grant| grant.kind == GrantKind::Subtree);
-        tree_policy.decide_inner(operation, path, false, false, None)
+        tree_policy.decide_inner(operation, path, false, false, None, view)
     }
 
     pub fn head_policy(&self, grant: &AccessGrant) -> HeadPolicy {
@@ -1170,14 +1282,19 @@ impl AccessPolicy {
                         AccessOperation::Write => {
                             grant.kind == GrantKind::Subtree
                                 && grant.path.is_dir()
-                                && self.decide_tree_write(&grant.path) == AccessDecision::Allow
+                                && self.decide_shell_tree_write(&grant.path)
+                                    == AccessDecision::Allow
                         }
                         AccessOperation::Read => {
                             (match grant.kind {
                                 GrantKind::Subtree => grant.path.is_dir(),
                                 GrantKind::File => grant.path.is_file(),
-                            }) && self.decide_capability(operation, grant.kind, &grant.path)
-                                == AccessDecision::Allow
+                            }) && self.decide_capability_using(
+                                operation,
+                                grant.kind,
+                                &grant.path,
+                                FloorView::Shell,
+                            ) == AccessDecision::Allow
                         }
                     }
             })
@@ -1217,6 +1334,17 @@ impl AccessPolicy {
         profile.data_policy.write_allow.push(temp_dir);
         Ok(profile)
     }
+}
+
+fn cortexkit_data_denial_message(rule: FloorRule, path: &Path) -> Option<String> {
+    let path = path.display();
+    Some(match rule {
+        FloorRule::CortexkitModuleData => format!("AFT's file tools never open files in the CortexKit data folder (~/.local/share/cortexkit/), because modules keep live databases there. Ask the owner of the CortexKit daemon about '{path}'."),
+        FloorRule::CortexkitBusDataWrite => format!("path '{path}' is in a CortexKit message-bus data folder. AFT's file tools never write there, because the module rewrites these files while it runs."),
+        FloorRule::CortexkitDatabase => format!("path '{path}' is a CortexKit database file. AFT's file tools never open it, because modules manage their own databases. Use the owning module's own commands."),
+        FloorRule::CortexkitCredential => format!("path '{path}' is a CortexKit credential file. AFT's file tools never open it, because it may contain passwords, tokens or keys."),
+        _ => return None,
+    })
 }
 
 fn environment_private_store_floors(
@@ -1314,101 +1442,10 @@ pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     floor_contains_resolved(&path, &prefix)
 }
 
-/// Compare identities that were already resolved for this request's snapshot.
-#[cfg(not(windows))]
-pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
-    floor_contains(path, prefix)
-}
-
-#[cfg(windows)]
-pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        #[link_name = "CompareStringOrdinal"]
-        fn compare_string_ordinal(
-            left: *const u16,
-            left_len: i32,
-            right: *const u16,
-            right_len: i32,
-            ignore_case: i32,
-        ) -> i32;
-    }
-    let path = crate::path_identity::normalize_path(path);
-    let prefix = crate::path_identity::normalize_path(prefix);
-    let mut components = path.components();
-    prefix.components().all(|expected| {
-        let Some(actual) = components.next() else {
-            return false;
-        };
-        let left = actual.as_os_str().encode_wide().collect::<Vec<_>>();
-        let right = expected.as_os_str().encode_wide().collect::<Vec<_>>();
-        let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
-        else {
-            return false;
-        };
-        // Both UTF-16 buffers stay alive for the call, and the lengths are checked.
-        // CompareStringOrdinal returns CSTR_EQUAL (2); errors conservatively
-        // match a protected name. This comparator never grants access.
-        unsafe {
-            matches!(
-                compare_string_ordinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1),
-                0 | 2
-            )
-        }
-    })
-}
+pub(crate) use aft_base::policy_path::contains_resolved as floor_contains_resolved;
 
 #[cfg(target_os = "macos")]
-pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
-    use std::ffi::c_void;
-    use std::os::unix::ffi::OsStrExt;
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        #[link_name = "CFStringCreateWithCharacters"]
-        fn create_string(allocator: *const c_void, chars: *const u16, len: isize) -> *const c_void;
-        #[link_name = "CFStringCompare"]
-        fn compare_strings(left: *const c_void, right: *const c_void, options: usize) -> isize;
-        #[link_name = "CFRelease"]
-        fn release(value: *const c_void);
-    }
-
-    // Protected names include case and Unicode decomposition aliases on macOS.
-    // Use these comparisons only to deny access, never to widen roots or grants.
-    let mut components = path.components();
-    prefix.components().all(|expected| {
-        let Some(actual) = components.next() else {
-            return false;
-        };
-        let (Some(left), Some(right)) =
-            (actual.as_os_str().to_str(), expected.as_os_str().to_str())
-        else {
-            return actual
-                .as_os_str()
-                .as_bytes()
-                .eq_ignore_ascii_case(expected.as_os_str().as_bytes());
-        };
-        let left = left.encode_utf16().collect::<Vec<_>>();
-        let right = right.encode_utf16().collect::<Vec<_>>();
-        // The buffers live through string creation. Every created CF string is
-        // released, and allocation failure conservatively matches a protected name.
-        unsafe {
-            let left = create_string(std::ptr::null(), left.as_ptr(), left.len() as isize);
-            let right = create_string(std::ptr::null(), right.as_ptr(), right.len() as isize);
-            // Ignore case and treat different Unicode decompositions of a letter as equal.
-            let equal =
-                left.is_null() || right.is_null() || compare_strings(left, right, 1 | 16) == 0;
-            if !left.is_null() {
-                release(left);
-            }
-            if !right.is_null() {
-                release(right);
-            }
-            equal
-        }
-    })
-}
+pub(crate) use aft_base::policy_path::contains_resolved as floor_contains;
 
 pub fn expand_home(path: &Path, home: &Path) -> PathBuf {
     let mut components = path.components();
@@ -1439,7 +1476,132 @@ impl crate::read_policy::StoragePathPolicy for StoragePaths {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn cortexkit_settings_are_not_a_floor_but_data_and_state_are() {
+    fn cortexkit_data_file_rules_are_absolute_even_in_a_project_root() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let home = policy_path(temp.path());
+        let data = home.join(".local/share/cortexkit");
+        let policy = AccessPolicy::from_config(
+            &Config::default(),
+            &data.join("aft"),
+            vec![data.clone()],
+            &home,
+        );
+        for operation in [AccessOperation::Read, AccessOperation::Write] {
+            for name in [
+                "run/daemon.sock",
+                "signing/actor.json",
+                "module/nested/caps.db",
+                "module/caps.db-wal",
+                "module/caps.sqlite-shm",
+                "module/caps.db3-journal",
+                "module/caps.sqlite3",
+                "module/caps.db.20261123T223158Z",
+                "module/caps.sqlite.20261123T223158Z",
+                "module/caps.sqlite3.20261123T223158Z-wal",
+                "module/auth-ToKeN.json",
+                "module/SECRET",
+                "module/credentials.json",
+                "module/probe.PEM",
+                "module/probe.p12",
+                "module/probe.key",
+                "module/probe.jwt",
+                "module/probe.nk",
+                "module/probe.creds",
+                "ckbus/actor.jwt",
+                "nats/server.db",
+            ] {
+                let path = data.join(name);
+                assert_eq!(
+                    policy.decide(operation, &path, false),
+                    AccessDecision::Deny(AccessDenial::Floor),
+                    "{name}"
+                );
+            }
+            for name in [
+                "module/notes.md",
+                "module/probe.db3.old",
+                "module/caps.db-journal-wal",
+                "runner/dev.json",
+            ] {
+                assert_eq!(
+                    policy.decide(operation, &data.join(name), false),
+                    AccessDecision::Allow,
+                    "{name}"
+                );
+            }
+        }
+        for name in ["ckbus", "nats", "nats-hub"] {
+            let path = data.join(name).join("public.json");
+            assert_eq!(
+                policy.decide(AccessOperation::Read, &path, false),
+                AccessDecision::Allow
+            );
+            assert_eq!(
+                policy.decide_tree_write(&path),
+                AccessDecision::Deny(AccessDenial::Floor)
+            );
+            assert_eq!(policy.floor_denial_message(AccessOperation::Write, &path, &path, false),
+                format!("path '{}' is in a CortexKit message-bus data folder. AFT's file tools never write there, because the module rewrites these files while it runs.", path.display()));
+        }
+    }
+
+    #[test]
+    fn cortexkit_data_worker_shell_keeps_its_preexisting_denies_and_grant_floor() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let home = policy_path(dir.path());
+        // Join one component at a time: the policy builds its paths that way,
+        // and the comparison below is byte-exact, so "/" must not reach Windows.
+        let data = home.join(".local").join("share").join("cortexkit");
+        let store = data.join("aft");
+        let project = home.join("worktree");
+        let external = data.join("other-module");
+        for path in [&project, &external] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let mut policy =
+            AccessPolicy::from_config(&Config::default(), &store, vec![project], &home);
+        policy.install_scope_grants(
+            [AccessOperation::Read, AccessOperation::Write]
+                .map(|operation| AccessGrant {
+                    path: external.clone(),
+                    operation,
+                    kind: GrantKind::Subtree,
+                })
+                .to_vec(),
+            true,
+        );
+        let profile = policy.compile_shell(home.clone(), vec![], vec![]).unwrap();
+        let expected = [
+            data.clone(),
+            home.join(".local").join("state").join("cortexkit"),
+            store,
+            data.join("run").join("subc-connection.json"),
+        ];
+        let actual: Vec<_> = profile
+            .data_policy
+            .deny
+            .iter()
+            .filter(|path| path.starts_with(&home))
+            .collect();
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        for operation in [AccessOperation::Read, AccessOperation::Write] {
+            assert_eq!(
+                policy.decide(operation, &external, false),
+                AccessDecision::Allow
+            );
+            assert!(!policy.shell_grants(operation).contains(&external));
+        }
+        assert!(!profile.data_policy.read_allow.contains(&external));
+        assert!(!profile.data_policy.write_allow.contains(&external));
+    }
+
+    #[test]
+    fn cortexkit_data_and_settings_take_normal_rules_but_state_keeps_its_floor() {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
         let home = policy_path(dir.path());
@@ -1454,17 +1616,27 @@ mod tests {
                 policy.decide(operation, &home.join(".config/cortexkit/x.jsonc"), false),
                 AccessDecision::Allow
             );
-            for relative in [".local/share/cortexkit", ".local/state/cortexkit"] {
-                assert_eq!(
-                    policy.decide(operation, &home.join(relative).join("x.jsonc"), false),
-                    AccessDecision::Deny(AccessDenial::Floor)
-                );
-            }
+            assert_eq!(
+                policy.decide(
+                    operation,
+                    &home.join(".local/share/cortexkit/module/x.jsonc"),
+                    false
+                ),
+                AccessDecision::Ask
+            );
+            assert_eq!(
+                policy.decide(
+                    operation,
+                    &home.join(".local/state/cortexkit/module/x.jsonc"),
+                    false
+                ),
+                AccessDecision::Deny(AccessDenial::Floor)
+            );
         }
     }
 
     #[test]
-    fn protected_folder_refusal_words_match_approved_table() {
+    fn protected_folder_refusal_words_match_table() {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
         let home = policy_path(dir.path());
@@ -1472,14 +1644,17 @@ mod tests {
         let mut config = Config::default();
         config.sandbox.read_deny.push(home.join("denied"));
         let policy = AccessPolicy::from_config(&config, &storage, vec![], &home);
+        let data_denial = "AFT's file tools never open files in the CortexKit data folder (~/.local/share/cortexkit/), because modules keep live databases there. Ask the owner of the CortexKit daemon about '<path>'.";
         for (relative, expected) in [
-            (".local/share/cortexkit/synapse/memory.db", "path '<path>' is in the synapse module's data folder. AFT's file tools never open it, because it can hold live databases. Use the synapse module's own commands, or ask the agent that owns it."),
+            (".local/share/cortexkit/synapse/memory.db", "path '<path>' is a CortexKit database file. AFT's file tools never open it, because modules manage their own databases. Use the owning module's own commands."),
+            (".local/share/cortexkit/synapse/api-ToKeN", "path '<path>' is a CortexKit credential file. AFT's file tools never open it, because it may contain passwords, tokens or keys."),
+            (".local/share/cortexkit/run/probe.json", data_denial),
+            (".local/share/cortexkit/signing/probe.json", data_denial),
             (".local/state/cortexkit/alfonso/state.json", "path '<path>' is in the alfonso module's state folder. AFT's file tools never open it. Use the alfonso module's own commands, or ask the agent that owns it."),
             (".local/share/cortexkit/aft/aft.db", "path '<path>' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status."),
             ("denied", "path '<path>' is denied by the access policy floor"),
             (".ssh/id_ed25519", "path '<path>' is denied by the access policy floor"),
             (".local/share/cortexkit/run/subc-connection.json", "path '<path>' is denied by the access policy floor"),
-            (".local/share/cortexkit", "path '<path>' is denied by the access policy floor"),
             (".local/state/cortexkit", "path '<path>' is denied by the access policy floor"),
         ] {
             let identity = home.join(relative);
@@ -1745,8 +1920,8 @@ mod tests {
     }
 
     #[test]
-    fn scope_read_grant_cannot_admit_cortexkit_data() {
-        assert_read_scope_floor(".local/share/cortexkit/alfonso/prompts/private.md");
+    fn cortexkit_data_scope_read_grant_cannot_admit_database() {
+        assert_read_scope_floor(".local/share/cortexkit/alfonso/prompts/private.db");
     }
 
     #[test]
@@ -1755,26 +1930,34 @@ mod tests {
     }
 
     #[test]
-    fn worker_worktrees_leave_the_private_store_floor() {
+    fn cortexkit_data_worker_worktree_fixtures_keep_ordinary_access() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let store = home.join(".local/share/cortexkit/aft");
-        let worktree = home.join(".local/share/cortexkit/alfonso/worktrees/pool/bg_x/src/lib.rs");
-        let private = home.join(".local/share/cortexkit/alfonso/prompts/brief.md");
+        let worktree = home.join(".local/share/cortexkit/alfonso/worktrees/pool/bg_x");
+        let private = home.join(".local/share/cortexkit/alfonso/prompts/token-fixture");
         let project = root.path().join("project");
         let policy = AccessPolicy::from_config(
             &Config::default(),
             &store,
-            vec![policy_path(&project)],
+            vec![policy_path(&project), policy_path(&worktree)],
             &home,
         );
         for operation in [AccessOperation::Read, AccessOperation::Write] {
-            // A worker's checkout is ordinary code outside this root: the
-            // outside rule decides, never the private-store floor.
-            assert_eq!(
-                policy.decide(operation, &policy_path(&worktree), false),
-                AccessDecision::Ask
-            );
+            for name in ["src/lib.rs", "fixtures/sample.db", "fixtures/token-test"] {
+                assert_eq!(
+                    policy.decide(operation, &policy_path(&worktree.join(name)), false),
+                    AccessDecision::Allow
+                );
+                assert_eq!(
+                    policy.decide(
+                        operation,
+                        &policy_path(&worktree.with_file_name("bg_neighbor").join(name)),
+                        false
+                    ),
+                    AccessDecision::Ask
+                );
+            }
             for denied in [&private, &store.join("aft.db")] {
                 assert_eq!(
                     policy.decide(operation, &policy_path(denied), false),

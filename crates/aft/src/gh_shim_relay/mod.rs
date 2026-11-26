@@ -366,6 +366,7 @@ pub struct RelayCall<'a> {
     pub route_scopes: &'a RouteScopes,
 }
 
+mod pending_watch;
 mod read_path_template;
 mod reservation;
 
@@ -1119,12 +1120,27 @@ async fn post_captured(
     request: &Value,
 ) -> Result<RelayReply, crate::gh_shim_speech::Refusal> {
     let ended = async {
-        loop {
-            if let (Some(service), Some(launch)) = (&routes.speech, &redeemed.launch) {
-                service.check_pending(None, launch, &redeemed.session_id, &redeemed.task_id)?;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let (Some(service), Some(launch)) = (&routes.speech, &redeemed.launch) else {
+            return std::future::pending().await;
+        };
+        let durable = {
+            let service = Arc::clone(service);
+            let launch = launch.clone();
+            move || service.store.check_launch(&launch)
+        };
+        Err(pending_watch::until_refused(
+            || {
+                service.check_pending_in_memory(
+                    None,
+                    launch,
+                    &redeemed.session_id,
+                    &redeemed.task_id,
+                )
+            },
+            durable,
+            service.committed_scope_ends(),
+        )
+        .await)
     };
     tokio::select! {
         biased;

@@ -37,6 +37,9 @@ pub(crate) enum Access {
 /// The data layer's call graph for `ctx`'s root, once no recorded edit
 /// waits for it, or [`Access::Building`] after [`READ_WAIT`].
 pub(crate) fn access(ctx: &AppContext) -> Access {
+    if ctx.watcher_gap_pending() && ctx.config().indexes.callgraph {
+        return Access::Building;
+    }
     #[cfg(feature = "wasm-grammars")]
     crate::grammar::configure(&ctx.config());
     let Some(checkout) = ctx
@@ -83,7 +86,7 @@ fn relative(root: &Path, file: &Path) -> Option<String> {
         canonical(file)
     };
     let relative = absolute.strip_prefix(&root).ok()?;
-    Some(relative.to_str()?.replace('\\', "/"))
+    crate::callgraph_store::facts::utf8_path_key(relative)
 }
 
 /// The reader a call-graph command answers from: the root's checkout in the

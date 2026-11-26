@@ -2116,7 +2116,7 @@ pub(crate) fn bind_cache_bytes() -> usize {
 /// memory while the next stage runs.
 fn relieve_allocator() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    crate::memory::return_free_pages();
+    crate::memory::return_free_pages(crate::memory::AllocatorReliefSource::ColdBuildStage);
 }
 
 fn batch_trim_cadence(value: Option<&str>) -> usize {

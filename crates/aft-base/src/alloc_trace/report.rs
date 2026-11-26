@@ -142,7 +142,8 @@ pub(super) fn format_event(event: &Event) -> String {
         EventKind::BurstCrossed => {
             let _ = write!(
                 line,
-                "allocation burst: op={label} live {} crossed {}",
+                "allocation burst: op={label} accounted {} crossed {} \
+                 (upper bound: allocations under the label minus same-thread frees, not memory held)",
                 mib(event.size),
                 mib(super::LABEL_BURST_BYTES as usize)
             );
@@ -150,7 +151,10 @@ pub(super) fn format_event(event: &Event) -> String {
         EventKind::BurstEnded => {
             let _ = write!(
                 line,
-                "allocation burst ended: op={label} peak {} over {:.1}s, live {} now",
+                "allocation burst ended: op={label} peak {} over {:.1}s, accounted {} now \
+                 (upper bound: allocations under the label minus same-thread frees, not memory held; \
+                 burst duration runs from threshold crossing to dropping below half the threshold \
+                 or label reset, not operation time)",
                 mib(event.size),
                 event.duration_ns as f64 / 1e9,
                 mib(event.old_size)

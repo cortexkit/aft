@@ -114,14 +114,16 @@ function artifactReadTool(
   const plugin = pluginContext(
     (tool, _preview, args) => {
       const rawTarget =
-        prepareCanonicalPathArguments(tool, args).path ??
+        (Array.isArray(args.path)
+          ? args.path[0]
+          : prepareCanonicalPathArguments(tool, args).path) ??
         args.path ??
         args.target ??
         args.scope ??
         (args.paths as unknown[] | undefined)?.[0] ??
         // Zoom sends only a batch of { target, ... } entries.
         (args.batch as Array<{ target?: unknown }> | undefined)?.[0]?.target;
-      const target = String(Array.isArray(rawTarget) ? rawTarget[0] : rawTarget);
+      const target = String(rawTarget);
       if (!owned || tool === "write" || target !== artifact) {
         const ask = engineOutsideAsk(target, args);
         if (ask) return ask;

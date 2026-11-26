@@ -125,18 +125,16 @@ export function runReadOnlySpineToolcallSuite(
       expect(resultText(output)).toContain("Found 1 match in 1 file");
     });
 
-    test("grep appends the plugin-side skipped path footer after tool_call", async () => {
+    test("grep reports a missing root instead of returning a partial search", async () => {
       const h = await harness();
       const tools = searchTools(createPluginContext(h));
 
-      const output = await tools.grep.execute(
-        { pattern: "tool_call_grep_marker", path: "src missing-dir" },
-        createToolContext(h),
-      );
-
-      expect(resultText(output)).toContain("tool_call_grep_marker");
-      expect(resultText(output)).toContain("Found 1 match in 1 file");
-      expect(resultText(output)).toContain("Skipped 1 path not found: missing-dir");
+      await expect(
+        tools.grep.execute(
+          { pattern: "tool_call_grep_marker", path: "src missing-dir" },
+          createToolContext(h),
+        ),
+      ).rejects.toThrow("missing-dir");
     });
 
     test("aft_search returns server-rendered literal search text through tool_call", async () => {

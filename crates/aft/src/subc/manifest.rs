@@ -24,6 +24,13 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 
 pub(crate) use crate::host_tool_names::{is_native_plumbing_call, is_subc_native_plumbing_tool};
 
+pub(crate) fn is_read_only_command(command: &str) -> bool {
+    matches!(
+        command_lane_explicit(command),
+        Some(Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit)
+    )
+}
+
 pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
     match command {
         "ping"
@@ -57,6 +64,11 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         // Only validates the call and hands its wait to its own thread.
         "bash_watch" => Some(Lane::PureRead),
 
+        // Terminal input changes no project state, and a write can wait (up
+        // to its deadline) for a program to read its input; on the writer
+        // lane that wait would queue every other call on the root.
+        "bash_write" => Some(Lane::PureRead),
+
         "status"
         | "inspect"
         | "lsp_diagnostics"
@@ -79,7 +91,6 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "bash_unnotify"
         | "bash_promote"
         | "bash_kill"
-        | "bash_write"
         | "db_set_state"
         | "db_set_host_state"
         | "undo"
@@ -1363,6 +1374,14 @@ mod tests {
         assert_eq!(command_lane("bash_status"), Lane::PureRead);
         assert_eq!(command_lane("bash_wait_detach"), Lane::PureRead);
         assert!(is_subc_native_plumbing_tool("bash_status"));
+    }
+
+    #[test]
+    fn bash_write_runs_on_a_reader_lane() {
+        // Terminal input changes no project state, and a write waiting for a
+        // program to read its input must not hold the root's writer lane,
+        // which would queue every other call on the root (`bash_kill` too).
+        assert_eq!(command_lane("bash_write"), Lane::PureRead);
     }
 
     #[test]

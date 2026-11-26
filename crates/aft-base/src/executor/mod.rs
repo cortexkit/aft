@@ -1,8 +1,11 @@
 mod context;
 mod handle;
+mod queue_trace;
 pub mod root_lifecycle;
 mod single_flight;
 pub use context::{ExecutorApp, ExecutorContext};
+use queue_trace::QueueBlocker;
+pub use queue_trace::{current_queue_observation, QueueObservation};
 pub use root_lifecycle::SubcLifecycleAdmission;
 
 use std::{
@@ -651,6 +654,7 @@ test_support_visibility! {
 #[derive(Debug)]
 struct JobCancellationInner {
     state: AtomicU8,
+    queue_blockers: AtomicU8,
     progress: Mutex<Option<crate::tool_progress::Progress>>,
     wait_lock: Mutex<()>,
     wake: Condvar,
@@ -669,6 +673,7 @@ impl JobCancellation {
         Self {
             inner: Arc::new(JobCancellationInner {
                 state: AtomicU8::new(JOB_CANCEL_STATE_PENDING),
+                queue_blockers: AtomicU8::new(0),
                 progress: Mutex::new(None),
                 wait_lock: Mutex::new(()),
                 wake: Condvar::new(),
@@ -3449,6 +3454,13 @@ fn try_admit_actor<C: ExecutorContext>(
         AdmissionPass::Class(JobClass::Maintenance) => actor.front_lane(job_class)?,
     };
     let mut heavy_permit = None;
+    if pass == AdmissionPass::Class(JobClass::Interactive) && lane == Lane::Mutating {
+        // Record readers held back by the selected writer, even when that
+        // writer cannot start yet because earlier readers are still running.
+        for reader in [Lane::PureRead, Lane::SerialLspStatus] {
+            queue_trace::note_head(actor, job_class, reader, QueueBlocker::WriterBarrier);
+        }
+    }
     let callgraph_acquisition = actor
         .class_queues(job_class)
         .queue(lane)
@@ -3463,11 +3475,15 @@ fn try_admit_actor<C: ExecutorContext>(
             lane,
             Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit
         );
-    if !matches!(lane, Lane::ProviderMetadata | Lane::CallLedger)
-        && ((actor.writer_inflight && !shared_bind_admits_lane)
-            || actor.higher_priority_writer_barrier_blocks(job_class))
-    {
-        return None;
+    if !matches!(lane, Lane::ProviderMetadata | Lane::CallLedger) {
+        if actor.writer_inflight && !shared_bind_admits_lane {
+            queue_trace::note_head(actor, job_class, lane, QueueBlocker::Writer);
+            return None;
+        }
+        if actor.higher_priority_writer_barrier_blocks(job_class) {
+            queue_trace::note_head(actor, job_class, lane, QueueBlocker::WriterBarrier);
+            return None;
+        }
     }
     // A bind backing off from a detached writer waits out its retry time.
     if lane == Lane::Mutating {
@@ -3551,6 +3567,15 @@ fn try_admit_actor<C: ExecutorContext>(
     };
 
     if !runnable {
+        let blocker = match lane {
+            Lane::Mutating if has_epoch_reader => QueueBlocker::EpochReaders,
+            Lane::PureRead | Lane::Mutating => QueueBlocker::RootCapacity,
+            Lane::SerialLspStatus | Lane::HeavyInit if !actor_has_interactive_capacity => {
+                QueueBlocker::RootCapacity
+            }
+            _ => QueueBlocker::Lane,
+        };
+        queue_trace::note_head(actor, job_class, lane, blocker);
         return None;
     }
     let shared_bind_gate = bind_may_share && has_epoch_reader;
@@ -3845,6 +3870,7 @@ test_support_visibility! {
 
 fn run_lane_job<C: ExecutorContext>(run_job: &mut RunJob<C>) -> LaneRun {
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
+    let _queue = queue_trace::enter(run_job.lane, run_job.cancellation.as_ref());
     let _waiting_writers_ctx = ActorWaitingWritersGuard::install(ActorWriterDemand {
         queued: Arc::clone(&run_job.waiting_writers),
         detached: Some(Arc::clone(&run_job.detached_writers)),
@@ -3874,7 +3900,15 @@ fn run_lane_job<C: ExecutorContext>(run_job: &mut RunJob<C>) -> LaneRun {
             .as_ref()
             .is_some_and(JobCancellation::cancel_requested_before_commit)
     };
+    let epoch_started = matches!(
+        run_job.lane,
+        Lane::PureRead | Lane::SerialLspStatus | Lane::Mutating | Lane::MaintenanceCommit
+    )
+    .then(Instant::now);
     let run = |job: ExecutorJob<C>| {
+        if let Some(since) = epoch_started {
+            queue_trace::note_epoch_wait(since.elapsed());
+        }
         if cancel_requested()
             || ((run_job.job_class == JobClass::Maintenance
                 || run_job.command == "inspect"

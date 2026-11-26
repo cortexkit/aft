@@ -78,9 +78,7 @@ pub mod bash_rewrite;
 pub(crate) mod blocking_wait;
 pub(crate) use aft_base::bounded_io;
 pub(crate) mod bounded_io_command;
-pub mod build_breaker;
 pub use aft_base::atomic_replace;
-pub use aft_base::build_state;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod callgraph;
@@ -276,7 +274,6 @@ use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;
 pub(crate) use aft_base::walk_boundary;
-pub mod watcher;
 pub(crate) mod watcher_backend;
 pub mod watcher_filter;
 pub(crate) use aft_base::watcher_markers;

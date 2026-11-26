@@ -117,7 +117,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: e2e-opencode2-${{ inputs.cargo_profile }}
+          prefix-key: aft-rust-v1
+          shared-key: linux-opencode2-${{ inputs.cargo_profile }}-wasm-hooks
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 

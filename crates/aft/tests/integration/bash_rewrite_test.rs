@@ -191,7 +191,7 @@ fn rewrites_grep_and_rejects_pipes() {
     let ctx = context(dir.path(), true);
 
     let data = rewrite(
-        &format!("grep -ni needle {}", dir.path().join("src").display()),
+        &format!("grep -rni needle {}", dir.path().join("src").display()),
         &ctx,
     )
     .expect("grep should rewrite");
@@ -231,7 +231,7 @@ fn grep_footer_steers_to_aft_search_when_registered() {
         filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
     )
     .unwrap();
-    let target = format!("grep -ni needle {}", dir.path().join("src").display());
+    let target = format!("grep -rni needle {}", dir.path().join("src").display());
 
     // Registered → footer names `aft_search`, not the grep tool.
     let registered = context_with_search(dir.path(), true);
@@ -567,15 +567,16 @@ fn rewrites_ls_directory_and_rejects_unknown_flags() {
     fs::write(dir.path().join("src/lib.rs"), "fn lib() {}\n").unwrap();
     let ctx = context(dir.path(), true);
 
-    // -a is fine; rewrite to read on the directory.
+    // -A matches a directory read (no `.`/`..`); rewrite to read.
     let data = assert_rewritten(
-        &format!("ls -a {}", dir.path().join("src").display()),
+        &format!("ls -A {}", dir.path().join("src").display()),
         &ctx,
         "read",
     );
     assert!(output(&data).contains("lib.rs"));
     assert!(rewrite("ls -h src", &ctx).is_none());
-    assert!(rewrite("ls -A src", &ctx).is_none());
+    // -a also prints `.` and `..`, which a directory read never returns.
+    assert!(rewrite("ls -a src", &ctx).is_none());
 }
 
 #[test]
@@ -802,7 +803,7 @@ fn binary_ls_rewrite_preserves_hidden_visibility_and_direct_read_default() {
             "session_id": "ls-hidden-rewrite",
             "command": "bash",
             "params": {
-                "command": format!("ls -a {}", tree.display()),
+                "command": format!("ls -A {}", tree.display()),
                 "workdir": project.path(),
                 "compressed": false,
             },
@@ -812,7 +813,7 @@ fn binary_ls_rewrite_preserves_hidden_visibility_and_direct_read_default() {
     assert_eq!(
         all["entries"],
         json!([".secret", "visible.txt"]),
-        "ls -a: {all:?}"
+        "ls -A: {all:?}"
     );
 
     let direct = aft.send(

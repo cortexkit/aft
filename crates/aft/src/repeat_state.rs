@@ -30,8 +30,8 @@ pub struct RepeatObservation {
 }
 
 impl RepeatObservation {
-    fn is_shell(&self) -> bool {
-        matches!(self.tool.as_str(), "bash" | "powershell")
+    pub(crate) fn is_reset_only(&self) -> bool {
+        self.mutating && !matches!(self.tool.as_str(), "bash" | "powershell")
     }
 }
 
@@ -125,10 +125,10 @@ impl RepeatBreaker {
         output_hash: u64,
         now: Instant,
     ) -> Option<RepeatIntervention> {
-        let key = RepeatKey {
+        let key = (!call.is_reset_only()).then(|| RepeatKey {
             tool: call.tool.clone(),
             input_hash: hash_value(&call.semantic_key),
-        };
+        });
         let mut sessions = self.sessions.lock();
         sessions.retain(|existing_id, state| {
             existing_id == session_id
@@ -136,23 +136,20 @@ impl RepeatBreaker {
                     now.saturating_duration_since(last_call.observed_at) <= SESSION_IDLE_EXPIRY
                 })
         });
+        let Some(key) = key else {
+            sessions.remove(session_id);
+            return None;
+        };
         if call.mutating {
-            if call.is_shell() {
-                if let Some(session) = sessions.get_mut(session_id) {
-                    // A shell can change the workspace, but task snapshots observe
-                    // a background task, not the workspace. Keep their histories
-                    // so interleaved sleep/status polling cannot evade steering.
-                    // Shell commands also keep their existing polling detection.
-                    session.calls.retain(|previous| {
-                        matches!(
-                            previous.key.tool.as_str(),
-                            "bash" | "powershell" | "bash_status" | "bash_watch"
-                        )
-                    });
-                }
-            } else {
-                sessions.remove(session_id);
-                return None;
+            if let Some(session) = sessions.get_mut(session_id) {
+                // Task snapshots observe a background task, not the workspace.
+                // Keep them and shell calls so interleaved polling is counted.
+                session.calls.retain(|previous| {
+                    matches!(
+                        previous.key.tool.as_str(),
+                        "bash" | "powershell" | "bash_status" | "bash_watch"
+                    )
+                });
             }
         }
         let session = sessions.entry(session_id.to_string()).or_default();

@@ -22,14 +22,16 @@
 //! names) are dropped from what it materializes and reported, matching what
 //! the resolver would ignore anyway.
 
-use std::fs::{self, Permissions};
+use std::fs::{self, Permissions, TryLockError};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::feature_config::{self, INDEX_INPUTS, RETIRED_PATHS};
+use crate::fs_lock::AdvisoryLockGuard;
 use crate::jsonc_edit;
 
 /// Which trust tier a config file belongs to.
@@ -619,12 +621,10 @@ impl UserConfigMigration {
     }
 }
 
-/// How long another process's migration lock is honoured before it is
-/// treated as left behind by a crash and removed.
-const MIGRATION_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a loader waits for another process that is migrating the same
 /// file before it gives up and reads the file as it is.
-const MIGRATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const MIGRATION_LOCK_WAIT: Duration = Duration::from_secs(2);
+const MIGRATION_LOCK_RETRY: Duration = Duration::from_millis(25);
 
 /// The retired-key translation of a config text, when it parses as an object
 /// and uses at least one retired key.
@@ -662,20 +662,8 @@ fn names_refused_key(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Exclusive, cross-process right to rewrite one config file, held as a lock
-/// file next to it and removed on drop.
-struct MigrationLock {
-    path: PathBuf,
-}
-
-impl Drop for MigrationLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 enum LockAttempt {
-    Acquired(MigrationLock),
+    Acquired(AdvisoryLockGuard),
     /// Another process holds the lock and did not release it in time.
     Busy,
     Failed(std::io::Error),
@@ -687,45 +675,45 @@ fn acquire_migration_lock(target: &Path) -> LockAttempt {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "aft.jsonc".to_string());
     let path = target.with_file_name(format!(".{name}.migrate.lock"));
-    let deadline = std::time::Instant::now() + MIGRATION_LOCK_WAIT;
-    loop {
-        match std::fs::OpenOptions::new()
+    let deadline = Instant::now() + MIGRATION_LOCK_WAIT;
+    // Never unlink the lock file: waiters may already have it open, and a new
+    // file at the same path would let two holders lock different files. The
+    // OS releases the lock on exit; the file's age and contents don't matter.
+    let file = loop {
+        match fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&path)
         {
-            Ok(_) => return LockAttempt::Acquired(MigrationLock { path }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age > MIGRATION_LOCK_STALE);
-                if stale {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                if std::time::Instant::now() >= deadline {
+            Ok(file) => break file,
+            // Windows can deny access while a lock file's deletion is pending.
+            // Retry within the deadline; a persistent denial still fails.
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == io::ErrorKind::PermissionDenied
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(MIGRATION_LOCK_RETRY);
+            }
+            Err(error) => return LockAttempt::Failed(error),
+        }
+    };
+    #[cfg(test)]
+    tests::migration_lock_hook(tests::LockStep::BeforeAttempt);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return LockAttempt::Acquired(AdvisoryLockGuard::from_locked_file(file)),
+            Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                tests::migration_lock_hook(tests::LockStep::Contended);
+                if Instant::now() >= deadline {
                     return LockAttempt::Busy;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(25));
+                std::thread::sleep(MIGRATION_LOCK_RETRY);
             }
-            Err(error) => {
-                // Windows refuses to create a file whose previous holder is
-                // still deleting it (a delete-pending name) with
-                // ERROR_ACCESS_DENIED rather than AlreadyExists, so a
-                // concurrent migration releasing the lock looks like a
-                // permission error. Retry it like a held lock until the wait
-                // ends; a real permission problem still fails after that.
-                if cfg!(windows)
-                    && error.kind() == std::io::ErrorKind::PermissionDenied
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                return LockAttempt::Failed(error);
-            }
+            Err(TryLockError::Error(error)) => return LockAttempt::Failed(error),
         }
     }
 }
@@ -902,7 +890,7 @@ fn auto_migrate_user_config_with_reader(
         Ok(path) => path,
         Err(error) => {
             return not_migrated(
-                format!("resolve source at /: {error}"),
+                format!("resolve source at {}: {error}", source.display()),
                 translation.as_ref(),
                 &text,
             )
@@ -915,7 +903,10 @@ fn auto_migrate_user_config_with_reader(
     };
     if actual.ends_with(Path::new(".cortexkit").join("aft.jsonc")) {
         return not_migrated(
-            "refused to replace a project settings file at /".to_string(),
+            format!(
+                "refused to replace a project settings file at {}",
+                actual.display()
+            ),
             translation.as_ref(),
             &text,
         );
@@ -936,7 +927,7 @@ fn auto_migrate_user_config_with_reader(
         Ok(metadata) => metadata.permissions(),
         Err(error) => {
             return not_migrated(
-                format!("inspect source at /: {error}"),
+                format!("inspect source at {}: {error}", actual.display()),
                 translation.as_ref(),
                 &text,
             )
@@ -948,7 +939,7 @@ fn auto_migrate_user_config_with_reader(
         LockAttempt::Busy => return None,
         LockAttempt::Failed(error) => {
             return not_migrated(
-                format!("lock source at /: {error}"),
+                format!("lock source at {}: {error}", actual.display()),
                 translation.as_ref(),
                 &text,
             );
@@ -965,7 +956,7 @@ fn auto_migrate_user_config_with_reader(
         Ok(text) => text,
         Err(error) => {
             return not_migrated(
-                format!("read source at /: {error}"),
+                format!("read source at {}: {error}", actual.display()),
                 translation.as_ref(),
                 &text,
             )
@@ -980,11 +971,12 @@ fn auto_migrate_user_config_with_reader(
         Ok(_) => return None,
         Err(error) => return not_migrated(error, translation.as_ref(), &text),
     };
-    let backup = match write_backup(&backup_dir(), &text) {
+    let backup_dir = backup_dir();
+    let backup = match write_backup(&backup_dir, &text) {
         Ok(backup) => backup,
         Err(error) => {
             return not_migrated(
-                format!("write old copy at /: {error}"),
+                format!("write old copy at {}: {error}", backup_dir.display()),
                 translation.as_ref(),
                 &text,
             );
@@ -1002,7 +994,7 @@ fn auto_migrate_user_config_with_reader(
     };
     if let Err(error) = publish() {
         let cleanup = fs::remove_file(&backup);
-        let mut reason = format!("publish settings at /: {error}");
+        let mut reason = format!("publish settings at {}: {error}", target.display());
         if let Err(error) = cleanup {
             reason.push_str(&format!("; could not remove {}: {error}", backup.display()));
         }
@@ -1012,7 +1004,7 @@ fn auto_migrate_user_config_with_reader(
     // yet. Keep the backup if syncing fails, and don't remove a legacy source.
     if let Err(error) = crate::durability::sync_dir(parent) {
         return not_migrated(
-            format!("publish settings at /: {error}"),
+            format!("publish settings at {}: {error}", target.display()),
             translation.as_ref(),
             &text,
         );

@@ -1698,7 +1698,7 @@ fn record_blocking_inspect_observations(
     let batch = match AcceptedObservationBatch::from_diagnostic_snapshots(
         req.session(),
         &snapshot.project_root,
-        accepted_snapshots,
+        ctx.current_lsp_observations(accepted_snapshots),
     ) {
         Ok(batch) => batch,
         Err(error) => {
@@ -3269,7 +3269,7 @@ fn add_section(section: &str, categories: &mut BTreeSet<InspectCategory>) -> Res
         .map_err(|error| format!("inspect: {error}"))?;
     if !category.is_active() {
         return Err(format!(
-            "inspect: category '{category}' is registered but disabled in v0.33"
+            "inspect: category '{category}' is registered but disabled"
         ));
     }
     categories.insert(category);
@@ -9450,7 +9450,6 @@ mod deferred_terminal_tests {
             InspectBuilderState::GatedBySemanticSeed.as_str(),
             "gated_by_semantic_seed"
         );
-        assert_eq!(InspectBuilderState::Suspended.as_str(), "suspended");
         assert_eq!(
             InspectBuilderState::BuildDenied.as_str(),
             "build_denied (borrow-only)"

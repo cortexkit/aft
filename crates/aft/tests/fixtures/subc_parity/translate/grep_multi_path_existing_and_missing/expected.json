@@ -1,7 +1,11 @@
 {
   "args": {
     "case_sensitive": true,
-    "path": "<PROJECT_ROOT>/src <PROJECT_ROOT>/docs",
+    "path": [
+      "<PROJECT_ROOT>/src",
+      "<PROJECT_ROOT>/docs",
+      "<PROJECT_ROOT>/missing-dir"
+    ],
     "pattern": "value"
   },
   "command": "grep"

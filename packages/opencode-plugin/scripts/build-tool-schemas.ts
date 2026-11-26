@@ -81,20 +81,23 @@ async function main() {
 
   // --check-source-only avoids compiling the native library before a train
   // push. The unit CI workflow and release gates still run the full --check.
-  // Disable sccache for that native check: its client has hung on the server
-  // socket here. A deadline turns that failure into an error, not a stuck push.
   if (!sourceOnly) {
-    const generator = Bun.spawn(
-      ["cargo", "run", "--quiet", "-p", "agent-file-tools", "--bin", "hashline-schema-artifact"],
-      {
-        cwd: repoRoot,
-        stdout: "pipe",
-        stderr: "inherit",
-        env: { ...process.env, CARGO_BUILD_RUSTC_WRAPPER: "", RUSTC_WRAPPER: "" },
-        timeout: 10 * 60 * 1000,
-        killSignal: "SIGKILL",
-      },
-    );
+    // CI supplies the generator from its preceding Cargo build. If it is
+    // missing, fail rather than silently compiling a different feature set.
+    const prebuilt = process.env.AFT_HASHLINE_SCHEMA_GENERATOR;
+    const command =
+      prebuilt === undefined
+        ? ["cargo", "run", "--quiet", "-p", "agent-file-tools", "--bin", "hashline-schema-artifact"]
+        : [path.resolve(repoRoot, prebuilt)];
+    const generator = Bun.spawn(command, {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "inherit",
+      // The compiler cache wrapper has hung on its socket during local Cargo builds.
+      env: { ...process.env, CARGO_BUILD_RUSTC_WRAPPER: "", RUSTC_WRAPPER: "" },
+      timeout: 10 * 60 * 1000,
+      killSignal: "SIGKILL",
+    });
     const hashlineJson = await new Response(generator.stdout).text();
     if ((await generator.exited) !== 0) {
       throw new Error(

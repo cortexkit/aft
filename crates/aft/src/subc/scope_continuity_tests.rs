@@ -81,6 +81,7 @@ impl Fixture {
             Some(speech),
             Some(runs),
             grant_sweep,
+            None,
         );
         let task = spawn_scoped(&ctx, &root, scope, "sleep 30");
         Self {

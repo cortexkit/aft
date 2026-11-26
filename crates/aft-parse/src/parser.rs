@@ -1,7 +1,7 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::SystemTime;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -18,11 +18,23 @@ use crate::error::AftError;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
 mod file_language;
+mod freshness;
 pub use file_language::dynamic_language_for_extension;
 mod grammar_selection;
+mod navigation_symbols;
 pub use grammar_selection::grammar_for;
 pub mod dead_code_facts;
 pub mod outline_facts;
+mod reusable;
+#[cfg(any(test, feature = "test-support"))]
+pub use freshness::{fresh_file_stamp, Stamp};
+#[cfg(not(any(test, feature = "test-support")))]
+use freshness::{fresh_file_stamp, Stamp};
+#[cfg(not(any(test, feature = "test-support")))]
+use reusable::parse_source_with_parser_deadline;
+pub use reusable::reusable_parser_pools_memory;
+#[cfg(any(test, feature = "test-support"))]
+pub use reusable::{parse_source_with_parser_deadline, REUSABLE_PARSERS};
 pub mod todo_markers;
 
 const MAX_REEXPORT_DEPTH: usize = 10;
@@ -990,15 +1002,6 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
 }
 }
 
-thread_local! {
-    // A Parser is mutable and not Sync, so each semantic/rayon worker retains its
-    // own language parsers without a global lock or cross-thread sharing.
-    #[cfg(any(test, feature = "test-support"))]
-    pub static REUSABLE_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
-    #[cfg(not(any(test, feature = "test-support")))]
-    static REUSABLE_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
-}
-
 pub fn read_source(path: &Path) -> std::io::Result<String> {
     #[cfg(any(test, feature = "test-support"))]
     work_counters::SOURCE_READS.with(|count| count.set(count.get() + 1));
@@ -1037,105 +1040,10 @@ pub fn parse_source_with_cached_parser(
     parse_resolved_source(path, source, lang).map(|(tree, _)| tree)
 }
 
-#[derive(Default)]
-struct HeaderParseCache {
-    entries: HashMap<blake3::Hash, (Tree, LangId)>,
-    order: VecDeque<blake3::Hash>,
-}
-
-// FileParser instances are request-local. Share header trees by content so a
-// language-only consumer and a later symbol/graph consumer use the same verdict
-// without repeating the fallback parses. Eviction affects reuse, not results.
-static HEADER_PARSE_CACHE: LazyLock<Mutex<HeaderParseCache>> =
-    LazyLock::new(|| Mutex::new(HeaderParseCache::default()));
-
+mod header_cache;
 #[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    pub static HEADER_PARSE_ON_MISS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
-}
-
-/// Reuse a resolved header tree in path-free extraction without changing the
-/// caller's already-resolved language.
-pub fn cached_header_tree(source: &str, lang: LangId) -> Option<Tree> {
-    if !matches!(lang, LangId::C | LangId::Cpp | LangId::ObjC) {
-        return None;
-    }
-    HEADER_PARSE_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entries
-        .get(&cache_freshness::hash_bytes(source.as_bytes()))
-        .filter(|(_, resolved)| *resolved == lang)
-        .map(|(tree, _)| tree.clone())
-}
-
-pub fn parse_resolved_source(
-    path: &Path,
-    source: &str,
-    lang: LangId,
-) -> Result<(Tree, LangId), AftError> {
-    if !is_h_header(path) {
-        return parse_source_with_parser(path, source, lang).map(|tree| (tree, lang));
-    }
-    let hash = cache_freshness::hash_bytes(source.as_bytes());
-    if let Some(parsed) = HEADER_PARSE_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entries
-        .get(&hash)
-    {
-        return Ok(parsed.clone());
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    HEADER_PARSE_ON_MISS.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
-
-    let c_tree = parse_source_with_parser(path, source, LangId::C)?;
-    let mut resolved = (c_tree.clone(), LangId::C);
-    if c_tree.root_node().has_error() {
-        for candidate in [LangId::Cpp, LangId::ObjC] {
-            let Some(tree) = parse_source_with_parser_deadline(
-                path,
-                source,
-                candidate,
-                Some(HEADER_FALLBACK_PARSE_DEADLINE),
-            )?
-            else {
-                continue;
-            };
-            // has_error includes both ERROR nodes and inserted MISSING nodes.
-            if !tree.root_node().has_error() {
-                resolved = (tree, candidate);
-                break;
-            }
-        }
-    }
-    // Parsing must not serialize unrelated headers behind this cache lock.
-    // Racing misses may both parse; return the first inserted verdict to both
-    // callers, including when one of their fallback attempts was cancelled.
-    // Wall deadlines are load-sensitive: a near-budget clean alternative could
-    // finish in only one racing thread. The 1,900 ms budget leaves over 10x Zig's
-    // measured 189.362 ms 99.9th-percentile Objective-C header parse time as a
-    // margin (see the deadline constant below). Returning the stored verdict
-    // keeps callers consistent at that boundary.
-    let mut cache = HEADER_PARSE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(parsed) = cache.entries.get(&hash) {
-        return Ok(parsed.clone());
-    }
-    // Bound retained trees independently of the number of FileParser instances.
-    if cache.entries.len() == 128 {
-        if let Some(oldest) = cache.order.pop_front() {
-            cache.entries.remove(&oldest);
-        }
-    }
-    cache.order.push_back(hash);
-    cache.entries.insert(hash, resolved.clone());
-    Ok(resolved)
-}
+pub use header_cache::HEADER_PARSE_ON_MISS;
+pub use header_cache::{cached_header_tree, parse_resolved_source};
 
 test_support_visibility! {
 fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
@@ -1155,73 +1063,6 @@ test_support_visibility! {
 // selected trees changed. This is cooperative cancellation, not a memory cap
 // or a bound on one native lexer/scanner call between progress callbacks.
 const HEADER_FALLBACK_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1900);
-}
-
-test_support_visibility! {
-fn parse_source_with_parser_deadline(
-    path: &Path,
-    source: &str,
-    lang: LangId,
-    deadline: Option<std::time::Duration>,
-) -> Result<Option<Tree>, AftError> {
-    if markdown_too_deep_to_parse(lang, source) {
-        return Err(AftError::ParseError {
-            message: format!("{}: {MARKDOWN_TOO_DEEP}", path.display()),
-        });
-    }
-    #[cfg(feature = "test-hooks")]
-    SEARCH_PARSE_COUNT.with(|count| count.set(count.get() + 1));
-    #[cfg(any(test, feature = "test-support"))]
-    work_counters::CACHED_PARSER_PARSES.with(|count| count.set(count.get() + 1));
-    REUSABLE_PARSERS.with(|parsers| {
-        let mut parsers = parsers.borrow_mut();
-        let mut parser = match parsers.remove(&lang) {
-            Some(parser) => parser,
-            None => {
-                #[cfg(any(test, feature = "test-support"))]
-                work_counters::GRAMMAR_LOADS.with(|count| count.set(count.get() + 1));
-                let mut parser = Parser::new();
-                initialize_parser(&mut parser, lang)?;
-                parser
-            }
-        };
-        #[cfg(any(test, feature = "test-support"))]
-        parser.note_parse();
-        let result = if let Some(deadline) = deadline {
-            let start = std::time::Instant::now();
-            let mut expired = false;
-            let mut progress = |_: &tree_sitter::ParseState| {
-                if start.elapsed() >= deadline {
-                    expired = true;
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            };
-            let bytes = source.as_bytes();
-            let tree = parser.parse_with_options(
-                &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
-                None,
-                Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-            );
-            // A cancelled parser retains partial native state. Discard it rather
-            // than resuming that state on the next unrelated header.
-            if expired {
-                Ok(None)
-            } else {
-                tree.map(Some).ok_or_else(|| AftError::ParseError {
-                    message: format!("tree-sitter parse returned None for {}", path.display()),
-                })
-            }
-        } else {
-            parse_with_parser(&mut parser, path, source, lang, None).map(Some)
-        };
-        if matches!(result, Ok(Some(_))) {
-            parsers.insert(lang, parser);
-        }
-        result
-    })
-}
 }
 
 // The five largest react-lua runtime modules took 3.4-7.3 s each on an
@@ -1263,7 +1104,7 @@ pub fn with_luau_parse_deadline_for_test<T>(
 ))]
 pub fn install_luau_parser_for_test(parser: Parser) {
     REUSABLE_PARSERS.with(|parsers| {
-        parsers.borrow_mut().insert(LangId::Luau, parser);
+        parsers.edit(|map| map.insert(LangId::Luau, parser));
     });
 }
 
@@ -1373,6 +1214,7 @@ test_support_visibility! {
 /// Cached parse result: mtime at parse time + the tree.
 struct CachedTree {
     mtime: SystemTime,
+    stamp: Option<Stamp>,
     size: u64,
     content_hash: blake3::Hash,
     tree: Tree,
@@ -1393,44 +1235,8 @@ pub struct RustModule {
     pub children: Vec<RustModule>,
 }
 
-pub fn rust_modules(root: Node<'_>, source: &str) -> Vec<RustModule> {
-    #[cfg(any(test, feature = "test-support"))]
-    work_counters::RUST_MODULE_SCANS.with(|count| count.set(count.get() + 1));
-    fn immediate_modules<'a>(node: Node<'a>, modules: &mut Vec<Node<'a>>) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.kind() == "mod_item" {
-                modules.push(child);
-            } else {
-                immediate_modules(child, modules);
-            }
-        }
-    }
-    let mut modules = Vec::new();
-    immediate_modules(root, &mut modules);
-    modules
-        .into_iter()
-        .map(|module| {
-            let mut cursor = module.walk();
-            let exported = module
-                .named_children(&mut cursor)
-                .any(|child| child.kind() == "visibility_modifier");
-            RustModule {
-                name: module
-                    .child_by_field_name("name")
-                    .map(|name| node_text(source, &name))
-                    .unwrap_or("module")
-                    .to_string(),
-                range: node_range_with_decorators(&module, source, LangId::Rust),
-                exported,
-                children: module
-                    .child_by_field_name("body")
-                    .map(|body| rust_modules(body, source))
-                    .unwrap_or_default(),
-            }
-        })
-        .collect()
-}
+mod rust_modules;
+pub use rust_modules::rust_modules;
 
 /// A request-local source and tree captured together, for read-only consumers.
 pub struct ParsedFile {
@@ -1439,6 +1245,7 @@ pub struct ParsedFile {
     pub lang: LangId,
     pub modules: Option<Arc<Vec<RustModule>>>,
     mtime: SystemTime,
+    stamp: Option<Stamp>,
     size: u64,
     content_hash: blake3::Hash,
 }
@@ -1451,6 +1258,7 @@ struct CachedSymbols {
     pub mtime: SystemTime,
     #[cfg(not(any(test, feature = "test-support")))]
     mtime: SystemTime,
+    stamp: Option<Stamp>,
     size: u64,
     content_hash: blake3::Hash,
     /// Shared so a lookup can snapshot an entry under the read lock with a
@@ -1501,46 +1309,6 @@ thread_local! {
     pub static FRESHNESS_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
     pub static CACHE_REFRESH_TEST_MUTATOR: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
     pub static CACHE_REFRESH_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
-}
-
-test_support_visibility! {
-fn cached_file_is_fresh(
-    path: &Path,
-    cached_mtime: SystemTime,
-    cached_size: u64,
-    cached_content_hash: blake3::Hash,
-    fallback_mtime: SystemTime,
-) -> bool {
-    #[cfg(any(test, feature = "test-support"))]
-    FRESHNESS_TEST_BARRIERS.with(|slot| {
-        if let Some((arrived, released)) = slot.borrow_mut().take() {
-            arrived.wait();
-            released.wait();
-        }
-    });
-    let Ok(metadata) = crate::bounded_io::metadata(path) else {
-        return false;
-    };
-    let current_size = metadata.len();
-    if current_size != cached_size {
-        return false;
-    }
-
-    let current_mtime = metadata.modified().unwrap_or(fallback_mtime);
-    // Matching size and mtime is the steady-state fast path. If only mtime moved,
-    // hash below to keep touched or no-op rewritten files cached when content is identical.
-    if current_mtime == cached_mtime {
-        return true;
-    }
-    if current_size > cache_freshness::CONTENT_HASH_SIZE_CAP {
-        return false;
-    }
-
-    matches!(
-        cache_freshness::hash_file_if_small(path, current_size),
-        Ok(Some(hash)) if hash == cached_content_hash
-    )
-}
 }
 
 /// Shared symbol cache that can be pre-warmed in a background thread
@@ -1679,6 +1447,7 @@ impl SymbolCache {
         self.insert_shared(
             path,
             mtime,
+            None,
             size,
             content_hash,
             Arc::new(symbols),
@@ -1699,7 +1468,17 @@ impl SymbolCache {
         content_hash: blake3::Hash,
         symbols: Arc<Vec<Symbol>>,
     ) -> bool {
-        self.insert_entry(path, mtime, size, content_hash, symbols, None, None, true)
+        self.insert_entry(
+            path,
+            mtime,
+            None,
+            size,
+            content_hash,
+            symbols,
+            None,
+            None,
+            true,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1707,6 +1486,7 @@ impl SymbolCache {
         &mut self,
         path: PathBuf,
         mtime: SystemTime,
+        stamp: Option<Stamp>,
         size: u64,
         content_hash: blake3::Hash,
         symbols: Arc<Vec<Symbol>>,
@@ -1716,6 +1496,7 @@ impl SymbolCache {
         self.insert_entry(
             path,
             mtime,
+            stamp,
             size,
             content_hash,
             symbols,
@@ -1730,6 +1511,7 @@ impl SymbolCache {
         &mut self,
         path: PathBuf,
         mtime: SystemTime,
+        stamp: Option<Stamp>,
         size: u64,
         content_hash: blake3::Hash,
         symbols: Arc<Vec<Symbol>>,
@@ -1741,6 +1523,8 @@ impl SymbolCache {
             if cached.mtime == mtime
                 && cached.size == size
                 && cached.content_hash == content_hash
+                && (content_hash != cache_freshness::zero_hash()
+                    || stamp.is_some() && cached.stamp == stamp)
                 && cached.symbols == symbols
             {
                 // Same content: keep what was already derived from it. A
@@ -1765,11 +1549,13 @@ impl SymbolCache {
                 if has_error.is_some() {
                     cached.has_error = has_error;
                 }
+                cached.stamp = stamp.or(cached.stamp);
                 return false;
             }
         }
         let entry = CachedSymbols {
             mtime,
+            stamp,
             size,
             content_hash,
             symbols,
@@ -1811,15 +1597,13 @@ impl SymbolCache {
     }
 
     /// Return cached symbols when the source file is still fresh.
-    pub fn get(&self, path: &Path, mtime: SystemTime) -> Option<Vec<Symbol>> {
+    pub fn get(&self, path: &Path, _mtime: SystemTime) -> Option<Vec<Symbol>> {
         self.entries.get(path).and_then(|cached| {
-            cached_file_is_fresh(path, cached.mtime, cached.size, cached.content_hash, mtime).then(
-                || {
-                    #[cfg(any(test, feature = "test-support"))]
-                    work_counters::OWNED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
-                    cached.symbols.as_ref().clone()
-                },
-            )
+            fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash).map(|_| {
+                #[cfg(any(test, feature = "test-support"))]
+                work_counters::OWNED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
+                cached.symbols.as_ref().clone()
+            })
         })
     }
 
@@ -1977,16 +1761,14 @@ impl SymbolCache {
 pub fn cached_symbol_count_shared(
     cache: &SharedSymbolCache,
     path: &Path,
-    mtime: SystemTime,
+    _mtime: SystemTime,
     size: u64,
 ) -> Option<usize> {
     let cached = cache.read().ok()?.entries.get(path)?.clone();
-    if cached.mtime == mtime && cached.size == size {
-        return Some(cached.symbols.len());
-    }
-    if !cached_file_is_fresh(path, cached.mtime, cached.size, cached.content_hash, mtime) {
+    if cached.size != size {
         return None;
     }
+    fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash)?;
     // Hashing runs without a guard. A replacement during that I/O must not
     // turn the old table into a fresh count for the newly installed entry.
     let current = cache.read().ok()?;
@@ -2100,23 +1882,19 @@ impl FileParser {
             })?;
 
         let canon = path.to_path_buf();
-        let current_mtime = crate::bounded_io::metadata(path)
-            .and_then(|m| m.modified())
-            .map_err(|e| AftError::FileNotFound {
-                path: format!("{}: {}", path.display(), e),
-            })?;
+        let metadata = crate::bounded_io::metadata(path).map_err(|e| AftError::FileNotFound {
+            path: format!("{}: {}", path.display(), e),
+        })?;
+        let current_mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let stamp = Stamp::of(&metadata);
 
         // Check cache validity. Mtime alone is not enough: editors and tests can
         // restore timestamps after changing file contents, so small files fall
         // back to a Blake3 content hash when size does not prove staleness.
         let needs_reparse = match self.cache.get(&canon) {
-            Some(cached) => !cached_file_is_fresh(
-                path,
-                cached.mtime,
-                cached.size,
-                cached.content_hash,
-                current_mtime,
-            ),
+            Some(cached) => {
+                fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash).is_none()
+            }
             None => true,
         };
 
@@ -2137,6 +1915,7 @@ impl FileParser {
                 canon.clone(),
                 CachedTree {
                     mtime: current_mtime,
+                    stamp: stamp.and_then(|stamp| stamp.unchanged_after(path)),
                     size: source.len() as u64,
                     content_hash: content_hash_for_source(&source),
                     tree,
@@ -2188,6 +1967,7 @@ impl FileParser {
                     // a real mtime, so a later `parse` of the path checks the
                     // content hash before reusing this tree.
                     mtime: SystemTime::UNIX_EPOCH,
+                    stamp: None,
                     size,
                     content_hash,
                     tree,
@@ -2238,6 +2018,7 @@ impl FileParser {
             lang,
             modules,
             mtime: cached.mtime,
+            stamp: cached.stamp,
             size: cached.size,
             content_hash: cached.content_hash,
         })
@@ -2262,12 +2043,12 @@ impl FileParser {
             Some(cached)
                 if cached.size == parsed.size
                     && cached.content_hash == parsed.content_hash
-                    && (cached.mtime == parsed.mtime
-                        || parsed.content_hash != cache_freshness::zero_hash()) =>
+                    && (parsed.content_hash != cache_freshness::zero_hash()
+                        || parsed.stamp.is_some() && cached.stamp == parsed.stamp) =>
             {
                 cached.symbols
             }
-            _ => Arc::new(extract_symbols_from_tree(
+            _ => Arc::new(navigation_symbols::extract(
                 &parsed.source,
                 &parsed.tree,
                 parsed.lang,
@@ -2287,6 +2068,7 @@ impl FileParser {
             cache.insert_shared(
                 path.to_path_buf(),
                 parsed.mtime,
+                parsed.stamp,
                 parsed.size,
                 parsed.content_hash,
                 Arc::clone(&symbols),
@@ -2301,39 +2083,21 @@ impl FileParser {
     /// `Some(true)` when the file had syntax errors. `None` when there is no
     /// entry, the entry has no verdict, or the file changed since.
     pub fn cached_has_error(&self, path: &Path) -> Option<bool> {
-        let current_mtime = crate::bounded_io::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()?;
         let cached = self.symbol_cache.read().ok()?.entries.get(path)?.clone();
         let has_error = cached.has_error?;
-        cached_file_is_fresh(
-            path,
-            cached.mtime,
-            cached.size,
-            cached.content_hash,
-            current_mtime,
-        )
-        .then_some(has_error)
+        fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash)?;
+        Some(has_error)
     }
 
     /// Everything a multi-file outline stored for `path`, when the entry is
     /// still fresh and carries outline facts. A miss means the caller parses.
     pub fn cached_outline(&self, path: &Path) -> Option<CachedOutline> {
-        let current_mtime = crate::bounded_io::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()?;
         let cached = self.symbol_cache.read().ok()?.entries.get(path)?.clone();
         let (Some(has_error), Some(facts)) = (cached.has_error, cached.outline_facts) else {
             return None;
         };
-        cached_file_is_fresh(
-            path,
-            cached.mtime,
-            cached.size,
-            cached.content_hash,
-            current_mtime,
-        )
-        .then_some(CachedOutline {
+        fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash)?;
+        Some(CachedOutline {
             symbols: cached.symbols,
             modules: cached.modules,
             has_error,
@@ -2419,7 +2183,7 @@ impl FileParser {
         /// real cost when warming the symbol cache / call graph over a large repo.
         /// This variant takes the already-read `source` and the already-computed
         /// `current_mtime`/`size`/`content_hash` so the cold path does one read and
-        /// one hash. Tree-cache freshness semantics are identical to `parse()`.
+        /// one hash. Reuse requires the tree to match the supplied bytes.
         fn parse_with_source(
             &mut self,
             path: &Path,
@@ -2444,18 +2208,12 @@ impl FileParser {
                 })?;
 
             let canon = path.to_path_buf();
-            let needs_reparse = match self.cache.get(&canon) {
-                Some(cached) => !cached_file_is_fresh(
-                    path,
-                    cached.mtime,
-                    cached.size,
-                    cached.content_hash,
-                    current_mtime,
-                ),
-                None => true,
-            };
+            let reusable = size <= cache_freshness::CONTENT_HASH_SIZE_CAP
+                && self.cache.get(&canon).is_some_and(|cached| {
+                    cached.size == size && cached.content_hash == content_hash
+                });
 
-            if needs_reparse {
+            if !reusable {
                 let (tree, lang) = parse_resolved_source(path, source, lang)?;
                 #[cfg(any(test, feature = "test-support"))]
                 work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
@@ -2464,6 +2222,7 @@ impl FileParser {
                     canon.clone(),
                     CachedTree {
                         mtime: current_mtime,
+                        stamp: None,
                         size,
                         content_hash,
                         tree,
@@ -2521,11 +2280,12 @@ impl FileParser {
         // bypasses the symbol-cache snapshot and parses one coherent source read.
         for attempt in 0..=3 {
             let canon = path.to_path_buf();
-            let current_mtime = crate::bounded_io::metadata(path)
-                .and_then(|m| m.modified())
-                .map_err(|e| AftError::FileNotFound {
+            let metadata =
+                crate::bounded_io::metadata(path).map_err(|e| AftError::FileNotFound {
                     path: format!("{}: {}", path.display(), e),
                 })?;
+            let current_mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let stamp = Stamp::of(&metadata);
             // A shared symbol cache cannot opt a built-in-only context into a
             // dynamic language after another context has populated that cache.
             if !self.dynamic_languages && language_for_extension(path).is_none() {
@@ -2554,14 +2314,10 @@ impl FileParser {
                 None
             };
             if let Some(cached) = cached {
-                if cached_file_is_fresh(
-                    path,
-                    cached.mtime,
-                    cached.size,
-                    cached.content_hash,
-                    current_mtime,
-                ) {
-                    if cached.mtime != current_mtime {
+                if let Some(fresh_stamp) =
+                    fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash)
+                {
+                    if cached.stamp != fresh_stamp || cached.mtime != current_mtime {
                         #[cfg(any(test, feature = "test-support"))]
                         CACHE_REFRESH_TEST_BARRIERS.with(|slot| {
                             if let Some((arrived, released)) = slot.borrow_mut().take() {
@@ -2583,10 +2339,12 @@ impl FileParser {
                                 })?;
                         if let Some(entry) = cache.entries.get_mut(&canon) {
                             if entry.mtime == cached.mtime
+                                && entry.stamp == cached.stamp
                                 && entry.size == cached.size
                                 && entry.content_hash == cached.content_hash
                             {
                                 entry.mtime = current_mtime;
+                                entry.stamp = fresh_stamp;
                             } else {
                                 // A concurrent writer replaced the snapshot while we hashed.
                                 // Retry rather than returning superseded symbols.
@@ -2605,6 +2363,7 @@ impl FileParser {
             let source = read_source(path).map_err(|e| AftError::FileNotFound {
                 path: format!("{}: {}", path.display(), e),
             })?;
+            let stamp = stamp.and_then(|stamp| stamp.unchanged_after(path));
             let size = source.len() as u64;
             let content_hash = content_hash_for_source(&source);
 
@@ -2613,13 +2372,7 @@ impl FileParser {
                 // same file a second time.
                 let (tree, lang) =
                     self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
-                let mut symbols = extract_symbols_from_tree(&source, tree, lang)?;
-                if lang == LangId::Rust {
-                    complete_rust_trait_members(
-                        &mut symbols,
-                        crate::callgraph::rust_trait_members(&source, tree.root_node(), Direct),
-                    );
-                }
+                let symbols = navigation_symbols::extract(&source, tree, lang)?;
                 (
                     Arc::new(symbols),
                     (lang == LangId::Rust)
@@ -2638,28 +2391,19 @@ impl FileParser {
                 .map_err(|_| AftError::ParseError {
                     message: "symbol cache lock poisoned".to_string(),
                 })?;
-            let cache_changed = if let Some(generation) = self.symbol_cache_generation {
-                symbol_cache.generation == generation
-                    && symbol_cache.insert_shared(
-                        canon,
-                        current_mtime,
-                        size,
-                        content_hash,
-                        Arc::clone(&symbols),
-                        modules,
-                        has_error,
-                    )
-            } else {
-                symbol_cache.insert_shared(
+            let cache_changed = self
+                .symbol_cache_generation
+                .is_none_or(|generation| symbol_cache.generation == generation)
+                && symbol_cache.insert_shared(
                     canon,
                     current_mtime,
+                    stamp,
                     size,
                     content_hash,
                     Arc::clone(&symbols),
                     modules,
                     has_error,
-                )
-            };
+                );
 
             return Ok((symbols, cache_changed, false));
         }
@@ -3206,15 +2950,11 @@ fn mark_named_exports(symbols: &mut [Symbol], exported_names: &HashSet<String>) 
     }
 }
 
+mod signature;
 test_support_visibility! {
 /// Extract the first line of a node as its signature.
 fn extract_signature(source: &str, node: &Node) -> String {
-    let text = node_text(source, node);
-    let first_line = text.lines().next().unwrap_or(text);
-    // Trim trailing opening brace if present
-    let trimmed = first_line.trim_end();
-    let trimmed = trimmed.strip_suffix('{').unwrap_or(trimmed).trim_end();
-    trimmed.to_string()
+    signature::bounded_parts([signature::first_line(node_text(source, node))])
 }
 }
 
@@ -3941,7 +3681,7 @@ fn extract_py_symbols<'tree>(
                         if dc.goto_first_child() {
                             loop {
                                 if dc.node().kind() == "decorator" {
-                                    sig_parts.push(node_text(source, &dc.node()).to_string());
+                                    sig_parts.push(node_text(source, &dc.node()));
                                 }
                                 if !dc.goto_next_sibling() {
                                     break;
@@ -3952,8 +3692,8 @@ fn extract_py_symbols<'tree>(
                     }
                     parent = nav.parent(p);
                 }
-                sig_parts.push(extract_signature(source, &def_node));
-                Some(sig_parts.join("\n"))
+                sig_parts.push(signature::first_line(node_text(source, &def_node)));
+                Some(signature::join_lines(&sig_parts))
             } else {
                 Some(extract_signature(source, &def_node))
             };
@@ -3983,7 +3723,7 @@ fn extract_py_symbols<'tree>(
                         if dc.goto_first_child() {
                             loop {
                                 if dc.node().kind() == "decorator" {
-                                    sig_parts.push(node_text(source, &dc.node()).to_string());
+                                    sig_parts.push(node_text(source, &dc.node()));
                                 }
                                 if !dc.goto_next_sibling() {
                                     break;
@@ -3994,8 +3734,8 @@ fn extract_py_symbols<'tree>(
                     }
                     parent = nav.parent(p);
                 }
-                sig_parts.push(extract_signature(source, &def_node));
-                Some(sig_parts.join("\n"))
+                sig_parts.push(signature::first_line(node_text(source, &def_node)));
+                Some(signature::join_lines(&sig_parts))
             } else {
                 Some(extract_signature(source, &def_node))
             };
@@ -4946,10 +4686,8 @@ fn cpp_parent_scope_chain(node: &Node, source: &str) -> Vec<String> {
 }
 
 fn template_signature(source: &str, template_node: &Node, item_node: &Node) -> String {
-    format!(
-        "{}\n{}",
-        extract_signature(source, template_node),
-        extract_signature(source, item_node)
+    signature::join_lines(
+        &[template_node, item_node].map(|node| signature::first_line(node_text(source, node))),
     )
 }
 
@@ -5503,7 +5241,7 @@ fn extract_zig_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<S
         }
 
         if let (Some(name_node), Some(def_node)) = (const_name_node, const_def_node) {
-            let signature = extract_signature(source, &def_node);
+            let signature = signature::first_line(node_text(source, &def_node));
             let is_container = signature.contains("= struct")
                 || signature.contains("= enum")
                 || signature.contains("= union")
@@ -5515,7 +5253,7 @@ fn extract_zig_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<S
                     name: name.to_string(),
                     kind: SymbolKind::Variable,
                     range: node_range_with_decorators(&def_node, source, lang),
-                    signature: Some(signature),
+                    signature: Some(signature::bounded_parts([signature])),
                     scope_chain: vec![],
                     exported: false,
                     parent: None,
@@ -6154,7 +5892,7 @@ fn extract_solidity_symbols(
         // receive() / fallback() — synthetic names, parent is the enclosing contract
         if let Some(def_node) = fallback_receive_def_node {
             let scope_chain = solidity_scope_chain(&def_node, source);
-            let signature = extract_signature(source, &def_node);
+            let signature = signature::first_line(node_text(source, &def_node));
             let name = if signature.trim_start().starts_with("receive") {
                 "receive"
             } else {
@@ -6164,7 +5902,7 @@ fn extract_solidity_symbols(
                 name: name.to_string(),
                 kind: SymbolKind::Method,
                 range: node_range_with_decorators(&def_node, source, lang),
-                signature: Some(signature),
+                signature: Some(signature::bounded_parts([signature])),
                 parent: scope_chain.last().cloned(),
                 scope_chain,
                 exported: true,
@@ -6493,11 +6231,11 @@ fn r_rightward_function_assignment_symbol(
 }
 
 fn r_rightward_function_signature(source: &str, function_node: &Node, name: &str) -> String {
-    let signature = extract_signature(source, function_node);
+    let signature = signature::first_line(node_text(source, function_node));
     if signature.contains(name) {
-        signature
+        signature::bounded_parts([signature])
     } else {
-        format!("{signature} -> {name}")
+        signature::bounded_parts([signature, " -> ", name])
     }
 }
 

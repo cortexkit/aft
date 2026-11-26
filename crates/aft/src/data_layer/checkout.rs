@@ -27,8 +27,8 @@ use aft_store::ids::{CheckoutId, ContentKey, Digest128, FamilyId, SegmentId};
 use aft_store::scan::{ContentKind, ContentSink, PathScan, Scan, ScanError, ScanPolicy};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::text::{
-    candidates, ContentTrigrams, Located, OverlayEntry, PathText, Query, Scope, TextLocator,
-    TextMembership, TextOverlay, TextSections, TextSectionsBuilder, TextSegment, TextStatus,
+    ContentTrigrams, Located, OverlayEntry, PathText, Query, Scope, TextLocator, TextMembership,
+    TextOverlay, TextSections, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
 use super::callgraph::{CheckoutInputs, EncodedResolution, FileResolution};
@@ -43,9 +43,11 @@ use super::refresh_budget::{RefreshBudget, RefreshLimit, Stage};
 use super::refresh_memory::{ColdGrowth, MemoryLimit, RefreshChecks, RefreshMemory, RefreshStop};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::ParseBlob;
+use build_report::{BuildCause, ColdBuildLog};
 use conversion::{extract_recorded, parse_record, staged_failure, warn_conversion_failure};
 use staged_records::StagedKind;
 
+mod build_report;
 mod conversion;
 mod engines;
 #[cfg(feature = "test-hooks")]
@@ -62,6 +64,7 @@ mod status_view;
 mod stored_records;
 use stored_records::StoredRecords;
 mod text_build;
+mod text_query;
 use text_build::TextBuild;
 #[cfg(test)]
 mod grammar_parity_tests;
@@ -75,6 +78,7 @@ mod resume_tests;
 #[cfg(test)]
 mod todo_tests;
 
+pub use build_report::BuildReport;
 pub use fold::{FoldReport, Folded, OtherFoldReport};
 
 /// [`aft_store::scan::scan`]: every pass over the checkout's files goes
@@ -899,55 +903,6 @@ impl DeltaReport {
     }
 }
 
-/// What a build did.
-#[derive(Clone, Debug, Default, serde::Serialize)]
-pub struct BuildReport {
-    pub files: usize,
-    pub text_units: usize,
-    /// What the new segment left out because another checkout already
-    /// reads it from a segment this build shares.
-    pub shared: SharedUnits,
-    pub parsed_files: usize,
-    pub extract_failures: usize,
-    pub scan_ms: f64,
-    pub resolve_ms: f64,
-    pub write_ms: f64,
-    pub publish_ms: f64,
-    /// For a checkout with nothing published yet, when its text index was
-    /// published, ahead of the call graph: milliseconds from the build's
-    /// start.
-    pub text_ready_ms: Option<f64>,
-    pub segment_bytes: u64,
-    /// Segments no checkout needs any more, left out of the new generation.
-    pub retired_segments: usize,
-    /// Other checkouts of the family whose folder is gone, left out of the
-    /// new generation with their states.
-    pub retired_checkouts: usize,
-    /// Another process published this checkout while the build ran, so
-    /// nothing was published; the checkout serves that publication.
-    pub superseded: bool,
-    /// When the build started from another checkout's publication, how
-    /// many paths differed from it; `None` for a build from scratch.
-    pub started_from_sibling: Option<usize>,
-    /// Content records the build's scan read from the store instead of
-    /// parsing their files again.
-    pub stored_records: usize,
-    /// Records an earlier attempt of the same build staged, used instead of
-    /// extracting the files again.
-    pub resumed_records: usize,
-    /// Whether passes 2-3 were taken from an earlier attempt of the same
-    /// build instead of resolved again.
-    pub resumed_passes: bool,
-    /// Files the reclamation after publishing removed, or why it could not
-    /// run (the publication stands either way).
-    pub reclaimed_files: usize,
-    pub reclaim_error: Option<String>,
-    /// What the build held at each stage, in bytes, as `stage.part`; only
-    /// from [`Checkout::build_measuring_memory`], since walking the
-    /// structures costs time.
-    pub memory: Vec<(String, usize)>,
-}
-
 impl Checkout {
     /// Binds the checkout at `root` to the family store at `family_dir`.
     /// If the family has a published state for this checkout, the view
@@ -1397,12 +1352,21 @@ impl Checkout {
         measure: bool,
         reservation: BuildReservation,
     ) -> Result<BuildReport, DataError> {
+        self.build_reserved_as(measure, reservation, BuildCause::Build)
+    }
+
+    fn build_reserved_as(
+        &self,
+        measure: bool,
+        reservation: BuildReservation,
+        cause: BuildCause,
+    ) -> Result<BuildReport, DataError> {
         // A refresh already inside the engine finishes first. The reservation
         // blocks new refreshes, so no decoded engine overlaps the cold scan.
         self.clear_engine_for_build();
         let _alloc_label =
             crate::alloc_trace::scope(crate::alloc_trace::Label::INDEX_BUILD, Some(&self.root));
-        let result = self.build_inner(measure);
+        let result = self.build_inner(measure, cause);
         drop(reservation);
         self.note_outcome("build", &result);
         result
@@ -1424,7 +1388,7 @@ impl Checkout {
         }
     }
 
-    fn build_inner(&self, measure: bool) -> Result<BuildReport, DataError> {
+    fn build_inner(&self, measure: bool, cause: BuildCause) -> Result<BuildReport, DataError> {
         let mut report = BuildReport::default();
         let build_started = Instant::now();
         // A newer build wrote a file the build would retire, reclaim or
@@ -1451,12 +1415,14 @@ impl Checkout {
         // A checkout with nothing published gets its text index first: a
         // text-only scan takes about a second where the call graph takes
         // far longer, and text queries need nothing else.
-        let unpublished = self
-            .live
-            .read()
-            .expect("no panics while holding it")
-            .published
-            .is_none();
+        let (unpublished, graph_built) = {
+            let live = self.live.read().expect("no panics while holding it");
+            let published = live.published.as_ref();
+            (
+                published.is_none(),
+                published.is_some_and(|p| p.graph_built),
+            )
+        };
         checkpoint()?;
         // A checkout another one of the family is close to starts from that
         // one's publication rather than building cold.
@@ -1517,6 +1483,7 @@ impl Checkout {
             &paused,
             &claimed,
             growth,
+            ColdBuildLog::new(build_started, cause, graph_built),
         );
         if let Err(error) = &result {
             claimed.ended(error);
@@ -1536,6 +1503,7 @@ impl Checkout {
         paused: &DiskPause,
         claimed: &resume::Claimed,
         growth: Option<ColdGrowth>,
+        log: ColdBuildLog,
     ) -> Result<BuildReport, DataError> {
         let started = Instant::now();
         let scratch = Arc::clone(&claimed.scratch);
@@ -1897,6 +1865,7 @@ impl Checkout {
                 retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
+        let graph_published = Instant::now();
         // The publication is in the manifest, so nothing in the workspace is
         // needed any more. The staged records' files close first (see the
         // stand-down above); every other builder closed its files when it
@@ -1937,6 +1906,7 @@ impl Checkout {
                     .as_ref(),
             )
             .map_err(DataError::Store)?;
+        log.completed(&self.root, graph_published, &report);
         Ok(report)
     }
 
@@ -3979,17 +3949,7 @@ impl CheckoutView {
         query: &Query,
         scope: Scope<'_>,
     ) -> Result<Vec<Vec<u8>>, DataError> {
-        let published = &self.published;
-        let texts = published.texts()?;
-        candidates(
-            &published.state,
-            &published.membership,
-            &texts,
-            &self.text,
-            query,
-            scope,
-        )
-        .map_err(DataError::store)
+        text_query::candidates(self, query, scope)
     }
 
     /// What the text plane holds for `path`, with the changes since the
@@ -5907,8 +5867,8 @@ impl Checkout {
                 // A recorded parse gap has no TODO record. The grammar driver
                 // retries transient gaps; a TODO query must not wait for a
                 // publication that cannot contain this file's markers yet.
-                if view.current_state().skipped_parses().contains_key(path) {
-                    return Ok(PathTodos::Unextracted);
+                if let Some(reason) = view.current_state().skipped_parses().get(path) {
+                    return Ok(grammar::todo_parse_gap(reason));
                 }
                 let published = !view.published.state.skipped_parses().contains_key(path)
                     && view.published.state.get(path).is_some_and(|published| {
@@ -5946,9 +5906,8 @@ impl Checkout {
                         note_source_work(&self.root, |work| work.todo_decodes += 1);
                         PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
                     }
-                    Extracted::GrammarGap(_) | Extracted::Nothing | Extracted::ConversionFailed => {
-                        PathTodos::Unextracted
-                    }
+                    Extracted::GrammarGap(reason) => grammar::todo_parse_gap(reason),
+                    Extracted::Nothing | Extracted::ConversionFailed => PathTodos::Unextracted,
                 })
             })
             .collect()

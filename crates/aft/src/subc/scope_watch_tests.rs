@@ -472,11 +472,29 @@ async fn scope_watch_handoff_case(evict_completed: bool) {
         "handoff-one".into(),
         true,
     );
+    let start_handoff_watch = |control: Arc<readiness::DaemonControl>| {
+        let runs = Arc::new(run_scope::RunScopes::new(control.clone()));
+        let watched_runs = runs.clone();
+        let watched_executor = executor.clone();
+        // This fixture answers the watch worker's confirmation probes. Hold
+        // the independent saved-grant sweep so it cannot receive those replies.
+        let (hold_sweep, start) = oneshot::channel();
+        let watch = start_with_scope_source_impl(
+            control.clone(),
+            executor.clone(),
+            poll_interval(),
+            move || work_scopes(watched_executor.clone(), watched_runs.clone()),
+            Some(service.clone()),
+            Some(runs),
+            Some(TestGrantSweep { control, start }),
+            None,
+        );
+        (watch, hold_sweep)
+    };
     let (first_control, first_pending, mut first_frames) =
         control(&["scope.describe", "scope.watch"]);
-    let first_runs = Arc::new(run_scope::RunScopes::new(first_control.clone()));
-    let (_first_handle, _first_ended, first_worker) =
-        start_for_speech(first_control, executor.clone(), first_runs, service.clone());
+    let ((_first_handle, _first_ended, first_worker), _hold_first_sweep) =
+        start_handoff_watch(first_control);
     let watch = opening_watch(&first_pending, &mut first_frames).await;
     snapshot(&first_pending, &watch);
     turns().await;
@@ -509,16 +527,10 @@ async fn scope_watch_handoff_case(evict_completed: bool) {
     );
     first_worker.abort();
     let _ = first_worker.await;
-    let replacement_service = service.clone();
     let (second_control, second_pending, mut second_frames) =
         control(&["scope.describe", "scope.watch"]);
-    let second_runs = Arc::new(run_scope::RunScopes::new(second_control.clone()));
-    let (second_handle, mut second_ended, second_worker) = start_for_speech(
-        second_control,
-        executor.clone(),
-        second_runs,
-        replacement_service,
-    );
+    let ((second_handle, mut second_ended, second_worker), _hold_second_sweep) =
+        start_handoff_watch(second_control);
     let rearm = opening_watch(&second_pending, &mut second_frames).await;
     snapshot_status(&second_pending, &rearm, ScopeWatchStatus::Ended);
     turns().await;
@@ -826,6 +838,40 @@ fn control(
 }
 
 #[tokio::test(start_paused = true)]
+async fn steady_scope_observations_do_not_rebuild_verification_schedule() {
+    use std::sync::atomic::Ordering;
+
+    let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
+    let scopes: Vec<_> = (0..2_000).map(stamp).collect();
+    let (handle, _ended, worker) = start_with_scope_source(
+        control,
+        Arc::new(Executor::new()),
+        Duration::from_secs(60),
+        move || std::future::ready(scopes.clone()),
+    );
+    let mut covered = 0;
+    while covered < 2_000 {
+        let watch = request(&mut frames, "scope.watch").await;
+        covered += snapshot(&pending, &watch);
+    }
+    turns().await;
+    let before_iterations = handle.iterations.load(Ordering::Relaxed);
+    let before_reconciles = handle.verification_reconciles.load(Ordering::Relaxed);
+    for index in 0..100 {
+        // These observations wake the worker without changing the
+        // protected inventory or the health of any watch.
+        handle.observed.send(stamp(index)).unwrap();
+    }
+    turns().await;
+    assert!(handle.iterations.load(Ordering::Relaxed) >= before_iterations + 100);
+    assert_eq!(
+        handle.verification_reconciles.load(Ordering::Relaxed) - before_reconciles,
+        0
+    );
+    worker.abort();
+}
+
+#[tokio::test(start_paused = true)]
 async fn scope_watch_healthy_does_not_poll_and_live_rearm_needs_no_confirmation() {
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     let scopes = vec![stamp(0), stamp(1), stamp(2)];
@@ -1122,11 +1168,12 @@ async fn scope_watch_five_minute_backstop_repairs_unnotified_membership() {
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     let scopes = Arc::new(StdMutex::new(vec![stamp(0)]));
     let source = scopes.clone();
-    let (_handle, _ended, worker) = start_with_scope_source(
+    let (_handle, _ended, worker) = start_with_scope_source_and_notifier(
         control.clone(),
         Arc::new(Executor::new()),
         Duration::from_secs(60),
         move || std::future::ready(source.lock().unwrap().clone()),
+        Some(Notify::new()),
     );
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);

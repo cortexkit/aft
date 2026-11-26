@@ -27,6 +27,13 @@ pub(crate) const MAX_GRAPH_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const TOO_LARGE: &str = "over the 1 MiB size limit";
 pub(crate) const GRAPH_TOO_LARGE: &str = "over the 4 MiB size limit";
 
+/// Reason recorded for a scope file whose read failed for a reason other than
+/// the file being gone (permission denied, a non-regular file, an I/O error).
+/// The file is a named gap instead of a silently empty or failed scan.
+pub(crate) fn unreadable_reason(error: &std::io::Error) -> String {
+    format!("could not be read: {}", error.kind())
+}
+
 const MAX_LINE_COUNT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Count lines without allocating even when a file contains one enormous line.

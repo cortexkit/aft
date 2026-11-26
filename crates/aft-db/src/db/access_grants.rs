@@ -469,11 +469,24 @@ pub fn holds(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Result
 /// owner_synced=true; not_synced, errors, and timeouts retain all scope state.
 pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
+    end_scope_rows(&tx, key)?;
+    tx.commit()?;
+    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
+    Ok(())
+}
+
+/// The database half of a confirmed scope end, shared by the live scope-end
+/// handler and the background sweep so both leave the same rows behind.
+/// Returns how many grants were deleted.
+fn end_scope_rows(tx: &rusqlite::Transaction<'_>, key: &ScopeKey) -> rusqlite::Result<usize> {
+    // The tombstone keeps a late catalog from reviving the scope. Nothing
+    // reads an ended scope's configuration, so the tombstone drops it.
     tx.execute(
         "INSERT INTO access_scopes(owner,scope_ref,epoch,config,ended) VALUES (?1,?2,?3,'{}',1)
-        ON CONFLICT(owner,scope_ref,epoch) DO UPDATE SET ended=1",
+        ON CONFLICT(owner,scope_ref,epoch) DO UPDATE SET ended=1, config='{}'",
         params![key.owner, key.scope_ref, key.epoch.to_string()],
     )?;
+    let mut deleted_grants = 0;
     for table in [
         "access_grants",
         "access_launch_params",
@@ -481,16 +494,17 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
         "access_modes",
         "access_scope_agents",
     ] {
-        tx.execute(
+        let deleted = tx.execute(
             &format!("DELETE FROM {table} WHERE owner=?1 AND scope_ref=?2 AND epoch=?3"),
             params![key.owner, key.scope_ref, key.epoch.to_string()],
         )?;
+        if table == "access_grants" {
+            deleted_grants = deleted;
+        }
     }
-    crate::db::remote_exec::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
-    crate::db::catalog_edit_modes::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
-    tx.commit()?;
-    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
-    Ok(())
+    crate::db::remote_exec::forget_scope(tx, &key.owner, &key.scope_ref, key.epoch)?;
+    crate::db::catalog_edit_modes::forget_scope(tx, &key.owner, &key.scope_ref, key.epoch)?;
+    Ok(deleted_grants)
 }
 
 /// Preserve per-row decoding errors so one corrupt row cannot hide other saved
@@ -555,19 +569,26 @@ pub fn saved_scope_batch(
     rows
 }
 
-/// A definite daemon end and its saved-grant deletion commit together.
+/// A definite daemon end and its saved-row cleanup commit together. The
+/// cleanup matches the live scope-end handler's: `end_scope_grants`, the
+/// code-mode owner rows, and the call-ledger settlement of calls that never
+/// started. The sweep only sees ends that no AFT process was watching, so no
+/// in-process waiter holds those calls; runners read the settlements through
+/// `late_results`, as after any restart. One transaction keeps a failed step
+/// retryable: until it commits, the scope's grants keep it in the sweep.
 pub fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<usize> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "UPDATE access_scopes SET ended=1 WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
-        params![key.owner, key.scope_ref, key.epoch.to_string()],
-    )?;
-    let deleted = tx.execute(
-        "DELETE FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
-        params![key.owner, key.scope_ref, key.epoch.to_string()],
-    )?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let deleted = end_scope_rows(&tx, key)?;
+    crate::db::codemode_owners::end(&tx, key)?;
+    let ledger = crate::db::call_ledger::ledger_scope(key);
+    if let Some(scope) = &ledger {
+        crate::db::call_ledger::end_scope_in(&tx, scope, crate::db::call_ledger::now_ms())?;
+    }
     tx.commit()?;
     aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
+    if ledger.is_some() {
+        crate::db::call_ledger::scope_end_committed();
+    }
     Ok(deleted)
 }
 
@@ -1256,5 +1277,207 @@ mod tests {
         insert(&conn, &worker, &grant).unwrap();
         assert!(list(&conn, &worker).unwrap().is_empty());
         assert!(!authorized(&conn, &head, &worker).unwrap());
+    }
+
+    /// Rows a scope end leaves for the ended epoch, the launch parameters a
+    /// later epoch of the same scope would receive, the ledger state of each
+    /// call, and the late-results entries the calls' runner reads afterwards
+    /// as (call key, kind, reason).
+    type EndOutcome = (
+        Vec<(&'static str, i64)>,
+        Option<serde_json::Value>,
+        Vec<(&'static str, crate::db::call_ledger::State)>,
+        Vec<(String, String, String)>,
+    );
+
+    /// How the live scope-end handler identifies the scope in the call ledger.
+    fn live_ledger_scope() -> crate::db::call_ledger::ScopeIdentity {
+        crate::db::call_ledger::ScopeIdentity {
+            owner: "reserved:prefrontal".into(),
+            scope_ref: "worker".into(),
+            scope_epoch: 5,
+        }
+    }
+
+    fn end_with(end: impl Fn(&Connection, &ScopeKey)) -> EndOutcome {
+        use crate::access_policy::ApprovalMode;
+        use subc_protocol::Principal;
+        let owner = owner_key(&Principal::Reserved {
+            module_id: "prefrontal".into(),
+        });
+        let policy = |epoch| PolicyKey {
+            project_root: "/project".into(),
+            harness: "opencode".into(),
+            session: "session".into(),
+            principal: "principal".into(),
+            owner: owner.clone(),
+            scope_ref: "worker".into(),
+            epoch,
+            preset: "default".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let scope = ScopeKey::from_policy(&policy(5));
+        register_scope(&conn, &scope, None, &Config::default()).unwrap();
+        register_worker(&conn, &scope).unwrap();
+        set_mode(&conn, &scope, ApprovalMode::Ask).unwrap();
+        let outside = crate::policy_path::policy_path(dir.path()).join("outside");
+        let grant = AccessGrant {
+            path: outside.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        materialize(
+            &conn,
+            &policy(5),
+            &serde_json::json!([{"path": outside, "mode": "read"}]),
+            &[(grant, None)],
+        )
+        .unwrap();
+        use crate::db::call_ledger::{self as ledger, Key, State};
+        const CARRIER: &str = "reserved:runner";
+        let calls = [
+            ("prepared", State::Prepared),
+            ("authorized", State::Authorized),
+            ("started", State::DispatchStarted),
+        ];
+        for (call_key, state) in calls {
+            let key = Key {
+                carrier: CARRIER.into(),
+                call_key: call_key.into(),
+            };
+            ledger::admit(&conn, &key, "digest", Some(&live_ledger_scope()), state).unwrap();
+        }
+        end(&conn, &scope);
+        let states = calls
+            .map(|(call_key, _)| {
+                let key = Key {
+                    carrier: CARRIER.into(),
+                    call_key: call_key.into(),
+                };
+                (call_key, ledger::get(&conn, &key).unwrap().unwrap().state)
+            })
+            .to_vec();
+        let page = ledger::tests::page(&conn, CARRIER, None, None, ledger::now_ms(), 1 << 20);
+        let mut entries: Vec<(String, String, String)> = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let field = |name: &str| entry[name].as_str().unwrap_or_default().to_string();
+                (field("call_key"), field("kind"), field("reason"))
+            })
+            .collect();
+        entries.sort();
+        let left = [
+            "access_grants",
+            "access_launch_params",
+            "access_materialized",
+            "access_modes",
+            "access_scope_agents",
+        ]
+        .map(|table| {
+            let count = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE scope_ref='worker' AND epoch='5'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (table, count)
+        })
+        .to_vec();
+        register_scope(
+            &conn,
+            &ScopeKey::from_policy(&policy(6)),
+            None,
+            &Config::default(),
+        )
+        .unwrap();
+        (
+            left,
+            launch_params(&conn, &policy(6)).unwrap(),
+            states,
+            entries,
+        )
+    }
+
+    #[test]
+    fn sweep_scope_end_cleans_the_same_rows_as_the_live_scope_end() {
+        // The live handler's database steps, in its order.
+        let live = end_with(|conn, key| {
+            end_scope_grants(conn, key).unwrap();
+            crate::db::codemode_owners::end(conn, key).unwrap();
+            crate::db::call_ledger::end_scope(
+                conn,
+                &live_ledger_scope(),
+                crate::db::call_ledger::now_ms(),
+            )
+            .unwrap();
+        });
+        let sweep = end_with(|conn, key| {
+            end_saved_scope(conn, key).unwrap();
+        });
+        assert!(live.0.iter().all(|(_, count)| *count == 0), "{live:?}");
+        assert_eq!(live.1, None);
+        use crate::db::call_ledger::State;
+        assert_eq!(
+            live.2,
+            [
+                ("prepared", State::Settled),
+                ("authorized", State::Settled),
+                ("started", State::DispatchStarted),
+            ]
+        );
+        let settled = |call_key: &str| {
+            (
+                call_key.to_string(),
+                "not_started".to_string(),
+                "scope_ended".to_string(),
+            )
+        };
+        // The runner's late_results read returns both never-started calls as
+        // settled by the scope end, and nothing for the call already running.
+        assert_eq!(
+            live.3
+                .iter()
+                .filter(|(_, kind, _)| kind == "not_started")
+                .cloned()
+                .collect::<Vec<_>>(),
+            [settled("authorized"), settled("prepared")]
+        );
+        assert!(live.3.iter().all(|(call_key, _, _)| call_key != "started"));
+        assert_eq!(sweep, live);
+    }
+
+    #[test]
+    fn ended_scope_tombstone_drops_its_configuration() {
+        for sweep in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+            let key = ScopeKey {
+                owner: "owner".into(),
+                scope_ref: "run".into(),
+                epoch: 3,
+            };
+            register_scope(&conn, &key, None, &Config::default()).unwrap();
+            if sweep {
+                end_saved_scope(&conn, &key).unwrap();
+            } else {
+                end_scope_grants(&conn, &key).unwrap();
+            }
+            let (config, ended): (String, i64) = conn
+                .query_row(
+                    "SELECT config, ended FROM access_scopes WHERE owner='owner' AND scope_ref='run' AND epoch='3'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((config.as_str(), ended), ("{}", 1), "sweep={sweep}");
+            assert!(scope_ended(&conn, &key).unwrap());
+            // A late registration of the ended identity cannot revive it.
+            register_scope(&conn, &key, None, &Config::default()).unwrap();
+            assert!(scope_config(&conn, &key).unwrap().is_none());
+        }
     }
 }

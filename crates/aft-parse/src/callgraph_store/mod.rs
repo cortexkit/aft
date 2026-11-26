@@ -53,7 +53,6 @@ pub const MACRO_BODY_CALL_REF_KIND: &str = "macro_body_call";
 /// parsed as Rust. Never resolved into an edge.
 pub const MACRO_MENTION_REF_KIND: &str = "macro_mention";
 pub const TOP_LEVEL_SYMBOL: &str = "<top-level>";
-const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 /// Work counters for measurement tests: source parses by the store and
 /// resolution-config reads (`package.json`, `tsconfig.json`, `Cargo.toml`).
@@ -84,7 +83,6 @@ pub enum CallGraphStoreError {
         path: PathBuf,
         project_root: PathBuf,
     },
-    Suspended(crate::build_state::BuildSuspension),
     Superseded,
     CorpusSnapshotMissing(PathBuf),
     CorpusInventoryChanged(Option<PathBuf>),
@@ -130,13 +128,6 @@ impl fmt::Display for CallGraphStoreError {
                 "callgraph path identity mismatch: {} is not under project root {}",
                 path.display(),
                 project_root.display()
-            ),
-            Self::Suspended(suspension) => write!(
-                formatter,
-                "callgraph build suspended for {} after {} deaths ({})",
-                suspension.domain.as_str(),
-                suspension.death_count,
-                suspension.reason
             ),
             Self::Superseded => {
                 write!(formatter, "callgraph store build superseded before publish")
@@ -354,18 +345,17 @@ pub trait CallGraphRead {
     fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
     fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>>;
-    /// Raw ref rows of `kind` whose short name is `short_name`, resolved or
-    /// not, at most `limit` of them in file and line order. `callers` uses it
-    /// to find macro invocations and macro facts by name. Stores that keep no
-    /// such rows answer with none.
+    /// Raw ref rows whose short name is `short_name`, resolved or not, for
+    /// each `(kind, limit)` asked: at most `limit` rows of that kind, in file
+    /// and line order. `callers` uses it to find macro invocations and macro
+    /// facts by name, every kind in one pass. Stores without such rows: none.
     fn ref_sites_named(
         &self,
-        kind: &str,
         short_name: &str,
-        limit: usize,
-    ) -> Result<Vec<StoreRefSite>> {
-        let _ = (kind, short_name, limit);
-        Ok(Vec::new())
+        kinds: &[(&str, usize)],
+    ) -> Result<Vec<Vec<StoreRefSite>>> {
+        let _ = short_name;
+        Ok(vec![Vec::new(); kinds.len()])
     }
     /// The calls written inside the `macro_rules!` template that `node`, a
     /// macro owner (`name!`), defines, resolved or not, in source order.
@@ -1185,7 +1175,7 @@ impl ResolverIndex for ProjectIndex<'_> {
             &paths,
             &self.rust_crate_roots,
         )
-        .map(|path| relative_path(&self.project_root, &path))
+        .and_then(|path| relative_path(&self.project_root, &path))
     }
 
     fn inline_scoped_target(
@@ -1549,11 +1539,10 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     }
     fn ref_sites_named(
         &self,
-        kind: &str,
         short_name: &str,
-        limit: usize,
-    ) -> Result<Vec<StoreRefSite>> {
-        (**self).ref_sites_named(kind, short_name, limit)
+        kinds: &[(&str, usize)],
+    ) -> Result<Vec<Vec<StoreRefSite>>> {
+        (**self).ref_sites_named(short_name, kinds)
     }
     fn macro_template_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         (**self).macro_template_calls_of(node)
@@ -1744,7 +1733,7 @@ fn rust_declared_module_targets(
                     module_name,
                     facts,
                 )
-                .map(|target| {
+                .and_then(|target| {
                     relative_path(
                         project_root,
                         &facts.canonical(&target).unwrap_or(target.clone()),
@@ -2914,11 +2903,10 @@ pub fn go_module_map(facts: &FactPaths<'_>) -> HashMap<String, String> {
                 for line in text.lines() {
                     let mut words = line.split_whitespace();
                     if words.next() == Some("module") {
-                        if let Some(name) = words.next() {
-                            modules.insert(
-                                name.trim_matches('"').to_string(),
-                                relative_path(facts.root, &dir),
-                            );
+                        if let Some((name, path)) =
+                            words.next().zip(relative_path(facts.root, &dir))
+                        {
+                            modules.insert(name.trim_matches('"').to_string(), path);
                         }
                     }
                 }
@@ -2993,7 +2981,7 @@ fn go_files_in_dir(facts: &FactPaths<'_>, dir: &Path, include_tests: bool) -> Ve
             (entry.kind == EntryKind::Regular
                 && path.extension().and_then(|s| s.to_str()) == Some("go")
                 && (include_tests || !path.to_string_lossy().ends_with("_test.go")))
-            .then(|| relative_path(facts.root, &path))
+            .then(|| relative_path(facts.root, &path))?
         })
         .collect::<Vec<_>>();
     files.sort();
@@ -3973,10 +3961,12 @@ fn build_workspace_crate_prefixes_with_manifests(
                         .canonical(&dir.join("src"))
                         .unwrap_or_else(|| dir.join("src")),
                 );
-                for crate_name in crate_names {
-                    prefixes
-                        .entry(crate_name)
-                        .or_insert_with(|| src_prefix.clone());
+                if let Some(src_prefix) = src_prefix {
+                    for crate_name in crate_names {
+                        prefixes
+                            .entry(crate_name)
+                            .or_insert_with(|| src_prefix.clone());
+                    }
                 }
             }
         }
@@ -4628,7 +4618,7 @@ fn module_ref_target(
         return python_module_candidates(project_root, &caller_path, module_path)
             .into_iter()
             .find(|candidate| facts.is_file(candidate))
-            .map(|path| relative_path(project_root, &path))
+            .and_then(|path| relative_path(project_root, &path))
             .filter(|path| is_indexed(path));
     }
     if Path::new(caller_file)
@@ -4651,7 +4641,7 @@ fn module_ref_target(
     }
     let caller_dir = caller_path.parent()?;
     let resolved = callgraph::resolve_module_path_with_memo(caller_dir, module_path, memo, facts)?;
-    let rel_path = relative_path(project_root, &resolved);
+    let rel_path = relative_path(project_root, &resolved)?;
     is_indexed(&rel_path).then_some(rel_path)
 }
 
@@ -4691,10 +4681,10 @@ fn module_target_from_dependencies(
     dependencies.iter().find_map(|dep| {
         let path = project_root.join(dep);
         if facts.is_file(&path) {
-            Some(relative_path(
+            relative_path(
                 project_root,
                 &facts.canonical(&path).unwrap_or(path.clone()),
-            ))
+            )
         } else {
             None
         }
@@ -4766,21 +4756,23 @@ fn module_dependencies_with_memo(
         // Keep missing candidates too, so creating a module rebinds its importers.
         return python_module_candidates(project_root, abs_path, module_path)
             .into_iter()
-            .map(|path| relative_path(project_root, &path))
+            .filter_map(|path| relative_path(project_root, &path))
             .collect();
     }
     let mut deps = rust_module_dependencies(project_root, abs_path, module_path, memo, facts);
     let caller_dir = abs_path.parent().unwrap_or(project_root);
     if let Some(resolved) =
         callgraph::resolve_module_path_with_memo(caller_dir, module_path, memo, facts)
+            .and_then(|path| relative_path(project_root, &path))
     {
-        deps.insert(relative_path(project_root, &resolved));
+        deps.insert(resolved);
     }
     if module_path.starts_with('.') {
         let base = caller_dir.join(module_path);
-        for candidate in relative_module_candidates(&base) {
-            deps.insert(relative_path(project_root, &candidate));
-        }
+        deps.extend(
+            callgraph::relative_module_candidates(&base)
+                .filter_map(|candidate| relative_path(project_root, &candidate)),
+        );
     }
     deps
 }
@@ -4845,24 +4837,28 @@ fn rust_module_candidates(
     facts: &FactPaths<'_>,
 ) -> Vec<String> {
     let mut candidates = Vec::new();
-    let rel_path = relative_path(
+    let Some(rel_path) = relative_path(
         project_root,
         &facts
             .canonical(abs_path)
             .unwrap_or_else(|| abs_path.to_path_buf()),
-    );
+    ) else {
+        return candidates;
+    };
     // A manifest can put a crate root outside src/, as ripgrep's binary does.
     // Resolve use paths from that target's directory, not from a guessed src/.
     let root_dir = memo
         .rust_crate_root_file(project_root, abs_path, facts)
         .and_then(|root| root.parent().map(Path::to_path_buf));
     let (src_prefix, path_segments) = if let Some(root_dir) = root_dir {
-        let caller_rel = relative_path(
+        let Some(caller_rel) = relative_path(
             &root_dir,
             &facts
                 .canonical(abs_path)
                 .unwrap_or_else(|| abs_path.to_path_buf()),
-        );
+        ) else {
+            return candidates;
+        };
         let path = rust_module_path_without_alias_or_use_list(module_path);
         let segments = path
             .split("::")
@@ -4872,8 +4868,11 @@ fn rust_module_candidates(
         if segments.is_empty() || matches!(segments[0], "std" | "core" | "alloc") {
             return candidates;
         }
+        let Some(prefix) = relative_path(project_root, &root_dir) else {
+            return candidates;
+        };
         (
-            relative_path(project_root, &root_dir),
+            prefix,
             rust_resolve_segments_from(rust_module_segments_for_rel(&caller_rel), &segments),
         )
     } else {
@@ -4954,21 +4953,6 @@ fn rust_push_module_dependency_candidate(
     }
 }
 
-fn relative_module_candidates(base: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if base.extension().is_some() {
-        candidates.push(base.to_path_buf());
-        return candidates;
-    }
-    for ext in JS_TS_EXTENSIONS {
-        candidates.push(base.with_extension(ext));
-    }
-    for ext in JS_TS_EXTENSIONS {
-        candidates.push(base.join(format!("index.{ext}")));
-    }
-    candidates
-}
-
 fn import_local_names(import: &ImportStatement) -> Vec<String> {
     let mut names = Vec::new();
     if let Some(default) = &import.default_import {
@@ -5042,44 +5026,8 @@ pub fn lang_label(lang: LangId) -> &'static str {
     }
 }
 
-pub fn lang_from_label(label: &str) -> Option<LangId> {
-    match label {
-        "typescript" => Some(LangId::TypeScript),
-        "tsx" => Some(LangId::Tsx),
-        "javascript" => Some(LangId::JavaScript),
-        "python" => Some(LangId::Python),
-        "rust" => Some(LangId::Rust),
-        "go" => Some(LangId::Go),
-        "c" => Some(LangId::C),
-        "cpp" => Some(LangId::Cpp),
-        "cuda" => Some(LangId::Cuda),
-        "metal" => Some(LangId::Metal),
-        "zig" => Some(LangId::Zig),
-        "csharp" => Some(LangId::CSharp),
-        "bash" => Some(LangId::Bash),
-        "html" => Some(LangId::Html),
-        "markdown" => Some(LangId::Markdown),
-        "solidity" => Some(LangId::Solidity),
-        "scss" => Some(LangId::Scss),
-        "vue" => Some(LangId::Vue),
-        "json" => Some(LangId::Json),
-        "scala" => Some(LangId::Scala),
-        "java" => Some(LangId::Java),
-        "ruby" => Some(LangId::Ruby),
-        "kotlin" => Some(LangId::Kotlin),
-        "swift" => Some(LangId::Swift),
-        "php" => Some(LangId::Php),
-        "lua" => Some(LangId::Lua),
-        "perl" => Some(LangId::Perl),
-        "yaml" => Some(LangId::Yaml),
-        "pascal" => Some(LangId::Pascal),
-        "r" => Some(LangId::R),
-        "groovy" => Some(LangId::Groovy),
-        "objc" => Some(LangId::ObjC),
-        "toml" => Some(LangId::Toml),
-        _ => None,
-    }
-}
+mod language;
+pub use language::lang_from_label;
 
 pub fn normalize_file_path(project_root: &Path, path: &Path) -> Result<PathBuf> {
     let full_path = if path.is_relative() {
@@ -5215,17 +5163,7 @@ fn canonicalize_missing_path(path: &Path) -> PathBuf {
 }
 }
 
-pub fn relative_path(project_root: &Path, path: &Path) -> String {
-    if let Ok(stripped) = path.strip_prefix(project_root) {
-        return stripped.to_string_lossy().replace('\\', "/");
-    }
-    let canon_root = canonicalize_path(project_root);
-    let canon_path = canonicalize_path(path);
-    if let Ok(stripped) = canon_path.strip_prefix(&canon_root) {
-        return stripped.to_string_lossy().replace('\\', "/");
-    }
-    canon_path.to_string_lossy().replace('\\', "/")
-}
+pub use facts::relative_path;
 
 fn ref_id(parts: &[&str]) -> String {
     let joined = parts.join("\0");

@@ -1,0 +1,18 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/tests.rs",
+    "crates/aft/src/search_b2/plan_table.rs",
+    "crates/aft/src/search_b2/variants.rs",
+    "crates/aft/src/search_state/rerank/onnx.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "These repairs change embedding and runtime recovery, cache lifetimes, and work done to compute the same per-file scores and reranker inputs. They do not change lane routing, scoring, or ranked rows."
+}

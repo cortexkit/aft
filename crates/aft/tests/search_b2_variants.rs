@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 
 use aft::commands::semantic_search::extensions::{SearchExtensions, Token, TokenVariant};
-use aft::search_b2::variants::{
-    contributing_variants, generate_variants, variants_footer, OrderedVariantPipeline,
-    MAX_QUERY_VARIANTS,
-};
+use aft::search_b2::variants::{generate_variants, OrderedVariantPipeline, MAX_QUERY_VARIANTS};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -237,32 +234,12 @@ fn ready_backend_cases_ignore_definition_presence_and_never_embed() {
             observed_ready_definition_states.push(case.definition_present);
         } else {
             assert!(generated.is_empty(), "{}", case.name);
-            assert!(variants_footer(&generated, &admitted).is_none());
         }
     }
 
     observed_ready_definition_states.sort_unstable();
     observed_ready_definition_states.dedup();
     assert_eq!(observed_ready_definition_states, [false, true]);
-}
-
-#[test]
-fn footer_contains_only_contributors_in_generation_order() {
-    let case = backend_cases()
-        .into_iter()
-        .find(|case| case.name == "only admitted variants reach the footer")
-        .unwrap();
-    let mut embedding = EmbeddingProbe::default();
-    let (generated, admitted) = run_variants_lane(&case, &mut embedding);
-
-    assert_eq!(
-        contributing_variants(&generated, &admitted),
-        ["http-server", "HTTP_SERVER"]
-    );
-    assert_eq!(
-        variants_footer(&generated, &admitted).as_deref(),
-        Some("variants applied: http-server, HTTP_SERVER")
-    );
 }
 
 #[test]

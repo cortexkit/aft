@@ -111,7 +111,6 @@ pub mod cause {
     /// AFT does not build one (see `semantic_admission`).
     pub const SEMANTIC_NOT_OPENED: &str = "not_opened";
     /// The callgraph builder was suspended after repeated build deaths.
-    pub const BUILD_SUSPENDED: &str = "build_suspended";
     /// The callgraph build was refused for this configure generation.
     pub const CALLGRAPH_BUILD_DENIED: &str = "callgraph_build_denied";
     /// A read-only checkout (a linked worktree) shares a callgraph store that
@@ -447,7 +446,6 @@ pub fn callgraph_access_observation(
         CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => {
             IndexObservation::building()
         }
-        CallgraphStoreAccess::Suspended(_) => IndexObservation::unavailable(cause::BUILD_SUSPENDED),
         CallgraphStoreAccess::Unavailable | CallgraphStoreAccess::Error(_) => {
             match observed_index_status(ctx, policy, IndexPlane::Callgraph) {
                 observation if observation.effective == IndexEffective::Unavailable => observation,

@@ -75,8 +75,12 @@ jobs:
         run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Keep the fallback cache key stable across manifest edits. The lane
+        # and runner image stay in the key; Cargo rebuilds stale artifacts.
         with:
-          shared-key: unit-linux
+          prefix-key: aft-rust-v1
+          shared-key: linux-archive-test-wasm-hooks
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -210,7 +214,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: unit-linux
+          prefix-key: aft-rust-v1
+          shared-key: linux-conformance-dev-test-wasm-timing-hooks
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -306,14 +312,17 @@ jobs:
           node scripts/release-gate-v049.mjs --check-inputs
 
       - name: Cargo build (debug — needed by plugin e2e tests)
+        # Build all enabled binary targets, including hashline-schema-artifact.
         run: cargo build --features wasm-grammars -p agent-file-tools
 
       # release-gate --check-inputs validates JS artifacts without Cargo.
       # This full check also compares the committed hashline schema to its Rust
       # generator, preventing stale native schemas from landing on main while
-      # reusing the debug generator already built with the test binaries.
+      # reusing the generator from the debug build rather than invoking Cargo again.
       - name: Native generated-schema byte gate
         run: bun packages/opencode-plugin/scripts/build-tool-schemas.ts --check
+        env:
+          AFT_HASHLINE_SCHEMA_GENERATOR: ${{ github.workspace }}/target/debug/hashline-schema-artifact
 
       - name: Rust test gate (watcher isolated, feature-enabled conformance)
         run: ./scripts/rust-test-gate.sh
@@ -409,7 +418,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: unit-linux
+          prefix-key: aft-rust-v1
+          shared-key: linux-plugin-e2e-dev-wasm
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: oven-sh/setup-bun@v2
@@ -501,7 +512,8 @@ jobs:
   worker-gh-read-landlock:
     name: Worker GitHub reads (required Landlock)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    # The Ubuntu 24.04 runner kernel meets the required Landlock ABI v3 floor.
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
       AFT_REQUIRE_LANDLOCK: "1"
@@ -515,6 +527,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          prefix-key: aft-rust-v1
+          shared-key: linux-worker-landlock-dev-test-wasm-hooks
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build real AFT for the worker-read jail gate
@@ -570,7 +585,7 @@ jobs:
   sandbox-landlock-probes:
     name: Sandbox real-kernel Landlock probes
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -583,6 +598,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          prefix-key: aft-rust-v1
+          shared-key: linux-sandbox-landlock-dev-test-wasm-timing-hooks
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -639,7 +657,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-storm-off
+          prefix-key: aft-rust-v1
+          shared-key: linux-storm-ci-storm-off-wasm-hooks
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -667,7 +687,9 @@ jobs:
         run: bash scripts/ci-sccache-start.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-storm-thin
+          prefix-key: aft-rust-v1
+          shared-key: linux-storm-ci-storm-thin-wasm-hooks
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-nextest
@@ -710,7 +732,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: unit-linux-msrv
+          prefix-key: aft-rust-v1
+          shared-key: linux-msrv-dev-check-wasm-hooks
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 

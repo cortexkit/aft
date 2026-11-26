@@ -137,6 +137,38 @@ async fn settings_review_classifies_live_and_restart_fields() {
     }
 }
 
+#[tokio::test]
+async fn settings_review_classifies_harness_overrides_like_their_root_field() {
+    let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
+    let candidate = ConfigLayerSnapshot::file(
+        "aft",
+        ConfigLayer::User,
+        "/config/aft.jsonc",
+        Some(
+            br#"{"harnesses":{"pi":{"format_on_edit":false,"disabled_tools":["search"]}}}"#
+                .to_vec(),
+        ),
+    );
+    let request = ConfigReviewRequest::new(0, vec![candidate], None);
+    let reply = review::response(&schema, &frame(FrameType::Request, 8, json!(request)))
+        .await
+        .unwrap()
+        .unwrap();
+    let response: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+    assert!(response.refusals.is_empty(), "{:?}", response.refusals);
+    for (path, kind) in [
+        ("/harnesses/pi/disabled_tools", ApplyKind::ModuleRestart),
+        ("/harnesses/pi/format_on_edit", ApplyKind::Live),
+    ] {
+        let field = response
+            .fields
+            .iter()
+            .find(|field| field.path.starts_with(path))
+            .unwrap_or_else(|| panic!("{path} missing from the review"));
+        assert_eq!(field.apply, kind, "{path}");
+    }
+}
+
 fn frame(kind: FrameType, corr: u64, body: Value) -> Frame {
     Frame::build(
         kind,
@@ -332,6 +364,79 @@ async fn exercise_bootstrap() {
     let mut report = subc_protocol::session::HealthReport::ok();
     note_health(&mut report, Some(&session));
     assert_eq!(report.detail.as_deref(), Some(PENDING_HEALTH));
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_first_declaration_timeout_is_retried_without_a_push() {
+    tokio::time::timeout(Duration::from_secs(600), async {
+        let (writer, mut written) = mpsc::channel(16);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        let replies = readiness::PendingControlReplies::default();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let control = readiness::DaemonControl::new(
+            writer.clone(),
+            metrics.clone(),
+            PROTOCOL_VERSION,
+            vec![],
+            vec![],
+            replies.clone(),
+            2,
+        );
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            crate::config::Config::default(),
+        ));
+        let schema = sample_schema();
+        let declaration = ConfigDeclareRequest::new(schema.clone(), "/config/aft.jsonc", vec![]);
+        let (boot, ()) = tokio::join!(
+            startup::drive_first_view(
+                &control,
+                &ctx,
+                Some((declaration, Schema::new(schema).unwrap())),
+                &mut incoming_rx,
+                &replies,
+                &writer,
+                &metrics
+            ),
+            async {
+                // The first declaration is never answered, so it times out on
+                // the paused clock; no `config.changed` push follows.
+                let (_, first) = next(&mut written).await;
+                assert_eq!(first["op"], "config.declare");
+                let (corr, second) = next(&mut written).await;
+                assert_eq!(second["op"], "config.declare", "{second}");
+                incoming(
+                    &incoming_tx,
+                    frame(
+                        FrameType::Response,
+                        corr,
+                        json_as(golden!("config_declare_reply")),
+                    ),
+                )
+                .await;
+                let (corr, get) = next(&mut written).await;
+                assert_eq!(get, json_as::<Value>(golden!("config_get_request")));
+                // A `config_gated` refusal (no approved settings yet) is not
+                // transient: the module waits for a `config.changed` push
+                // and sends nothing more until the connection closes.
+                incoming(
+                    &incoming_tx,
+                    frame(
+                        FrameType::Error,
+                        corr,
+                        json_as(golden!("config_get_error_gated")),
+                    ),
+                )
+                .await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                assert!(written.try_recv().is_err());
+                drop(incoming_tx);
+            },
+        );
+        assert!(matches!(boot, Ok(Err(ModuleLoopExit::ConnectionLost))));
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

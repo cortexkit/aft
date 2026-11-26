@@ -214,6 +214,15 @@ pub fn sync_file(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Flush an open source file or directory and record the successful sync.
+/// A source file needs the configured flush before rename, even when the
+/// caller batches device flushes for backups.
+pub fn sync_immediately(file: &File, path: &Path, kind: EventKind) -> io::Result<()> {
+    full_sync(file, path)?;
+    record(kind, path);
+    Ok(())
+}
+
 pub fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(any(test, feature = "test-support"))]
     if FAIL_DIRECTORY_SYNC.with(|slot| {

@@ -27,6 +27,8 @@ use crate::github_read::{
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
+mod unranged;
+
 const DEFAULT_LIMIT: u32 = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024; // 50KB output cap
@@ -35,6 +37,10 @@ const MAX_DIRECTORY_ENTRIES: usize = 1000;
 const MAX_DIRECTORY_SCAN: usize = 10_000;
 const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const MEDIA_MAGIC_BYTES: usize = 16;
+#[cfg(test)]
+thread_local! {
+    static UNRANGED_READ_RETENTION: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
 const MAX_INLINE_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2; // 4.5 MiB encoded payload cap
 const MAX_INLINE_IMAGE_DIMENSION: u32 = 1024;
 const MIN_FITTED_IMAGE_DIMENSION: u32 = 256;
@@ -892,6 +898,7 @@ fn start_past_end_error(id: &str, start_line: u64, total_lines: u32) -> Response
 
 fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response {
     let byte_size = bytes.len();
+    crate::run_tool_call::read_trace::note_file(byte_size as u64);
     if let Some(media) = sniff_media(&bytes[..bytes.len().min(MEDIA_MAGIC_BYTES)]) {
         if byte_size as u64 > MAX_FILE_READ_BYTES {
             return media_file_too_large_response(&req.id, byte_size as u64);
@@ -1041,14 +1048,18 @@ pub(crate) fn github_read_engine(ctx: &AppContext) -> Arc<GithubReadEngine> {
     let mut engines = GITHUB_READ_ENGINES
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    Arc::clone(engines.entry(database_path.clone()).or_insert_with(|| {
+    let engine = Arc::clone(engines.entry(database_path.clone()).or_insert_with(|| {
         Arc::new(GithubReadEngine::new(
-            sqlite_cache_store(database_path),
+            sqlite_cache_store(database_path.clone()),
             Arc::new(GhCliFetcher::system()),
             Arc::new(ReqwestGithubImageDownloader),
             Arc::new(SystemGithubReadClock),
         ))
-    }))
+    }));
+    drop(engines);
+    // The cache works through the context's own connection when it has one.
+    engine.attach_resident_connection(ctx.app().db_for_path(&database_path).as_ref());
+    engine
 }
 
 fn github_read_selector(req: &RawRequest) -> (GithubReadSelector, usize) {
@@ -1167,13 +1178,32 @@ fn github_read_response(
             page.truncated,
         )
     } else {
-        let lines_read = completion.content.lines().count();
+        // A start past the end selects nothing. An empty success would read
+        // as "those lines exist and are empty", as for file reads.
+        if start_line > completion.total_lines && completion.total_lines > 0 {
+            return Response::error(
+                &req.id,
+                "invalid_range",
+                format!(
+                    "invalid_range: startLine {start_line} is past the end of the document ({total} lines); no lines selected. Use a start line between 1 and {total}.",
+                    total = completion.total_lines
+                ),
+            );
+        }
+        // A page cut at the byte ceiling ends with the truncation notice,
+        // which is not a document line.
+        let lines_read = completion
+            .content
+            .lines()
+            .count()
+            .saturating_sub(usize::from(completion.page_cut_by_size));
         let actual_end = start_line.saturating_add(lines_read.saturating_sub(1));
         (
             start_line,
             lines_read,
             actual_end,
-            lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines),
+            completion.page_cut_by_size
+                || lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines),
         )
     };
     let attachments = if crate::context::call_context::active() {
@@ -1203,7 +1233,7 @@ fn github_read_response(
     let mut data = serde_json::json!({
         "content": completion.content,
         "attachments": attachments,
-        "complete": !truncated,
+        "complete": !truncated && !completion.document_gap,
         "total_lines": completion.total_lines,
         "lines_read": lines_read,
         "start_line": start_line,
@@ -1342,7 +1372,8 @@ pub(crate) fn handle_github_outline(req: &RawRequest, ctx: &AppContext, target: 
             &req.id,
             serde_json::json!({
                 "text": completion.content,
-                "complete": matches!(completion.freshness, crate::github_read::GithubReadFreshness::Fetched),
+                "complete": matches!(completion.freshness, crate::github_read::GithubReadFreshness::Fetched)
+                    && !completion.document_gap,
             }),
         ),
         Err(error) => Response::error(&req.id, error.code(), error.to_string()),
@@ -1774,7 +1805,8 @@ fn handle_revision_read(req: &RawRequest, ctx: &AppContext, reference: &str) -> 
         Ok(staged) => staged,
         Err(refusal) => return refusal,
     };
-    let mut response = handle_read_path(req, &staged, false, &mut None).into_response(&req.id);
+    let mut response =
+        handle_read_path(req, &staged, false, &mut None, &mut None).into_response(&req.id);
     session.annotate(&mut response);
     response
 }
@@ -1967,7 +1999,9 @@ fn handle_read_local(
         #[cfg(test)]
         IMAGE_PROCESSING_DELAY.with(|value| value.set(image_delay));
         let mut captured = None;
-        let response = handle_read_path(&owned_req, &path, capture_source, &mut captured);
+        let mut size = None;
+        let response =
+            handle_read_path(&owned_req, &path, capture_source, &mut captured, &mut size);
         #[cfg(test)]
         let observations = (
             crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.get()),
@@ -1975,10 +2009,10 @@ fn handle_read_local(
         );
         #[cfg(not(test))]
         let observations = ();
-        Ok((response, captured, observations))
+        Ok((response, captured, observations, size))
     });
     match result {
-        Ok((response, captured, _observations)) => {
+        Ok((response, captured, _observations, size)) => {
             #[cfg(test)]
             {
                 crate::hashline::snapshot::SOURCE_READS
@@ -1986,6 +2020,9 @@ fn handle_read_local(
                 LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(bytes.get() + _observations.1));
             }
             *captured_source = captured;
+            if let Some(size) = size {
+                crate::run_tool_call::read_trace::note_file(size);
+            }
             // Decoding, resizing and base64 encoding are CPU work, not OS access.
             // Run them after the filesystem helper returns so a slow image uses
             // the image-processing timeout rather than the filesystem deadline.
@@ -2000,6 +2037,7 @@ fn handle_read_path(
     path: &Path,
     capture_source: bool,
     captured_source: &mut Option<CapturedRead>,
+    observed_size: &mut Option<u64>,
 ) -> PreparedPathRead {
     let file = path.to_string_lossy();
     // Check existence
@@ -2034,6 +2072,7 @@ fn handle_read_path(
             "read: only regular files and directories can be read",
         ));
     }
+    *observed_size = Some(metadata.len());
 
     let magic = match read_magic(path) {
         Ok(magic) => magic,
@@ -2120,22 +2159,10 @@ fn handle_text_or_binary_read(
         .then(|| crate::hashline::snapshot::read_source(path).ok())
         .flatten()
         .filter(|source| source.has_complete_bytes());
-    let fallback_bytes;
-    let raw_bytes = if let Some(source) = &read_source {
-        source.bytes()
-    } else {
-        fallback_bytes = match crate::bounded_io::read(path, None) {
-            Ok(b) => b,
-            Err(e) => {
-                return Response::error(
-                    &req.id,
-                    "io_error",
-                    format!("read: failed to read file: {}", e),
-                );
-            }
-        };
-        &fallback_bytes
+    let Some(source) = read_source else {
+        return unranged::read(req, path, limit);
     };
+    let raw_bytes = source.bytes();
 
     let byte_size = raw_bytes.len();
 
@@ -2169,39 +2196,36 @@ fn handle_text_or_binary_read(
     };
 
     #[cfg(test)]
-    let skip_render = read_source.is_some() && !LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
+    let skip_render = !LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
     #[cfg(not(test))]
-    let skip_render = read_source.is_some();
+    let skip_render = true;
     let response = render_text_read(
         req,
         content,
+        unranged::count_lines(raw_bytes),
         byte_size,
         start_line,
         explicit_end_line,
         limit,
         skip_render,
     );
-    if let Some(source) = read_source {
-        *captured_source = Some(CapturedRead {
-            path: path.to_path_buf(),
-            source,
-        });
-    }
+    *captured_source = Some(CapturedRead {
+        path: path.to_path_buf(),
+        source,
+    });
     response
 }
 
 fn render_text_read(
     req: &RawRequest,
     content: &str,
+    total_lines: u32,
     byte_size: usize,
     start_line: u32,
     explicit_end_line: Option<u64>,
     limit: u32,
     skip_render: bool,
 ) -> Response {
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len() as u32;
-
     let end_line = explicit_end_line.map(|v| v as u32).unwrap_or_else(|| {
         start_line
             .saturating_add(limit)
@@ -2212,10 +2236,10 @@ fn render_text_read(
     // Clamp to actual line count. `.max(start_idx)` keeps the slice below
     // from panicking; inverted windows were already refused above, so it
     // never turns a real request into an empty one.
-    let start_idx = (start_line.saturating_sub(1) as usize).min(lines.len());
-    let end_idx = (end_line as usize).min(lines.len()).max(start_idx);
+    let start_idx = (start_line.saturating_sub(1) as usize).min(total_lines as usize);
+    let end_idx = (end_line as usize).min(total_lines as usize).max(start_idx);
 
-    if start_idx >= lines.len() {
+    if start_idx >= total_lines as usize {
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -2240,7 +2264,12 @@ fn render_text_read(
 
     let line_num_width = format!("{}", end_idx).len();
 
-    for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
+    for (i, line) in content
+        .lines()
+        .skip(start_idx)
+        .take(end_idx - start_idx)
+        .enumerate()
+    {
         let line_num = start_idx + i + 1; // 1-based
         let (display_text, truncated_line) = if line.len() > MAX_LINE_LENGTH {
             // Find a safe UTF-8 boundary at or before MAX_LINE_LENGTH to avoid
@@ -2248,7 +2277,7 @@ fn render_text_read(
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
             (&line[..safe_end], true)
         } else {
-            (*line, false)
+            (line, false)
         };
         let display_size = line_num_width
             + 2
@@ -2609,15 +2638,6 @@ fn handle_streaming_range_read(
 
 /// Handle directory listing.
 fn handle_directory(req: &RawRequest, path: &Path) -> Response {
-    // This server-owned field lets transparent bash rewrites preserve `ls`
-    // visibility. Direct read calls omit it and retain the existing show-all default.
-    let include_hidden = req
-        .params
-        .get("include_hidden")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
-    let mut entries: Vec<String> = Vec::new();
-
     let read_dir = match fs::read_dir(path) {
         Ok(rd) => rd,
         Err(e) => {
@@ -2628,28 +2648,63 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
             );
         }
     };
+    handle_directory_entries(
+        req,
+        read_dir.map(|entry| {
+            entry.map(|entry| {
+                (entry.path(), entry.file_name(), move || {
+                    entry.file_type().map(|ty| ty.is_dir())
+                })
+            })
+        }),
+    )
+}
+
+fn handle_directory_entries<F: FnOnce() -> std::io::Result<bool>>(
+    req: &RawRequest,
+    read_dir: impl Iterator<Item = std::io::Result<(PathBuf, std::ffi::OsString, F)>>,
+) -> Response {
+    // When Bash translates an `ls` call into a read, carry over its hidden-file
+    // setting. Direct read calls omit this server-owned field and show all entries.
+    let include_hidden = req
+        .params
+        .get("include_hidden")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let mut entries: Vec<String> = Vec::new();
 
     let mut examined = 0;
     let mut enumeration_cut = false;
+    let mut enumeration_errors = 0;
+    let mut type_errors = 0;
+    let mut first_error = None;
     for entry_result in read_dir.take(MAX_DIRECTORY_SCAN + 1) {
         examined += 1;
         if examined > MAX_DIRECTORY_SCAN {
             enumeration_cut = true;
             break;
         }
-        let entry = match entry_result {
+        let (path, name, is_dir) = match entry_result {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(error) => {
+                enumeration_errors += 1;
+                first_error.get_or_insert(error);
+                continue;
+            }
         };
-        if crate::watcher_backend::flush::is_marker_path(&entry.path()) {
+        if crate::watcher_backend::flush::is_marker_path(&path) {
             continue;
         }
 
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = name.to_string_lossy().into_owned();
         if !include_hidden && name.starts_with('.') {
             continue;
         }
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let is_dir = is_dir().unwrap_or_else(|error| {
+            type_errors += 1;
+            first_error.get_or_insert(error);
+            false
+        });
 
         if is_dir {
             entries.push(format!("{}/", name));
@@ -2689,10 +2744,11 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
     let skip = start.saturating_sub(1).min(total as u64) as usize;
     entries = entries.into_iter().skip(skip).take(count).collect();
     let shown = entries.len();
-    let truncated = enumeration_cut || shown < total;
+    let enumeration_incomplete = enumeration_cut || enumeration_errors > 0;
+    let truncated = enumeration_incomplete || type_errors > 0 || shown < total;
     let envelope =
-        crate::list_surfaces::read::build_directory_envelope(shown, total, enumeration_cut);
-    let offset_note = (start > total as u64 && !enumeration_cut && start > 1)
+        crate::list_surfaces::read::build_directory_envelope(shown, total, enumeration_incomplete);
+    let offset_note = (start > total as u64 && !enumeration_incomplete && start > 1)
         .then(|| format!("offset past end: offset {start} exceeds {total} entries"));
     // Put the offset-past-end note before the trailer so the final line keeps its standard format.
     let mut trailer_text = offset_note.clone().unwrap_or_default();
@@ -2717,10 +2773,15 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
         "truncated": truncated,
         "total_entries": total,
         "entries_shown": shown,
-        "total_entries_exact": !enumeration_cut,
+        "total_entries_exact": !enumeration_incomplete,
         "entries_examined": examined,
         "enumeration_gap": enumeration_cut.then_some("directory entry budget; narrow: subdirectory"),
     });
+    if let Some(error) = first_error {
+        data["enumeration_gap"] = format!("read: failed to read directory: {error}").into();
+        data["enumeration_errors"] = enumeration_errors.into();
+        data["type_errors"] = type_errors.into();
+    }
     if let Some(note) = offset_note {
         data["offset_note"] = note.into();
     }
@@ -2732,6 +2793,34 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edit_review_gpt_9_directory_listing_discloses_item_and_type_errors() {
+        use std::io;
+
+        let req =
+            serde_json::from_value(serde_json::json!({"id":"gaps", "command":"read"})).unwrap();
+        let failed_type = || Err(io::Error::other("type lookup failed"));
+        let directory = || Ok(true);
+        for item_gap in [false, true] {
+            let mut items: Vec<io::Result<(_, _, fn() -> io::Result<bool>)>> = vec![
+                Ok(("/healthy".into(), "healthy".into(), directory)),
+                Ok(("/unknown".into(), "unknown".into(), failed_type)),
+            ];
+            if item_gap {
+                items.push(Err(io::Error::other("enumeration failed")));
+            }
+            let response = super::handle_directory_entries(&req, items.into_iter());
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(response.data["truncated"], true);
+            assert_eq!(response.data["total_entries_exact"], !item_gap);
+            assert_eq!(response.data["type_errors"], 1);
+            assert_eq!(response.data["enumeration_errors"], usize::from(item_gap));
+            assert_eq!(response.data["entries"][0], "healthy/");
+            assert_eq!(response.data["entries"][1], "unknown");
+        }
+    }
+
     #[test]
     fn bash_flush_markers_are_not_directory_entries() {
         let root = tempfile::tempdir().unwrap();
@@ -2758,6 +2847,118 @@ mod tests {
     use crate::context::default_language_provider_factory;
 
     #[test]
+    fn edit_review_opus_7_unranged_read_retains_only_the_rendered_window() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("many-lines.txt");
+        let line = "🦀".repeat(250) + "\r\n";
+        let content = line.repeat(10_000);
+        std::fs::write(&file, &content).unwrap();
+        let req = serde_json::from_value(serde_json::json!({"id":"retention", "command":"read"}))
+            .unwrap();
+        super::UNRANGED_READ_RETENTION.with(|retention| retention.set((0, 0)));
+        let response =
+            super::handle_text_or_binary_read(&req, &file, content.len() as u64, false, &mut None);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["total_lines"], 10_000);
+        assert_eq!(response.data["lines_read"], 50);
+        assert_eq!(response.data["truncated"], true);
+        let (lines, bytes) = super::UNRANGED_READ_RETENTION.with(|retention| retention.get());
+        assert!((50..=56).contains(&lines), "retained {lines} lines");
+        assert!(
+            (50_000..=100_000).contains(&bytes),
+            "retained {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn github_read_size_cut_or_fetch_gap_is_never_reported_complete() {
+        let request = RawRequest {
+            id: "github-cut".to_string(),
+            command: "read".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({ "file": "issue://7" }),
+        };
+        let completion = |content: &str, page_cut_by_size, document_gap| GithubReadCompletion {
+            content: content.to_string(),
+            total_lines: 2,
+            freshness: crate::github_read::GithubReadFreshness::Fetched,
+            attachments: Vec::new(),
+            document: None,
+            diff_page: None,
+            page_cut_by_size,
+            document_gap,
+        };
+
+        let cut = github_read_response(
+            &request,
+            completion(
+                "line one\n... (output truncated at 50KB, use start_line/end_line to read sections)\n",
+                true,
+                false,
+            ),
+            1,
+        );
+        assert_eq!(cut.data["complete"], false);
+        assert_eq!(cut.data["truncated"], true);
+        assert_eq!(cut.data["lines_read"], 1);
+        assert_eq!(cut.data["end_line"], 1);
+
+        let gap =
+            github_read_response(&request, completion("line one\nline two\n", false, true), 1);
+        assert_eq!(gap.data["complete"], false);
+        assert_eq!(gap.data["lines_read"], 2);
+
+        let whole = github_read_response(
+            &request,
+            completion("line one\nline two\n", false, false),
+            1,
+        );
+        assert_eq!(whole.data["complete"], true);
+    }
+
+    #[test]
+    fn github_read_page_past_the_end_is_refused_not_reported_complete() {
+        let request = RawRequest {
+            id: "github-past-end".to_string(),
+            command: "read".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({ "file": "issue://7", "start_line": 3 }),
+        };
+        let canonical = "line one\nline two\n";
+        let completion = |start_line| GithubReadCompletion {
+            content: crate::github_read::apply_selector(
+                canonical,
+                crate::github_read::GithubReadSelector::LineRange {
+                    start_line,
+                    end_line: None,
+                    limit: 2000,
+                },
+            ),
+            total_lines: 2,
+            freshness: crate::github_read::GithubReadFreshness::Fetched,
+            attachments: Vec::new(),
+            document: None,
+            diff_page: None,
+            page_cut_by_size: false,
+            document_gap: false,
+        };
+
+        let response = github_read_response(&request, completion(3), 3);
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(response.data["code"], "invalid_range");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.contains("(2 lines)"), "{message}");
+
+        // The last line itself is still an ordinary page.
+        let response = github_read_response(&request, completion(2), 2);
+        assert!(response.success);
+        assert_eq!(response.data["content"], "line two\n");
+        assert_eq!(response.data["end_line"], 2);
+    }
+
+    #[test]
     fn github_read_response_preserves_engine_text_and_attachment_metadata() {
         let _decoder_guard = image_decoder_test_guard();
         let request = RawRequest {
@@ -2780,6 +2981,8 @@ mod tests {
                 }],
                 document: None,
                 diff_page: None,
+                page_cut_by_size: false,
+                document_gap: false,
             },
             1,
         );
@@ -2837,6 +3040,8 @@ mod tests {
             attachments: images.clone(),
             document: None,
             diff_page: None,
+            page_cut_by_size: false,
+            document_gap: false,
         };
         let legacy = github_read_response(&request, completion(), 1);
         assert!(legacy.success);
@@ -2893,6 +3098,8 @@ mod tests {
             attachments: Vec::new(),
             document: None,
             diff_page: None,
+            page_cut_by_size: false,
+            document_gap: false,
         };
         assert!(github_read_response(&request, completion(), 1).success);
         let _budget = crate::context::call_context::enter(true);
@@ -2925,6 +3132,8 @@ mod tests {
             }],
             document: None,
             diff_page: None,
+            page_cut_by_size: false,
+            document_gap: false,
         };
         let _budget = crate::context::call_context::enter(true);
         let _io = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
@@ -3754,7 +3963,7 @@ mod github_deferred_deadline_tests {
     use crate::github_read::{
         DownloadedGithubImage, GithubDocument, GithubFetchRequest, GithubFetcher,
         GithubImageDownloader, GithubReadCacheStore, GithubReadClock, GithubReadError,
-        GithubResourceKind,
+        GithubReadFreshness, GithubReadRequest, GithubResourceKind,
     };
 
     /// A cache that always holds a copy of the requested resource.
@@ -3767,12 +3976,19 @@ mod github_deferred_deadline_tests {
         ) -> Result<Option<GithubReadCacheEntry>, String> {
             Ok(Some(GithubReadCacheEntry {
                 canonical_text: "# Cached issue\n".to_string(),
+                document_gap: Some(false),
                 fetched_at_ms: 1_234,
                 updated_at_ms: 1_234,
             }))
         }
 
-        fn upsert(&self, _key: &GithubReadCacheKey, _text: &str, _at: i64) -> Result<(), String> {
+        fn upsert(
+            &self,
+            _key: &GithubReadCacheKey,
+            _text: &str,
+            _at: i64,
+            _document_gap: bool,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -3822,6 +4038,139 @@ mod github_deferred_deadline_tests {
         fn now_ms(&self) -> i64 {
             2_000
         }
+    }
+
+    struct FixtureFetch(Result<GithubDocument, GithubReadError>);
+
+    impl GithubFetcher for FixtureFetch {
+        fn fetch(&self, _request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+            self.0.clone()
+        }
+    }
+
+    fn assert_cached_read_completeness(
+        document: GithubDocument,
+        live_complete: bool,
+        legacy_rewrite: Option<&str>,
+        cached_complete: bool,
+    ) {
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("aft.db");
+        let config = crate::config::GithubConfig {
+            read: true,
+            ..Default::default()
+        };
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "cached-read",
+            "command": "read",
+            "file": "pr://owner/repo/1",
+        }))
+        .unwrap();
+        let start = |result| {
+            let engine = GithubReadEngine::new(
+                sqlite_cache_store(&database),
+                Arc::new(FixtureFetch(result)),
+                Arc::new(NoImages),
+                Arc::new(FixedClock),
+            );
+            let request =
+                GithubReadRequest::parse("pr://owner/repo/1", "/fixture", "identity", None)
+                    .unwrap();
+            let GithubReadStart::Deferred(deferred) = engine
+                .start(&config, request, GithubReadSelector::default())
+                .unwrap()
+            else {
+                panic!("read must attempt a live fetch");
+            };
+            deferred
+        };
+        let assert_response = |completion: GithubReadCompletion, freshness, expected_complete| {
+            assert_eq!(completion.freshness, freshness);
+            let response = github_read_response(&req, completion, 1);
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["truncated"], false);
+            assert_eq!(response.data["complete"], expected_complete);
+            response
+        };
+
+        let live = start(Ok(document))
+            .wait_until(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_response(live, GithubReadFreshness::Fetched, live_complete);
+
+        if let Some(text) = legacy_rewrite {
+            // The older upsert updates canonical_text without refreshing its gap metadata.
+            let conn = crate::db::open(&database).unwrap();
+            assert_eq!(
+                conn.execute("UPDATE github_read_cache SET canonical_text = ?1", [text])
+                    .unwrap(),
+                1,
+            );
+        }
+
+        let (receiver, late) =
+            start(Err(GithubReadError::FetchFailed("offline".into()))).into_parts();
+        for cached in [
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            late.answer(Duration::from_secs(1)).unwrap(),
+        ] {
+            let response =
+                assert_response(cached, GithubReadFreshness::CachedFallback, cached_complete);
+            if let Some(text) = legacy_rewrite {
+                assert!(response.data["content"].as_str().unwrap().ends_with(text));
+            }
+        }
+    }
+
+    fn fixture_pull_request() -> GithubDocument {
+        GithubDocument {
+            repository: "owner/repo".into(),
+            kind: crate::github_read::GithubDocumentKind::PullRequest,
+            number: 1,
+            title: "Fixture pull request".into(),
+            state: "OPEN".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn github_read_cached_fallback_keeps_fetch_gaps_incomplete() {
+        assert_cached_read_completeness(
+            GithubDocument {
+                timeline_cut_at_bytes: Some(100),
+                ..fixture_pull_request()
+            },
+            false,
+            None,
+            false,
+        );
+        assert_cached_read_completeness(
+            GithubDocument {
+                review_pages_cut_after: Some(1),
+                ..fixture_pull_request()
+            },
+            false,
+            None,
+            false,
+        );
+    }
+
+    #[test]
+    fn github_read_cached_fallback_keeps_whole_documents_complete() {
+        assert_cached_read_completeness(fixture_pull_request(), true, None, true);
+    }
+
+    #[test]
+    fn github_read_cached_fallback_rejects_metadata_after_an_older_write() {
+        assert_cached_read_completeness(
+            fixture_pull_request(),
+            true,
+            Some("# Pull request cached by an older build\n"),
+            false,
+        );
     }
 
     #[test]

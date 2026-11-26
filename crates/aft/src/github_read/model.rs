@@ -39,6 +39,20 @@ pub struct GithubDocument {
     pub review_decision: Option<String>,
     /// Timeline events selected from GitHub's issue timeline endpoint.
     pub timeline: Vec<GithubTimelineEvent>,
+    /// Set to the fetch ceiling when the timeline fetch stopped there; events
+    /// after the last whole page that arrived are missing.
+    pub timeline_cut_at_bytes: Option<usize>,
+    /// Set to the number of reviews fetched when later review pages, and the
+    /// inline comments on those reviews, were not fetched.
+    pub review_pages_cut_after: Option<usize>,
+}
+
+impl GithubDocument {
+    /// True when the fetch left out part of the resource, which the rendered
+    /// document names. A read of such a document is never complete.
+    pub fn has_fetch_gap(&self) -> bool {
+        self.timeline_cut_at_bytes.is_some() || self.review_pages_cut_after.is_some()
+    }
 }
 
 impl GithubDocument {

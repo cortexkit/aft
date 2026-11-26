@@ -250,9 +250,13 @@ mod idle_root_retention_tests;
 #[cfg(test)]
 mod ledger_lane_tests;
 mod perf_sweep;
+mod root_quiesce;
 mod route_census;
 mod route_delivery;
 use crate::bash_background::registry::RouteDeliverySessions;
+use root_quiesce::{
+    quiesce_connection_roots, quiesce_unbound_root, submit_ignore_rule_load, QuiescedLsp,
+};
 #[cfg(test)]
 use route_delivery::sync_all_callgraph_refresh_policies as sync_bg_live_delivery_sessions;
 mod secret_consent;
@@ -268,7 +272,7 @@ mod standalone;
 pub use self::health::SubcTestHealthRollupProbe;
 mod bash_notice_text;
 mod keepalive;
-mod manifest;
+pub(crate) mod manifest;
 mod page_collect;
 mod permissions;
 mod persistence;
@@ -1541,7 +1545,9 @@ struct RootMeta {
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
+    idle_release_context: std::sync::Weak<AppContext>,
     unbound_quiesced: bool,
+    goodbye_quiesce_at: Option<tokio::time::Instant>,
     consecutive_missing_sweeps: u8,
     /// The newest [`RootPresence`] generation already counted in
     /// `consecutive_missing_sweeps`, so a probe result is counted once even
@@ -1800,12 +1806,8 @@ impl Deref for RouteIdentity {
     }
 }
 
-#[derive(Debug, Clone)]
-struct RetainedSessionIdentity {
-    principal: Option<String>,
-    harness: String,
-    trust: BindTrust,
-}
+mod detached_replay;
+use detached_replay::{PushBuffer, SessionIdentities};
 
 #[derive(Clone)]
 struct BgSub {
@@ -1938,7 +1940,9 @@ impl RootMeta {
             diagnostics_on_edit: false,
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
+            idle_release_context: std::sync::Weak::new(),
             unbound_quiesced: false,
+            goodbye_quiesce_at: None,
             consecutive_missing_sweeps: 0,
             presence_generation_seen: 0,
             reclaim_kill_in_flight: None,
@@ -1957,7 +1961,9 @@ impl RootMeta {
     fn reactivate_bound(&mut self) {
         self.note_activity();
         self.idle_artifacts_evicted = false;
+        self.idle_release_context = std::sync::Weak::new();
         self.unbound_quiesced = false;
+        self.goodbye_quiesce_at = None;
         self.teardown_persist_submitted_at = None;
         self.ttl_retention_logged = None;
     }
@@ -2056,6 +2062,13 @@ fn due_maintenance_jobs_with_tail_limits(
                 Some(ctx) => INITIAL_MAINTENANCE_DRAIN_KINDS
                     .into_iter()
                     .filter(|kind| {
+                        // While no route is bound, finish configure work the
+                        // bind already scheduled without discovering new jobs.
+                        if meta.goodbye_quiesce_at.is_some()
+                            && *kind != MaintenanceDrainKind::ConfigureTail
+                        {
+                            return false;
+                        }
                         if meta.unbound_quiesced && !matches!(kind, MaintenanceDrainKind::Lsp) {
                             return false;
                         }
@@ -2083,7 +2096,7 @@ fn due_maintenance_jobs_with_tail_limits(
                         }
                     })
                     .collect(),
-                None if meta.unbound_quiesced => Vec::new(),
+                None if meta.unbound_quiesced || meta.goodbye_quiesce_at.is_some() => Vec::new(),
                 // No context handle (actor gone mid-tick): enqueue everything.
                 None => INITIAL_MAINTENANCE_DRAIN_KINDS.to_vec(),
             };
@@ -2245,156 +2258,12 @@ fn allocator_pressure_relief_after_idle_sweep(
 
     #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
     {
-        Some(crate::memory::relieve_allocator_pressure())
+        Some(crate::memory::relieve_allocator_pressure_after_idle_sweep())
     }
     #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
     {
         None
     }
-}
-
-/// Who stops a root's running language servers once the root is quiesced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QuiescedLsp {
-    /// Detach the clients and shut them down on a background thread. Right for
-    /// a route that closes while the module keeps running: nothing else would
-    /// stop those servers.
-    ReapInBackground,
-    /// Refuse new starts but leave the clients in the manager, because the
-    /// caller's exit phase shuts down every manager's servers together under
-    /// one shared budget right after the module loop returns.
-    LeaveForExitSweep,
-}
-
-fn quiesce_unbound_root(
-    root_id: &ProjectRootId,
-    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    executor: &Arc<Executor>,
-) {
-    quiesce_unbound_root_with(root_id, live_roots, executor, QuiescedLsp::ReapInBackground);
-}
-
-fn quiesce_unbound_root_with(
-    root_id: &ProjectRootId,
-    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    executor: &Arc<Executor>,
-    lsp: QuiescedLsp,
-) {
-    let Some(meta) = live_roots.get_mut(root_id) else {
-        return;
-    };
-
-    let ctx = executor.actor_context(root_id);
-    if let Some(ctx) = ctx.as_ref() {
-        // Close lifecycle admission before touching scheduler queues. A running
-        // ConfigureTail cannot release gates, install a watcher, or reserve a
-        // callgraph build after this transition becomes visible.
-        ctx.mark_subc_unbound();
-        // Parent folders have no local build progress to retain. Their watcher
-        // owns exclusion retries independently of the child-reader session, so
-        // release both lifetimes when the final route closes.
-        if crate::parent_search::release_context(ctx) || ctx.root_too_broad() {
-            ctx.stop_watcher_runtime();
-            ctx.invalidate_artifacts_after_watcher_gap();
-        }
-        match lsp {
-            QuiescedLsp::ReapInBackground => {
-                // Detach under the root's manager lock before allowing a
-                // rebind. The reaper owns only the old clients, never servers
-                // a new route starts.
-                let clients = ctx.lsp().quiesce();
-                crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
-            }
-            QuiescedLsp::LeaveForExitSweep => ctx.lsp().close_start_admission(),
-        }
-        ctx.bash_background().clear_live_delivery_sessions();
-    }
-    // A bind replayed by the identity retry is this root's bind in flight.
-    // Cancel it as route teardown cancels a route's own pending bind: queued,
-    // it is removed; running, it stops at its next checkpoint before the
-    // commit seal and publishes nothing. One that already sealed finishes, and
-    // its completion quiesces the root again (`finish_identity_replay`).
-    if let Some(replay) = meta.identity_replay.as_ref() {
-        let outcome = executor.cancel_job(root_id, replay);
-        log::debug!(
-            "subc attach: cancelled identity retry bind for quiescing root {} ({outcome:?})",
-            root_id.as_path().display()
-        );
-    }
-    let cancelled = if root_id.as_path().is_dir() {
-        executor.cancel_queued_root_maintenance(root_id)
-    } else {
-        executor.cancel_root_maintenance(root_id)
-    };
-    // Ordinary projects keep their watcher and resident artifacts across brief
-    // unbinds, so a reconnect can replay observed changes without re-reading the
-    // entire checkout. Parent folders and broad roots were stopped above.
-    // Queued maintenance is dropped immediately, but running project builds and
-    // inspect jobs retain a 120-second abandonment grace: their cancellation
-    // checks stop them after that grace, or as soon as the checkout disappears.
-    // The idle-TTL reaper stops project watchers later and marks their cached
-    // artifacts for verification because changes after shutdown were not seen.
-    let discarded = ctx
-        .map(|ctx| crate::commands::configure::cancel_deferred_configure_maintenance(&ctx))
-        .unwrap_or(0);
-    meta.unbound_quiesced = true;
-    meta.maintenance_queued_kinds.clear();
-    meta.maintenance_pending = meta.maintenance_jobs_in_flight > 0;
-    log::info!(
-        "subc attach: quiesced unbound root {} (cancelled {} queued or running maintenance job(s), cancelled {} configure maintenance job(s)); cause=goodbye_unbound",
-        root_id.as_path().display(),
-        cancelled,
-        discarded
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn quiesce_connection_roots(
-    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
-    routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut RootChannels,
-    installed_route_epochs: &mut HashMap<u16, u32>,
-    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
-    active_tool_calls: &ActiveToolCalls,
-    executor: &Arc<Executor>,
-    delivery: &RouteDeliverySessions,
-    lsp: QuiescedLsp,
-) {
-    cancel_all_active_tool_calls(active_tool_calls, executor, "connection teardown");
-    for cancel in route_bash_cancels.values() {
-        cancel.token.cancel();
-    }
-    route_bash_cancels.clear();
-
-    let mut roots = live_roots.keys().cloned().collect::<HashSet<_>>();
-    for pending in pending_binds.values_mut() {
-        pending.cancelled = true;
-        roots.insert(pending.bind_root_id.clone());
-        let _ = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
-    }
-
-    // A connection exit abandons every installed route at once. Close lifecycle
-    // admission before cancelling maintenance so no deferred worker can restore
-    // root activity after the loop-owned route tables disappear.
-    for root_id in roots {
-        if live_roots.contains_key(&root_id) {
-            quiesce_unbound_root_with(&root_id, live_roots, executor, lsp);
-        } else if let Some(ctx) = executor.actor_context(&root_id) {
-            ctx.mark_subc_unbound();
-            executor.cancel_queued_root_maintenance(&root_id);
-            crate::commands::configure::cancel_deferred_configure_maintenance(&ctx);
-        }
-    }
-
-    for route in routes.values() {
-        installed_routes::status_unbound(route);
-        runner_notices::route_unbound(route);
-    }
-    routes.clear();
-    route_delivery::publish_sessions(delivery, routes);
-    root_channels.clear();
-    installed_route_epochs.clear();
 }
 
 /// Per-channel epoch watermarks for roots reclaimed without a client Goodbye.
@@ -2454,32 +2323,6 @@ fn note_unbound_ttl_retention(
     }
 }
 
-/// Queue the ignore-rule load for a root whose watcher was restored before
-/// anything built its gitignore matcher. The load walks the project for ignore
-/// files, so it runs as a maintenance job on the root's actor, never on this
-/// transport loop. Publishing the matcher bumps its generation, and the running
-/// watcher backend re-derives its exclusions (`target/`, `node_modules/`, ...)
-/// from it without a restart.
-fn submit_ignore_rule_load(executor: &Executor, root_id: &ProjectRootId) {
-    let request_id = format!(
-        "subc-ignore-rule-load-{}",
-        root_id.as_path().to_string_lossy()
-    );
-    let response_id = request_id.clone();
-    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
-        let published = crate::commands::configure::load_ignore_rules_if_unpublished(ctx);
-        Response::success(response_id, json!({ "published": published }))
-    });
-    // Nothing waits on the outcome: an unpublished root is queued again on
-    // its next rebind.
-    drop(executor.submit_maintenance_async(
-        root_id.clone(),
-        Lane::MaintenanceCommit,
-        request_id,
-        job,
-    ));
-}
-
 /// Queue the final artifact work for an unbound root past its idle TTL:
 /// persist the search delta the way graceful shutdown does and drop inspect
 /// completions nobody will drain. It runs as a maintenance job on the root's
@@ -2502,95 +2345,8 @@ fn submit_unbound_teardown_persist(executor: &Executor, root_id: &ProjectRootId)
     drop(executor.submit_unbound_teardown_async(root_id.clone(), request_id, job));
 }
 
-/// Which live roots' directories existed at one probe. The idle reaper needs
-/// this to retire deleted roots, but a `stat` can stall on a slow or hung
-/// filesystem, so the frame loop never runs it: [`RootPresenceProbe`] probes
-/// on a background thread and the reaper reads its newest finished result.
-#[derive(Clone, Debug, Default)]
-struct RootPresence {
-    /// Increases with every probe; zero means no probe has finished.
-    generation: u64,
-    probed: HashSet<ProjectRootId>,
-    absent: HashSet<ProjectRootId>,
-}
-
-impl RootPresence {
-    /// Check each root's directory on the calling thread. The frame loop
-    /// never calls this directly; [`RootPresenceProbe`] runs it on a
-    /// background thread.
-    fn probe<'a>(generation: u64, roots: impl IntoIterator<Item = &'a ProjectRootId>) -> Self {
-        let mut presence = Self {
-            generation,
-            ..Self::default()
-        };
-        for root_id in roots {
-            if !root_id.as_path().exists() {
-                presence.absent.insert(root_id.clone());
-            }
-            presence.probed.insert(root_id.clone());
-        }
-        presence
-    }
-
-    /// `Some(true)` when the probe found the root's directory missing,
-    /// `Some(false)` when it found it, `None` when the probe did not cover it.
-    fn observed_absent(&self, root_id: &ProjectRootId) -> Option<bool> {
-        self.probed
-            .contains(root_id)
-            .then(|| self.absent.contains(root_id))
-    }
-}
-
-/// Runs [`RootPresence`] probes off the frame loop, at most one at a time,
-/// and keeps the newest finished result.
-struct RootPresenceProbe {
-    latest: Arc<parking_lot::Mutex<RootPresence>>,
-    in_flight: Arc<AtomicBool>,
-    next_generation: u64,
-}
-
-impl RootPresenceProbe {
-    fn new() -> Self {
-        Self {
-            latest: Arc::new(parking_lot::Mutex::new(RootPresence::default())),
-            in_flight: Arc::new(AtomicBool::new(false)),
-            next_generation: 0,
-        }
-    }
-
-    /// The newest finished probe. A result being published right now reads
-    /// as "no probe yet", which the reaper treats as no new observation.
-    fn latest(&self) -> RootPresence {
-        self.latest
-            .try_lock()
-            .map(|presence| presence.clone())
-            .unwrap_or_default()
-    }
-
-    /// Start a probe of `roots` unless one is still running. A probe stuck
-    /// on a hung filesystem only delays deletion detection; the frame loop
-    /// never waits for it.
-    fn request(&mut self, roots: Vec<ProjectRootId>) {
-        if roots.is_empty() || self.in_flight.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.next_generation += 1;
-        let generation = self.next_generation;
-        let latest = Arc::clone(&self.latest);
-        let in_flight = Arc::clone(&self.in_flight);
-        let spawned = std::thread::Builder::new()
-            .name("aft-root-presence".to_owned())
-            .spawn(move || {
-                let presence = RootPresence::probe(generation, &roots);
-                *latest.lock() = presence;
-                in_flight.store(false, Ordering::Release);
-            });
-        if spawned.is_err() {
-            self.in_flight.store(false, Ordering::Release);
-        }
-    }
-}
-
+mod root_presence;
+use root_presence::{RootPresence, RootPresenceProbe};
 /// Tests reap with a presence probe taken synchronously, so each call sees
 /// the filesystem as it is when the call is made.
 #[cfg(test)]
@@ -2635,39 +2391,27 @@ fn reap_idle_roots_with_presence(
     let pending_bind_roots = roots_with_bind_in_flight(pending_binds, live_roots);
     let mut census = ReapBlockerCensus::default();
     let mut candidates = Vec::new();
-    let mut evicted_contexts: Option<Option<HashMap<ProjectRootId, Arc<AppContext>>>> = None;
 
     for (root_id, meta) in live_roots.iter_mut() {
-        // A missing directory makes a bound route obsolete, but one failed
-        // lookup is not enough evidence to tear down a client-visible actor.
-        // Requiring two presence probes protects atomic replacement and
-        // transient filesystem failures; observing the path resets the proof.
-        // Absence also covers renames: a task's cwd handle can follow the
-        // moved directory while the registered path disappears. The old
-        // path is deliberately treated as a retired root identity, so the
-        // reaper accepts killing such tasks; rename a project only with no
-        // live tasks rather than relying on cwd-resolution heuristics.
-        //
-        // Each probe result is counted once; sweeps that run before the next
-        // probe finishes keep the last observation.
-        let deleted = match presence.observed_absent(root_id) {
-            Some(absent) if presence.generation > meta.presence_generation_seen => {
-                meta.presence_generation_seen = presence.generation;
-                if absent {
-                    meta.consecutive_missing_sweeps =
-                        meta.consecutive_missing_sweeps.saturating_add(1);
-                } else {
-                    meta.consecutive_missing_sweeps = 0;
-                }
-                absent
-            }
-            _ => meta.consecutive_missing_sweeps > 0,
-        };
+        let deleted = presence.update_absence(root_id, meta);
         let deletion_confirmed = meta.consecutive_missing_sweeps >= 2;
         let has_bound_route = root_channels
             .get(root_id)
             .is_some_and(|channels| !channels.is_empty());
         let has_pending_bind = pending_bind_roots.contains(root_id);
+
+        if deletion_confirmed
+            && meta.goodbye_quiesce_at.is_some()
+            && !root_quiesce::has_live_route_bind(root_id, pending_binds)
+        {
+            root_quiesce::quiesce_root(
+                root_id,
+                meta,
+                executor,
+                QuiescedLsp::ReapInBackground,
+                "root_reclaim",
+            );
+        }
 
         // A connected route is not activity. Release only resident handles;
         // keep the actor and watcher so its next call takes the normal reload
@@ -2743,15 +2487,8 @@ fn reap_idle_roots_with_presence(
             // output filters stay while background task records remain, and
             // an evicted root is not reaped again, so retry here once the
             // records are gone.
-            // One non-waiting snapshot of the actors serves every evicted root
-            // in this sweep.
             if meta.idle_artifacts_evicted && !has_bound_route && meta.unbound_quiesced {
-                let contexts = evicted_contexts.get_or_insert_with(|| {
-                    executor
-                        .try_actor_entries()
-                        .map(|entries| entries.into_iter().collect::<HashMap<_, _>>())
-                });
-                if let Some(ctx) = contexts.as_ref().and_then(|contexts| contexts.get(root_id)) {
+                if let Some(ctx) = meta.idle_release_context.upgrade() {
                     ctx.retry_deferred_idle_release();
                 }
             }
@@ -2955,6 +2692,7 @@ fn reap_idle_roots_with_presence(
         } else {
             if let Some(meta) = live_roots.get_mut(&root_id) {
                 meta.idle_artifacts_evicted = true;
+                meta.idle_release_context = Arc::downgrade(&ctx);
                 meta.teardown_persist_submitted_at = None;
                 meta.ttl_retention_logged = None;
             }
@@ -2996,24 +2734,7 @@ fn reap_idle_roots_with_presence(
 /// each child's cwd from the kernel, stats reclaim markers and signals process
 /// groups; `killpg` has been seen to sit in the kernel for over a minute, so
 /// none of it runs on the frame loop.
-fn spawn_orphaned_lsp_child_reap(registry: crate::lsp::child_registry::LspChildRegistry) {
-    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let spawned = std::thread::Builder::new()
-        .name("aft-lsp-child-reap".to_owned())
-        .spawn(move || {
-            let reaped = registry.reap_children_with_gone_cwd_or_reclaimed_root();
-            if reaped > 0 {
-                log::warn!("subc attach: reaped {reaped} orphaned LSP child process group(s)");
-            }
-            IN_FLIGHT.store(false, Ordering::Release);
-        });
-    if spawned.is_err() {
-        IN_FLIGHT.store(false, Ordering::Release);
-    }
-}
+mod maintenance_probes;
 
 /// Terminate a deleted root's background tasks on their own thread: each kill
 /// waits out a signal grace period. `in_flight` is cleared when it finishes.
@@ -3099,8 +2820,8 @@ fn purge_deleted_root_residents(
     executor: &Executor,
     retry_buffer: &mut RetryBuffer,
     reclaimed_routes: &mut ReclaimedRoutes,
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    session_identity: &mut SessionIdentities,
+    push_buffer: &mut PushBuffer,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
@@ -3162,7 +2883,7 @@ fn purge_deleted_root_residents(
         bg_wake_pending.remove(&route);
     }
     root_channels.remove(root_id);
-    session_identity.retain(|(root, _), _| root != root_id);
+    session_identity.remove_root(root_id);
     push_buffer.retain(|key, _| &key.root != root_id);
     bg_wake_epoch.retain(|(root, _), _| root != root_id);
     pending_bash_asks.retain(|_, ask| {
@@ -4030,6 +3751,7 @@ async fn teardown_installed_route(
     executor: &Arc<Executor>,
     channel: RouteChannel,
     cancellation_reason: &str,
+    goodbye_grace: bool,
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
@@ -4045,7 +3767,8 @@ async fn teardown_installed_route(
     pending_responses: &mut PendingSubcResponses,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     retry_buffer: &mut RetryBuffer,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
+    session_identity: &mut SessionIdentities,
     shutdown: &Arc<Notify>,
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -4152,7 +3875,7 @@ async fn teardown_installed_route(
     }
     let migrated =
         push::migrate_retry_buffer_to_push_buffer(metrics, retry_buffer, channel, push_buffer);
-    if let Some(identity) = routes.get(&channel) {
+    if let Some(identity) = routes.get(&channel).filter(|_| !goodbye_grace) {
         let has_pending_bind = pending_binds
             .values()
             .any(|pending| pending.bind_root_id == identity.root);
@@ -4175,14 +3898,22 @@ async fn teardown_installed_route(
     delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, &mut root_channels.channels, channel) {
         metrics.completion_delivery.route_closed(channel);
-        route_delivery::sync_route_change(
-            executor,
-            delivery,
-            routes,
-            root_channels,
-            &identity.root,
-            metrics,
-        );
+        metrics.close_shell_reply_route(channel);
+        let defer_quiesce = goodbye_grace && !root_channels.contains_key(&identity.root);
+        if defer_quiesce {
+            // Publish the route removal without enabling extra background
+            // refresh for a root whose only routes were workers.
+            route_delivery::publish_sessions(delivery, routes);
+        } else {
+            route_delivery::sync_route_change(
+                executor,
+                delivery,
+                routes,
+                root_channels,
+                &identity.root,
+                metrics,
+            );
+        }
         if let Some(probe) = lifecycle_probe {
             probe.route_detached(channel, &identity.session);
         }
@@ -4190,6 +3921,7 @@ async fn teardown_installed_route(
             .values()
             .any(|route| route.root == identity.root && route.session == identity.session);
         if !session_still_routed {
+            session_identity.detach(&identity);
             if let Some(ctx) = executor.actor_context(&identity.root) {
                 // The binding goes with the session's last route, but the edit
                 // mode its runner head's catalog recorded stays in aft.db: the
@@ -4207,6 +3939,11 @@ async fn teardown_installed_route(
             );
         }
         if let Some(meta) = live_roots.get_mut(&identity.root) {
+            if defer_quiesce {
+                meta.goodbye_quiesce_at.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + root_quiesce::GOODBYE_QUIESCE_GRACE
+                });
+            }
             meta.route_activity.remove(&channel);
             let idle_for = meta.last_touched.elapsed();
             meta.note_activity();
@@ -4227,7 +3964,9 @@ async fn teardown_installed_route(
                 identity.session
             );
         }
-        if root_channels.release_if_unbound(&identity.root, pending_binds, replacement_root) {
+        if !defer_quiesce
+            && root_channels.release_if_unbound(&identity.root, pending_binds, replacement_root)
+        {
             quiesce_unbound_root(&identity.root, live_roots, executor);
         }
     } else {
@@ -4255,49 +3994,6 @@ async fn delay_route_detach_for_test(lifecycle_probe: Option<&SubcTestLifecycleP
     tokio::time::sleep(Duration::from_millis(delay)).await;
 }
 
-fn remember_session_identity(
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    identity: &RouteIdentity,
-) {
-    let key = (identity.root.clone(), identity.session.clone());
-    if matches!(identity.trust, BindTrust::Untrusted)
-        && session_identity
-            .get(&key)
-            .is_some_and(|retained| matches!(retained.trust, BindTrust::FirstParty))
-    {
-        return;
-    }
-
-    // Retained after route Goodbye so reliable session-scoped frames emitted while
-    // the session is detached can still be keyed by the full (root,harness,session)
-    // replay triple. Untrusted binds never overwrite a retained first-party
-    // session identity, because bash completion replay is an observation channel.
-    session_identity.insert(
-        key,
-        RetainedSessionIdentity {
-            principal: identity.task_identity().principal,
-            harness: identity.harness.clone(),
-            trust: identity.trust,
-        },
-    );
-}
-
-fn replay_key_for_session(
-    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    root: &ProjectRootId,
-    session: &str,
-) -> Option<(push::ReplayKey, BindTrust)> {
-    let retained = session_identity.get(&(root.clone(), session.to_string()))?;
-    Some((
-        push::ReplayKey {
-            root: root.clone(),
-            principal: retained.principal.clone(),
-            harness: retained.harness.clone(),
-            session: session.to_string(),
-        },
-        retained.trust,
-    ))
-}
 /// Sync command dispatch, passed in from `main` (the binary owns the command
 /// table). Invoked only inside executor jobs in subc mode.
 pub type DispatchFn = fn(RawRequest, &AppContext) -> Response;
@@ -4887,8 +4583,8 @@ async fn drain_pending_route_bind_completions(
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut RootChannels,
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    session_identity: &mut SessionIdentities,
+    push_buffer: &mut PushBuffer,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
@@ -5135,6 +4831,7 @@ where
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let mut next_maintenance_at = next_drain_at;
     let mut root_presence = RootPresenceProbe::new();
+    let mut orphaned_children = maintenance_probes::OrphanedChildrenProbe::new();
     let standing_actor = Arc::new(
         standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor))
             .with_startup_storage_dir(storage_dir),
@@ -5235,9 +4932,8 @@ where
         HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels = RootChannels::default();
-    let mut session_identity: HashMap<(ProjectRootId, String), RetainedSessionIdentity> =
-        HashMap::new();
-    let mut push_buffer: HashMap<push::ReplayKey, VecDeque<PushFrame>> = HashMap::new();
+    let mut session_identity = SessionIdentities::default();
+    let mut push_buffer = PushBuffer::default();
     let mut retry_buffer: RetryBuffer = HashMap::new();
     let mut reclaimed_routes = ReclaimedRoutes::default();
     let mut completed_tasks = push::CompletedTaskIds::default();
@@ -5427,6 +5123,14 @@ where
             {
                 break Err(error);
             }
+            root_quiesce::settle_goodbye_quiesces(
+                tokio::time::Instant::now(),
+                false,
+                &mut live_roots,
+                &pending_binds,
+                &mut root_channels,
+                &executor,
+            );
 
             dispatch_path_metrics.mark_frame_loop_step(
                 "push::drain_retry_buffers_for_bound_routes",
@@ -5566,6 +5270,7 @@ where
             Some(ended) = scopes_ended_rx.recv() => {
                 dispatch_path_metrics.mark_frame_loop_step("run_scopes::revoke", "", 0);
                 run_scopes.revoke(&ended.stamp);
+                session_identity.end_scope(&ended.stamp, &mut push_buffer, &dispatch_path_metrics);
                 ledger_edge.scope_ended(&ended.keys);
                 let keys: Vec<_> = pending_bash_asks.iter().filter(|(_, pending)| {
                     pending.cancel.scope.as_ref().is_some_and(|stamp| scope_describe::stamp_key(stamp) == scope_describe::stamp_key(&ended.stamp))
@@ -5723,6 +5428,7 @@ where
                             &executor,
                             channel,
                             "Goodbye",
+                            drain_progress.is_none(),
                             None,
                             &mut installed_route_epochs,
                             &mut routes,
@@ -5739,6 +5445,7 @@ where
                             &mut pending_binds,
                             &mut retry_buffer,
                             &mut push_buffer,
+                            &mut session_identity,
                             &shutdown,
                             tool_response_body_limit,
                             lifecycle_probe.as_ref(),
@@ -5818,6 +5525,7 @@ where
                             &mut pending_responses,
                             &mut retry_buffer,
                             &mut push_buffer,
+                            &mut session_identity,
                             &shutdown,
                             &configure_completion_tx,
                             &dispatch_path_metrics,
@@ -6279,7 +5987,8 @@ where
                                 // Opening the window is what detaches foreground
                                 // bash waits: each checks it on its next poll.
                                  scope_describe_task.abort();
-                                 module_drain.begin(until);
+                                  module_drain.begin(until);
+                                  root_quiesce::settle_goodbye_quiesces(tokio::time::Instant::now(), true, &mut live_roots, &pending_binds, &mut root_channels, &executor);
                                  gh_relay_requests.drain();
                                 drain_progress = Some(drain::DrainProgress {
                                     until,
@@ -6635,7 +6344,7 @@ where
                 dispatch_path_metrics.mark_frame_loop_step("logging::maybe_sweep_logs", "", 0);
                 crate::logging::maybe_sweep_logs();
                 dispatch_path_metrics.mark_frame_loop_step("compression_events::maybe_spawn_retention", "", 0);
-                let retention_registries = shared_app.try_memory_contexts().map(|contexts| {
+                let retention_registries = || shared_app.try_memory_contexts().map(|contexts| {
                     contexts
                         .into_iter()
                         .map(|(_, context)| context.bash_background().clone())
@@ -6651,9 +6360,11 @@ where
                     );
                 }
                 dispatch_path_metrics.mark_frame_loop_step("spawn_orphaned_lsp_child_reap", "", 0);
-                spawn_orphaned_lsp_child_reap(shared_app.lsp_child_registry());
+                orphaned_children.request(shared_app.lsp_child_registry());
                 dispatch_path_metrics.mark_frame_loop_step("reap_idle_lsp_servers", "", 0);
                 let now = Instant::now();
+                session_identity.expire();
+                push_buffer.expire(&dispatch_path_metrics);
                 reap_idle_lsp_servers(now, &live_roots, &executor);
                 dispatch_path_metrics.mark_frame_loop_step("reap_idle_roots_with_presence", "", 0);
                 let presence = root_presence.latest();
@@ -6666,7 +6377,7 @@ where
                     &dispatch_path_metrics,
                     &presence,
                 );
-                root_presence.request(live_roots.keys().cloned().collect());
+                root_presence.request(&live_roots);
                 for root_id in &reap.forgotten_deleted_roots {
                     dispatch_path_metrics.mark_frame_loop_step("purge_deleted_root_residents", "", 0);
                     bg_unacked_keys_by_root.remove(root_id);
@@ -6931,6 +6642,7 @@ where
         writer: writer_result,
         input_ended,
     } = close_daemon_connection(reader_rx, reader_task, writer_task).await;
+    dispatch_path_metrics.close_shell_reply_connection(writer_result.is_err());
     log::debug!("subc attach: connection closed; daemon input ended first: {input_ended}");
     log::info!(
         "subc exit phase=loop_teardown elapsed_ms={}",
@@ -7049,6 +6761,7 @@ where
                 continue;
             }
             queued.project_tool_result().map_err(|error| {
+                metrics.close_shell_reply_connection(true);
                 subc_transport::FrameIoError::Io(io::Error::other(error.to_string()))
             })?;
             let measure = queued.tool_response_trace.is_some();
@@ -7070,6 +6783,7 @@ where
                 Ok(write_timing) => write_timing,
                 Err(error) => {
                     queued.finish_ack_write(false);
+                    metrics.close_shell_reply_connection(true);
                     if let Some(trace) = queued.tool_response_trace.as_ref() {
                         trace.note_write_failure(&error.to_string());
                     }
@@ -7077,7 +6791,7 @@ where
                 }
             };
             queued.finish_ack_write(true);
-            metrics.tool_replied(queued.frame());
+            metrics.tool_replied(queued.frame(), queued.held_reply);
 
             if let (Some(trace), Some(dequeued), Some(write_timing)) =
                 (queued.tool_response_trace.take(), dequeued, write_timing)
@@ -7509,8 +7223,8 @@ async fn handle_route_bind_completion(
     a0: &A0Egress,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut RootChannels,
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    session_identity: &mut SessionIdentities,
+    push_buffer: &mut PushBuffer,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
@@ -7550,7 +7264,7 @@ async fn handle_route_bind_completion(
         if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
             ctx.mark_subc_bound();
             if restore_watcher {
-                crate::commands::configure::ensure_project_watcher(&ctx);
+                crate::commands::configure::fence_subc_watcher_gap(&ctx);
             }
         }
         let ack = route_bind_ack_frame(completion.ver, completion.corr, completion.flags)?;
@@ -7589,9 +7303,13 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             completion.inserted_new_actor,
         );
-        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
-            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
-        }
+        root_quiesce::quiesce_after_bind_failure(
+            &completion.bind_root_id,
+            live_roots,
+            pending_binds,
+            root_channels,
+            executor,
+        );
         remove_installed_route(installed_route_epochs, route_id);
         return Ok(());
     };
@@ -7620,9 +7338,13 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             inserted_new_actor,
         );
-        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
-            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
-        }
+        root_quiesce::quiesce_after_bind_failure(
+            &completion.bind_root_id,
+            live_roots,
+            pending_binds,
+            root_channels,
+            executor,
+        );
         log::debug!(
             "subc attach: discarded completed RouteBind for cancelled route {} root {}",
             completion.route,
@@ -7650,9 +7372,13 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             inserted_new_actor,
         );
-        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
-            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
-        }
+        root_quiesce::quiesce_after_bind_failure(
+            &completion.bind_root_id,
+            live_roots,
+            pending_binds,
+            root_channels,
+            executor,
+        );
         let message = response_message(response, fallback);
         let fatal = response_is_fatal_panic(response);
         let error_code = route_bind_error_code_for_configure_response(response);
@@ -7685,7 +7411,7 @@ async fn handle_route_bind_completion(
         return Ok(());
     }
 
-    remember_session_identity(session_identity, &completion.identity);
+    session_identity.remember(&completion.identity);
     let replay_key = push::ReplayKey::from_identity(&completion.identity);
     let bind_trust = completion.identity.trust;
     route_delivery::install_route(
@@ -7714,6 +7440,9 @@ async fn handle_route_bind_completion(
     }
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
         debug_assert!(ack_written);
+        if ctx.watcher_gap_pending() {
+            crate::commands::configure::restore_subc_watcher(ctx.clone());
+        }
         if crate::commands::configure::ignore_rules_load_pending(&ctx) {
             submit_ignore_rule_load(executor, &completion.bind_root_id);
         }
@@ -7958,7 +7687,8 @@ async fn handle_control_request(
     active_tool_calls: &ActiveToolCalls,
     pending_responses: &mut PendingSubcResponses,
     retry_buffer: &mut RetryBuffer,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
+    session_identity: &mut SessionIdentities,
     shutdown: &Arc<Notify>,
     control_completion_tx: &mpsc::Sender<ControlCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
@@ -8212,6 +7942,7 @@ async fn handle_control_request(
                         executor,
                         route_key(route_channel, installed_epoch),
                         "higher-epoch RouteBind",
+                        false,
                         None,
                         installed_route_epochs,
                         routes,
@@ -8228,6 +7959,7 @@ async fn handle_control_request(
                         pending_binds,
                         retry_buffer,
                         push_buffer,
+                        session_identity,
                         shutdown,
                         tool_response_body_limit,
                         lifecycle_probe,
@@ -8346,6 +8078,7 @@ async fn handle_control_request(
                     executor,
                     route_key(route_channel, installed_epoch),
                     "higher-epoch RouteBind",
+                    false,
                     Some(&replacement_root),
                     installed_route_epochs,
                     routes,
@@ -8362,6 +8095,7 @@ async fn handle_control_request(
                     pending_binds,
                     retry_buffer,
                     push_buffer,
+                    session_identity,
                     shutdown,
                     tool_response_body_limit,
                     lifecycle_probe,
@@ -10546,47 +10280,6 @@ async fn hold_for_consent(
     }
 }
 
-/// Return bash_watch's normal synchronous wait window for the deadline warning.
-/// The warning uses this value only; the handler still owns and enforces the wait.
-fn bash_watch_warning_wait_ms(
-    arguments: &Value,
-    worker: bool,
-    worker_limit_ms: u64,
-    primary_cap_ms: u64,
-) -> Option<u64> {
-    let arguments = arguments.get("params").unwrap_or(arguments);
-    let requested = match arguments
-        .get("timeout_ms")
-        .or_else(|| arguments.get("timeoutMs"))
-    {
-        None | Some(Value::Null) => None,
-        Some(value) => {
-            let requested = value.as_u64().or_else(|| {
-                value
-                    .as_str()
-                    .and_then(|raw| raw.trim().parse::<u64>().ok())
-            })?;
-            if requested == 0 {
-                return None;
-            }
-            Some(requested)
-        }
-    };
-    let background = arguments
-        .get("background")
-        .and_then(crate::subc_translate::model_boolean)
-        .unwrap_or(false);
-    Some(if worker && background {
-        worker_limit_ms
-    } else if worker {
-        requested.unwrap_or(worker_limit_ms).min(worker_limit_ms)
-    } else {
-        requested
-            .unwrap_or(crate::commands::bash_watch::DEFAULT_PRIMARY_WATCH_TIMEOUT_MS)
-            .min(primary_cap_ms)
-    })
-}
-
 // Direct decoder fixtures use the build's default HELLO capabilities. The live
 // loop passes the snapshot of the actual HELLO sent on that connection instead.
 #[cfg(test)]
@@ -10801,7 +10494,7 @@ async fn handle_tool_call_with_capabilities(
     }
     if restore_watcher {
         if let Some(ctx) = executor.actor_context(&identity.root) {
-            crate::commands::configure::ensure_project_watcher(&ctx);
+            crate::commands::configure::restore_subc_watcher(ctx.clone());
             if crate::commands::configure::ignore_rules_load_pending(&ctx) {
                 submit_ignore_rule_load(executor, &identity.root);
             }
@@ -11178,7 +10871,7 @@ async fn handle_tool_call_with_capabilities(
     if bare_name == "bash_watch" {
         if let Some(ctx) = executor.actor_context(&identity.root) {
             let worker_limit_ms = crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx);
-            if let Some(wait_ms) = bash_watch_warning_wait_ms(
+            if let Some(wait_ms) = health::bash_watch_warning_wait_ms(
                 &arguments,
                 role.is_worker(),
                 worker_limit_ms,
@@ -11719,6 +11412,11 @@ async fn handle_tool_call_with_capabilities(
         // them for its whole life.
         let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
         let fetch_reply_deadline = reply_budget.deadline;
+        let watch_timing = if bare_name == "bash_watch" {
+            metrics.watch_reply_timing(route_id, frame.header.corr)
+        } else {
+            None
+        };
         let job: crate::context::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(fetch_reply_deadline);
@@ -11821,6 +11519,7 @@ async fn handle_tool_call_with_capabilities(
                                 reply_budget,
                                 carrier_read_only::restricted(&identity_for_run),
                                 watch_yield,
+                                watch_timing,
                             )
                         } else {
                             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline(
@@ -12310,7 +12009,7 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
 /// exclusive writer barrier once configure asks to change the root. The
 /// root's meta keeps the bind's cancellation while it is in flight, so
 /// maintenance defers the root as for any bind in flight and quiescing the
-/// root cancels it (`quiesce_unbound_root_with`).
+/// root cancels it (`root_quiesce::quiesce_root`).
 ///
 /// Like a route bind, a replay whose configure commits then runs the
 /// standing half of the bind (`StandingActor::begin_session_bind`) before
@@ -14846,6 +14545,8 @@ pub(crate) mod test_support {
     /// a lock race that nothing in production depends on: `register_actor` wakes
     /// the scheduler, which grabs the same lock, and on a loaded runner that
     /// window is wide enough to lose. Sweep to the outcome instead.
+    /// If task cleanup needs a second attempt, advance the sweep clock to its
+    /// retry deadline once instead of spending the test's time budget in backoff.
     pub(super) fn reap_until_forgotten(
         root: &ProjectRootId,
         live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -14855,9 +14556,12 @@ pub(crate) mod test_support {
         metrics: &DispatchPathMetrics,
     ) -> IdleReapOutcome {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut sweep_clock_floor = None;
         loop {
+            let now = Instant::now();
+            let now = now.max(sweep_clock_floor.unwrap_or(now));
             let outcome = reap_idle_roots(
-                Instant::now(),
+                now,
                 live_roots,
                 pending_binds,
                 root_channels,
@@ -14867,10 +14571,44 @@ pub(crate) mod test_support {
             if outcome.forgotten_deleted_roots.contains(root) {
                 return outcome;
             }
-            assert!(
-                Instant::now() < deadline,
-                "deleted root was never forgotten: {root:?}"
-            );
+            let meta = &live_roots[root];
+            let retry_due = meta
+                .reclaim_kill_submitted_at
+                .map(|at| at + RECLAIM_KILL_RETRY);
+            if sweep_clock_floor.is_none() && retry_due.is_some_and(|due| now < due) {
+                let census = metrics.reap_census_for_test();
+                if census["deleted_task_blockers"]["task_kill_backoff"] == 1 {
+                    sweep_clock_floor = retry_due;
+                    continue;
+                }
+            }
+            if Instant::now() >= deadline {
+                let actor_idle = executor.try_actor_is_idle(root);
+                let ctx = executor.try_actor_context(root).flatten();
+                let tasks_reclaimable = ctx.as_ref().and_then(|ctx| {
+                    ctx.bash_background()
+                        .try_has_reclaimable_tasks_for_root(root)
+                });
+                #[cfg(unix)]
+                let group_samples = ctx.as_ref().and_then(|ctx| {
+                    crate::bash_background::registry::root_reclaim_tests::reclaim_group_samples(
+                        ctx.bash_background(),
+                        root,
+                    )
+                });
+                #[cfg(not(unix))]
+                let group_samples = "not available on this platform";
+                let kill_in_flight = meta
+                    .reclaim_kill_in_flight
+                    .as_ref()
+                    .map(|flag| flag.load(Ordering::Acquire));
+                panic!(
+                    "deleted root was never forgotten: {root:?}; absence_count={}, presence_generation={}, actor_idle={actor_idle:?}, kill_in_flight={kill_in_flight:?}, kill_retry_due={retry_due:?}, sweep_at={now:?}, tasks_reclaimable={tasks_reclaimable:?}, group_samples={group_samples:?}, census={}",
+                    meta.consecutive_missing_sweeps,
+                    meta.presence_generation_seen,
+                    metrics.reap_census_for_test()
+                );
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -16185,8 +15923,8 @@ mod tests {
 
         let mut retry_buffer = HashMap::new();
         let mut reclaimed_routes = ReclaimedRoutes::default();
-        let mut session_identity = HashMap::new();
-        let mut push_buffer = HashMap::new();
+        let mut session_identity = SessionIdentities::default();
+        let mut push_buffer = PushBuffer::default();
         let mut bg_subs = HashMap::from([(
             route,
             BgSub {
@@ -16362,8 +16100,8 @@ mod tests {
             &executor,
             &mut HashMap::new(),
             &mut ReclaimedRoutes::default(),
-            &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
+            &mut PushBuffer::default(),
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
@@ -16631,6 +16369,11 @@ mod tests {
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         assert!(executor.actor_is_idle(&root));
         root_dir.close().expect("delete project root");
+        assert_eq!(
+            root.as_path().metadata().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "the routing path must report a confirmed absence"
+        );
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
         let pending_binds = HashMap::new();
         let root_channels = HashMap::new();
@@ -16645,6 +16388,7 @@ mod tests {
             &metrics,
         );
         assert!(first.forgotten_deleted_roots.is_empty());
+        assert_eq!(live_roots[&root].consecutive_missing_sweeps, 1);
         assert!(crate::process_identity::is_process_alive(pid));
 
         let outcome = reap_until_forgotten(
@@ -17062,8 +16806,8 @@ mod tests {
             &executor,
             &metrics,
         );
-        let mut session_identity = HashMap::new();
-        let mut push_buffer = HashMap::new();
+        let mut session_identity = SessionIdentities::default();
+        let mut push_buffer = PushBuffer::default();
         let mut bg_subs = HashMap::new();
         let mut bg_sub_by_session = HashMap::new();
         let mut bg_wake_pending = BgWakePending::new();
@@ -18264,6 +18008,9 @@ mod tests {
         assert_eq!(meta.maintenance_jobs_in_flight, 0);
     }
 
+    #[cfg(unix)]
+    mod rust_check_maintenance;
+
     #[tokio::test]
     async fn quiesced_lsp_maintenance_drains_final_events_without_resubmission_loop() {
         let (_dir, root) = test_root("quiesced-lsp-drain");
@@ -18279,20 +18026,12 @@ mod tests {
         quiesce_unbound_root(&root, &mut live_roots, &executor);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (tx, mut rx) = mpsc::channel(4);
-        let batch = runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP;
-
         // Detached readers can still send final receipts during shutdown.
         // Repeated bursts must be consumed rather than retained until rebind.
         for _ in 0..4 {
-            for _ in 0..=batch {
-                ctx.lsp()
-                    .enqueue_event_for_test(crate::lsp::client::LspEvent::Notification {
-                        server_kind: crate::lsp::registry::ServerKind::Rust,
-                        root: root.as_path().to_path_buf(),
-                        method: "custom/final".into(),
-                        params: None,
-                    });
-            }
+            let _reader = ctx
+                .lsp()
+                .enqueue_maintenance_backlog_for_test(root.as_path());
             for remaining in [1, 0] {
                 let (due, _) = due_maintenance_jobs(
                     &mut live_roots,
@@ -18376,16 +18115,9 @@ mod tests {
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (tx, mut rx) = mpsc::channel(4);
-        let held = ctx.lsp();
-        let total = runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP + 1;
-        for _ in 0..total {
-            held.enqueue_event_for_test(crate::lsp::client::LspEvent::Notification {
-                server_kind: crate::lsp::registry::ServerKind::Rust,
-                root: root.as_path().to_path_buf(),
-                method: "custom/pending".into(),
-                params: None,
-            });
-        }
+        let mut held = ctx.lsp();
+        let _reader = held.enqueue_maintenance_backlog_for_test(root.as_path());
+        let total = held.pending_event_count_for_test();
         submit_maintenance_job(
             &executor,
             root.clone(),
@@ -19105,8 +18837,10 @@ mod tests {
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
-        let mut push_buffer =
-            HashMap::from([(replay_key, VecDeque::from([completion_frame("b2-replay")]))]);
+        let mut push_buffer = PushBuffer::default();
+        push_buffer
+            .queue(&replay_key)
+            .push_back(completion_frame("b2-replay"));
         let (writer_tx, mut writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let executor = Arc::new(Executor::new());
@@ -19124,7 +18858,7 @@ mod tests {
             &a0,
             &mut published_routes,
             &mut RootChannels::default(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
             &mut push_buffer,
             &mut HashMap::new(),
             &mut pending_binds,
@@ -19160,7 +18894,7 @@ mod tests {
             &a0,
             &mut published_routes,
             &mut RootChannels::default(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
             &mut push_buffer,
             &mut HashMap::new(),
             &mut pending_binds,
@@ -19257,8 +18991,8 @@ mod tests {
             &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &mut HashMap::new(),
             &mut RootChannels::default(),
-            &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
+            &mut PushBuffer::default(),
             &mut HashMap::new(),
             &mut pending_binds,
             &mut installed_route_epochs,
@@ -22405,6 +22139,7 @@ mod terminal_lifecycle_tests {
                         &executor,
                         route,
                         "higher-epoch RouteBind",
+                        false,
                         Some(&root),
                         &mut HashMap::from([(route.channel, route.epoch)]),
                         &mut routes,
@@ -22423,7 +22158,8 @@ mod terminal_lifecycle_tests {
                         &mut registry,
                         &mut HashMap::new(),
                         &mut RetryBuffer::new(),
-                        &mut HashMap::new(),
+                        &mut PushBuffer::default(),
+                        &mut SessionIdentities::default(),
                         &shutdown_signal,
                         MAX_FRAME_BODY_LEN as usize,
                         None,

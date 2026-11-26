@@ -119,6 +119,8 @@ pub(super) struct ScopeDescribes {
     #[cfg(test)]
     iterations: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
+    verification_reconciles: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
     completed: Arc<StdMutex<CompletedEnds>>,
 }
 
@@ -140,6 +142,8 @@ pub(super) fn start_for_speech(
         move || work_scopes(executor.clone(), watched_runs.clone()),
         Some(speech),
         Some(run_scopes),
+        #[cfg(test)]
+        None,
         #[cfg(test)]
         None,
     )
@@ -206,6 +210,7 @@ pub(super) fn start(
         None,
         Some(run_scopes),
         None,
+        None,
     )
 }
 
@@ -215,6 +220,25 @@ fn start_with_scope_source<F, Fut>(
     executor: Arc<Executor>,
     interval: Duration,
     scope_source: F,
+) -> (
+    ScopeDescribes,
+    mpsc::UnboundedReceiver<EndedScope>,
+    JoinHandle<()>,
+)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
+{
+    start_with_scope_source_and_notifier(control, executor, interval, scope_source, None)
+}
+
+#[cfg(test)]
+fn start_with_scope_source_and_notifier<F, Fut>(
+    control: Arc<readiness::DaemonControl>,
+    executor: Arc<Executor>,
+    interval: Duration,
+    scope_source: F,
+    unnotified_source: Option<Notify>,
 ) -> (
     ScopeDescribes,
     mpsc::UnboundedReceiver<EndedScope>,
@@ -239,9 +263,11 @@ where
         None,
         None,
         None,
+        unnotified_source,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_with_scope_source_impl<F, Fut>(
     control: Arc<readiness::DaemonControl>,
     executor: Arc<Executor>,
@@ -250,6 +276,7 @@ fn start_with_scope_source_impl<F, Fut>(
     speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
     run_scopes: Option<Arc<super::run_scope::RunScopes>>,
     #[cfg(test)] test_grant_sweep: Option<TestGrantSweep>,
+    #[cfg(test)] unnotified_source: Option<Notify>,
 ) -> (
     ScopeDescribes,
     mpsc::UnboundedReceiver<EndedScope>,
@@ -266,12 +293,16 @@ where
     let completed = Arc::new(StdMutex::new(CompletedEnds::default()));
     #[cfg(test)]
     let iterations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[cfg(test)]
+    let verification_reconciles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = ScopeDescribes {
         goodbye,
         routed: routed.clone(),
         observed,
         #[cfg(test)]
         iterations: iterations.clone(),
+        #[cfg(test)]
+        verification_reconciles: verification_reconciles.clone(),
         #[cfg(test)]
         completed: completed.clone(),
     };
@@ -321,21 +352,35 @@ where
         let mut next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
         let mut inventory = scope_watch::Inventory::default();
         let mut indexed = IndexedScopes::default();
-        let mut inventory_revision = scope_watch::revisions();
+        let notifier = scope_watch::notifier();
+        #[cfg(test)]
+        let notifier = unnotified_source.as_ref().unwrap_or(notifier);
+        let revisions = || {
+            // An isolated fake inventory never publishes a revision. Other
+            // tests' process-wide changes must not hide its missing hint.
+            #[cfg(test)]
+            if unnotified_source.is_some() {
+                return [0; 4];
+            }
+            scope_watch::revisions()
+        };
+        let mut inventory_revision = revisions();
         let mut refresh = scope_watch::Refresh::new();
         let mut verifications = scope_watch::Verifications::default();
         let mut watches = scope_watch::Watches::new(control.metrics.clone());
+        let mut schedule = None;
+        let mut protected = scope_watch::Coverage::default();
         loop {
             #[cfg(test)]
             iterations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let changed = scope_watch::notifier().notified();
+            let changed = notifier.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if scope_watch::revisions() != inventory_revision {
+            if revisions() != inventory_revision {
                 refresh.changed();
             }
             if refresh.due() {
-                inventory_revision = scope_watch::revisions();
+                inventory_revision = revisions();
                 let mut refreshed = scope_source().await;
                 refreshed.retain_unread(&inventory);
                 indexed.refresh(&inventory, &refreshed);
@@ -353,7 +398,7 @@ where
             if confirmed.len() != last_confirmed {
                 indexed.mark_dirty();
             }
-            indexed.reconcile(&confirmed);
+            let inventory_changed = indexed.reconcile(&confirmed);
             let held_scopes = indexed.active();
             next_poll.retain(|key, _| held_scopes.contains_key(key));
             retry.retain(|key, _| held_scopes.contains_key(key));
@@ -368,10 +413,23 @@ where
                 .flat_map(|(_, group)| group.iter().map(|(key, _, _)| key.clone()))
                 .collect();
             pending.retain(|key| queued.contains_key(key) || active_keys.contains(key));
-            watches.reconcile(held_scopes, &control, interval);
-            let protected = watches.coverage(held_scopes.len());
+            if inventory_changed {
+                watches.update_membership(held_scopes);
+            }
+            watches.open_due(held_scopes, &control, interval);
+            let current = watches.schedule_state();
+            if inventory_changed || schedule != Some(current) {
+                schedule = Some(current);
+                let next = watches.coverage(held_scopes.len());
+                if next != protected {
+                    coverage.send_replace(next.clone());
+                    protected = next;
+                }
+                #[cfg(test)]
+                verification_reconciles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                verifications.reconcile(&watches.healthy_keys(), held_scopes);
+            }
             let protected_keys = &protected.keys;
-            verifications.reconcile(&watches.healthy_keys(), held_scopes);
             if let Some(key) = verifications.take_due() {
                 if let Some(stamp) = held_scopes.get(&key) {
                     verification_keys.insert(key.clone());
@@ -389,7 +447,6 @@ where
             watches.health.poll_keys = next_poll.len();
             watches.health.confirmed_cleanup = confirmed.len();
             watches.health.prefrontal_continuity_holds = continuity_holds.len();
-            coverage.send_replace(protected.clone());
             control
                 .metrics
                 .scope_descriptions
@@ -542,7 +599,7 @@ where
                 Some(stamp) = closes.recv() => {
                     // An idle route needs no RPC; parked consent asks still
                     // need a scope-end determination even without a process.
-                    inventory_revision = scope_watch::revisions();
+                    inventory_revision = revisions();
                     let mut current = scope_source().await;
                     current.retain_unread(&inventory);
                     indexed.refresh(&inventory, &current);
@@ -567,7 +624,7 @@ where
                     if refresh.due() { continue; }
                     if verifications.deadline().is_some_and(|due| due <= tokio::time::Instant::now()) { continue; }
                     if tokio::time::Instant::now() >= next_backstop {
-                        let now = scope_watch::revisions();
+                        let now = revisions();
                         let mut refreshed = scope_source().await;
                         refreshed.retain_unread(&inventory);
                         watches.health.drift_repairs += refreshed.warn_drift(&inventory, inventory_revision, now);
@@ -579,7 +636,7 @@ where
                     }
                     let scan_due = tokio::time::Instant::now() >= next_scan;
                     if scan_due {
-                        inventory_revision = scope_watch::revisions();
+                        inventory_revision = revisions();
                         let mut refreshed = scope_source().await;
                         refreshed.retain_unread(&inventory);
                         indexed.refresh(&inventory, &refreshed);
@@ -877,7 +934,7 @@ pub(crate) async fn confirm_secret_rebind_for_test(
             }
         });
     // A still-open head route must not suppress authorization-epoch checks.
-    scopes.routed.lock().unwrap().keys.insert(stamp_key(&stamp));
+    Arc::make_mut(&mut scopes.routed.lock().unwrap().keys).insert(stamp_key(&stamp));
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut answered_head = false;
     loop {
@@ -954,12 +1011,24 @@ pub(super) async fn finish_confirmed_end(
     metrics: Arc<DispatchPathMetrics>,
     notices: mpsc::UnboundedSender<EndedScope>,
 ) -> Option<EndedScope> {
+    finish_confirmed_end_with(stamp.clone(), metrics, notices, || {
+        revoke(executor.clone(), &stamp)
+    })
+    .await
+}
+
+async fn finish_confirmed_end_with<F: std::future::Future<Output = ScopeRevokeResult>>(
+    stamp: ScopeStamp,
+    metrics: Arc<DispatchPathMetrics>,
+    notices: mpsc::UnboundedSender<EndedScope>,
+    mut revoke: impl FnMut() -> F,
+) -> Option<EndedScope> {
     metrics
         .scope_descriptions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .cleanup_started(&stamp);
-    let first = revoke(executor.clone(), &stamp).await;
+    let first = revoke().await;
     metrics
         .scope_descriptions
         .lock()
@@ -985,7 +1054,7 @@ pub(super) async fn finish_confirmed_end(
             _ => 5,
         };
         tokio::time::sleep(Duration::from_secs(delay)).await;
-        let result = revoke(executor.clone(), &stamp).await;
+        let result = revoke().await;
         metrics
             .scope_descriptions
             .lock()
@@ -994,6 +1063,14 @@ pub(super) async fn finish_confirmed_end(
         if result.complete {
             return Some(EndedScope {
                 stamp,
+                keys: result.keys,
+            });
+        }
+        if !result.keys.is_empty() {
+            // A settled ledger row won't be selected again, even if another
+            // part of this cleanup pass still needs to retry.
+            let _ = notices.send(EndedScope {
+                stamp: stamp.clone(),
                 keys: result.keys,
             });
         }
@@ -1286,6 +1363,57 @@ mod tests {
             "an approval must not be able to advance the settled row"
         );
         assert!(!ledger::begin_approved(&conn, &key).unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_edge_scope_retry_delivers_keys_from_incomplete_passes() {
+        let stamp = ScopeStamp::new(
+            Principal::Direct,
+            "partial-end",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        );
+        let key = crate::db::call_ledger::Key {
+            carrier: "fixture".into(),
+            call_key: "held-call".into(),
+        };
+        let mut passes = [
+            ScopeRevokeResult {
+                keys: vec![],
+                complete: false,
+            },
+            ScopeRevokeResult {
+                keys: vec![key.clone()],
+                complete: false,
+            },
+            ScopeRevokeResult {
+                keys: vec![],
+                complete: true,
+            },
+        ]
+        .into_iter();
+        let (notices, mut received) = mpsc::unbounded_channel();
+        let final_notice = finish_confirmed_end_with(
+            stamp.clone(),
+            Arc::new(DispatchPathMetrics::new()),
+            notices,
+            || std::future::ready(passes.next().expect("only three passes")),
+        )
+        .await;
+        let mut collected = Vec::new();
+        while let Ok(notice) = received.try_recv() {
+            assert_eq!(notice.stamp, stamp);
+            collected.extend(notice.keys);
+        }
+        if let Some(notice) = final_notice {
+            assert_eq!(notice.stamp, stamp);
+            collected.extend(notice.keys);
+        }
+        assert_eq!(
+            collected,
+            [key],
+            "the committed settlement must be delivered exactly once"
+        );
     }
 
     #[tokio::test]

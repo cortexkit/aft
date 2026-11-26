@@ -1,3 +1,4 @@
+mod analysis_progress;
 mod applicability_cache;
 pub mod child_registry;
 pub mod client;
@@ -8,6 +9,7 @@ mod diagnostic_registration;
 pub mod diagnostics;
 pub mod document;
 pub mod environmental;
+pub(crate) mod event_ingress;
 pub mod fresh_wait;
 pub mod jsonrpc;
 pub mod manager;

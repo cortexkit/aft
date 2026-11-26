@@ -51,6 +51,60 @@ use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    #[test]
+    fn audit_resolution_snapshot_cache_keeps_trait_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        std::fs::write(
+            &path,
+            "trait Greeter { fn greet(&self); fn wave(&self) {} }",
+        )
+        .unwrap();
+        let mut outline = FileParser::new();
+        let parsed = outline.parse_snapshot(&path).unwrap();
+        let first = outline
+            .extract_symbols_from_snapshot(&path, &parsed)
+            .unwrap();
+        let mut navigation = FileParser::with_symbol_cache(outline.symbol_cache.clone());
+        let second = navigation.extract_symbols(&path).unwrap();
+        for symbols in [&*first, &second[..]] {
+            for name in ["greet", "wave"] {
+                assert!(
+                    symbols.iter().any(|symbol| {
+                        symbol.name == name
+                            && symbol.kind == SymbolKind::Method
+                            && symbol.parent.as_deref() == Some("Greeter")
+                    }),
+                    "missing Greeter::{name} from {symbols:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audit_resolution_same_size_and_mtime_do_not_keep_old_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        std::fs::write(&path, "fn old() {}\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let mut parser = FileParser::new();
+        assert_eq!(parser.extract_symbols(&path).unwrap()[0].name, "old");
+        std::fs::write(&path, "fn new() {}\n").unwrap();
+        let mtime = before.modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), mtime);
+        #[cfg(unix)]
+        assert_ne!(Stamp::of(&after), Stamp::of(&before));
+        assert_eq!(parser.extract_symbols(&path).unwrap()[0].name, "new");
+    }
+
     /// The reason a too deeply nested Markdown file is not parsed reaches
     /// the coding agents that call AFT's tools, in the error for that file.
     /// Its wording is a reviewed interface, so it is pinned here, and it
@@ -434,6 +488,137 @@ mod tests {
                 assert!(tree.root_node().has_error());
             }
         }
+    }
+
+    #[test]
+    fn review_gpt7_python_import_duplicate_requires_the_requested_binding() {
+        let request = crate::imports::ImportRequest::legacy("pkg", &[], None, None, false);
+        for (source, expected) in [
+            ("import pkg as p\n", false),
+            ("import pkg\n", true),
+            ("import pkg as pkg\n", true),
+            ("import other, pkg\n", true),
+            ("from pkg import *\n", false),
+        ] {
+            let tree =
+                parse_source_with_parser(Path::new("imports.py"), source, LangId::Python).unwrap();
+            let block = crate::imports::parse_imports(source, &tree, LangId::Python);
+            assert_eq!(
+                crate::imports::is_duplicate_import_request(LangId::Python, &block, &request),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[ignore = "run in isolation so pressure on the process-wide cache cannot affect other tests"]
+    #[test]
+    fn review_opus2_header_cache_bounds_retained_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..22_000)
+            .map(|i| format!("#define REG_{i:05} 0x{i:08X}\n"))
+            .collect();
+        let mut sources = Vec::new();
+        for i in 0..128 {
+            let path = dir.path().join(format!("reg{i}.h"));
+            let source = format!("// {path:?}\n{body}");
+            std::fs::write(&path, source).unwrap();
+            sources.push(path);
+        }
+        for path in &sources {
+            let source = std::fs::read_to_string(path).unwrap();
+            let (_, lang) = parse_resolved_source(path, &source, LangId::C).unwrap();
+            assert_eq!(lang, LangId::C);
+        }
+        let mut trees = 0;
+        let mut retained_bytes = 0;
+        for path in sources {
+            let source = std::fs::read_to_string(path).unwrap();
+            if let Some(tree) = cached_header_tree(&source, LangId::C) {
+                trees += 1;
+                retained_bytes += source.len() + 128 * tree.root_node().descendant_count();
+            }
+        }
+        eprintln!("128 generated headers ({} bytes each): {trees} cached trees, {retained_bytes} estimated retained bytes", body.len());
+        assert!(retained_bytes <= 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn review_opus3_rust_modules_walk_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let nested = "(".repeat(10_000) + "1" + &")".repeat(10_000);
+                let source = format!("mod pre;\nfn f() {{ let n = {nested}; mod local {{ mod child; }} }}\npub mod post;");
+                let tree = parse_source_with_parser(Path::new("nested.rs"), &source, LangId::Rust).unwrap();
+                assert!(!tree.root_node().has_error());
+                let modules = rust_modules(tree.root_node(), &source);
+                assert_eq!(modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["pre", "local", "post"]);
+                assert_eq!(modules[1].children[0].name, "child");
+                assert!(modules[2].exported);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn review_opus8_signature_allocation_is_bounded() {
+        let prefix = "function f(){/*";
+        let source = format!(
+            "{prefix}{}é{}*/}}",
+            "x".repeat(MAX_SIGNATURE_BYTES - prefix.len() - 1),
+            "y".repeat(256 * 1024)
+        );
+        let tree =
+            parse_source_with_parser(Path::new("long.js"), &source, LangId::JavaScript).unwrap();
+        let node = tree.root_node().named_child(0).unwrap();
+        let signature = extract_signature(&source, &node);
+        assert!(
+            signature.capacity() <= MAX_SIGNATURE_BYTES + '…'.len_utf8(),
+            "signature allocated {} bytes",
+            signature.capacity()
+        );
+        assert_eq!(
+            signature,
+            format!("{}…", &source[..MAX_SIGNATURE_BYTES - 1])
+        );
+    }
+
+    #[test]
+    fn review_opus12_supplied_source_invalidates_cached_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.rs");
+        let disk = "fn old() {}\n";
+        let source = "struct B;  \n";
+        assert_eq!(disk.len(), source.len());
+        std::fs::write(&path, disk).unwrap();
+        let mut parser = FileParser::new();
+        assert_eq!(
+            parser
+                .parse(&path)
+                .unwrap()
+                .0
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .kind(),
+            "function_item"
+        );
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (tree, _) = parser
+            .parse_with_source(
+                &path,
+                source,
+                mtime,
+                source.len() as u64,
+                content_hash_for_source(source),
+            )
+            .unwrap();
+        assert_eq!(
+            tree.root_node().named_child(0).unwrap().kind(),
+            "struct_item"
+        );
     }
 
     #[test]
@@ -2722,48 +2907,52 @@ fn body_macros_are_not_items() {
         (dir, file, mtime, size, hash)
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, unix))]
     #[test]
     fn cached_freshness_unchanged_metadata_skips_hashing() {
-        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let (_dir, file, _, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let stamp = Stamp::of(&std::fs::metadata(&file).unwrap());
 
         cache_freshness::reset_hash_file_if_small_count_for_debug();
-        assert!(cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert_eq!(fresh_file_stamp(&file, stamp, size, hash), Some(stamp));
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 0);
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_mtime_with_identical_content_hashes_fresh() {
-        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let (_dir, file, _, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let stamp = Stamp::of(&std::fs::metadata(&file).unwrap());
         filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
 
         cache_freshness::reset_hash_file_if_small_count_for_debug();
-        assert!(cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert!(fresh_file_stamp(&file, stamp, size, hash).is_some());
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_mtime_and_same_size_content_hashes_stale() {
-        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn one() {}\n");
+        let (_dir, file, _, size, hash) = cached_freshness_fixture("pub fn one() {}\n");
+        let stamp = Stamp::of(&std::fs::metadata(&file).unwrap());
         std::fs::write(&file, "pub fn two() {}\n").unwrap();
         filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
         assert_eq!(std::fs::metadata(&file).unwrap().len(), size);
 
         cache_freshness::reset_hash_file_if_small_count_for_debug();
-        assert!(!cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert!(fresh_file_stamp(&file, stamp, size, hash).is_none());
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_size_skips_hashing() {
-        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let (_dir, file, _, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let stamp = Stamp::of(&std::fs::metadata(&file).unwrap());
         std::fs::write(&file, "pub fn hello() {}\n// longer\n").unwrap();
 
         cache_freshness::reset_hash_file_if_small_count_for_debug();
-        assert!(!cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert!(fresh_file_stamp(&file, stamp, size, hash).is_none());
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 0);
     }
 
@@ -2810,7 +2999,7 @@ fn body_macros_are_not_items() {
         eprintln!("heading line visits: baseline {old_line_visits}, indexed {indexed_visits}");
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, unix))]
     #[test]
     fn touched_symbol_cache_rehashes_only_first_query() {
         let (_dir, file, _, _, _) = cached_freshness_fixture("pub fn hello() {}\n");

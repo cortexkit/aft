@@ -137,4 +137,6 @@ async function reportFatal(error: unknown): Promise<number> {
 
 main()
   .catch(reportFatal)
-  .then((code) => process.exit(code));
+  .then((code) => {
+    process.exitCode = code;
+  });

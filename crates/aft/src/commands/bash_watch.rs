@@ -15,7 +15,7 @@
 pub(crate) mod restart;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -54,6 +54,39 @@ const WORKER_OUTPUT_TAIL_LINES: usize = 20;
 const WORKER_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 /// Output preview a watch result carries for a finished task.
 const PREVIEW_BYTES: usize = crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES;
+
+pub(crate) type WatchReplyTimingSink = Arc<OnceLock<WatchReplyTiming>>;
+
+#[derive(Default)]
+pub(crate) struct WatchReplyTiming {
+    recovery: Duration,
+    scan: Duration,
+    status: Duration,
+    preview: Duration,
+    format: Duration,
+}
+
+impl WatchReplyTiming {
+    pub(crate) fn append_log_fields(&self, line: &mut String) {
+        use std::fmt::Write;
+        let _ = write!(
+            line,
+            " recovery_ms={} scan_ms={} status_ms={} preview_ms={} format_ms={}",
+            self.recovery.as_millis(),
+            self.scan.as_millis(),
+            self.status.as_millis(),
+            self.preview.as_millis(),
+            self.format.as_millis(),
+        );
+    }
+}
+
+fn measure<T>(duration: &mut Duration, f: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let value = f();
+    *duration += started.elapsed();
+    value
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct BashWatchParams {
@@ -298,7 +331,7 @@ pub(crate) fn handle_deferred_with_observation_only(
     budget: crate::commands::blocking_wait::ReplyBudget,
     observation_only: bool,
 ) -> DispatchOutcome {
-    handle_deferred_yieldable(req, ctx, budget, observation_only, None)
+    handle_deferred_yieldable(req, ctx, budget, observation_only, None, None)
 }
 
 /// Asks a waiting watch to end now, with what it has seen so far, exactly as
@@ -330,6 +363,7 @@ pub(crate) fn handle_deferred_yieldable(
     budget: crate::commands::blocking_wait::ReplyBudget,
     observation_only: bool,
     yield_signal: Option<Arc<YieldSignal>>,
+    timing_sink: Option<WatchReplyTimingSink>,
 ) -> DispatchOutcome {
     let id = req.id.clone();
     let params = match parse_params(req) {
@@ -412,6 +446,8 @@ pub(crate) fn handle_deferred_yieldable(
             let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             crate::sandbox_spawn::with_authenticated_principal(principal, || {
+                let mut timing = WatchReplyTiming::default();
+                let recovery_started = Instant::now();
                 // Configure acknowledges the route before its replay tail finishes.
                 // Resolve the durable record before starting the wait, off executor
                 // slots, and without replaying unrelated tasks or relaxing the session.
@@ -434,6 +470,7 @@ pub(crate) fn handle_deferred_yieldable(
                         return;
                     }
                 }
+                timing.recovery = recovery_started.elapsed();
                 let watch = WatchJob {
                     registry,
                     task_id,
@@ -449,7 +486,7 @@ pub(crate) fn handle_deferred_yieldable(
                     project_root,
                     yield_signal,
                 };
-                if watch.observed_status(0).is_none() {
+                if measure(&mut timing.status, || watch.observed_status(0)).is_none() {
                     let response = Response::error(
                         &thread_id,
                         "task_not_found",
@@ -467,14 +504,15 @@ pub(crate) fn handle_deferred_yieldable(
                 if let (Some(signal), Some(wait)) = (&watch.yield_signal, restart_wait) {
                     restart::watch_waiting(signal, wait);
                 }
-                let Some(waited) = watch.wait(&worker_cancellation) else {
+                let Some(waited) = watch.wait_with_timing(&worker_cancellation, &mut timing) else {
                     // Cancelled: the transport already answered the call.
                     return;
                 };
                 // The task was already resolved under this route's identity. Do not
                 // re-adopt another session's task through status's relaxed fallback if
                 // the record disappears while the watch is waiting.
-                let snapshot = watch.observed_status(PREVIEW_BYTES);
+                let snapshot =
+                    measure(&mut timing.preview, || watch.observed_status(PREVIEW_BYTES));
                 let response = match snapshot {
                     Some(snapshot)
                         if snapshot.info.status == BgTaskStatus::FateUnknown
@@ -486,13 +524,18 @@ pub(crate) fn handle_deferred_yieldable(
                         restart::watch_unknown(watch.yield_signal.as_ref().unwrap());
                         return;
                     }
-                    Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
+                    Some(snapshot) => measure(&mut timing.format, || {
+                        watch.reply(&thread_id, snapshot, &waited)
+                    }),
                     None => Response::error(
                         &thread_id,
                         "task_not_found",
                         format_unknown_polled_task_message(&watch.task_id, &shell_tool),
                     ),
                 };
+                if let Some(sink) = timing_sink {
+                    let _ = sink.set(timing);
+                }
                 if watch
                     .yield_signal
                     .as_ref()
@@ -577,9 +620,18 @@ impl WatchJob {
         }
     }
 
+    #[cfg(test)]
+    fn wait(&self, cancellation: &crate::executor::JobCancellation) -> Option<Waited> {
+        self.wait_with_timing(cancellation, &mut WatchReplyTiming::default())
+    }
+
     /// Waits until the task exits, the pattern matches, or the limit passes.
     /// `None` when the call was cancelled first.
-    fn wait(&self, cancellation: &crate::executor::JobCancellation) -> Option<Waited> {
+    fn wait_with_timing(
+        &self,
+        cancellation: &crate::executor::JobCancellation,
+        timing: &mut WatchReplyTiming,
+    ) -> Option<Waited> {
         let started = self.budget.received_at;
         let deadline = self
             .budget
@@ -604,14 +656,16 @@ impl WatchJob {
             // A worker waiting on its task keeps the task's default hard kill
             // at least one worker wait limit away, as every other worker wait
             // does (see `BgTaskRegistry::renew_hard_kill`).
-            if self.worker && !self.observation_only {
-                self.registry.renew_hard_kill(
-                    &self.task_id,
-                    &self.session,
-                    Duration::from_millis(self.worker_limit_ms),
-                );
-            }
-            let snapshot = self.observed_status(0);
+            let snapshot = measure(&mut timing.status, || {
+                if self.worker && !self.observation_only {
+                    self.registry.renew_hard_kill(
+                        &self.task_id,
+                        &self.session,
+                        Duration::from_millis(self.worker_limit_ms),
+                    );
+                }
+                self.observed_status(0)
+            });
             let mut terminal = snapshot
                 .as_ref()
                 .is_none_or(|snapshot| snapshot.info.status.is_terminal());
@@ -621,7 +675,9 @@ impl WatchJob {
                 cancellation.report_progress();
             }
             if let (Some(pattern), Some(snapshot)) = (&self.pattern, &snapshot) {
-                if let Some(found) = self.scan(pattern, snapshot, &mut stdout, &mut stderr) {
+                if let Some(found) = measure(&mut timing.scan, || {
+                    self.scan(pattern, snapshot, &mut stdout, &mut stderr)
+                }) {
                     return Some(waited(WaitReason::Matched, Some(found)));
                 }
                 // Task exit is not the end of a paged scan. Check unread
@@ -664,8 +720,10 @@ impl WatchJob {
                 return Some(result);
             }
             let kill_remaining = if self.worker {
-                self.registry
-                    .hard_kill_remaining(&self.task_id, &self.session)
+                measure(&mut timing.status, || {
+                    self.registry
+                        .hard_kill_remaining(&self.task_id, &self.session)
+                })
             } else {
                 None
             };
@@ -1207,6 +1265,49 @@ mod tests {
             result.matched,
             Some(("FINAL-MATCH".into(), 65534, Some("stdout")))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn remote_timeout_metadata_cannot_extend_the_worker_watch_limit() {
+        use crate::bash_background::registry::remote::reply_test_fixtures::accepted_task_past_runner_timeout_for_test;
+        use crate::commands::blocking_wait::ReplyBudget;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path(), dir.path());
+        let registry = ctx.bash_background().clone();
+        let (_task_dir, task) = accepted_task_past_runner_timeout_for_test(&registry, SESSION);
+        let now = tokio::time::Instant::now().into_std();
+        let job = WatchJob {
+            registry,
+            task_id: task.task_id.clone(),
+            session: SESSION.into(),
+            pattern: None,
+            limit_ms: 1000,
+            worker: true,
+            worker_limit_ms: 60_000,
+            primary_cap_ms: 120_000,
+            budget: ReplyBudget::with_deadline(
+                now - Duration::from_secs(1),
+                now + Duration::from_secs(60),
+            )
+            .with_runtime_clock(),
+            observation_only: false,
+            storage_dir: crate::bash_background::task_storage_dir(&ctx),
+            project_root: Some(dir.path().into()),
+            yield_signal: None,
+        };
+        // Don't enter the watch loop if the remote timeout still looks like
+        // an imminent local kill: it would keep polling at the paused instant.
+        assert_eq!(
+            job.registry.hard_kill_remaining(&job.task_id, SESSION),
+            None
+        );
+        let waited = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        let response = job.reply("remote-watch", job.observed_status(0).unwrap(), &waited);
+        assert_eq!(response.data["waited"]["reason"], "timeout");
+        assert_eq!(response.data["waited"]["elapsed_ms"], 1000);
+        assert_eq!(response.data["status"], "running");
     }
 
     #[test]

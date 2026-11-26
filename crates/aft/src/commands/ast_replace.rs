@@ -671,7 +671,7 @@ mod lsp_tests {
             changed["textDocument"]["uri"],
             uri_for_path(&file).unwrap().to_string()
         );
-        assert_eq!(changed["textDocument"]["version"], 1);
+        assert_eq!(changed["textDocument"]["version"], 2);
         assert_eq!(changed["contentChanges"][0]["text"], expected);
     }
 
@@ -695,7 +695,7 @@ mod lsp_tests {
             restored["textDocument"]["uri"],
             uri_for_path(&file).unwrap().to_string()
         );
-        assert_eq!(restored["textDocument"]["version"], 2);
+        assert_eq!(restored["textDocument"]["version"], 3);
         assert_eq!(restored["contentChanges"][0]["text"], "fn main() {}\n");
     }
 }

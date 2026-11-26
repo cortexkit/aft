@@ -756,9 +756,8 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     // restored to its original content — the import was NOT added. Report that
     // honestly with an error instead of claiming success with `added: true`.
     if write_result.rolled_back {
-        return Response::error(
-            &req.id,
-            "generated_invalid_syntax",
+        return rolled_back_import_error(
+            req, ctx, &op_id, &path, &write_result,
             format!(
                 "add_import: adding '{module}' to {file} would produce invalid syntax; file left unchanged"
             ),
@@ -800,6 +799,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
     write_result.append_reformatted_excerpt_to(&mut result);
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, Some(&path));
     Response::success(&req.id, result)
 }
 
@@ -865,8 +865,79 @@ fn contains_parent_path_segment(module: &str) -> bool {
         .any(|segment| segment == "..")
 }
 
+pub(super) fn rolled_back_import_error(
+    req: &RawRequest,
+    ctx: &AppContext,
+    op_id: &str,
+    path: &Path,
+    written: &edit::WriteResult,
+    message: String,
+) -> Response {
+    let mut data = serde_json::json!({});
+    if let Err(error) = ctx
+        .backup()
+        .lock()
+        .try_discard_latest_operation_entry_for_path(req.session(), op_id, path)
+    {
+        crate::slog_warn!(
+            "failed to discard rolled-back import backup for {}: {error}",
+            path.display()
+        );
+        data["undo_cleanup_failed"] = serde_json::json!(true);
+    }
+    written.append_write_warnings_to(&mut data);
+    Response::error_with_data(&req.id, "generated_invalid_syntax", message, data)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edit_review_opus_1_undo_skips_rolled_back_import() {
+        use super::*;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.ts");
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        ctx.backup()
+            .lock()
+            .set_storage_dir(root.path().join("backup"), 72);
+        ctx.checkpoint().lock().set_storage_dir_for_harness(
+            root.path().join("checkpoints"),
+            crate::harness::Harness::Opencode,
+        );
+        std::fs::write(&path, "const v = 0;\n").unwrap();
+        let write: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "write", "command": "write", "file": path, "content": "const v = 1;\n",
+        }))
+        .unwrap();
+        let response = crate::commands::write::handle_write(&write, &ctx);
+        assert!(response.success, "{response:?}");
+        ctx.backup().lock().record_post_mutation_states();
+        let import: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "import", "command": "add_import", "file": path, "module": "./x", "names": ["1bad"],
+        })).unwrap();
+        let response = handle_add_import(&import, &ctx);
+        assert_eq!(
+            response.data["code"], "generated_invalid_syntax",
+            "{response:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "const v = 1;\n");
+        ctx.backup().lock().record_post_mutation_states();
+        let undo: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "undo", "command": "undo",
+        }))
+        .unwrap();
+        let response = crate::commands::undo::handle_undo(&undo, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "const v = 0;\n");
+    }
+
     use super::coerce_string_array_param;
     use serde_json::json;
 

@@ -635,6 +635,7 @@ pub fn synthetic_envelope(
         complete,
         files,
         op_id,
+        backup_skipped_reason: None,
         stop_reason: if success {
             None
         } else {

@@ -147,6 +147,7 @@ const EXTERNAL_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// A save AFT asked rust-analyzer to check.
 #[derive(Debug, Clone)]
 struct RustSaveRequest {
+    allow_resend: bool,
     /// The saved document.
     uri: lsp_types::Uri,
     /// Set while the save has not been sent: send it once this passes.
@@ -287,7 +288,7 @@ fn spawn_lsp_child(
     reclaim_root: Option<&Path>,
     root: &Path,
     kind: &ServerKind,
-) -> io::Result<Child> {
+) -> io::Result<(Child, super::child_registry::TrackedProcess)> {
     #[cfg(not(target_os = "linux"))]
     {
         registry.spawn_tracked_child(&mut command, reclaim_root, Some(root), Some(kind))
@@ -495,7 +496,7 @@ impl From<LspEvent> for ReceivedLspEvent {
 pub(crate) enum LspEventSender {
     Standalone(Sender<LspEvent>),
     Managed {
-        sender: Sender<ReceivedLspEvent>,
+        sender: super::event_ingress::EventIngress,
         instance: ServerInstanceId,
     },
 }
@@ -839,8 +840,8 @@ pub(crate) struct RustWorkspaceState {
 /// Per-server work-done runs used to certify background analysis.
 #[derive(Default)]
 struct WorkDoneAnalysis {
-    active: std::collections::HashSet<String>,
-    announced: std::collections::HashSet<String>,
+    tokens: super::analysis_progress::AnalysisTokens,
+    last_transition: u64,
     observed: bool,
     opens: HashMap<PathBuf, OpenAnalysis>,
     latest_input: Option<AnalysisInput>,
@@ -906,9 +907,8 @@ impl WorkDoneAnalysis {
         }
     }
 
-    fn announced(&mut self, token: String) {
+    fn started(&mut self) {
         self.observed = true;
-        self.announced.insert(token);
         for open in self.opens.values_mut() {
             open.requires_end = true;
         }
@@ -918,39 +918,55 @@ impl WorkDoneAnalysis {
     }
 
     fn running(&self) -> bool {
-        !self.active.is_empty() || !self.announced.is_empty()
+        self.tokens.running()
     }
 
     fn covered_by_end(&self, epoch: u64) -> bool {
         self.completed_through_epoch.is_some_and(|end| epoch <= end)
     }
 
-    fn record(&mut self, token: String, kind: &str, diagnostics_epoch: u64) {
-        match kind {
-            "begin" => {
-                self.observed = true;
-                self.announced.remove(&token);
-                self.active.insert(token);
-                for open in self.opens.values_mut() {
-                    open.requires_end = true;
-                }
-                if let Some(input) = &mut self.latest_input {
-                    input.requires_end = true;
-                }
-            }
-            "end" => {
-                if self.active.remove(&token) {
-                    if !self.running() {
-                        self.completed_through_epoch = Some(diagnostics_epoch);
-                        self.last_published_epoch =
-                            self.last_published_epoch.max(diagnostics_epoch);
-                        self.short_publication_seen = false;
-                        self.latest_input = None;
-                    }
-                }
-            }
-            _ => {}
+    fn completed(&mut self, diagnostics_epoch: u64) {
+        self.completed_through_epoch = Some(diagnostics_epoch);
+        self.last_published_epoch = self.last_published_epoch.max(diagnostics_epoch);
+        self.short_publication_seen = false;
+        self.latest_input = None;
+    }
+
+    fn record(
+        &mut self,
+        token: String,
+        transition: super::analysis_progress::Transition,
+        diagnostics_epoch: u64,
+    ) {
+        if !matches!(transition, super::analysis_progress::Transition::End) {
+            self.started();
         }
+        if self.tokens.record(token, transition) {
+            self.completed(diagnostics_epoch);
+        }
+    }
+
+    fn recover(
+        &mut self,
+        shadow: super::analysis_progress::AnalysisProgressShadow,
+        diagnostics_epoch: u64,
+    ) {
+        if shadow.last_transition <= self.last_transition {
+            return;
+        }
+        let start = shadow.last_start > self.last_transition;
+        let complete = shadow.last_completion > self.last_transition;
+        if start && shadow.last_start < shadow.last_completion {
+            self.started();
+        }
+        if complete {
+            self.completed(diagnostics_epoch);
+        }
+        if start && shadow.last_start > shadow.last_completion {
+            self.started();
+        }
+        self.tokens = shadow.tokens;
+        self.last_transition = shadow.last_transition;
     }
 
     fn pending(&self) -> bool {
@@ -1024,6 +1040,10 @@ pub struct LspClient {
     root: PathBuf,
     state: ServerState,
     child: Child,
+    child_process: super::child_registry::TrackedProcess,
+    _event_ingress: Option<super::event_ingress::EventIngressLease>,
+    watched_stale: bool,
+    pub(super) watched_epoch: u64,
     // Held until the child exits or Drop kills/reaps it, including failed handshakes.
     _rust_analyzer_permit: Option<RustAnalyzerPermit>,
     // Drop runs after the process group has been killed and reaped.
@@ -1038,6 +1058,7 @@ pub struct LspClient {
     pending: Arc<Mutex<PendingMap>>,
     /// Last outbound request or document open/change/save, not server-pushed traffic.
     last_used_at: Instant,
+    diagnostic_input_generation: u64,
     /// Next request ID counter.
     next_id: AtomicI64,
     /// Diagnostic capabilities reported by the server in its initialize response.
@@ -1068,6 +1089,9 @@ pub struct LspClient {
     /// the diagnostics store only when such a run finishes, so while one is
     /// running the published Rust diagnostics are missing those errors.
     rust_flycheck_running: HashMap<String, u64>,
+    /// The server event queue overflowed, so the last check cannot prove its
+    /// results. Only a new BEGIN can associate later pushes with another run.
+    rust_flycheck_lost: bool,
     /// Begin ordinal of the latest completed check. A matching begin/end is
     /// evidence even when a clean compiler run publishes no diagnostic rows.
     rust_completed_check_begin: Option<u64>,
@@ -1088,14 +1112,11 @@ pub struct LspClient {
     /// drained. Events wait in the channel until a caller drains them, so a
     /// begin drained after a save was sent may have been sent by the server
     /// before the save, for a run of the files before the edit; comparing
-    /// this count, taken when the save is sent, with
-    /// `rust_check_begins_drained` tells the two apart.
+    /// this count, taken when the save is sent, with the received BEGIN's
+    /// ordinal tells the two apart.
     rust_check_begins_read: Arc<AtomicU64>,
-    rust_check_begin_times: Arc<Mutex<HashMap<u64, SystemTime>>>,
+    rust_check_begin_receipts: Arc<Mutex<HashMap<u64, (u64, SystemTime)>>>,
     pub(crate) completed_rust_check: Option<super::completed_rust_check::CompletedRustCheck>,
-    /// How many check-run begin notifications have been drained (see
-    /// [`LspClient::record_rust_progress`]).
-    rust_check_begins_drained: u64,
     /// How the server asked to hear about saves (`textDocumentSync.save` in
     /// its initialize response). `None` until `initialize` succeeds, and when
     /// the server did not ask.
@@ -1286,18 +1307,20 @@ impl LspClient {
                 .join(" "),
             COMMAND_DISPLAY_BYTES,
         );
-        let mut child = spawn_lsp_child(command, &child_registry, reclaim_root, &root, &kind)
-            .map_err(|err| {
-                // A spawn error from the OS names neither the program nor the
-                // directory; both are what a reader needs to fix it.
-                io::Error::new(
-                    err.kind(),
-                    format!(
-                        "failed to start `{command_display}` in {}: {err}",
-                        root.display()
-                    ),
-                )
-            })?;
+        let (mut child, child_process) =
+            spawn_lsp_child(command, &child_registry, reclaim_root, &root, &kind).map_err(
+                |err| {
+                    // A spawn error from the OS names neither the program nor the
+                    // directory; both are what a reader needs to fix it.
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "failed to start `{command_display}` in {}: {err}",
+                            root.display()
+                        ),
+                    )
+                },
+            )?;
         let child_pid = child.id();
 
         let (stdout, stdin, stderr) =
@@ -1306,9 +1329,8 @@ impl LspClient {
                 _ => {
                     // No client will own this child, so stop it here rather
                     // than leave an untracked process behind.
-                    kill_lsp_child_group(&mut child);
-                    let _ = child.wait();
-                    child_registry.untrack(child_pid);
+                    stop_tracked_child(&child_registry, &child_process, &mut child);
+                    child_registry.finish_client(&child_process);
                     return Err(io::Error::other("language server is missing a stdio pipe"));
                 }
             };
@@ -1319,9 +1341,8 @@ impl LspClient {
         let writer = match LspWriter::spawn(stdin) {
             Ok(writer) => writer,
             Err(err) => {
-                kill_lsp_child_group(&mut child);
-                let _ = child.wait();
-                child_registry.untrack(child_pid);
+                stop_tracked_child(&child_registry, &child_process, &mut child);
+                child_registry.finish_client(&child_process);
                 return Err(err);
             }
         };
@@ -1340,9 +1361,19 @@ impl LspClient {
         let reader_root = root.clone();
         let rust_check_begins_read = Arc::new(AtomicU64::new(0));
         let reader_check_begins = Arc::clone(&rust_check_begins_read);
-        let rust_check_begin_times = Arc::new(Mutex::new(HashMap::new()));
-        let reader_check_begin_times = Arc::clone(&rust_check_begin_times);
+        let rust_check_begin_receipts = Arc::new(Mutex::new(HashMap::new()));
+        let reader_check_begin_receipts = Arc::clone(&rust_check_begin_receipts);
 
+        let event_ingress = match &event_tx {
+            LspEventSender::Managed { sender, instance } => Some(sender.register(
+                *instance,
+                super::roots::ServerKey {
+                    kind: kind.clone(),
+                    root: root.clone(),
+                },
+            )),
+            LspEventSender::Standalone(_) => None,
+        };
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -1369,8 +1400,8 @@ impl LspClient {
                         let receive_order = reader_writer.note_received();
                         if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
                             let ordinal = reader_check_begins.fetch_add(1, Ordering::SeqCst) + 1;
-                            if let Ok(mut times) = reader_check_begin_times.lock() {
-                                times.insert(ordinal, SystemTime::now());
+                            if let Ok(mut receipts) = reader_check_begin_receipts.lock() {
+                                receipts.insert(receive_order, (ordinal, SystemTime::now()));
                             }
                         }
                         let _ = event_tx.send_ordered(
@@ -1469,10 +1500,15 @@ impl LspClient {
             root,
             state: ServerState::Starting,
             child,
+            child_process,
+            _event_ingress: event_ingress,
+            watched_stale: false,
+            watched_epoch: 0,
             child_pid,
             writer,
             pending,
             last_used_at: Instant::now(),
+            diagnostic_input_generation: 0,
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             diagnostic_registrations,
@@ -1484,15 +1520,15 @@ impl LspClient {
             rust_analyzer_warning: None,
             rust_workspace_check_owed_since: None,
             rust_flycheck_running: HashMap::new(),
+            rust_flycheck_lost: false,
             rust_completed_check_begin: None,
             rust_check_begins_at_load: 0,
             rust_flycheck_finished_at: None,
             rust_flycheck_started_at: None,
             rust_save: None,
             rust_check_begins_read,
-            rust_check_begin_times,
+            rust_check_begin_receipts,
             completed_rust_check: None,
-            rust_check_begins_drained: 0,
             save_notification: None,
             rust_checks_on_save: false,
             rust_checks_on_load: false,
@@ -1722,18 +1758,14 @@ impl LspClient {
 
     pub(crate) fn start_document_diagnostic_request(
         &mut self,
-        file: &Path,
         mut params: super::pull_params::AftDocumentDiagnosticParams,
     ) -> Result<(PendingLspRequest, bool), LspError> {
-        let registrations = Arc::clone(&self.diagnostic_registrations);
-        let registrations = registrations.lock().unwrap_or_else(|p| p.into_inner());
         let caps = if self.pull_diagnostics_disabled {
             None
         } else {
             self.diagnostic_caps
                 .clone()
                 .filter(|caps| caps.pull_diagnostics)
-                .or_else(|| registrations.capabilities(&self.root, Some(file)))
         }
         .ok_or_else(|| {
             LspError::ServerNotReady("document diagnostics are not registered for this file".into())
@@ -1743,18 +1775,80 @@ impl LspClient {
         }
         params.identifier = caps.identifier;
         let used_previous = params.previous_result_id.is_some();
-        // Keep registration stable through FIFO enqueue: unregistration cannot
-        // be acknowledged ahead of a request authorized by the old registration.
         let request =
             self.start_request::<super::pull_params::AftDocumentDiagnosticRequest>(params)?;
-        drop(registrations);
         Ok((request, used_previous))
+    }
+
+    pub(super) fn registered_document_provider_generations(&self, file: &Path) -> Vec<u64> {
+        if self.pull_diagnostics_disabled
+            || self
+                .diagnostic_caps
+                .as_ref()
+                .is_some_and(|caps| caps.pull_diagnostics)
+        {
+            return Vec::new();
+        }
+        self.diagnostic_registrations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .document_providers(&self.root, file)
+            .into_iter()
+            .map(|(generation, _)| generation)
+            .collect()
+    }
+
+    pub(super) fn start_registered_document_pulls(
+        &mut self,
+        file: &Path,
+        uri: &lsp_types::Uri,
+        previous: Option<&super::diagnostics::ProviderResults>,
+    ) -> Vec<(u64, Result<PendingLspRequest, LspError>)> {
+        if self.pull_diagnostics_disabled
+            || self
+                .diagnostic_caps
+                .as_ref()
+                .is_some_and(|caps| caps.pull_diagnostics)
+        {
+            return Vec::new();
+        }
+        let registrations = Arc::clone(&self.diagnostic_registrations);
+        // Do not let an unregistration acknowledgement overtake a request
+        // authorised by that registration on the FIFO writer.
+        let registrations = registrations.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = previous.filter(|results| results.instance == self.instance);
+        registrations
+            .document_providers(&self.root, file)
+            .into_iter()
+            .map(|(generation, identifier)| {
+                let previous_result_id = previous
+                    .and_then(|results| {
+                        results
+                            .stamps
+                            .iter()
+                            .find(|stamp| stamp.generation == generation)
+                    })
+                    .and_then(|stamp| stamp.result_id.clone());
+                let params = super::pull_params::AftDocumentDiagnosticParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                    identifier,
+                    previous_result_id,
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                };
+                (
+                    generation,
+                    self.start_request::<super::pull_params::AftDocumentDiagnosticRequest>(params),
+                )
+            })
+            .collect()
     }
 
     /// Whether this server is still analyzing: Rust uses workspace/check state;
     /// enabled background-analysis producers use their work-done progress.
     pub fn diagnostics_are_provisional(&self) -> bool {
-        self.is_unresponsive()
+        self.watched_stale
+            || self.is_unresponsive()
             || (self.uses_analysis_progress()
                 && if self.uses_document_pull(None) {
                     self.analysis_progress.running()
@@ -1766,8 +1860,7 @@ impl LspClient {
     }
 
     pub(crate) fn uses_analysis_progress(&self) -> bool {
-        matches!(self.kind, ServerKind::Python)
-            || matches!(&self.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+        super::analysis_progress::uses_analysis_progress(&self.kind)
     }
 
     pub(crate) fn analysis_progress_authority(&self) -> Option<&'static str> {
@@ -1780,14 +1873,29 @@ impl LspClient {
         })
     }
 
-    pub(crate) fn record_analysis_progress(&mut self, params: &Value, diagnostics_epoch: u64) {
-        if let (Some(token), Some(kind)) = (
-            params.get("token"),
-            params.pointer("/value/kind").and_then(Value::as_str),
-        ) {
-            self.analysis_progress
-                .record(token.to_string(), kind, diagnostics_epoch);
+    pub(super) fn record_analysis_progress(
+        &mut self,
+        token: &Value,
+        transition: super::analysis_progress::Transition,
+        order: Option<u64>,
+        diagnostics_epoch: u64,
+    ) {
+        if let Some(order) = order {
+            if order <= self.analysis_progress.last_transition {
+                return;
+            }
+            self.analysis_progress.last_transition = order;
         }
+        self.analysis_progress
+            .record(token.to_string(), transition, diagnostics_epoch);
+    }
+
+    pub(super) fn recover_analysis_progress(
+        &mut self,
+        shadow: super::analysis_progress::AnalysisProgressShadow,
+        diagnostics_epoch: u64,
+    ) {
+        self.analysis_progress.recover(shadow, diagnostics_epoch);
     }
 
     pub(crate) fn analysis_progress_certifies(
@@ -1807,12 +1915,6 @@ impl LspClient {
 
     pub(crate) fn has_analysis_progress(&self) -> bool {
         self.uses_analysis_progress() && self.analysis_progress.observed
-    }
-
-    pub(crate) fn note_analysis_progress_support(&mut self, params: &Value) {
-        if let Some(token) = params.get("token") {
-            self.analysis_progress.announced(token.to_string());
-        }
     }
 
     pub(crate) fn note_analysis_publication(
@@ -1967,25 +2069,37 @@ impl LspClient {
     /// Record one rust-analyzer `$/progress` notification. Only check runs
     /// are tracked: rust-analyzer names their token `rust-analyzer/flycheck/N`
     /// and titles them with the check command (`cargo check`, `cargo clippy`).
-    pub(crate) fn record_rust_progress(&mut self, token: &str, kind: &str, title: Option<&str>) {
+    /// Returns true only when an END matches a tracked run.
+    pub(super) fn record_rust_progress(
+        &mut self,
+        token: &str,
+        kind: &str,
+        title: Option<&str>,
+        order: Option<u64>,
+    ) -> bool {
         if !matches!(&self.kind, ServerKind::Rust) {
-            return;
+            return false;
         }
         match kind {
             "begin" => {
                 if is_rust_check_progress(token, title) {
-                    self.rust_check_begins_drained += 1;
-                    let ordinal = self.rust_check_begins_drained;
-                    let began = self
-                        .rust_check_begin_times
-                        .lock()
-                        .ok()
-                        .and_then(|mut times| times.remove(&ordinal));
-                    if let Some(cache) = self.completed_rust_check.as_mut() {
-                        if let Some(began) = began {
+                    let ordinal = if let Some(order) = order {
+                        let Some((ordinal, began)) = self
+                            .rust_check_begin_receipts
+                            .lock()
+                            .ok()
+                            .and_then(|mut receipts| receipts.remove(&order))
+                        else {
+                            return false;
+                        };
+                        if let Some(cache) = self.completed_rust_check.as_mut() {
                             cache.begin(began);
                         }
-                    }
+                        ordinal
+                    } else {
+                        self.rust_check_begins_read.load(Ordering::Acquire)
+                    };
+                    self.rust_flycheck_lost = false;
                     self.rust_flycheck_running
                         .insert(token.to_string(), ordinal);
                     self.rust_flycheck_started_at = Some(Instant::now());
@@ -2024,10 +2138,46 @@ impl LspClient {
                         self.rust_completed_check_begin
                             .map_or(begin, |previous| previous.max(begin)),
                     );
+                    return true;
                 }
             }
             _ => {}
         }
+        false
+    }
+
+    pub(super) fn lose_flycheck_progress(&mut self, through: u64) {
+        // Keep BEGIN receipts newer than the overflow's last discarded event.
+        // Their ordinals still have to match the notifications in the queue.
+        let mut lost =
+            !self.rust_flycheck_running.is_empty() || self.rust_completed_check_begin.is_some();
+        if let Ok(mut receipts) = self.rust_check_begin_receipts.lock() {
+            receipts.retain(|&order, _| {
+                lost |= order <= through;
+                order > through
+            });
+        }
+        if lost {
+            self.rust_flycheck_running.clear();
+            self.rust_completed_check_begin = None;
+            self.rust_flycheck_started_at = None;
+            self.rust_flycheck_finished_at = None;
+            self.rust_save = None;
+            self.rust_workspace_check_owed_since = None;
+            self.rust_flycheck_lost = true;
+        }
+    }
+
+    pub(super) fn rust_publish_settle_deadline(&self) -> Option<Instant> {
+        self.completed_rust_check
+            .as_ref()
+            .filter(|cache| cache.finished)?;
+        self.rust_flycheck_finished_at
+            .map(|finished| finished + FLYCHECK_PUBLISH_SETTLE)
+    }
+
+    pub(super) fn has_lost_flycheck(&self) -> bool {
+        self.rust_flycheck_lost
     }
 
     /// How this server wants to be told that a document was saved, or `None`
@@ -2057,12 +2207,19 @@ impl LspClient {
     fn record_save_sent_at(&mut self, uri: &lsp_types::Uri, at: Instant, begins_read: u64) {
         if self.rust_checks_on_save {
             self.rust_save = Some(RustSaveRequest {
+                allow_resend: true,
                 uri: uri.clone(),
                 due_at: None,
                 last_sent_at: Some(at),
                 sends: 1,
                 begins_read_at_send: Some(begins_read),
             });
+        }
+    }
+
+    pub(super) fn make_rust_save_one_shot(&mut self) {
+        if let Some(save) = self.rust_save.as_mut() {
+            save.allow_resend = false;
         }
     }
 
@@ -2078,6 +2235,7 @@ impl LspClient {
         if self.rust_checks_on_save {
             let now = Instant::now();
             self.rust_save = Some(RustSaveRequest {
+                allow_resend: true,
                 uri: uri.clone(),
                 due_at: Some(now + EXTERNAL_SAVE_DELAY),
                 last_sent_at: None,
@@ -2097,7 +2255,8 @@ impl LspClient {
         let due = match (save.due_at, save.last_sent_at) {
             (Some(due_at), _) => now >= due_at,
             (None, Some(sent)) => {
-                save.sends < MAX_SAVE_SENDS
+                save.allow_resend
+                    && save.sends < MAX_SAVE_SENDS
                     && now.saturating_duration_since(sent) >= SAVE_RESEND_AFTER
             }
             (None, None) => false,
@@ -2155,7 +2314,7 @@ impl LspClient {
             let awaiting = match save.last_sent_at {
                 None => true,
                 Some(sent) => {
-                    save.sends < MAX_SAVE_SENDS
+                    (save.allow_resend && save.sends < MAX_SAVE_SENDS)
                         || now.saturating_duration_since(sent) < SAVE_CHECK_START_GRACE
                 }
             };
@@ -2176,6 +2335,7 @@ impl LspClient {
             Some(finished) if now.saturating_duration_since(finished) < publish_settle => {
                 RustCheckState::Running
             }
+            _ if self.rust_flycheck_lost => RustCheckState::Unreported,
             _ => RustCheckState::Current,
         }
     }
@@ -2195,7 +2355,9 @@ impl LspClient {
         if let Some(save) = &self.rust_save {
             times.extend(save.due_at);
             if let Some(sent) = save.last_sent_at {
-                times.push(sent + SAVE_RESEND_AFTER);
+                if save.allow_resend {
+                    times.push(sent + SAVE_RESEND_AFTER);
+                }
                 times.push(sent + SAVE_CHECK_START_GRACE);
             }
         }
@@ -2240,6 +2402,9 @@ impl LspClient {
             return false;
         }
         if let Some(save) = self.rust_save.as_mut() {
+            if !save.allow_resend {
+                return false;
+            }
             save.due_at = Some(now);
             save.last_sent_at = None;
             save.sends = 0;
@@ -2352,6 +2517,9 @@ impl LspClient {
     where
         P: serde::Serialize,
     {
+        if self.watched_stale && method != "shutdown" {
+            return Err(LspError::ServerNotReady("server not found".into()));
+        }
         self.ensure_can_send()?;
 
         let id = RequestId::Int(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -2378,6 +2546,14 @@ impl LspClient {
             writer: self.writer.clone(),
             received_before_request,
         })
+    }
+
+    pub(super) fn mark_watched_stale(&mut self) {
+        self.watched_stale = true;
+    }
+
+    pub(super) fn watched_stale(&self) -> bool {
+        self.watched_stale
     }
 
     /// Clone the installed writer and rust-analyzer check-begin counter for
@@ -2433,6 +2609,16 @@ impl LspClient {
         self.ensure_can_send()?;
         let params = serde_json::to_value(params)?;
         let notification = Notification::new(N::METHOD, (!params.is_null()).then_some(params));
+        if matches!(
+            N::METHOD,
+            "textDocument/didOpen"
+                | "textDocument/didChange"
+                | "textDocument/didSave"
+                | "textDocument/didClose"
+                | "workspace/didChangeWatchedFiles"
+        ) {
+            self.note_diagnostic_input();
+        }
         let order = self
             .writer
             .send_ordered(serde_json::to_string(&notification)?)?;
@@ -2459,6 +2645,15 @@ impl LspClient {
 
     pub(crate) fn last_used_at(&self) -> Instant {
         self.last_used_at
+    }
+
+    pub(super) fn diagnostic_input_generation(&self) -> u64 {
+        self.diagnostic_input_generation
+    }
+
+    fn note_diagnostic_input(&mut self) {
+        // Count before sending: a write that times out can still reach the server.
+        self.diagnostic_input_generation = self.diagnostic_input_generation.wrapping_add(1);
     }
 
     pub(crate) fn has_pending_requests(&self) -> bool {
@@ -2497,6 +2692,7 @@ impl LspClient {
     ) -> Result<u64, LspError> {
         self.ensure_can_send()?;
         let json = full_did_change_message(uri, version, text)?;
+        self.note_diagnostic_input();
         let order = self.writer.send_ordered(json)?;
         // A document change is use: it keeps this server from the per-server
         // idle stop, like every other didOpen/didChange/didSave sender.
@@ -2517,6 +2713,7 @@ impl LspClient {
     ) -> Result<(), LspError> {
         self.ensure_can_send()?;
         let json = did_save_message(uri, text)?;
+        self.note_diagnostic_input();
         self.send_serialized_notification(&json)
     }
 
@@ -2534,7 +2731,7 @@ impl LspClient {
 
     fn shutdown_with_request_timeout(&mut self, request_timeout: Duration) -> Result<(), LspError> {
         let result = self.shutdown_child(request_timeout);
-        if self.child.try_wait().ok().flatten().is_some() {
+        if self.try_wait_child().ok().flatten().is_some() {
             self._rust_analyzer_permit.take();
         }
         result
@@ -2542,13 +2739,11 @@ impl LspClient {
 
     fn shutdown_child(&mut self, request_timeout: Duration) -> Result<(), LspError> {
         if self.state == ServerState::Exited {
-            self.child_registry.untrack(self.child_pid);
             return Ok(());
         }
 
-        if self.child.try_wait()?.is_some() {
+        if self.try_wait_child()?.is_some() {
             self.state = ServerState::Exited;
-            self.child_registry.untrack(self.child_pid);
             return Ok(());
         }
 
@@ -2561,9 +2756,8 @@ impl LspClient {
             if matches!(err, LspError::ServerDisconnected(_)) {
                 return self.abort_live_child_after_shutdown_error(err);
             }
-            if matches!(err, LspError::Timeout(_)) && self.child.try_wait()?.is_some() {
+            if matches!(err, LspError::Timeout(_)) && self.try_wait_child()?.is_some() {
                 self.state = ServerState::Exited;
-                self.child_registry.untrack(self.child_pid);
                 return Err(LspError::ServerDisconnected(
                     "server exited during shutdown".into(),
                 ));
@@ -2585,7 +2779,7 @@ impl LspClient {
 
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
-            if self.child.try_wait()?.is_some() {
+            if self.try_wait_child()?.is_some() {
                 self.state = ServerState::Exited;
                 return Ok(());
             }
@@ -2593,9 +2787,8 @@ impl LspClient {
                 // Kill the entire process group, not just the wrapper PID, so
                 // npm-wrapped servers (biome's `node biome lsp-proxy` spawns
                 // a separate cli-darwin-arm64 child) don't leak orphans.
-                kill_lsp_child_group(&mut self.child);
+                self.stop_child();
                 self.state = ServerState::Exited;
-                self.child_registry.untrack(self.child_pid);
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for {:?} to exit; did not exit within {}ms; killed and reaped",
                     self.kind,
@@ -2618,7 +2811,7 @@ impl LspClient {
     }
 
     pub fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        let status = self.child.try_wait().ok().flatten();
+        let status = self.try_wait_child().ok().flatten();
         if status.is_some() {
             self._rust_analyzer_permit.take();
         }
@@ -2627,6 +2820,19 @@ impl LspClient {
 
     pub(crate) fn child_pid(&self) -> u32 {
         self.child_pid
+    }
+
+    pub(super) fn child_process(&self) -> super::child_registry::TrackedProcess {
+        self.child_process.clone()
+    }
+
+    fn try_wait_child(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child_registry
+            .try_wait_client(&self.child_process, &mut self.child)
+    }
+
+    fn stop_child(&mut self) {
+        stop_tracked_child(&self.child_registry, &self.child_process, &mut self.child);
     }
 
     /// Which part of its life this server is in, for exit reports.
@@ -2692,57 +2898,39 @@ impl LspClient {
         match self.reap_after_reader_exit(reason) {
             ReaderExitReap::AlreadyExited(status) => self.exit_report(phase, Some(status), false),
             ReaderExitReap::KilledWhileAlive => {
-                let killed_status = self.child.try_wait().ok().flatten();
+                let killed_status = self.try_wait_child().ok().flatten();
                 self.exit_report(phase, killed_status, true)
             }
         }
     }
 
     /// If the child is still running, kill its process group and wait bounded.
-    /// Always untrack. The caller logs whether this was a real exit or a reader
-    /// death that left the child alive.
+    /// The caller logs whether this was a real exit or a reader death that
+    /// left the child alive.
     pub(crate) fn reap_after_reader_exit(&mut self, _reason: &ServerExitReason) -> ReaderExitReap {
-        let outcome = match self.child.try_wait() {
+        let outcome = match self.try_wait_child() {
             Ok(Some(status)) => ReaderExitReap::AlreadyExited(status),
             Ok(None) | Err(_) => {
-                kill_lsp_child_group(&mut self.child);
-                self.wait_for_child_exit_bounded();
+                self.stop_child();
                 ReaderExitReap::KilledWhileAlive
             }
         };
         self.state = ServerState::Exited;
-        self.child_registry.untrack(self.child_pid);
         outcome
     }
 
     fn abort_live_child_after_shutdown_error(&mut self, err: LspError) -> Result<(), LspError> {
-        if self.child.try_wait()?.is_some() {
+        if self.try_wait_child()?.is_some() {
             self.state = ServerState::Exited;
-            self.child_registry.untrack(self.child_pid);
             return if matches!(err, LspError::ServerDisconnected(_)) {
                 Err(err)
             } else {
                 Ok(())
             };
         }
-        kill_lsp_child_group(&mut self.child);
-        self.wait_for_child_exit_bounded();
+        self.stop_child();
         self.state = ServerState::Exited;
-        self.child_registry.untrack(self.child_pid);
         Err(err)
-    }
-
-    fn wait_for_child_exit_bounded(&mut self) {
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        loop {
-            if self.child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                return;
-            }
-            thread::sleep(EXIT_POLL_INTERVAL);
-        }
     }
 
     // Used only by the Unix-gated child-spawning test modules.
@@ -2961,14 +3149,8 @@ impl Drop for LspClient {
             self.child_registry.mark_client_gone(self.child_pid);
             return;
         }
-        // Record the transition before normal teardown untracks it. A control
-        // thread that snapshots in this narrow window sees an honest orphan
-        // rather than a child that is still reported as client-owned.
-        self.child_registry.mark_client_gone(self.child_pid);
-        // Untrack before the synchronous kill so signal cleanup cannot race this
-        // normal teardown.
-        self.child_registry.untrack(self.child_pid);
-        kill_lsp_child_group(&mut self.child);
+        self.stop_child();
+        self.child_registry.finish_client(&self.child_process);
     }
 }
 
@@ -3032,19 +3214,57 @@ fn stderr_tail_to_string(tail: &VecDeque<String>) -> String {
 /// Necessary because some LSP servers ship as npm-installed Node shims that
 /// spawn the real binary as a child. Killing only the wrapper PID leaves the
 /// real server orphaned to PID 1 and accumulates over time.
-pub(crate) fn kill_lsp_child_group(child: &mut std::process::Child) {
+fn stop_tracked_child(
+    registry: &LspChildRegistry,
+    process: &super::child_registry::TrackedProcess,
+    child: &mut Child,
+) {
+    if registry
+        .try_wait_client(process, child)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
     #[cfg(unix)]
     {
-        let pgid = child.id() as i32;
-        // LSP cleanup holds the manager lock, so retain the short leader-only wait.
-        crate::bash_background::process::terminate_pgid_leader_grace(pgid, child);
-        let _ = child.wait();
+        registry.signal_client(process, false);
+        let grace = Instant::now() + crate::bash_background::process::TERMINATE_GRACE;
+        for (deadline, force) in [(grace, false), (grace + SHUTDOWN_TIMEOUT, true)] {
+            if force {
+                registry.signal_client(process, true);
+            }
+            loop {
+                if registry
+                    .try_wait_client(process, child)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(EXIT_POLL_INTERVAL);
+            }
+        }
     }
     #[cfg(not(unix))]
     {
+        let _ = registry;
         crate::bash_background::process::terminate_process(child);
         let _ = child.wait();
     }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn kill_lsp_child_group(child: &mut Child) {
+    let registry = LspChildRegistry::new();
+    registry.track(child.id());
+    let process = registry.tracked_processes().pop().unwrap();
+    stop_tracked_child(&registry, &process, child);
 }
 
 fn record_watched_file_registration(
@@ -3293,7 +3513,9 @@ mod tests {
         client
             .send_request_with_timeout::<lsp_types::request::Shutdown>((), Duration::from_secs(3))
             .expect("fake server answered shutdown");
-        client.child.wait().expect("fake server exited");
+        client
+            .wait_for_exit(Duration::from_secs(3))
+            .expect("fake server exited");
         let error = LspError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         assert!(client.abort_live_child_after_shutdown_error(error).is_ok());
         assert!(!registry.pids().contains(&pid));
@@ -3345,45 +3567,48 @@ mod tests {
 
     #[test]
     fn analysis_progress_end_before_publication_cannot_certify_the_report() {
+        use crate::lsp::analysis_progress::Transition::*;
         let file = PathBuf::from("checked.py");
         let mut progress = WorkDoneAnalysis::default();
-        progress.record("old".into(), "begin", 0);
+        progress.record("old".into(), Begin, 0);
         progress.opened(file.clone());
-        progress.record("old".into(), "end", 1);
+        progress.record("old".into(), End, 1);
         progress.published(&file, 2, Some(Instant::now()));
         assert!(!progress.certifies(&file, 2, Some(Instant::now())));
-        progress.record("new".into(), "begin", 2);
-        progress.record("new".into(), "end", 2);
+        progress.record("new".into(), Begin, 2);
+        progress.record("new".into(), End, 2);
         assert!(progress.certifies(&file, 2, Some(Instant::now())));
         assert_eq!(progress.authority(), "work_done_progress");
     }
 
     #[test]
     fn analysis_progress_nested_tokens_and_no_progress_fallback_are_distinct() {
+        use crate::lsp::analysis_progress::Transition::*;
         let file = PathBuf::from("checked.py");
         let mut progress = WorkDoneAnalysis::default();
         progress.opened(file.clone());
         progress.published(&file, 1, Some(Instant::now()));
         progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
         assert_eq!(progress.authority(), "first_publish_no_analysis_progress");
-        progress.record("outer".into(), "begin", 0);
-        progress.record("inner".into(), "begin", 0);
-        progress.record("inner".into(), "end", 1);
+        progress.record("outer".into(), Begin, 0);
+        progress.record("inner".into(), Begin, 0);
+        progress.record("inner".into(), End, 1);
         assert!(progress.pending());
-        progress.record("outer".into(), "end", 1);
+        progress.record("outer".into(), End, 1);
         assert!(!progress.pending());
         progress.opened(file.clone());
         progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
-        progress.announced("next".into());
+        progress.record("next".into(), Announce, 0);
         assert_eq!(progress.authority(), "analysis_progress_pending");
     }
 
     #[test]
     fn analysis_progress_short_run_requires_its_own_post_open_publication() {
+        use crate::lsp::analysis_progress::Transition::*;
         let file = PathBuf::from("small.py");
         let mut progress = WorkDoneAnalysis::default();
-        progress.record("warmup".into(), "begin", 0);
-        progress.record("warmup".into(), "end", 1);
+        progress.record("warmup".into(), Begin, 0);
+        progress.record("warmup".into(), End, 1);
         progress.opened(file.clone());
         progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
         assert!(
@@ -3404,21 +3629,22 @@ mod tests {
         assert!(progress.certifies(&file, 3, published_at));
         progress.certified(true);
         assert_eq!(progress.authority(), "post_input_publish_no_analysis_run");
-        progress.record("recheck".into(), "begin", 3);
+        progress.record("recheck".into(), Begin, 3);
         assert!(!progress.certifies(&file, 3, published_at));
-        progress.record("recheck".into(), "end", 3);
+        progress.record("recheck".into(), End, 3);
         assert!(progress.certifies(&file, 3, published_at));
     }
 
     #[test]
     fn analysis_progress_short_batch_can_update_a_dependent_file() {
+        use crate::lsp::analysis_progress::Transition::*;
         let first = PathBuf::from("consumer.py");
         let second = PathBuf::from("dependency.py");
         let mut progress = WorkDoneAnalysis::default();
         progress.opened(first.clone());
         progress.published(&first, 1, Some(Instant::now()));
-        progress.record("warmup".into(), "begin", 1);
-        progress.record("warmup".into(), "end", 1);
+        progress.record("warmup".into(), Begin, 1);
+        progress.record("warmup".into(), End, 1);
         progress.opened(second.clone());
         let old = Instant::now() - WorkDoneAnalysis::GRACE - Duration::from_secs(1);
         progress.latest_input.as_mut().unwrap().at = old;
@@ -3432,13 +3658,13 @@ mod tests {
             !progress.certifies(&first, 3, at),
             "another file's epoch cannot settle the consumer"
         );
-        progress.announced("next".into());
+        progress.record("next".into(), Announce, 0);
         assert!(
             !progress.certifies(&first, 2, at),
             "a promised run cannot fall back after the grace"
         );
-        progress.record("next".into(), "begin", 3);
-        progress.record("next".into(), "end", 3);
+        progress.record("next".into(), Begin, 3);
+        progress.record("next".into(), End, 3);
         assert!(progress.certifies(&first, 2, at));
     }
     // Only the Unix-gated reap tests below spawn real children and name paths.
@@ -3764,12 +3990,17 @@ with open(sys.argv[1], 'w') as output:
             RustCheckState::Current
         );
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
-        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None);
+        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None, None);
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         client.rust_check_begins_read.store(1, Ordering::SeqCst);
-        client.record_rust_progress("rust-analyzer/flycheck/0", "begin", Some("cargo check"));
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/0",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
-        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None);
+        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None, None);
         assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::from_secs(1)));
 
@@ -3778,12 +4009,22 @@ with open(sys.argv[1], 'w') as output:
         let uri = "file:///test/lib.rs".parse().unwrap();
         client.rust_check_begins_read.store(2, Ordering::SeqCst);
         client.record_save_sent(&uri);
-        client.record_rust_progress("rust-analyzer/flycheck/1", "begin", Some("cargo check"));
-        client.record_rust_progress("rust-analyzer/flycheck/1", "end", None);
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/1",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
+        client.record_rust_progress("rust-analyzer/flycheck/1", "end", None, None);
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         client.rust_check_begins_read.store(3, Ordering::SeqCst);
-        client.record_rust_progress("rust-analyzer/flycheck/2", "begin", Some("cargo check"));
-        client.record_rust_progress("rust-analyzer/flycheck/2", "end", None);
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/2",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
+        client.record_rust_progress("rust-analyzer/flycheck/2", "end", None, None);
         assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
 
         // Reloading the workspace requires a check begun after the reload;
@@ -3791,16 +4032,26 @@ with open(sys.argv[1], 'w') as output:
         client.rust_check_begins_read.store(4, Ordering::SeqCst);
         let previous = client.begin_rust_workspace_reload(SystemTime::now());
         client.set_rust_analyzer_quiescent(true);
-        client.record_rust_progress("rust-analyzer/flycheck/3", "begin", Some("cargo check"));
-        client.record_rust_progress("rust-analyzer/flycheck/3", "end", None);
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/3",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
+        client.record_rust_progress("rust-analyzer/flycheck/3", "end", None, None);
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         client.restore_rust_workspace_state(previous);
         assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         client.begin_rust_workspace_reload(SystemTime::now());
         client.set_rust_analyzer_quiescent(true);
         client.rust_check_begins_read.store(5, Ordering::SeqCst);
-        client.record_rust_progress("rust-analyzer/flycheck/4", "begin", Some("cargo check"));
-        client.record_rust_progress("rust-analyzer/flycheck/4", "end", None);
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/4",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
+        client.record_rust_progress("rust-analyzer/flycheck/4", "end", None, None);
         assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
     }
 

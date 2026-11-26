@@ -808,6 +808,7 @@ pub fn is_duplicate_import_request(
                     named,
                 } if named.iter().any(|specifier| {
                     specifier_imported_name(specifier) == req.module_path
+                        && specifier_local_name(specifier) == req.module_path
                 })
             )
         });

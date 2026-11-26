@@ -24,21 +24,22 @@ async fn notice_records_gate_opens_only_after_every_notice_view_put_is_acknowled
     }
 
     let notice_views: Vec<_> = crate::subc::tool_views::bus_snapshot()
-        .into_iter()
+        .iter()
         .filter(|(pin, _)| pin.starts_with("nv1:"))
+        .cloned()
         .collect();
     assert_eq!(notice_views.len(), 3);
     let ready = NoticeViewsReady::default();
     let mut publication = Publication::new(&ready);
     let mut writer = RejectLast(notice_views.len());
     assert_eq!(
-        publication.sync(&mut writer, notice_views.clone()).await,
+        publication.sync(&mut writer, &notice_views).await,
         Err("put_not_acknowledged")
     );
     assert!(!ready.wait(Duration::ZERO).await);
 
     let mut writer = RecordingWriter::default();
-    publication.sync(&mut writer, notice_views).await.unwrap();
+    publication.sync(&mut writer, &notice_views).await.unwrap();
     assert_eq!(writer.0.len(), 1, "only the unacknowledged view is retried");
     assert!(
         ready.wait(Duration::ZERO).await,
@@ -57,7 +58,7 @@ async fn oversized_notice_view_disables_pending_notice_publication() {
     publication
         .sync(
             &mut writer,
-            vec![(
+            &[(
                 notice_pin.clone(),
                 vec![b'x'; declaration().max_value_bytes as usize + 1],
             )],
@@ -104,16 +105,13 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
     let mut writer = RecordingWriter::default();
     let ready = NoticeViewsReady::default();
     let mut publication = Publication::new(&ready);
-    publication
-        .sync(&mut writer, snapshot.clone())
-        .await
-        .unwrap();
+    publication.sync(&mut writer, snapshot).await.unwrap();
     assert_eq!(writer.0.len(), keys);
     for (pin, _) in snapshot.iter().filter(|(pin, _)| pin.starts_with("tp")) {
         let request = ViewsRequest::new(vec![pin.clone()]);
         let reply = ViewsReply::new(std::collections::BTreeMap::from([(
             pin.clone(),
-            ViewEntry::Manifest(tool_views::view(pin).unwrap()),
+            ViewEntry::Manifest(tool_views::view(pin).unwrap().into_owned()),
         )]));
         reply.validate_for(&request).unwrap();
         let route_bytes = serde_json::to_vec(&serde_json::to_value(reply).unwrap()).unwrap();
@@ -196,7 +194,7 @@ async fn bus_views_oversized_is_skipped_not_truncated_and_changes_republish() {
     publication
         .sync(
             &mut writer,
-            vec![
+            &[
                 ("oversize".into(), vec![b'x'; cap + 1]),
                 ("at-limit".into(), vec![b'y'; cap]),
             ],
@@ -206,7 +204,7 @@ async fn bus_views_oversized_is_skipped_not_truncated_and_changes_republish() {
     assert_eq!(publication.skipped.len(), 1);
     assert_eq!(writer.0, vec![(key("at-limit"), vec![b'y'; cap])]);
     publication
-        .sync(&mut writer, vec![("at-limit".into(), b"revised".to_vec())])
+        .sync(&mut writer, &[("at-limit".into(), b"revised".to_vec())])
         .await
         .unwrap();
     assert_eq!(writer.0[1], (key("at-limit"), b"revised".to_vec()));

@@ -458,6 +458,109 @@ fn edit_symbol_replace() {
     assert!(status.success());
 }
 
+fn replace_symbol_with_edit_tool(aft: &mut AftProcess, file: &str, symbol: &str, content: &str) {
+    let req = serde_json::json!({
+        "id": "symbol-indent",
+        "command": "tool_call",
+        "name": "edit",
+        "arguments": { "path": file, "symbol": symbol, "content": content },
+    });
+    let resp = aft.send(&req.to_string());
+    assert_eq!(resp["success"], true, "{file}: {resp:#}");
+    assert_eq!(resp["syntax_valid"], true, "{file}: {resp:#}");
+}
+
+#[test]
+fn edit_symbol_replace_does_not_double_indent_js_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("dialog.js");
+    let before =
+        "(() => {\n  // old comment line 1\n  // old comment line 2\n  // old comment line 3\n";
+    fs::write(
+        &target,
+        format!("{before}  function conversationDialog() {{ return 1; }}\n}})();\n"),
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let replacement = "  // new comment line 1\n  // new comment line 2\n  function conversationDialog() { return 2; }";
+    replace_symbol_with_edit_tool(&mut aft, "dialog.js", "conversationDialog", replacement);
+    assert_eq!(
+        fs::read_to_string(target).unwrap(),
+        format!("{before}{replacement}\n}})();\n")
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn edit_symbol_replace_accepts_explicit_or_inherited_indentation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for (file, before, old, replacement, after) in [
+        (
+            "example.ts",
+            "class Example {\n",
+            "  method(): number { return 1; }",
+            "  method(): number { return 2; }",
+            "\n}\n",
+        ),
+        (
+            "example.rs",
+            "struct Example;\nimpl Example {\n",
+            "    fn method() -> i32 { 1 }",
+            "    fn method() -> i32 { 2 }",
+            "\n}\n",
+        ),
+        (
+            "example.py",
+            "class Example:\n",
+            "    @staticmethod\n    def method():\n        return 1",
+            "    @staticmethod\n    def method():\n        return 2",
+            "\n",
+        ),
+        (
+            "example.go",
+            "package example\n\nfunc outer() {\n",
+            "\ttype method struct{ Old int }",
+            "\ttype method struct{ New int }",
+            "\n}\n",
+        ),
+    ] {
+        let target = dir.path().join(file);
+        for content in [replacement.trim_start_matches([' ', '\t']), replacement] {
+            fs::write(&target, format!("{before}{old}{after}")).unwrap();
+            replace_symbol_with_edit_tool(&mut aft, file, "method", content);
+            assert_eq!(
+                fs::read_to_string(&target).unwrap(),
+                format!("{before}{replacement}{after}"),
+                "{file}: {content:?}"
+            );
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn edit_symbol_replace_preserves_code_before_inline_symbol() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("inline.js");
+    fs::write(&target, "(() => { function inner() { return 1; } })();\n").unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    replace_symbol_with_edit_tool(
+        &mut aft,
+        "inline.js",
+        "inner",
+        " function inner() { return 2; }",
+    );
+    assert_eq!(
+        fs::read_to_string(target).unwrap(),
+        "(() => {  function inner() { return 2; } })();\n"
+    );
+    assert!(aft.shutdown().success());
+}
+
 fn assert_empty_symbol_replacement(source: &str, expected: &str) {
     let dir = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();

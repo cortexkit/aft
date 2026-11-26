@@ -190,13 +190,17 @@ fn bash_background_ticket_budget_withholds_previews_and_keeps_pointers() {
     assert!(context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
     let completion = registry.completion_snapshot_for_task(&task).unwrap();
     assert!(completion.output_truncated);
-    assert!(completion
-        .output_preview
-        .starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
-    assert!(completion
-        .output_preview
-        .contains(&task.paths.stdout.display().to_string()));
+    // A completion notice no longer carries a whole over-budget ordinary line:
+    // it keeps a cut fragment within the preview budget, which is small enough
+    // to mask. Either way the ticket must not appear.
+    assert!(
+        completion.output_preview.len() < 1024,
+        "{}",
+        completion.output_preview.len()
+    );
     assert!(!completion.output_preview.contains(TICKET));
+    assert!(!completion.output_preview.contains(&TICKET[..16]));
+    assert!(!completion.output_preview.contains(&TICKET[16..]));
     let mut assembled = output;
     registry.mask_completion_text(&id, &mut assembled);
     assert!(assembled.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
@@ -244,6 +248,97 @@ fn bash_background_completion_ticket_tail_uses_intact_halo() {
         assert!(!preview.contains(&TICKET[16..]));
         assert!(count.load(Ordering::SeqCst) > 0);
     }
+}
+
+const RAW_ENDING_TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+const RAW_ENDING_VERDICT: &str =
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s";
+const RAW_ENDING_STDERR: &str = "    Finished `test` profile [unoptimized + debuginfo] in 1.23s";
+
+fn cargo_notice_with_unmapped_ending(ending: &str) -> String {
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    registry.set_compressor_with_exit_code(|command, output, exit| {
+        use crate::compress::{cargo::CargoCompressor, Compressor};
+        CargoCompressor.compress_with_exit_code(command, &output, exit)
+    });
+    // Cargo keeps the ordinary report lines, but drops the per-test progress
+    // and blank lines. The terminal cap then cuts the render, and stdout's
+    // version line no longer maps to a contiguous raw head or tail.
+    let report = format!("generated item: {}\n", "z".repeat(80)).repeat(260);
+    let stdout = format!(
+        "{report}\nrunning 1 test\ntest suite::example ... ok\n\n{RAW_ENDING_VERDICT}\n\n{ending}"
+    );
+    let (_, task) = tests::insert_terminal_piped_task(
+        &registry,
+        &fixture,
+        "cargo test",
+        &stdout,
+        &format!("{RAW_ENDING_STDERR}\n"),
+        true,
+    );
+    let metadata = {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.completion_has_env_secrets = Some(true);
+        state.metadata.completion_has_non_ticket_env_secrets = Some(false);
+        state.metadata.completion_has_secret_placeholders = Some(false);
+        state.metadata.completion_ticket_digest = Some(
+            blake3::hash(RAW_ENDING_TICKET.as_bytes())
+                .to_hex()
+                .to_string(),
+        );
+        state.metadata.clone()
+    };
+    let cache = registry.ensure_terminal_output_cache(&task).unwrap();
+    let recovery = cache.recovery.as_ref().unwrap();
+    assert!(recovery.byte_truncated);
+    assert_eq!(recovery.disk_truncated_prefix_bytes, 0);
+    assert!(registry
+        .terminal_preview_for_reply(&metadata, &cache, Some(&task.paths))
+        .0
+        .starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
+
+    let (notice, truncated) =
+        registry.completion_preview_for_notice(&metadata, &cache, Some(&task.paths));
+    assert!(truncated);
+    notice
+}
+
+#[test]
+fn bash_background_completion_raw_ending_preserves_cargo_verdict() {
+    let notice = cargo_notice_with_unmapped_ending("build report: crate v0.3.0\n");
+    assert!(notice.contains(RAW_ENDING_VERDICT), "{notice}");
+    assert!(notice.contains("build report: crate v0.3.0"), "{notice}");
+    assert!(notice.contains(RAW_ENDING_STDERR), "{notice}");
+    assert!(notice.contains("[truncated output;"), "{notice}");
+}
+
+#[test]
+fn bash_background_completion_raw_ending_masks_ticket() {
+    let notice = cargo_notice_with_unmapped_ending(&format!(
+        "build report: {RAW_ENDING_TICKET} crate v0.3.0\n"
+    ));
+    assert!(
+        notice.contains(&format!("build report: {SECRET_PLACEHOLDER} crate v0.3.0")),
+        "{notice}"
+    );
+    assert!(notice.contains(RAW_ENDING_VERDICT), "{notice}");
+    assert!(!notice.contains(RAW_ENDING_TICKET), "{notice}");
+}
+
+#[test]
+fn bash_background_completion_raw_ending_masks_ticket_crossing_window_start() {
+    let suffix = " build report: crate v0.3.0\n";
+    let width = super::super::output::COMPLETION_SUCCESS_PREVIEW_BYTES;
+    let padding = "\n".repeat(width - suffix.len() - RAW_ENDING_TICKET.len() / 2);
+    let notice =
+        cargo_notice_with_unmapped_ending(&format!("{RAW_ENDING_TICKET}{suffix}{padding}"));
+    assert!(
+        notice.contains(&format!("{SECRET_PLACEHOLDER}{}", suffix.trim_end())),
+        "{notice}"
+    );
+    assert!(!notice.contains(&RAW_ENDING_TICKET[..16]), "{notice}");
+    assert!(!notice.contains(&RAW_ENDING_TICKET[16..]), "{notice}");
 }
 
 #[test]

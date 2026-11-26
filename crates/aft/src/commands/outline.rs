@@ -39,6 +39,7 @@ fn detect_language(path: &Path) -> Option<LangId> {
 #[cfg(test)]
 thread_local! {
     static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PLANNER_ROW_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) use crate::parser::outline_facts::symbol_to_entry;
@@ -60,7 +61,9 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn handle_outline_with_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = crate::bounded_io_command::command(req, ctx, handle_outline_inner);
+    let mut response = crate::context::confinement::with_floor_disclosure(|| {
+        crate::bounded_io_command::command(req, ctx, handle_outline_inner)
+    });
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
     super::read_manifest::normalize_response_content_files(ctx, &mut response.data);
     response
@@ -242,12 +245,18 @@ fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Resp
         Ok(path) => path,
         Err(resp) => return resp,
     };
-    if crate::bounded_io::metadata(&path).is_err() {
-        return Response::error(
-            &req.id,
-            "file_not_found",
-            format!("file not found: {}", file),
-        );
+    match crate::bounded_io::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            crate::run_tool_call::read_trace::note_file(metadata.len());
+        }
+        Ok(_) => {}
+        Err(_) => {
+            return Response::error(
+                &req.id,
+                "file_not_found",
+                format!("file not found: {}", file),
+            );
+        }
     }
 
     if is_http_url(file)
@@ -1982,21 +1991,18 @@ fn compare_directory_code_share(
     (a_code as u128 * b_total as u128).cmp(&(b_code as u128 * a_total as u128))
 }
 
+mod file_plan;
+
 fn plan_outline_file_rows(
     roots: &[usize],
     directory_nodes: &[OutlineDirectoryNode],
     file_entries: &[OutlineFileEntry],
     max_bytes: usize,
 ) -> Vec<OutlineTableRow> {
-    plan_outline_file_rows_with_length(
-        roots,
-        directory_nodes,
-        file_entries,
-        max_bytes,
-        files_table_rendered_len,
-    )
+    file_plan::plan(roots, directory_nodes, file_entries, max_bytes)
 }
 
+#[cfg(test)]
 fn plan_outline_file_rows_with_length(
     roots: &[usize],
     directory_nodes: &[OutlineDirectoryNode],
@@ -2476,6 +2482,7 @@ fn files_table_fields(
 
 /// Rust string formatting pads by character count, but the output budget counts
 /// bytes. Keep both quantities so Unicode paths make the same budget decisions.
+#[cfg(test)]
 fn files_table_rendered_len(
     rows: &[OutlineTableRow],
     directory_nodes: &[OutlineDirectoryNode],
@@ -2518,6 +2525,14 @@ fn files_table_trailer_len(
         }
     }
 
+    files_table_trailer_len_counts(shown, budget_rollup_files, budget_rollups_present)
+}
+
+fn files_table_trailer_len_counts(
+    shown: usize,
+    budget_rollup_files: usize,
+    budget_rollups_present: bool,
+) -> usize {
     if budget_rollups_present {
         let envelope = crate::list_envelope::ListEnvelope::new(
             shown,
@@ -2745,6 +2760,9 @@ fn outline_many_files(
                 continue;
             }
         };
+        if metadata.is_file() {
+            crate::run_tool_call::read_trace::note_file(metadata.len());
+        }
         if metadata.len() > MAX_OUTLINE_FILE_BYTES {
             writer.content_incomplete |= downloaded_language(&path).is_some();
             skipped_files.push((index, SkippedFile::new(rel_path, "too_large")));
@@ -3141,6 +3159,9 @@ where
             if file_type.is_symlink() {
                 return false;
             }
+            if outline_walk_denied_data(entry.path()) {
+                return false;
+            }
             if !file_type.is_dir() {
                 return confined.as_ref().map_or(true, |confined| {
                     !file_type.is_file()
@@ -3311,6 +3332,9 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             if file_type.is_symlink() {
                 continue;
             }
+            if outline_walk_denied_data(&entry.path()) {
+                continue;
+            }
             if file_type.is_dir() {
                 child_directories.push(entry.path());
             } else if file_type.is_file() {
@@ -3371,6 +3395,16 @@ fn collect_outline_files_breadth_first_with_device_lookup(
         }
     }
     entries_examined
+}
+
+fn outline_walk_denied_data(path: &Path) -> bool {
+    if crate::context::confinement::active()
+        || !crate::project_content::is_cortexkit_data_read_denied(path)
+    {
+        return false;
+    }
+    crate::context::confinement::capture().record_matched_floor(path);
+    true
 }
 
 fn should_skip_directory(path: &Path) -> bool {
@@ -3646,9 +3680,8 @@ fn outline_member_is_public(member: &OutlineEntry, language: Option<LangId>) -> 
     }
 }
 
-// Trait declarations are containers in the symbol table, but their required
-// signatures have no symbols. Add them only to broad API previews; focused
-// outlines keep their established product-member listing.
+// Broad API previews use source-spelled trait method signatures; the
+// navigation symbols may already have supplied rows for those methods.
 fn add_trait_member_previews(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -3739,7 +3772,7 @@ fn push_trait_member_preview(
     previews.push((range, methods));
 }
 
-/// Append each collected trait's method rows to the outline entry for that
+/// Merge each collected trait's method rows into the outline entry for that
 /// trait. A trait with no entry (for example one inside collapsed test code)
 /// gets nothing.
 fn apply_trait_member_previews(
@@ -3764,7 +3797,21 @@ fn apply_trait_member_previews(
     }
     for (range, methods) in previews {
         if let Some(entry) = find_trait(entries, range) {
-            entry.members.extend(methods.iter().cloned());
+            for method in methods {
+                if let Some(existing) = entry.members.iter_mut().find(|existing| {
+                    existing.kind == method.kind
+                        && existing.name == method.name
+                        && (existing.range.end_line, existing.range.end_col)
+                            == (method.range.end_line, method.range.end_col)
+                }) {
+                    *existing = method.clone();
+                } else {
+                    entry.members.push(method.clone());
+                }
+            }
+            entry
+                .members
+                .sort_by_key(|member| (member.range.start_line, member.range.start_col));
         }
     }
 }
@@ -5139,6 +5186,26 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
     }
 
     #[test]
+    fn edit_review_gpt_7_planner_measures_each_sibling_only_once() {
+        for size in [50, 100] {
+            let (mut nodes, files) = planner_fixture();
+            nodes[0].children = (1..=size).collect();
+            for node in &mut nodes[1..=size] {
+                node.direct_files = vec![node.direct_files[0]];
+                node.stats.files = 1;
+                node.stats.code_files = 1;
+            }
+            PLANNER_ROW_MEASUREMENTS.with(|count| count.set(0));
+            let rows = plan_outline_file_rows(&[0], &nodes, &files, usize::MAX);
+            assert_eq!(rows.len(), size);
+            assert!(rows
+                .iter()
+                .all(|row| matches!(row, OutlineTableRow::File(_))));
+            assert_eq!(PLANNER_ROW_MEASUREMENTS.with(|count| count.get()), 2 * size);
+        }
+    }
+
+    #[test]
     fn files_planner_materializes_only_the_final_table() {
         let (nodes, files) = planner_fixture();
         let before = TABLE_RENDERS.with(|count| count.get());
@@ -5223,6 +5290,10 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             );
             assert!(candidates > 0);
             assert_eq!(measured, reference);
+            assert_eq!(
+                plan_outline_file_rows(&[0, 3], &nodes, &files, budget),
+                reference
+            );
             assert_eq!(
                 format_files_table(&measured, &nodes, &files, budget),
                 format_files_table(&reference, &nodes, &files, budget)
@@ -5869,6 +5940,9 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         let text = multi_file_text(&[rs]);
         assert!(
             text.contains(".fn first(&self); 2:2")
+                && text.matches(".fn first(&self)").count() == 1
+                && text.matches(".fn second(&self)").count() == 1
+                && text.matches(".fn third(&self)").count() == 1
                 && text.contains("(1 more)")
                 && !text.contains("fourth"),
             "{text}"

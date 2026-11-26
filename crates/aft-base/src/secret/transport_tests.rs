@@ -226,9 +226,11 @@ fn raw_call(daemon: &FakeClaustrum, identity: Option<ConsumerIdentity>, params: 
                     },
                     BindIdentity::new("secret-contract", "negative"),
                     ScopeSelector::new(stamp.owner, stamp.scope_ref, Some(stamp.scope_epoch)),
+                    // A generous positive wait: a busy Windows runner can take
+                    // over a second to bind the fake daemon's route.
                     CallOptions {
                         consumer_identity: identity,
-                        timeout: Duration::from_secs(1),
+                        timeout: Duration::from_secs(30),
                         ..CallOptions::default()
                     },
                 )
@@ -239,7 +241,7 @@ fn raw_call(daemon: &FakeClaustrum, identity: Option<ConsumerIdentity>, params: 
                     &route,
                     serde_json::to_vec(&json!({"method":"secret.use","params":params})).unwrap(),
                     CallOptions {
-                        timeout: Duration::from_secs(1),
+                        timeout: Duration::from_secs(30),
                         ..CallOptions::default()
                     },
                 )

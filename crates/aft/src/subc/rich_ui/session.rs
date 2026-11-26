@@ -416,9 +416,10 @@ pub(in crate::subc) async fn submit(
                                 dispatch(request, ctx)
                             }
                         };
-                        let ToolCallOutcome::Unary(mut result) = run_tool_call(
-                            &name, args, &format, &tool_ctx, ctx, &observe, None, None,
-                        );
+                        let ToolCallOutcome::Unary(mut result) =
+                            crate::run_tool_call::run_carrier_tool_call(
+                                &name, args, &format, &tool_ctx, ctx, &observe,
+                            );
                         // File and search handlers return native metadata; their
                         // rendered tool text is the session-read result field.
                         if result.response.success {

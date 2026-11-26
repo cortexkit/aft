@@ -111,6 +111,15 @@ pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
+    handle_append_with_open(req, ctx, op_id, open_append_file)
+}
+
+fn handle_append_with_open(
+    req: &RawRequest,
+    ctx: &AppContext,
+    op_id: &str,
+    open: impl FnOnce(&Path) -> std::io::Result<(std::fs::File, bool)>,
+) -> Response {
     let file = match req
         .params
         .get("file")
@@ -254,14 +263,14 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         String::new()
     };
 
-    let (mut file_handle, read_access) = match open_append_file(path.as_path()) {
+    let (mut file_handle, read_access) = match open(path.as_path()) {
         Ok(opened) => opened,
         Err(error) => {
-            if !existed {
-                ctx.backup()
-                    .lock()
-                    .discard_operation_entries(req.session(), op_id);
-            }
+            ctx.backup().lock().discard_latest_operation_entry_for_path(
+                req.session(),
+                op_id,
+                path.as_path(),
+            );
             return Response::error(
                 &req.id,
                 "write_error",
@@ -272,7 +281,16 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
 
     let original_len = match file_handle.metadata() {
         Ok(metadata) => metadata.len(),
-        Err(error) => return Response::error(&req.id, "write_error", error.to_string()),
+        Err(error) => {
+            if existed {
+                ctx.backup().lock().discard_latest_operation_entry_for_path(
+                    req.session(),
+                    op_id,
+                    path.as_path(),
+                );
+            }
+            return Response::error(&req.id, "write_error", error.to_string());
+        }
     };
     if let Err(error) = edit::remote_links::check_open(&file_handle, path.as_path()) {
         ctx.backup()
@@ -480,6 +498,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             // rollback (handled by the shared write pipeline only). Surface
             // false until/unless append gains the same rollback flow.
             rolled_back: false,
+            rollback_skipped_reason: None,
             lsp_outcome,
             final_text: None,
             write_warnings: Vec::new(),
@@ -1291,6 +1310,35 @@ mod tests {
 
     use super::{handle_edit_match, restore_glob_checkpoint};
 
+    #[test]
+    fn edit_review_opus_1_undo_skips_failed_append_open() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a.txt");
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        ctx.backup()
+            .lock()
+            .set_storage_dir(root.path().join("backup"), 72);
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "append", "command": "edit_match", "file": file, "append_content": "more",
+        }))
+        .unwrap();
+        fs::write(&file, b"before").unwrap();
+        ctx.backup()
+            .lock()
+            .snapshot_with_op(req.session(), &file, "original", Some("previous"))
+            .unwrap();
+        fs::write(&file, b"current").unwrap();
+        ctx.backup().lock().record_post_mutation_states();
+
+        let response = super::handle_append_with_open(&req, &ctx, "failed", |_| {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(response.data["code"], "write_error", "{response:?}");
+        let preview = ctx.backup().lock().history(req.session(), &file);
+        assert_eq!(preview.len(), 1);
+        assert_eq!(fs::read(&file).unwrap(), b"current");
+    }
+
     /// Measures real edit handlers plus a 512 KiB request-side SQLite commit.
     /// The payload forces many crossings of SQLite's default 1000-page limit
     /// without relying on a concurrent writer or synthetic CPU/disk load.
@@ -1788,10 +1836,9 @@ pub(crate) fn push_fuzzy_replacement(
     // A match that already ends with its line's separator replaces it, so the
     // text after it (such as a following blank line) is not a separator to
     // drop.
-    let remaining = source[end..].trim_start_matches([' ', '\t']);
-    let separator_is_outside = matched.pass > 1
-        && !source[..end].ends_with('\n')
-        && (remaining.starts_with('\n') || remaining.starts_with("\r\n"));
+    let remaining = source[end..].trim_start_matches(|ch: char| ch != '\n' && ch.is_whitespace());
+    let separator_is_outside =
+        matched.pass > 1 && !source[..end].ends_with('\n') && remaining.starts_with('\n');
     if separator_is_outside && replacement.ends_with('\n') {
         output.push_str(
             replacement
@@ -1802,7 +1849,11 @@ pub(crate) fn push_fuzzy_replacement(
         output.push_str(replacement);
     }
     if fuzzy_replacement_restores_newline(source, matched, replacement) {
-        output.push('\n');
+        output.push_str(if source[..end].ends_with("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        });
     }
     Ok(())
 }
@@ -2162,6 +2213,7 @@ fn handle_single_file_edit_match(
     if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
     }
+    write_result.append_rollback_skipped_to(&mut result);
 
     if let Some(ref reason) = write_result.format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -2197,8 +2249,9 @@ fn handle_single_file_edit_match(
     // The match was satisfied (replacements > 0) but no net change landed.
     // Pi/OpenCode UIs use this to render "matched but no change" instead of
     // a bare `+0/-0` that looks like a tool failure (see GitHub #45).
+    let rollback_skipped = write_result.rollback_skipped_reason.is_some();
     let final_content = write_result.final_content(&path).unwrap_or(&new_source);
-    if source == final_content {
+    if !rollback_skipped && source == final_content {
         result["no_op"] = serde_json::json!(true);
     }
 
@@ -2773,6 +2826,36 @@ mod audit_regressions {
             )
             .unwrap(),
             "x\ny\r\nc\r\n"
+        );
+    }
+
+    #[test]
+    fn fuzzy_separator_after_unicode_padding_is_not_duplicated() {
+        let source = "alpha\u{a0}\nnext\n";
+        let matches = crate::fuzzy_match::find_all_fuzzy(source, "alpha\n");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source, &matches, "alpha\n", "beta\n", None,
+            )
+            .unwrap(),
+            "beta\u{a0}\nnext\n"
+        );
+    }
+
+    #[test]
+    fn fuzzy_restore_retains_the_consumed_crlf() {
+        let source = "alpha\r\nnext\r\n";
+        let needle = "alpha \n";
+        let matches = crate::fuzzy_match::find_all_fuzzy(source, needle);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(&source[..matches[0].byte_len], "alpha\r\n");
+        assert_eq!(
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source, &matches, needle, "beta", None,
+            )
+            .unwrap(),
+            "beta\r\nnext\r\n"
         );
     }
 }

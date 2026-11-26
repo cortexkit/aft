@@ -162,8 +162,23 @@ manifest = [
 ]
 
 [[rows]]
-id = "ls-decline-all-mode"
+id = "ls-accept-almost-all-mode"
 command = "ls -A src"
+route = "rewritten:ls"
+basis = "ls-entry-set"
+normalizations = ["footer-removal"]
+decision_class = "dc.ls.accept.v1"
+branch_ids = ["ls.accept"]
+semantic_dimensions = ["shell-tokenization", "path-resolution", "hidden-files", "ordering"]
+manifest = [
+  { path = "src", kind = "directory" },
+  { path = "src/visible.txt", content = "visible\n" },
+  { path = "src/.secret", content = "secret\n" },
+]
+
+[[rows]]
+id = "ls-decline-all-mode"
+command = "ls -a src"
 route = "native"
 basis = "ls-entry-sequence"
 branch_ids = ["ls.decline"]

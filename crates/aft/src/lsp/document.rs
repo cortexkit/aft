@@ -5,6 +5,12 @@ use std::time::SystemTime;
 
 use crate::bounded_io::open_content_file;
 
+// Start above zero so gopls can echo the version without omitting it.
+pub(super) const FIRST_VERSION: i32 = 1;
+
+#[cfg(feature = "test-hooks")]
+pub const FIRST_VERSION_FOR_TEST: i32 = FIRST_VERSION;
+
 /// Per-document state tracked for LSP synchronization.
 ///
 /// We track `mtime`, `size`, and a content hash so we can
@@ -15,7 +21,7 @@ use crate::bounded_io::open_content_file;
 /// computed from stale in-memory content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentEntry {
-    /// Monotonically increasing LSP version, starts at 0.
+    /// Monotonically increasing LSP version.
     pub version: i32,
     /// Filesystem modification time at the moment we last synced this file
     /// to the LSP server (didOpen or didChange). `None` if the file did not
@@ -43,13 +49,23 @@ pub struct DocumentEntry {
 /// This store ALSO records (mtime, size, content hash) at sync time so callers can detect
 /// disk drift via `is_stale_on_disk()` and resync stale entries before
 /// issuing pull-diagnostic requests against potentially stale server state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DocumentStore {
     entries: HashMap<PathBuf, DocumentEntry>,
     entry_bytes: u64,
     /// Higher than every version of a closed document. A scalar floor avoids
     /// retaining one path forever for every file an inspect briefly opened.
     reopen_version_floor: i32,
+}
+
+impl Default for DocumentStore {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            entry_bytes: 0,
+            reopen_version_floor: FIRST_VERSION,
+        }
+    }
 }
 
 impl DocumentStore {
@@ -79,7 +95,7 @@ impl DocumentStore {
     }
 
     /// Open a document, recording its on-disk metadata/hash. The initial version
-    /// starts at zero and advances past every closed document's last version.
+    /// starts at one and advances past every closed document's last version.
     /// If metadata cannot be read, the
     /// document is still tracked but `mtime`/`size` will be `None`, which
     /// causes `is_stale_on_disk()` to conservatively report stale on the
@@ -485,22 +501,22 @@ mod tests {
     }
 
     #[test]
-    fn open_and_close_roundtrip() {
+    fn fresh_store_opens_at_one_and_tracks_versions_until_close() {
         let mut store = DocumentStore::new();
         let path = PathBuf::from("/tmp/aft-doc-test-doesnt-exist");
         assert!(!store.is_open(&path));
 
         let v = store.open(path.clone());
-        assert_eq!(v, 0);
+        assert_eq!(v, 1);
         assert!(store.is_open(&path));
-        assert_eq!(store.version(&path), Some(0));
-
-        let bumped = store.bump_version(&path);
-        assert_eq!(bumped, Some(1));
         assert_eq!(store.version(&path), Some(1));
 
+        let bumped = store.bump_version(&path);
+        assert_eq!(bumped, Some(2));
+        assert_eq!(store.version(&path), Some(2));
+
         let closed = store.close(&path);
-        assert_eq!(closed, Some(1));
+        assert_eq!(closed, Some(2));
         assert!(!store.is_open(&path));
     }
 
@@ -619,7 +635,7 @@ mod tests {
         store.open(path.clone());
 
         let entry = store.entry(&path).expect("entry");
-        assert_eq!(entry.version, 0);
+        assert_eq!(entry.version, 1);
         assert!(entry.mtime.is_some());
         assert_eq!(entry.size, Some(3));
         assert!(entry.content_hash.is_some());

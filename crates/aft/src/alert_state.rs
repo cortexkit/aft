@@ -100,6 +100,7 @@ pub struct AcceptedDiagnosticSnapshot {
     pub server_key: ServerKey,
     pub document_version: i32,
     pub diagnostics: Vec<StoredDiagnostic>,
+    pub(crate) watched_epoch: Option<(crate::lsp::client::ServerInstanceId, u64)>,
 }
 
 impl AcceptedDiagnosticSnapshot {
@@ -112,6 +113,7 @@ impl AcceptedDiagnosticSnapshot {
             server_key,
             document_version,
             diagnostics,
+            watched_epoch: None,
         }
     }
 

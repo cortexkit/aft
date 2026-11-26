@@ -68,6 +68,8 @@ pub(super) fn request(language: &str) -> Result<(), ManifestJoinError> {
     Ok(())
 }
 
+pub(super) const INVALID_UTF8_REASON: &str = r#"{"code":"invalid_utf8"}"#;
+
 /// Persist only stable codes. Messages, retry countdowns and timeout budgets
 /// belong to the handling process and are reconstructed when a reply is made.
 pub(super) fn reason(error: &ManifestJoinError) -> Option<String> {
@@ -78,6 +80,7 @@ pub(super) fn reason(error: &ManifestJoinError) -> Option<String> {
         ManifestJoinError::GrammarParseTimeout { .. } => {
             serde_json::json!({"code": "grammar_parse_timeout", "state": "parse_timeout"})
         }
+        ManifestJoinError::InvalidSourceEncoding => return Some(INVALID_UTF8_REASON.into()),
         _ => return None,
     };
     let reason = value.to_string();
@@ -137,6 +140,10 @@ impl GapReply {
                 AftError::from(error).to_error_json()
             }
             "callgraph_off" => saved,
+            "invalid_utf8" => serde_json::json!({
+                "code": "invalid_utf8",
+                "message": crate::inspect::scanners::source_text::NOT_VALID_UTF8,
+            }),
             _ => return None,
         };
         value["path"] = serde_json::json!(path);

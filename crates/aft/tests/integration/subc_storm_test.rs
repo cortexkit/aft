@@ -70,9 +70,7 @@ static SYNTHETIC_WATCHER_SENDERS: OnceLock<
     Mutex<Vec<crossbeam_channel::Sender<WatcherDispatchEvent>>>,
 > = OnceLock::new();
 
-struct SyntheticRawWatcher(
-    #[allow(dead_code)] std::sync::mpsc::Sender<notify::Result<notify::Event>>,
-);
+struct SyntheticRawWatcher(#[allow(dead_code)] aft::watcher_filter::RawEventSender);
 
 #[derive(Clone, Debug)]
 struct StormScale {

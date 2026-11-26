@@ -1863,54 +1863,6 @@ fn finish_bash_poll_done(
     response
 }
 
-/// Combine the reply windows chosen by bash dispatch into the watchdog deadline.
-pub(super) fn unanswered_bash_reply_deadline(
-    received_at: Instant,
-    wait_window_ms: u64,
-    startup_window_ms: u64,
-    capture_deadline: Option<Instant>,
-    command_timeout_ms: u64,
-) -> Instant {
-    // Local command timeouts start at launch, not receipt. Allow startup before
-    // that timeout while keeping the reply wait cap measured from receipt.
-    let reply_wait_ms = wait_window_ms.min(startup_window_ms.saturating_add(command_timeout_ms));
-    let mut deadline = received_at + Duration::from_millis(startup_window_ms.max(reply_wait_ms));
-    if let Some(capture_deadline) = capture_deadline {
-        deadline = deadline.max(capture_deadline);
-    }
-    deadline
-}
-
-#[cfg(test)]
-mod unanswered_deadline_tests {
-    use super::*;
-
-    #[test]
-    fn command_timeout_watchdog_includes_startup_but_respects_reply_cap() {
-        let received_at = Instant::now();
-        for (wait_ms, startup_ms, timeout_ms, capture_ms, expected_ms) in [
-            (120_000, 5_000, 30_000, None, 35_000),
-            (32_000, 5_000, 30_000, None, 32_000),
-            (2_000, 5_000, 30_000, None, 5_000),
-            (120_000, 5_000, 30_000, Some(60_000), 60_000),
-            (120_000, 5_000, u64::MAX, None, 120_000),
-        ] {
-            let deadline = unanswered_bash_reply_deadline(
-                received_at,
-                wait_ms,
-                startup_ms,
-                capture_ms.map(|ms| received_at + Duration::from_millis(ms)),
-                timeout_ms,
-            );
-            assert_eq!(
-                deadline.duration_since(received_at),
-                Duration::from_millis(expected_ms),
-                "wait={wait_ms} startup={startup_ms} timeout={timeout_ms} capture={capture_ms:?}"
-            );
-        }
-    }
-}
-
 /// Preserve the unavailable refusal for worker programs and run routes that
 /// cannot receive held replies. Capable agent programs use Cingulate instead.
 fn refuse_run_permission_ask(response: Response, unavailable: bool) -> Response {
@@ -2001,6 +1953,7 @@ pub(super) fn submit_deferred_bash(
     reply_budget: impl Into<crate::commands::blocking_wait::ReplyBudget>,
 ) {
     let reply_budget = reply_budget.into();
+    metrics.set_bash_unanswered_deadline(route, corr, reply_budget.deadline);
     let program = super::secret_consent::current_identity().filter(|identity| {
         identity
             .run_owner
@@ -2600,7 +2553,6 @@ pub(super) fn submit_deferred_bash(
     // A task records the same requester as its call's ledger row.
     let task_requester = cancel.ledger_carrier.clone();
     let submit_executor = executor.clone();
-    let unanswered_metrics = Arc::clone(metrics);
     let spawn_cancel = JobCancellation::new();
     let submit_cancel = spawn_cancel.clone();
     let submit_request_id = request_id.clone();
@@ -2748,9 +2700,6 @@ pub(super) fn submit_deferred_bash(
                         Some(owner_scope) if settings.background => Some(owner_scope.clone()),
                         _ => scope_stamp.clone(),
                     };
-                    let command_timeout_ms = settings.timeout.unwrap_or_else(|| {
-                        crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64
-                    });
                     let runon_requested = translated.args.contains_key("runon");
                     let raw_req = RawRequest { id: request_id_for_spawn.clone(),
                     command: "bash".to_string(),
@@ -2890,18 +2839,6 @@ pub(super) fn submit_deferred_bash(
                         || (run_scoped && settings.background)
                         || hands_back_launch;
                     if launch_answers_now && (is_pty || settings.background) {
-                        let unanswered_deadline = unanswered_bash_reply_deadline(
-                            received_at,
-                            0,
-                            startup_window,
-                            capture_deadline,
-                            command_timeout_ms,
-                        );
-                        unanswered_metrics.set_bash_unanswered_deadline(
-                            route,
-                            corr,
-                            unanswered_deadline,
-                        );
                         // A terminal spawn reply still has no display text;
                         // format the launch guidance before answering the host.
                         let mut launch_response = bash_background_launch_response(
@@ -2958,14 +2895,6 @@ pub(super) fn submit_deferred_bash(
                                     .unwrap_or(wait_window_ms);
                             wait_window_ms.min(20_000)
                         };
-                    let unanswered_deadline = unanswered_bash_reply_deadline(
-                        received_at,
-                        wait_window_ms,
-                        startup_window,
-                        capture_deadline,
-                        command_timeout_ms,
-                    );
-                    unanswered_metrics.set_bash_unanswered_deadline(route, corr, unanswered_deadline);
                     let deadline = reply_budget.cap(received_at + Duration::from_millis(wait_window_ms));
                     receipt_for_spawn.limit_changed_files_deadline(deadline);
                     // Server-owned calls use the outer transport timer rather
@@ -4767,6 +4696,7 @@ pub(super) async fn handle_bash_deferred_completion(
             )?;
             send_reliable_writer_frame(tx, metrics, frame, "deferred bash response").await?;
         } else {
+            metrics.drop_shell_reply(done.route, done.corr, "unbound");
             log::debug!(
                 "subc attach: dropping deferred bash response {} for unbound route {}",
                 done.request_id,
@@ -4774,6 +4704,7 @@ pub(super) async fn handle_bash_deferred_completion(
             );
         }
     } else {
+        metrics.drop_shell_reply(done.route, done.corr, "cancelled");
         log::debug!(
             "subc attach: deferred bash wait {} cancelled before delivery on route {}",
             done.request_id,
@@ -6490,6 +6421,52 @@ mod grant_path_tests {
             .expect("time spent in the reader queue is part of startup's reply budget")
             .unwrap();
         assert_eq!(done.response_for_test().data["code"], "bash_start_deadline");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_timeout_metadata_cannot_hold_capped_bash_past_promotion() {
+        use crate::bash_background::registry::remote::reply_test_fixtures::accepted_task_past_runner_timeout_for_test;
+
+        fn dispatch_registered_task(req: RawRequest, _: &AppContext) -> Response {
+            Response::success(
+                req.id,
+                json!({"task_id": req.params["command"], "status": "running", "mode": "pipes"}),
+            )
+        }
+
+        let (_root_dir, root) =
+            super::super::test_support::test_root("bash-remote-runtime-metadata");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| config.bash.worker_wait_max_ms = 60_000);
+        let (_task_dir, task) =
+            accepted_task_past_runner_timeout_for_test(ctx.bash_background(), "deadline-session");
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let timing = BashTimingForTest::new(Instant::now());
+        // The wait window has elapsed. Keep the fallback reply timer paused
+        // so the call must move the command to the background to answer.
+        let receipt = Instant::now() - Duration::from_secs(60);
+        let mut reply = with_bash_timing_for_test(Some(timing), || {
+            deadline_test_call_owned(
+                &executor,
+                &root,
+                dispatch_registered_task,
+                json!({"command": task.task_id, "wait": true}),
+                receipt,
+                true,
+            )
+        });
+        let completion = tokio::time::timeout(Duration::from_secs(5), reply.recv())
+            .await
+            .expect("remote timeout metadata must not suppress promotion at the wait cap")
+            .unwrap();
+        let response = completion.response_for_test();
+        assert_eq!(response.data["task_id"], task.task_id);
+        assert_eq!(response.data["status"], "running");
+        let state = task.state.lock().unwrap();
+        assert!(!state.metadata.is_terminal());
+        assert!(!state.metadata.remote.as_ref().unwrap().cancel_requested);
     }
 
     /// The fake runner's connection file for [`remote_runon_stub`]; a dispatch

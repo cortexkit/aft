@@ -106,10 +106,7 @@ fn relocate_user_config(
             crate::slog_warn!("config user: {}", outcome.notice())
         }
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            crate::slog_warn!(
-                "config user {}: read source at /: {error}",
-                source.display()
-            );
+            crate::slog_warn!("config user {}: read source: {error}", source.display());
         }
         _ => {}
     }

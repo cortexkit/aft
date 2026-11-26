@@ -7,6 +7,7 @@ pub(crate) fn register() {
         enabled: super::rich_ui::display::enabled,
         current_task: super::rich_ui::display::current_task,
         bash_reply: super::rich_ui::display::bash_reply,
+        bash_reply_persisted: super::rich_ui::display::bash_reply_persisted,
         bash_terminal: super::rich_ui::display::bash_terminal,
         bash_tail: super::rich_ui::display::bash_tail,
         bash_detail_byte_limit: super::rich_ui::display::detail_byte_limit,

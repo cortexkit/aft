@@ -137,9 +137,18 @@ pub(crate) fn run_cycles_scan_with_oxc(
     }
 
     contributions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
-    let aggregate = aggregate_cycle_contributions_with_limit(
-        &project_root,
-        &contributions,
+    // The import graph is already resolved in `oxc_result`; building the
+    // cycle graph from it avoids a second analysis of every file's facts.
+    // The from-contributions path remains for rolling up cached contributions.
+    let honesty = contributions
+        .iter()
+        .filter_map(|contribution| CycleHonesty::deserialize(&contribution.contribution).ok())
+        .collect::<Vec<_>>();
+    let aggregate = cycles_aggregate(
+        &CycleGraph::from_oxc_result(&project_root, oxc_result),
+        honesty
+            .iter()
+            .map(|item| (item.parse_errors.as_slice(), item.skipped_files.as_slice())),
         skipped_languages(&job.scope_files),
         Some(DRILL_DOWN_LIMIT),
     );
@@ -177,31 +186,50 @@ pub(crate) fn aggregate_cycle_contributions_with_limit(
     } else {
         CycleGraph::from_contributions(&parsed)
     };
-    let mut cycles = graph.cycles();
-    cycles.sort_by(|left, right| {
-        right
-            .files
-            .len()
-            .cmp(&left.files.len())
-            .then_with(|| left.files.cmp(&right.files))
-    });
+    cycles_aggregate(
+        &graph,
+        parsed.iter().map(|contribution| {
+            (
+                contribution.parse_errors.as_slice(),
+                contribution.skipped_files.as_slice(),
+            )
+        }),
+        languages_skipped,
+        drill_down_limit,
+    )
+}
 
-    let count = cycles.len();
-    let largest = cycles.first().map(|cycle| cycle.files.len()).unwrap_or(0);
+/// The parse-error and skipped-file fields of one contribution, read without
+/// its import facts.
+#[derive(Debug, Deserialize)]
+struct CycleHonesty {
+    // Required, like `CycleContribution::file`, so both paths count the same
+    // contributions as scanned.
+    #[serde(rename = "file")]
+    _file: serde::de::IgnoredAny,
+    #[serde(default)]
+    parse_errors: Vec<Value>,
+    #[serde(default)]
+    skipped_files: Vec<Value>,
+}
+
+fn cycles_aggregate<'a>(
+    graph: &CycleGraph,
+    honesty: impl Iterator<Item = (&'a [Value], &'a [Value])>,
+    languages_skipped: Vec<String>,
+    drill_down_limit: Option<usize>,
+) -> Value {
+    let (count, largest, cycles) = graph.cycles(drill_down_limit.unwrap_or(usize::MAX));
     let limit = drill_down_limit.unwrap_or(usize::MAX);
-    let items = cycles
-        .iter()
-        .take(limit)
-        .map(CycleReport::to_value)
-        .collect::<Vec<_>>();
-    let (parse_errors, skipped_files) = honesty_fields(&parsed);
+    let items = cycles.iter().map(CycleReport::to_value).collect::<Vec<_>>();
+    let (scanned_files, parse_errors, skipped_files) = honesty_fields(honesty);
 
     let mut aggregate = json!({
         "count": count,
         "largest": largest,
         "items": items,
         "drill_down_capped": count > limit,
-        "scanned_files": parsed.len(),
+        "scanned_files": scanned_files,
         "languages_skipped": languages_skipped,
         "complete": parse_errors.is_empty() && skipped_files.is_empty(),
         "note": "TS/JS import cycles only; Rust module cycles are out of scope.",
@@ -277,7 +305,7 @@ fn cycle_file_contribution(
     skipped_files: &[Value],
 ) -> Option<FileContribution> {
     let path = &facts.path;
-    let freshness = cache_freshness::collect(path).ok()?;
+    let freshness = freshness_from_facts(facts)?;
     let relative = relative_string(project_root, path);
     let facts_payload = OxcCycleFactsPayload {
         format_version: FACTS_FORMAT_VERSION,
@@ -363,6 +391,22 @@ fn non_js_empty_contribution(project_root: &Path, path: &Path) -> Option<FileCon
         freshness,
         contribution,
     ))
+}
+
+/// Freshness for a file whose facts were just built: stat it, and reuse the
+/// content hash the facts already carry (the same hash of the same bytes)
+/// instead of reading the file again.
+fn freshness_from_facts(facts: &FileFacts) -> Option<FileFreshness> {
+    let metadata = fs::metadata(&facts.path).ok()?;
+    let content_hash = match blake3::Hash::from_hex(&facts.content_hash) {
+        Ok(hash) if metadata.len() <= cache_freshness::CONTENT_HASH_SIZE_CAP => hash,
+        _ => return cache_freshness::collect(&facts.path).ok(),
+    };
+    Some(FileFreshness {
+        mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+        size: metadata.len(),
+        content_hash,
+    })
 }
 
 fn freshness_for_existing_file(path: &Path) -> Option<FileFreshness> {
@@ -471,9 +515,12 @@ impl CycleGraph {
             .collect::<Vec<_>>();
         let oxc_result =
             analyze_file_facts(project_root, facts, AnalyzeOptions::default(), Vec::new());
+        Self::from_oxc_result(project_root, &oxc_result)
+    }
 
+    fn from_oxc_result(project_root: &Path, oxc_result: &OxcEngineResult) -> Self {
         let mut graph = Self::default();
-        let mut edges_by_file = cycle_edges_by_file(project_root, &oxc_result);
+        let mut edges_by_file = cycle_edges_by_file(project_root, oxc_result);
         for facts in &oxc_result.facts {
             let path = normalize_path(&facts.path);
             let from = relative_string(project_root, &path);
@@ -520,8 +567,12 @@ impl CycleGraph {
         }
     }
 
-    fn cycles(&self) -> Vec<CycleReport> {
-        self.strongly_connected_components()
+    /// Every cycle's count and the largest size, with reports built only for
+    /// the first `limit` cycles (largest first, then by file list): a report
+    /// costs a graph search, and the rest would be cut anyway.
+    fn cycles(&self, limit: usize) -> (usize, usize, Vec<CycleReport>) {
+        let mut components = self
+            .strongly_connected_components()
             .into_iter()
             .filter(|component| {
                 component.len() >= 2
@@ -531,8 +582,17 @@ impl CycleGraph {
                             .is_some_and(|neighbors| neighbors.contains(node))
                     })
             })
+            .collect::<Vec<_>>();
+        components
+            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        let count = components.len();
+        let largest = components.first().map_or(0, Vec::len);
+        let reports = components
+            .into_iter()
+            .take(limit)
             .filter_map(|component| self.report_for_component(component))
-            .collect()
+            .collect();
+        (count, largest, reports)
     }
 
     fn strongly_connected_components(&self) -> Vec<Vec<String>> {
@@ -593,7 +653,12 @@ impl CycleGraph {
         }
     }
 
+    /// Report one shortest cycle through the component's first file. `files`
+    /// still names the whole component; the chain is the cycle an agent can
+    /// break, at most one hop per file, found with a single search.
     fn report_for_component(&self, files: Vec<String>) -> Option<CycleReport> {
+        #[cfg(test)]
+        REPORTS_BUILT.with(|built| built.set(built.get() + 1));
         if files.len() == 1 {
             let file = files.first()?.clone();
             let edge = self.edge_report(&file, &file);
@@ -606,22 +671,31 @@ impl CycleGraph {
             });
         }
 
-        let component_set = files.iter().cloned().collect::<BTreeSet<_>>();
-        let mut chain = vec![files.first()?.clone()];
-        let mut edges = Vec::new();
-
-        for target in files.iter().skip(1).chain(files.first()) {
-            let current = chain.last()?.clone();
-            let path = self.shortest_path_in_component(&current, target, &component_set)?;
-            for pair in path.windows(2) {
-                let from = pair[0].clone();
-                let to = pair[1].clone();
-                if chain.last() != Some(&to) {
-                    chain.push(to.clone());
-                }
-                edges.push(self.edge_report(&from, &to));
-            }
+        let component_set = files.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let start = files.first()?.as_str();
+        let distances = self.distances_in_component(start, &component_set);
+        // The shortest cycle through `start` closes on the in-component
+        // predecessor nearest to it; ties go to the first file name.
+        let closing = self
+            .reverse_adjacency
+            .get(start)?
+            .iter()
+            .filter(|from| from.as_str() != start)
+            .filter_map(|from| Some((distances.get(from.as_str())?.0, from.as_str())))
+            .min()?
+            .1;
+        let mut chain = vec![closing.to_string()];
+        let mut current = closing;
+        while current != start {
+            current = distances.get(current)?.1?;
+            chain.push(current.to_string());
         }
+        chain.reverse();
+        chain.push(start.to_string());
+        let edges = chain
+            .windows(2)
+            .map(|pair| self.edge_report(&pair[0], &pair[1]))
+            .collect::<Vec<_>>();
 
         let edge_kind = cycle_edge_kind(edges.iter().map(|edge| edge.edge_kind.as_str()));
         Some(CycleReport {
@@ -632,31 +706,27 @@ impl CycleGraph {
         })
     }
 
-    fn shortest_path_in_component(
-        &self,
-        start: &str,
-        target: &str,
-        component: &BTreeSet<String>,
-    ) -> Option<Vec<String>> {
-        if start == target {
-            return Some(vec![start.to_string()]);
-        }
-        let mut queue = VecDeque::from([start.to_string()]);
-        let mut seen = BTreeSet::from([start.to_string()]);
-        let mut previous = BTreeMap::<String, String>::new();
+    /// Breadth-first distances from `start` inside one component, with each
+    /// file's predecessor on a shortest path.
+    fn distances_in_component<'a>(
+        &'a self,
+        start: &'a str,
+        component: &BTreeSet<&str>,
+    ) -> BTreeMap<&'a str, (usize, Option<&'a str>)> {
+        let mut distances = BTreeMap::from([(start, (0, None))]);
+        let mut queue = VecDeque::from([start]);
         while let Some(node) = queue.pop_front() {
-            for neighbor in self.adjacency.get(&node).into_iter().flatten() {
-                if !component.contains(neighbor) || !seen.insert(neighbor.clone()) {
+            let distance = distances[node].0;
+            for neighbor in self.adjacency.get(node).into_iter().flatten() {
+                let neighbor = neighbor.as_str();
+                if !component.contains(neighbor) || distances.contains_key(neighbor) {
                     continue;
                 }
-                previous.insert(neighbor.clone(), node.clone());
-                if neighbor == target {
-                    return Some(reconstruct_path(start, target, &previous));
-                }
-                queue.push_back(neighbor.clone());
+                distances.insert(neighbor, (distance + 1, Some(node)));
+                queue.push_back(neighbor);
             }
         }
-        None
+        distances
     }
 
     fn edge_report(&self, from: &str, to: &str) -> CycleEdgeReport {
@@ -675,18 +745,9 @@ impl CycleGraph {
     }
 }
 
-fn reconstruct_path(start: &str, target: &str, previous: &BTreeMap<String, String>) -> Vec<String> {
-    let mut path = vec![target.to_string()];
-    let mut current = target;
-    while current != start {
-        let Some(prior) = previous.get(current) else {
-            break;
-        };
-        path.push(prior.clone());
-        current = prior;
-    }
-    path.reverse();
-    path
+#[cfg(test)]
+thread_local! {
+    static REPORTS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn edge_rank(edge_kind: &str) -> u8 {
@@ -728,24 +789,28 @@ fn parse_errors_by_file(oxc_result: &OxcEngineResult) -> BTreeMap<PathBuf, Vec<S
     )
 }
 
-fn honesty_fields(contributions: &[CycleContribution]) -> (Vec<Value>, Vec<Value>) {
+fn honesty_fields<'a>(
+    contributions: impl Iterator<Item = (&'a [Value], &'a [Value])>,
+) -> (usize, Vec<Value>, Vec<Value>) {
+    let mut scanned_files = 0;
     let mut parse_error_keys = BTreeSet::new();
     let mut parse_errors = Vec::new();
     let mut skipped_file_keys = BTreeSet::new();
     let mut skipped_files = Vec::new();
-    for contribution in contributions {
-        for value in &contribution.parse_errors {
+    for (contribution_parse_errors, contribution_skipped_files) in contributions {
+        scanned_files += 1;
+        for value in contribution_parse_errors {
             if parse_error_keys.insert(value.to_string()) {
                 parse_errors.push(value.clone());
             }
         }
-        for value in &contribution.skipped_files {
+        for value in contribution_skipped_files {
             if skipped_file_keys.insert(value.to_string()) {
                 skipped_files.push(value.clone());
             }
         }
     }
-    (parse_errors, skipped_files)
+    (scanned_files, parse_errors, skipped_files)
 }
 
 fn skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) -> Vec<Value> {
@@ -863,6 +928,134 @@ mod tests {
         let mut components = graph.strongly_connected_components();
         components.sort();
         assert_eq!(components, vec![vec!["a"], vec!["b"], vec!["c", "d"]]);
-        assert_eq!(graph.cycles().len(), 1);
+        assert_eq!(graph.cycles(usize::MAX).2.len(), 1);
+    }
+
+    #[test]
+    fn cycles_scan_reuses_the_oxc_analysis_and_the_facts_hashes() {
+        use crate::inspect::oxc_engine::{analyze_files, ANALYZE_FILE_FACTS_CALLS};
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_normalized(dir.path());
+        let a = root.join("a.ts");
+        let b = root.join("b.ts");
+        fs::write(&a, "import { b } from './b';\nexport const a = b + 1;\n").unwrap();
+        fs::write(&b, "import { a } from './a';\nexport const b = a + 1;\n").unwrap();
+        let files = vec![a, b];
+        let oxc_result = analyze_files(&root, &files, AnalyzeOptions::default()).unwrap();
+        let scope = crate::inspect::JobScope::for_project(root.clone());
+        let job = InspectJob {
+            job_id: 1,
+            key: crate::inspect::JobKey::for_category_scope(InspectCategory::Cycles, &scope),
+            category: InspectCategory::Cycles,
+            scope_files: files.clone(),
+            project_root: root.clone(),
+            inspect_dir: root.join("inspect"),
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            symbol_cache: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::parser::SymbolCache::new(),
+            )),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        };
+
+        ANALYZE_FILE_FACTS_CALLS.with(|calls| calls.set(0));
+        cache_freshness::reset_hash_file_if_small_count_for_debug();
+        let success = run_cycles_scan_with_oxc(&job, Some(&oxc_result))
+            .outcome
+            .unwrap();
+        assert_eq!(
+            ANALYZE_FILE_FACTS_CALLS.with(std::cell::Cell::get),
+            0,
+            "the scan must use the analysis it was given"
+        );
+        assert_eq!(
+            cache_freshness::hash_file_if_small_count_for_debug(),
+            0,
+            "freshness must reuse the facts' content hash"
+        );
+        assert_eq!(success.aggregate["count"], 1);
+        for contribution in &success.contributions {
+            assert_eq!(
+                contribution.freshness,
+                cache_freshness::collect(&contribution.file_path).unwrap()
+            );
+        }
+        // Rolling the same contributions up from the cache gives the same
+        // aggregate.
+        let rolled_up = aggregate_cycle_contributions_with_limit(
+            &root,
+            &success.contributions,
+            skipped_languages(&files),
+            Some(DRILL_DOWN_LIMIT),
+        );
+        assert_eq!(success.aggregate, rolled_up);
+    }
+
+    fn import(graph: &mut CycleGraph, from: &str, to: &str) {
+        graph.add_edge(
+            from,
+            CycleEdgeContribution {
+                to: to.to_string(),
+                specifier: format!("./{to}"),
+                kind: "import".to_string(),
+                line: 1,
+                edge_kind: "static".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn cycle_report_is_one_shortest_cycle_through_the_first_file() {
+        // A barrel: index imports every file and each imports it back.
+        let mut barrel = CycleGraph::default();
+        for index in 0..3_000 {
+            let file = format!("m{index:04}.ts");
+            import(&mut barrel, "index.ts", &file);
+            import(&mut barrel, &file, "index.ts");
+        }
+        let (count, largest, reports) = barrel.cycles(usize::MAX);
+        assert_eq!((count, largest), (1, 3_001));
+        assert_eq!(reports[0].files.len(), 3_001);
+        assert_eq!(reports[0].chain, vec!["index.ts", "m0000.ts", "index.ts"]);
+        assert_eq!(reports[0].edges.len(), 2);
+
+        // A ring whose file names are out of import order: the old tour
+        // walked between alphabetically adjacent files and grew quadratically.
+        let n = 800;
+        let name = |index: usize| format!("r{:04}.ts", (index * 337) % n);
+        let mut ring = CycleGraph::default();
+        for index in 0..n {
+            import(&mut ring, &name(index), &name(index + 1));
+        }
+        let (_, largest, reports) = ring.cycles(usize::MAX);
+        assert_eq!(largest, n);
+        let report = &reports[0];
+        assert_eq!(report.chain.len(), n + 1);
+        assert_eq!(report.edges.len(), n);
+        assert_eq!(report.chain.first(), report.chain.last());
+        for (edge, pair) in report.edges.iter().zip(report.chain.windows(2)) {
+            assert_eq!((&edge.from, &edge.to), (&pair[0], &pair[1]));
+            assert_eq!(edge.imports.len(), 1, "every hop is a real import");
+        }
+    }
+
+    #[test]
+    fn cycle_reports_are_built_only_for_the_reported_cycles() {
+        let mut graph = CycleGraph::default();
+        for index in 0..5 {
+            let (a, b) = (format!("a{index}.ts"), format!("b{index}.ts"));
+            import(&mut graph, &a, &b);
+            import(&mut graph, &b, &a);
+        }
+        import(&mut graph, "c0.ts", "c1.ts");
+        import(&mut graph, "c1.ts", "c2.ts");
+        import(&mut graph, "c2.ts", "c0.ts");
+        REPORTS_BUILT.with(|built| built.set(0));
+        let (count, largest, reports) = graph.cycles(2);
+        assert_eq!(REPORTS_BUILT.with(std::cell::Cell::get), 2);
+        assert_eq!((count, largest), (6, 3));
+        assert_eq!(reports[0].files, vec!["c0.ts", "c1.ts", "c2.ts"]);
+        assert_eq!(reports[1].files, vec!["a0.ts", "b0.ts"]);
     }
 }

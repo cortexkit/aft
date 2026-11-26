@@ -65,6 +65,26 @@ pub(crate) fn kill_attempts(registry: &BgTaskRegistry) -> usize {
     registry.inner.reclaim_kill_attempts.load(Ordering::SeqCst)
 }
 
+pub(crate) fn reclaim_group_samples(
+    registry: &BgTaskRegistry,
+    root: &crate::path_identity::ProjectRootId,
+) -> Option<Vec<String>> {
+    let tasks = registry.inner.tasks.try_lock().ok()?;
+    Some(tasks.values().filter(|task| task.project_root == root.as_path()).map(|task| {
+        let Ok(state) = task.state.try_lock() else {
+            return format!("{}: task state unavailable", task.task_id);
+        };
+        let metadata = &state.metadata;
+        let members = metadata.live_descendants.as_ref().map(Vec::len);
+        format!(
+            "{}: status={:?}, pgid={:?}, sample_pending={}, members={members:?}, omitted={}, unavailable={:?}, group_unowned={}",
+            task.task_id, metadata.status, metadata.pgid, state.descendant_sample_pending,
+            metadata.live_descendants_omitted, metadata.live_descendants_unavailable,
+            state.root_reclaim_group_unowned,
+        )
+    }).collect())
+}
+
 pub(crate) fn completion_attempts(registry: &BgTaskRegistry) -> usize {
     registry
         .inner

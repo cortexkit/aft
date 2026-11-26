@@ -100,6 +100,7 @@ pub struct DiagnosticEntry {
     /// Optional resultId from a pull response. Sent back as `previousResultId`
     /// on the next pull request to enable `kind: "unchanged"` short-circuiting.
     pub result_id: Option<String>,
+    pub(super) provider_results: Option<ProviderResults>,
     /// Document version this report was proven against. Versioned
     /// `publishDiagnostics` payloads provide it directly; a synchronous pull
     /// response is tagged with the client's current document version.
@@ -128,6 +129,47 @@ pub struct DiagnosticEntry {
     /// successful text sync supplied the version proof instead. This proof is
     /// no longer sufficient if that server later registers document pulls.
     pub from_receive_order: bool,
+    /// A certified report preceded this row; repeated unverified reports must
+    /// not erase the status bar's knowledge that this file needs a new proof.
+    replaced_certified: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CountReadiness {
+    Current,
+    Provisional,
+    UncertifiedReplacement,
+}
+
+impl DiagnosticEntry {
+    pub(super) fn needs_recertification(&self) -> bool {
+        self.stale && self.content_hash.is_none() && self.replaced_certified
+    }
+
+    fn count_readiness(&self) -> CountReadiness {
+        // For example, gopls sends versionless pushes for closed files. The
+        // new report replaces the old one but cannot prove a lower count.
+        if self.needs_recertification() {
+            CountReadiness::UncertifiedReplacement
+        } else if self.provisional {
+            CountReadiness::Provisional
+        } else {
+            CountReadiness::Current
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProviderResults {
+    pub(super) instance: super::client::ServerInstanceId,
+    pub(super) stamps: Vec<ProviderStamp>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProviderStamp {
+    pub(super) generation: u64,
+    pub(super) result_id: Option<String>,
+    pub(super) items: std::ops::Range<usize>,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -465,23 +507,72 @@ impl DiagnosticsStore {
         version: Option<i32>,
         provisional: bool,
     ) {
+        self.publish_report(
+            server,
+            file,
+            diagnostics,
+            result_id,
+            version,
+            provisional,
+            None,
+        );
+    }
+
+    pub(super) fn publish_provider_results(
+        &mut self,
+        server: ServerKey,
+        file: PathBuf,
+        diagnostics: Vec<StoredDiagnostic>,
+        version: Option<i32>,
+        provisional: bool,
+        results: ProviderResults,
+    ) {
+        let result_id = match results.stamps.as_slice() {
+            [one] => one.result_id.clone(),
+            _ => None,
+        };
+        self.publish_report(
+            server,
+            file,
+            diagnostics,
+            result_id,
+            version,
+            provisional,
+            Some(results),
+        );
+    }
+
+    fn publish_report(
+        &mut self,
+        server: ServerKey,
+        file: PathBuf,
+        diagnostics: Vec<StoredDiagnostic>,
+        result_id: Option<String>,
+        version: Option<i32>,
+        provisional: bool,
+        provider_results: Option<ProviderResults>,
+    ) {
         let key = (server, file);
         self.next_epoch = self.next_epoch.saturating_add(1);
         self.generation = self.generation.wrapping_add(1);
-        let from_document_pull = result_id.is_some();
-        let entry = DiagnosticEntry {
+        let from_document_pull = result_id.is_some() || provider_results.is_some();
+        let mut entry = DiagnosticEntry {
             diagnostics,
             epoch: self.next_epoch,
             result_id,
+            provider_results,
             version,
             stale: false,
             provisional,
             from_document_pull,
             content_hash: None,
             from_receive_order: false,
+            replaced_certified: false,
         };
 
         let entry_bytes = if let Some((stored_key, previous)) = self.entries.get_key_value(&key) {
+            entry.replaced_certified = previous.replaced_certified
+                || (previous.content_hash.is_some() && !previous.provisional);
             #[cfg(test)]
             LRU_KEY_PROBES.with(|probes| probes.set(probes.get() + 1));
             self.memory_bytes = self
@@ -655,8 +746,15 @@ impl DiagnosticsStore {
     /// this exact file. Pull diagnostics use stale entries as the previous
     /// resultId cache when asking the server whether diagnostics are unchanged.
     pub fn has_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
-        self.entries
-            .contains_key(&(server.clone(), file.to_path_buf()))
+        self.report_for_server_file(server, file).is_some()
+    }
+
+    pub(super) fn report_for_server_file(
+        &self,
+        server: &ServerKey,
+        file: &Path,
+    ) -> Option<&DiagnosticEntry> {
+        self.entries.get(&(server.clone(), file.to_path_buf()))
     }
 
     /// True if this exact server instance has a non-stale report for this file.
@@ -770,18 +868,16 @@ impl DiagnosticsStore {
     /// tsconfig-membership filtered, cross-server deduped) should use
     /// [`filtered_error_warning_counts`](Self::filtered_error_warning_counts).
     pub fn error_warning_counts(&self) -> (usize, usize) {
-        self.error_warning_counts_with_provisional().0
+        self.error_warning_counts_with_readiness().0
     }
 
-    /// Raw warm-set counts plus whether any current entry is provisional.
-    pub fn error_warning_counts_with_provisional(&self) -> ((usize, usize), bool) {
+    /// Raw warm-set counts plus the readiness of its reports.
+    pub fn error_warning_counts_with_readiness(&self) -> ((usize, usize), CountReadiness) {
         let mut errors = 0usize;
         let mut warnings = 0usize;
-        let mut has_provisional = false;
+        let mut readiness = CountReadiness::Current;
         for entry in self.entries.values() {
-            if entry.provisional {
-                has_provisional = true;
-            }
+            readiness = readiness.max(entry.count_readiness());
             if entry.stale || entry.provisional {
                 continue;
             }
@@ -793,7 +889,7 @@ impl DiagnosticsStore {
                 }
             }
         }
-        ((errors, warnings), has_provisional)
+        ((errors, warnings), readiness)
     }
 
     /// Error/warning counts after applying a per-file `keep` predicate,
@@ -809,16 +905,14 @@ impl DiagnosticsStore {
     /// it in `keep` (see `LspManager::filtered_error_warning_counts`). `keep`
     /// is `FnMut` because the membership cache resolves lazily.
     pub fn filtered_error_warning_counts(&self, keep: impl FnMut(&Path) -> bool) -> (usize, usize) {
-        self.filtered_error_warning_counts_with_provisional(keep).0
+        self.filtered_error_warning_counts_with_readiness(keep).0
     }
 
-    /// Return status-bar counts plus whether a kept entry is still provisional.
-    /// The boolean lets the context retain the previous authoritative E/W values
-    /// instead of replacing them with zero while an analyzer warms up.
-    pub fn filtered_error_warning_counts_with_provisional(
+    /// Return status-bar counts plus the readiness of the kept reports.
+    pub fn filtered_error_warning_counts_with_readiness(
         &self,
         mut keep: impl FnMut(&Path) -> bool,
-    ) -> ((usize, usize), bool) {
+    ) -> ((usize, usize), CountReadiness) {
         // Dedup key mirrors `sort_and_dedup` in inspect/diagnostics_category.rs
         // exactly (file, range, severity, message, source) so the bar and
         // inspect collapse the same multi-server overlaps.
@@ -834,18 +928,17 @@ impl DiagnosticsStore {
         )> = std::collections::HashSet::new();
         let mut errors = 0usize;
         let mut warnings = 0usize;
-        let mut has_provisional = false;
+        let mut readiness = CountReadiness::Current;
         for ((_, file), entry) in &self.entries {
-            if entry.provisional && keep(file) {
-                has_provisional = true;
-            }
-            if entry.stale || entry.provisional {
-                continue;
-            }
             // All diagnostics in an entry share the entry's file, so the keep
             // predicate (the cost center: tsconfig resolution) runs once per
             // (server, file) entry, not once per diagnostic.
-            if !keep(file) {
+            let entry_readiness = entry.count_readiness();
+            if (entry.stale && entry_readiness == CountReadiness::Current) || !keep(file) {
+                continue;
+            }
+            readiness = readiness.max(entry_readiness);
+            if entry.stale || entry.provisional {
                 continue;
             }
             for diagnostic in &entry.diagnostics {
@@ -872,7 +965,7 @@ impl DiagnosticsStore {
                 }
             }
         }
-        ((errors, warnings), has_provisional)
+        ((errors, warnings), readiness)
     }
 
     /// Drop all entries for a server kind (e.g., on server crash/restart).
@@ -1038,6 +1131,30 @@ impl DiagnosticsStore {
                         .memory_bytes
                         .saturating_sub(crate::memory::usize_to_u64(result_id.len()));
                 }
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    pub(super) fn invalidate_changed_provider_results(
+        &mut self,
+        key: &ServerKey,
+        generations: impl Fn(&Path) -> Vec<u64>,
+    ) {
+        let mut changed = false;
+        for ((server, file), entry) in &mut self.entries {
+            if server == key
+                && !entry.stale
+                && entry.provider_results.as_ref().is_some_and(|results| {
+                    !generations(file)
+                        .into_iter()
+                        .eq(results.stamps.iter().map(|stamp| stamp.generation))
+                })
+            {
+                entry.stale = true;
                 changed = true;
             }
         }
@@ -1221,6 +1338,13 @@ impl DiagnosticsStore {
                     .map_or(0, |id| crate::memory::usize_to_u64(id.len())),
             )
             .saturating_add(diagnostic_bytes)
+            .saturating_add(entry.provider_results.as_ref().map_or(0, |results| {
+                results.stamps.iter().fold(0u64, |bytes, stamp| {
+                    bytes
+                        .saturating_add(std::mem::size_of::<ProviderStamp>() as u64)
+                        .saturating_add(stamp.result_id.as_ref().map_or(0, |id| id.len() as u64))
+                })
+            }))
     }
 
     // All report-removal paths retire the payload and its three secondary

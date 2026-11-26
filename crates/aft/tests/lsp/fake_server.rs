@@ -623,6 +623,19 @@ pub(crate) fn main() -> io::Result<()> {
     // last published for them from its own analysis, for the emulated check.
     let mut analysis_opens = 0usize;
     let dynamic_pull = std::env::var_os("AFT_FAKE_LSP_DYNAMIC_PULL").is_some();
+    let mut hover_burst_sent = false;
+    // Hold the first batch of didOpen publishes until a hover releases them.
+    // The hover reply follows the last publish on the same stdout stream.
+    let mut open_burst = std::env::var_os("AFT_FAKE_LSP_OPEN_BURST_READY")
+        .map(|path| (path, Vec::new()));
+    let open_burst_count = std::env::var("AFT_FAKE_LSP_OPEN_BURST_COUNT")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap());
+    let reopen_burst_uri = std::env::var("AFT_FAKE_LSP_REOPEN_BURST_URI").ok();
+    let mut reopen_burst_ready = std::env::var_os("AFT_FAKE_LSP_REOPEN_BURST_READY");
+    let mut held_close = None;
+    let mut held_reopen = None;
+    let mut held_hover = None;
     let mut client_dynamic_pull = false;
     let mut client_disables_pull = false;
     let mut diagnostic_registered = false;
@@ -1050,6 +1063,38 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/hover" => {
+                    if let Some(uri) = held_reopen.take() {
+                        write_publish_diagnostics(&mut writer, held_close.take().unwrap(), json!([]))?;
+                        write_publish_diagnostics(&mut writer, uri, json!([]))?;
+                        write_response(&mut writer, id, Value::Null)?;
+                        continue;
+                    }
+                    if let Some((_, publishes)) = open_burst.take() {
+                        for (uri, version) in publishes {
+                            write_publish_diagnostics_versioned(
+                                &mut writer, uri, opened_diagnostics(), version,
+                            )?;
+                        }
+                        write_response(&mut writer, id, Value::Null)?;
+                        continue;
+                    }
+                    if std::env::var_os("AFT_FAKE_LSP_HOLD_HOVER").is_some() {
+                        held_hover = Some(id);
+                        write_notification(&mut writer, &Notification::new("custom/hoverHeld", None))?;
+                        continue;
+                    }
+                    if let Ok(count) = std::env::var("AFT_FAKE_LSP_HOVER_EVENT_BURST") {
+                        let uri = document_uri(&params);
+                        for _ in 0..count.parse::<usize>().unwrap() {
+                            write_publish_diagnostics(&mut writer, uri.clone(), opened_diagnostics())?;
+                        }
+                        write_response(&mut writer, id, Value::Null)?;
+                        if hover_burst_sent {
+                            break;
+                        }
+                        hover_burst_sent = true;
+                        continue;
+                    }
                     // AFT_FAKE_LSP_HOVER_DELAY_SIGNAL=<path> is written when a
                     // hover arrives and AFT_FAKE_LSP_HOVER_DELAY_MS=<ms> holds
                     // the reply, so a test can act while AFT waits on a slow
@@ -1140,6 +1185,25 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/diagnostic" => {
+                    if std::env::var_os("AFT_FAKE_LSP_MULTIPLE_PULL").is_some() {
+                        let params = params.unwrap_or_default();
+                        let provider = params["identifier"].as_str().unwrap();
+                        let result = format!("{provider}-result");
+                        record_pull_event(&format!("provider={provider} previous={}", params["previousResultId"]))?;
+                        if workspace_root.as_deref().is_some_and(|root| root.join(format!("fail-{provider}")).exists()) {
+                            write_json_message(&mut writer, &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"provider failed"}}))?;
+                            continue;
+                        }
+                        if params["previousResultId"].as_str() == Some(&result) {
+                            write_response(&mut writer, id, json!({"kind":"unchanged","resultId":result}))?;
+                        } else {
+                            write_response(&mut writer, id, json!({"kind":"full","resultId":result,"items":[{
+                                "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                                "severity":1,"message":provider
+                            }]}))?;
+                        }
+                        continue;
+                    }
                     if dynamic_pull {
                         record_pull_event(&format!("pull registered={diagnostic_registered} {}", request_document_uri_string(&params)))?;
                         if !diagnostic_registered {
@@ -1454,8 +1518,19 @@ pub(crate) fn main() -> io::Result<()> {
                 }
             },
             ServerMessage::Notification { method, params } => match method.as_str() {
+                "workspace/didChangeConfiguration" if held_hover.is_some() => {
+                    write_response(&mut writer, held_hover.take().unwrap(), Value::Null)?;
+                }
                 "initialized" => {
-                    if dynamic_pull && client_dynamic_pull {
+                    if std::env::var_os("AFT_FAKE_LSP_MULTIPLE_PULL").is_some() && client_dynamic_pull {
+                        let registrations = [("types", Value::Null), ("lint", Value::Null),
+                            ("other", json!([{"language":"javascript"}])), ("removed", Value::Null)]
+                            .map(|(id, selector)| json!({"id":id,"method":"textDocument/diagnostic","registerOptions":{
+                                "documentSelector":selector,"identifier":id,"interFileDependencies":true,"workspaceDiagnostics":false
+                            }}));
+                        write_request(&mut writer, 22_010, "client/registerCapability", json!({"registrations":registrations}))?;
+                        write_request(&mut writer, 22_011, "client/unregisterCapability", json!({"unregisterations":[{"id":"removed","method":"textDocument/diagnostic"}]}))?;
+                    } else if dynamic_pull && client_dynamic_pull {
                         if let Some(delay) = std::env::var("AFT_FAKE_LSP_REGISTER_DIAGNOSTICS_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
                             std::thread::sleep(std::time::Duration::from_millis(delay));
                         }
@@ -1553,6 +1628,18 @@ pub(crate) fn main() -> io::Result<()> {
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if held_close.as_ref() == Some(&uri) {
+                        held_reopen = Some(uri);
+                        std::fs::write(reopen_burst_ready.take().unwrap(), b"ready")?;
+                        continue;
+                    }
+                    if let Some((ready, publishes)) = &mut open_burst {
+                        publishes.push((uri, version));
+                        if Some(publishes.len()) == open_burst_count {
+                            std::fs::write(ready, b"ready")?;
+                        }
+                        continue;
+                    }
                     if let (Some(uri), Some(text)) = (
                         uri.as_str(),
                         params
@@ -1820,6 +1907,10 @@ pub(crate) fn main() -> io::Result<()> {
                         uri.clone(),
                         Value::Null,
                     )?;
+                    if reopen_burst_ready.is_some() && reopen_burst_uri.as_deref() == uri.as_str() {
+                        held_close = Some(uri);
+                        continue;
+                    }
                     // AFT_FAKE_LSP_CLOSE_DELAY_MS=<ms>: answer the close late.
                     if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_CLOSE_DELAY_MS")
                         .ok()

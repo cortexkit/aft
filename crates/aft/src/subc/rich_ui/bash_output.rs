@@ -4,6 +4,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::ops::ControlFlow;
 
 use crate::{
     context::AppContext,
@@ -13,6 +14,11 @@ use crate::{
 const ITEM_BYTES: usize = 8192;
 const PAGE_BYTES: usize = 262_144;
 const CURSOR_VERSION: u8 = 1;
+const CURSOR_PAYLOAD_BYTES: usize = 25;
+const CURSOR_BYTES: usize = CURSOR_PAYLOAD_BYTES + 32;
+const CURSOR_TEXT_BYTES: usize = (CURSOR_BYTES * 4).div_ceil(3);
+const PAGE_WITH_CURSOR: usize = br#"{"items":[],"next":""}"#.len() + CURSOR_TEXT_BYTES;
+const PAGE_WITH_NULL: usize = br#"{"items":[],"next":null}"#.len();
 
 #[derive(Clone, Copy, Default)]
 struct Offsets {
@@ -64,13 +70,13 @@ impl Cursor<'_> {
             return None;
         }
         let bytes = URL_SAFE_NO_PAD.decode(cursor).ok()?;
-        if bytes.len() != 57 || bytes[0] != CURSOR_VERSION {
+        if bytes.len() != CURSOR_BYTES || bytes[0] != CURSOR_VERSION {
             return None;
         }
-        let mac = self.mac(&bytes[..25]);
+        let mac = self.mac(&bytes[..CURSOR_PAYLOAD_BYTES]);
         let difference = mac
             .iter()
-            .zip(&bytes[25..])
+            .zip(&bytes[CURSOR_PAYLOAD_BYTES..])
             .fold(0u8, |diff, (a, b)| diff | (a ^ b));
         if difference != 0 {
             return None;
@@ -186,41 +192,55 @@ fn page(
         offsets.stderr = 0;
     }
     let mut items = Vec::new();
+    let mut item_bytes = 0;
     let mut consumed = [0usize; 2];
     let streams = [stdout, stderr];
     for (index, stream) in streams.iter().enumerate() {
-        for (text, bytes) in stream_items(&stream.bytes, terminal && !stream.more) {
-            if items.len() == limit {
-                return Ok(envelope(cursor, offsets, items, false));
-            }
-            let mut advanced = offsets;
-            if index == 0 {
-                advanced.stdout += bytes as u64;
-            } else {
-                advanced.stderr += bytes as u64;
-            }
+        if items.len() == limit {
+            break;
+        }
+        let filled = visit_stream_items(&stream.bytes, terminal && !stream.more, |text, bytes| {
             let item = json!({"stream":stream.name, "text":text, "bytes":bytes,
                 "continued":false, "firstAvailableOffset":if prefix_unknown { None } else { Some(0) },
                 "prefixDropped":prefix_unknown});
-            items.push(item);
-            // Budget the complete serialized page, including JSON escaping and
-            // the cursor (or null when this item drains both terminal streams).
+            #[cfg(test)]
+            tests::record_work(1, 1);
+            let row_bytes = match serde_json::to_vec(&item) {
+                Ok(encoded) => encoded.len(),
+                Err(_) => return ControlFlow::Break(Err("result_schema_mismatch")),
+            };
             let candidate_drained = terminal
                 && streams.iter().enumerate().all(|(i, stream)| {
                     !stream.more
                         && consumed[i] + if i == index { bytes } else { 0 } == stream.bytes.len()
                 });
-            let candidate = envelope(cursor, advanced, items.clone(), candidate_drained);
-            if serde_json::to_vec(&candidate)
-                .map_err(|_| "result_schema_mismatch")?
-                .len()
-                > PAGE_BYTES
-            {
-                items.pop();
-                return Ok(envelope(cursor, offsets, items, false));
+            let wrapper = if candidate_drained {
+                PAGE_WITH_NULL
+            } else {
+                PAGE_WITH_CURSOR
+            };
+            // Each preceding item needs one comma. URL-safe cursor characters
+            // never need JSON escaping and all encoded cursors are the same length.
+            if wrapper + item_bytes + items.len() + row_bytes > PAGE_BYTES {
+                return ControlFlow::Break(Ok(()));
             }
+            items.push(item);
+            item_bytes += row_bytes;
             consumed[index] += bytes;
-            offsets = advanced;
+            if index == 0 {
+                offsets.stdout += bytes as u64;
+            } else {
+                offsets.stderr += bytes as u64;
+            }
+            if items.len() == limit {
+                ControlFlow::Break(Ok(()))
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        if let ControlFlow::Break(result) = filled {
+            result?;
+            break;
         }
     }
     let drained = terminal
@@ -240,17 +260,21 @@ fn envelope(cursor: &Cursor<'_>, mut offsets: Offsets, items: Vec<Value>, draine
 
 /// Match `from_utf8_lossy`'s maximal invalid subparts. An unfinished suffix is
 /// retained until more bytes arrive or the terminal stream reaches its end.
-fn stream_items(bytes: &[u8], finished: bool) -> Vec<(String, usize)> {
-    let mut items = Vec::new();
+fn visit_stream_items<B>(
+    bytes: &[u8],
+    finished: bool,
+    mut visit: impl FnMut(String, usize) -> ControlFlow<B>,
+) -> ControlFlow<B> {
     let mut text = String::new();
     let mut source = 0;
     let mut add = |unit: &str, count: usize| {
         if text.len() + unit.len() > ITEM_BYTES || source + count > ITEM_BYTES {
-            items.push((std::mem::take(&mut text), source));
+            visit(std::mem::take(&mut text), source)?;
             source = 0;
         }
         text.push_str(unit);
         source += count;
+        ControlFlow::Continue(())
     };
     let mut remaining = bytes;
     while !remaining.is_empty() {
@@ -263,7 +287,7 @@ fn stream_items(bytes: &[u8], finished: bool) -> Vec<(String, usize)> {
         };
         for character in valid.chars() {
             let mut buffer = [0; 4];
-            add(character.encode_utf8(&mut buffer), character.len_utf8());
+            add(character.encode_utf8(&mut buffer), character.len_utf8())?;
         }
         remaining = &remaining[valid.len()..];
         match invalid {
@@ -271,15 +295,15 @@ fn stream_items(bytes: &[u8], finished: bool) -> Vec<(String, usize)> {
             Some(None) if !finished => break,
             Some(length) => {
                 let count = length.unwrap_or(remaining.len());
-                add("\u{fffd}", count);
+                add("\u{fffd}", count)?;
                 remaining = &remaining[count..];
             }
         }
     }
     if !text.is_empty() {
-        items.push((text, source));
+        visit(text, source)?;
     }
-    items
+    ControlFlow::Continue(())
 }
 
 #[cfg(test)]

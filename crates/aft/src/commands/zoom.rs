@@ -113,20 +113,30 @@ thread_local! {
     static ZOOM_COORD_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_CALL_NAME_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_ENRICHMENT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_JSON_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LEGACY_ZOOM_PARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Files a multi-target zoom already resolved and read, keyed by the target's
-/// `file` string, plus the per-file call enrichment. Several targets in one
-/// file then share one read and one enrichment instead of each repeating it.
+/// `file` string, plus analyses shared by the selectors in one request.
 #[derive(Default)]
 struct ZoomTargetMemo<'a> {
     files: HashMap<String, (PathBuf, String)>,
-    enrichments: HashMap<PathBuf, ZoomEnrichment>,
+    analysis: ZoomAnalysisMemo,
     /// The git revision every target is read at, when the call passed `ref`.
     revision: Option<&'a RevisionSession>,
 }
+
+#[derive(Default)]
+struct ZoomAnalysisMemo {
+    enrichments: HashMap<PathBuf, ZoomEnrichment>,
+    // Use the same key as the read cache. Two aliases may have been read at
+    // different times, so never use a tree from another source snapshot.
+    json: HashMap<String, JsonZoomParse>,
+}
+
+type JsonZoomParse = Result<(tree_sitter::Tree, LangId), crate::error::AftError>;
 
 struct ZoomEnrichment {
     symbols: std::sync::Arc<Vec<Symbol>>,
@@ -135,6 +145,7 @@ struct ZoomEnrichment {
     source: String,
     tree: tree_sitter::Tree,
     calls: Vec<RawCall>,
+    calls_by_name: HashMap<String, Vec<usize>>,
     line_starts: Vec<usize>,
 }
 
@@ -144,6 +155,17 @@ struct RawCall {
     line: u32,
     start_byte: usize,
     end_byte: usize,
+}
+
+fn index_calls_by_name(calls: &[RawCall]) -> HashMap<String, Vec<usize>> {
+    // The preorder walk visits each call before its children and visits siblings
+    // in source order. Equal byte starts therefore keep their original order.
+    debug_assert!(calls.is_sorted_by_key(|call| call.start_byte));
+    let mut by_name = HashMap::<String, Vec<usize>>::new();
+    for (index, call) in calls.iter().enumerate() {
+        by_name.entry(call.name.clone()).or_default().push(index);
+    }
+    by_name
 }
 
 fn zoom_parse_source(
@@ -163,6 +185,10 @@ fn zoom_parse_source(
         })?;
     // Zoom already read these bytes. Parse the displayed source, not a second
     // disk snapshot that can differ if an editor saves during the request.
+    #[cfg(test)]
+    if lang == LangId::Json {
+        ZOOM_JSON_PARSES.with(|count| count.set(count.get() + 1));
+    }
     Ok((FileParser::parse_source(path, source, lang)?, lang))
 }
 
@@ -288,6 +314,7 @@ fn resolve_zoom_file(
             ),
         )
     })?;
+    crate::run_tool_call::read_trace::note_file(source.len() as u64);
     Ok((path, source))
 }
 
@@ -327,7 +354,7 @@ fn zoom_one_target_response(
         symbol,
         context_lines,
         include_callgraph,
-        &mut memo.enrichments,
+        &mut memo.analysis,
     )
 }
 
@@ -477,6 +504,7 @@ fn handle_zoom_targets(
                 any_usable = true;
                 match zoom_target_symbol_names(req, ctx, file, symbols, &mut memo) {
                     Ok(names) => {
+                        crate::run_tool_call::read_trace::note_symbols(names.len());
                         for name in names {
                             let mut response = zoom_one_target_response(
                                 req,
@@ -861,6 +889,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
             Ok(selector) => selector,
             Err(response) => return response,
         };
+        crate::run_tool_call::read_trace::note_symbols(1);
         return handle_github_zoom(req, ctx, file, &selector);
     }
 
@@ -954,6 +983,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
             }
 
             let content = lines[start_idx..=end_idx].join("\n");
+            crate::run_tool_call::read_trace::note_symbols(0);
             let ctx_start = start_idx.saturating_sub(context_lines);
             let context_before: Vec<String> = if ctx_start < start_idx {
                 lines[ctx_start..start_idx]
@@ -1018,6 +1048,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
         Ok(names) => names,
         Err(resp) => return resp,
     };
+    crate::run_tool_call::read_trace::note_symbols(symbol_names.len());
 
     if symbol_names.is_empty() {
         return Response::error(
@@ -1041,7 +1072,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
             &symbol_names[0],
             context_lines,
             include_callgraph,
-            &mut HashMap::new(),
+            &mut ZoomAnalysisMemo::default(),
         );
     }
 
@@ -1408,7 +1439,7 @@ fn zoom_batch_symbols(
 ) -> Response {
     let mut entries = Vec::with_capacity(symbol_names.len());
     let mut all_ok = true;
-    let mut enrichments = HashMap::new();
+    let mut analysis = ZoomAnalysisMemo::default();
 
     for name in symbol_names {
         let resp = zoom_one_symbol(
@@ -1421,7 +1452,7 @@ fn zoom_batch_symbols(
             name,
             context_lines,
             include_callgraph,
-            &mut enrichments,
+            &mut analysis,
         );
         crate::tool_progress::report();
         let json = match serde_json::to_value(&resp) {
@@ -1456,33 +1487,33 @@ fn zoom_one_symbol(
     req: &RawRequest,
     ctx: &AppContext,
     path: &Path,
-    _file: &str,
+    file: &str,
     source: &str,
     lines: &[&str],
     symbol_name: &str,
     context_lines: usize,
     include_callgraph: bool,
-    enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
+    analysis: &mut ZoomAnalysisMemo,
 ) -> Response {
     let mut content_files = BTreeSet::from([path.to_path_buf()]);
-    let mut response = if is_http_url(_file) && detect_language(path) == Some(LangId::Json) {
+    let mut response = if is_http_url(file) && detect_language(path) == Some(LangId::Json) {
         super::url_output::json_preview(req, source, Some(symbol_name))
     } else {
         zoom_one_symbol_inner(
             req,
             ctx,
             path,
-            _file,
+            file,
             source,
             lines,
             symbol_name,
             context_lines,
             include_callgraph,
-            enrichments,
+            analysis,
             &mut content_files,
         )
     };
-    if is_http_url(_file) {
+    if is_http_url(file) {
         if !response.success
             && response.data["code"] == "symbol_not_found"
             && is_heading_zoom_language(detect_language(path))
@@ -1515,13 +1546,13 @@ fn zoom_one_symbol_inner(
     req: &RawRequest,
     ctx: &AppContext,
     path: &Path,
-    _file: &str,
+    file: &str,
     source: &str,
     lines: &[&str],
     symbol_name: &str,
     context_lines: usize,
     include_callgraph: bool,
-    enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
+    analysis: &mut ZoomAnalysisMemo,
     content_files: &mut BTreeSet<PathBuf>,
 ) -> Response {
     // Keep raw heading labels for outline display. Zoom resolves heading names in tiers:
@@ -1533,6 +1564,10 @@ fn zoom_one_symbol_inner(
     // JSON files resolve dotted paths (`a.b.c`, `servers[0]`) against the parsed
     // document in addition to literal top-level keys. See `resolve_json_zoom`.
     if lang == Some(LangId::Json) {
+        let parsed = analysis
+            .json
+            .entry(file.to_string())
+            .or_insert_with(|| zoom_parse_source(path, source));
         return resolve_json_zoom(
             req,
             ctx,
@@ -1542,6 +1577,7 @@ fn zoom_one_symbol_inner(
             symbol_name,
             context_lines,
             include_callgraph,
+            parsed,
         );
     }
 
@@ -1733,6 +1769,7 @@ fn zoom_one_symbol_inner(
         None
     };
     let (calls_out, called_by, other_calls) = if include_callgraph {
+        let enrichments = &mut analysis.enrichments;
         if !enrichments.contains_key(resolved_file_path) {
             #[cfg(test)]
             ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(count.get() + 1));
@@ -1762,6 +1799,7 @@ fn zoom_one_symbol_inner(
                 }
             };
             let calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
+            let calls_by_name = index_calls_by_name(&calls);
             let line_starts = zoom_line_starts(&resolved_source);
             let local_names = symbols.iter().map(|symbol| symbol.name.clone()).collect();
             let imported_bindings = imported_call_bindings(&resolved_source, &tree, lang);
@@ -1774,12 +1812,12 @@ fn zoom_one_symbol_inner(
                     source: resolved_source,
                     tree,
                     calls,
+                    calls_by_name,
                     line_starts,
                 },
             );
         }
         let enrichment = &enrichments[resolved_file_path];
-        let all_symbols = &enrichment.symbols;
         let resolved_source = &enrichment.source;
         let line_starts = &enrichment.line_starts;
         let all_file_calls = &enrichment.calls;
@@ -1823,46 +1861,7 @@ fn zoom_one_symbol_inner(
         }
         let calls_out = dedupe_call_refs_by_name(calls_out);
 
-        // Preserve file-call order for each name when attributing nested symbols.
-        let matching_calls: Vec<&RawCall> = all_file_calls
-            .iter()
-            .filter(|call| {
-                #[cfg(test)]
-                ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
-                call.name == target.name
-            })
-            .collect();
-        let mut called_by: Vec<CallRef> = Vec::new();
-        for sym in all_symbols.iter() {
-            if sym.name == target.name && sym.range.start_line == target.range.start_line {
-                continue; // skip self
-            }
-            let sym_byte_start = zoom_line_col_to_byte(
-                &resolved_source,
-                &line_starts,
-                sym.range.start_line,
-                sym.range.start_col,
-            );
-            let sym_byte_end = zoom_line_col_to_byte(
-                &resolved_source,
-                &line_starts,
-                sym.range.end_line,
-                sym.range.end_col,
-            );
-            for call in &matching_calls {
-                #[cfg(test)]
-                ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
-                if call.start_byte >= sym_byte_start && call.end_byte <= sym_byte_end {
-                    called_by.push(CallRef {
-                        name: sym.name.clone(),
-                        line: call.line,
-                        extra_count: 0,
-                    });
-                }
-            }
-        }
-
-        let called_by = dedupe_call_refs_by_name(called_by);
+        let called_by = zoom_called_by(enrichment, target);
 
         (calls_out, called_by, other_calls)
     } else {
@@ -1898,6 +1897,45 @@ fn zoom_one_symbol_inner(
             format!("zoom: failed to serialize response: {err}"),
         ),
     }
+}
+
+fn zoom_called_by(enrichment: &ZoomEnrichment, target: &Symbol) -> Vec<CallRef> {
+    let Some(matching_calls) = enrichment.calls_by_name.get(&target.name) else {
+        return Vec::new();
+    };
+    let byte =
+        |line, col| zoom_line_col_to_byte(&enrichment.source, &enrichment.line_starts, line, col);
+    let call_of = |index: &usize| &enrichment.calls[*index];
+    let mut called_by = Vec::new();
+    for sym in enrichment.symbols.iter() {
+        if sym.name == target.name && sym.range.start_line == target.range.start_line {
+            continue; // skip self
+        }
+        let start = byte(sym.range.start_line, sym.range.start_col);
+        let end = byte(sym.range.end_line, sym.range.end_col);
+        let first = matching_calls.partition_point(|index| {
+            #[cfg(test)]
+            ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
+            call_of(index).start_byte < start
+        });
+        // Each enclosing symbol can own a nested call. Keep symbol order and
+        // visit only that symbol's byte window, in the original call order.
+        for call in matching_calls[first..].iter().map(call_of) {
+            #[cfg(test)]
+            ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
+            if call.start_byte > end {
+                break;
+            }
+            if call.end_byte <= end {
+                called_by.push(CallRef {
+                    name: sym.name.clone(),
+                    line: call.line,
+                    extra_count: 0,
+                });
+            }
+        }
+    }
+    dedupe_call_refs_by_name(called_by)
 }
 
 /// The `callgraph` field of a `callgraph:true` zoom when the callgraph index
@@ -2173,9 +2211,10 @@ fn resolve_json_zoom(
     symbol_name: &str,
     context_lines: usize,
     include_callgraph: bool,
+    parsed: &JsonZoomParse,
 ) -> Response {
-    let (tree, _) = match zoom_parse_source(path, source) {
-        Ok(parsed) => parsed,
+    let (tree, lang) = match parsed {
+        Ok((tree, lang)) => (tree, *lang),
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
     let root = tree.root_node();
@@ -2249,7 +2288,7 @@ fn resolve_json_zoom(
             symbol_name,
             &literal[0].symbol,
             context_lines,
-            include_callgraph,
+            include_callgraph.then_some((root, lang)),
         );
     }
 
@@ -2264,7 +2303,7 @@ fn resolve_json_zoom(
             &resolved.path,
             &json_node_to_symbol(&resolved.node, &resolved.path),
             context_lines,
-            include_callgraph,
+            include_callgraph.then_some((root, lang)),
         );
     }
 
@@ -2492,7 +2531,7 @@ fn render_json_zoom(
     name: &str,
     target: &Symbol,
     context_lines: usize,
-    include_callgraph: bool,
+    callgraph: Option<(tree_sitter::Node, LangId)>,
 ) -> Response {
     let start = target.range.start_line as usize;
     let end = target.range.end_line as usize;
@@ -2526,12 +2565,12 @@ fn render_json_zoom(
     // are always computed. When the callgraph index is not ready, zoom adds an
     // explicit `callgraph` field with its status so the reader knows no
     // index-backed (cross-file) information is included.
-    let callgraph_unavailable = if include_callgraph {
+    let callgraph_unavailable = if callgraph.is_some() {
         unavailable_callgraph_field(ctx)
     } else {
         None
     };
-    let (calls_out, called_by) = if include_callgraph {
+    let (calls_out, called_by) = if let Some((root, lang)) = callgraph {
         let all_symbols = match crate::parser::list_symbols_shared(
             ctx.provider(),
             path,
@@ -2541,17 +2580,13 @@ fn render_json_zoom(
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
         let known_names: Vec<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
-        let (tree, lang) = match zoom_parse_source(path, source) {
-            Ok(r) => r,
-            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
-        };
-        let all_file_calls = extract_calls_with_ranges(source, tree.root_node(), lang);
+        let all_file_calls = extract_calls_with_ranges(source, root, lang);
         let signature_byte_start =
             line_col_to_byte(source, target.range.start_line, target.range.start_col);
         let signature_byte_end =
             line_col_to_byte(source, target.range.end_line, target.range.end_col);
         let (target_byte_start, target_byte_end) =
-            symbol_body_byte_range(tree.root_node(), signature_byte_start, signature_byte_end)
+            symbol_body_byte_range(root, signature_byte_start, signature_byte_end)
                 .unwrap_or((signature_byte_start, signature_byte_end));
         let calls_out = dedupe_call_refs_by_name(
             all_file_calls
@@ -3812,7 +3847,7 @@ function helper(value: number): number {
         ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.set(0));
         ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(0));
         ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(0));
-        let mut enrichments = HashMap::new();
+        let mut analysis = ZoomAnalysisMemo::default();
         let mut shared_responses = Vec::new();
         for name in &names {
             let shared = zoom_one_symbol(
@@ -3825,21 +3860,21 @@ function helper(value: number): number {
                 name,
                 0,
                 true,
-                &mut enrichments,
+                &mut analysis,
             );
             shared_responses.push(serde_json::to_value(shared).unwrap());
         }
-        assert_eq!(enrichments.len(), 1);
+        assert_eq!(analysis.enrichments.len(), 1);
         assert_eq!(ZOOM_ENRICHMENT_BUILDS.with(|count| count.get()), 1);
         let actual_comparisons = ZOOM_CALL_NAME_COMPARISONS.with(|count| count.get());
-        let enriched = &enrichments[&path];
+        let enriched = &analysis.enrichments[&path];
         let baseline_comparisons = enriched.symbols.len() * enriched.calls.len() * names.len();
         assert!(baseline_comparisons > actual_comparisons * 20);
         eprintln!("zoom incoming call comparisons: baseline {baseline_comparisons}, indexed {actual_comparisons}");
         eprintln!(
             "batch parses/extractions: baseline {}, shared {}",
             names.len(),
-            enrichments.len()
+            analysis.enrichments.len()
         );
         for (name, shared) in names.iter().zip(shared_responses) {
             let standalone = zoom_one_symbol(
@@ -3852,7 +3887,7 @@ function helper(value: number): number {
                 name,
                 0,
                 true,
-                &mut HashMap::new(),
+                &mut ZoomAnalysisMemo::default(),
             );
             assert_eq!(shared, serde_json::to_value(standalone).unwrap());
         }
@@ -3980,6 +4015,85 @@ import { before, acquireRefreshFileLock, after } from './ops';
             assert_eq!(json["success"], true, "{json}");
             assert_eq!(json["annotations"]["calls_out"], expected, "{name}");
         }
+    }
+
+    #[test]
+    fn zoom_incoming_call_range_index_matches_nested_legacy_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fan_in.ts");
+        let source = format!(
+            "{}{}",
+            "function target(arg?: unknown) { target(); }\n\
+             function outer() {\n\
+               function inner() {\n\
+                 target(target());\n\
+                 target();\n\
+               }\n\
+               target();\n\
+             }\n",
+            (0..512)
+                .map(|i| format!("function fan{i}() {{ target(); }}\n"))
+                .collect::<String>()
+        );
+        std::fs::write(&path, &source).unwrap();
+        let file = path.to_str().unwrap();
+        let req = make_zoom_request_cg("range-index", file, "target");
+        let ctx = make_ctx();
+        let mut analysis = ZoomAnalysisMemo::default();
+        ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(0));
+        let actual = zoom_one_symbol(
+            &req,
+            &ctx,
+            &path,
+            file,
+            &source,
+            &source.lines().collect::<Vec<_>>(),
+            "target",
+            0,
+            true,
+            &mut analysis,
+        );
+        assert!(actual.success, "{:?}", actual.data);
+        let enrichment = &analysis.enrichments[&path];
+        let target = enrichment
+            .symbols
+            .iter()
+            .find(|s| s.name == "target")
+            .unwrap();
+        let matching: Vec<_> = enrichment
+            .calls
+            .iter()
+            .filter(|c| c.name == "target")
+            .collect();
+        let mut reference = Vec::new();
+        for sym in enrichment.symbols.iter() {
+            if sym.name == target.name && sym.range.start_line == target.range.start_line {
+                continue;
+            }
+            let start = line_col_to_byte(&source, sym.range.start_line, sym.range.start_col);
+            let end = line_col_to_byte(&source, sym.range.end_line, sym.range.end_col);
+            for call in &matching {
+                if call.start_byte >= start && call.end_byte <= end {
+                    reference.push(CallRef {
+                        name: sym.name.clone(),
+                        line: call.line,
+                        extra_count: 0,
+                    });
+                }
+            }
+        }
+        let reference = dedupe_call_refs_by_name(reference);
+        let nested = |name| reference.iter().find(|call| call.name == name).unwrap();
+        assert_eq!((nested("outer").line, nested("outer").extra_count), (4, 3));
+        assert_eq!((nested("inner").line, nested("inner").extra_count), (4, 2));
+        assert_eq!(reference.len(), 514);
+        assert_eq!(
+            serde_json::to_vec(&actual.data["annotations"]["called_by"]).unwrap(),
+            serde_json::to_vec(&serde_json::to_value(&reference).unwrap()).unwrap(),
+        );
+        let old_work = (enrichment.symbols.len() - 1) * matching.len();
+        let indexed_work = ZOOM_CALL_NAME_COMPARISONS.with(|count| count.get());
+        assert!(indexed_work * 20 < old_work, "{indexed_work} vs {old_work}");
     }
 
     #[test]
@@ -4898,6 +5012,59 @@ def local():
     #[test]
     fn json_zoom_resolves_comments_inside_object() {
         assert_json_zoom_resolves("zoom_json_comments_inside.jsonc", "chains", "\"executor\"");
+    }
+
+    #[test]
+    fn json_zoom_batches_share_one_tree_per_file_and_keep_each_response() {
+        let ctx = make_ctx();
+        let first = fixture_path("nested.json");
+        let second = fixture_path("zoom_jsonc_leading_line_comments.jsonc");
+        let cases = [
+            (&first, "servers"),
+            (&second, "chains"),
+            (&first, "servers[0].name"),
+            (&first, "literal.dotted.key"),
+            (&second, "chains.executor.entries[1].model"),
+            (&first, "servers[7].name"),
+        ];
+        for callgraph in [false, true] {
+            let run = |queries: &[(&PathBuf, &str)]| {
+                let targets: Vec<_> = queries
+                    .iter()
+                    .map(|(file, symbol)| serde_json::json!({ "file": file, "symbol": symbol }))
+                    .collect();
+                let req = serde_json::from_value(serde_json::json!({
+                    "id": "json-zoom-batch", "command": "zoom", "targets": targets,
+                    "callgraph": callgraph, "context_lines": 0,
+                }))
+                .unwrap();
+                serde_json::to_value(handle_zoom(&req, &ctx)).unwrap()
+            };
+            ZOOM_JSON_PARSES.with(|count| count.set(0));
+            let batch = run(&cases);
+            assert_eq!(ZOOM_JSON_PARSES.with(|count| count.get()), 2);
+            let entries = batch["targets"].as_array().unwrap();
+            assert_eq!(entries.len(), cases.len());
+            for (case, entry) in cases.iter().zip(entries) {
+                let individual = run(std::slice::from_ref(case));
+                assert_eq!(entry, &individual["targets"][0]);
+            }
+            assert_eq!(entries[0]["response"]["success"], true);
+            assert_eq!(entries[3]["response"]["code"], "ambiguous_match");
+            assert_eq!(entries[5]["response"]["code"], "symbol_not_found");
+
+            let req = serde_json::from_value(serde_json::json!({
+                "id": "json-zoom-batch", "command": "zoom", "file": first,
+                "symbols": ["servers", "servers[0].name"],
+                "callgraph": callgraph, "context_lines": 0,
+            }))
+            .unwrap();
+            ZOOM_JSON_PARSES.with(|count| count.set(0));
+            let same_file = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+            assert_eq!(ZOOM_JSON_PARSES.with(|count| count.get()), 1);
+            assert_eq!(same_file["symbols"][0]["response"], entries[0]["response"]);
+            assert_eq!(same_file["symbols"][1]["response"], entries[2]["response"]);
+        }
     }
 
     #[test]

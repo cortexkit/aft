@@ -134,19 +134,32 @@ pub(crate) fn withdraw(session: &dyn ParentView) {
 
 /// A weak publication never keeps a runtime session or its readers alive.
 pub fn session_for_root(root: &Path) -> Option<Arc<dyn ParentView>> {
-    let views = views()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if views.is_empty() {
-        return None;
-    }
-    let session = views
-        .get(root)
-        .or_else(|| {
+    let exact = {
+        let views = views()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if views.is_empty() {
+            return None;
+        }
+        views.get(root).cloned()
+    };
+    let view = match exact {
+        Some(view) => view,
+        // Canonicalizing touches the filesystem, which can stall on a slow
+        // mount; it runs unlocked so other lookups, publications and
+        // withdrawals never wait for it.
+        None => {
+            #[cfg(test)]
+            tests::before_canonicalize(root);
             let canonical = std::fs::canonicalize(root).ok()?;
-            views.get(&canonical)
-        })?
-        .upgrade()?;
+            views()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&canonical)
+                .cloned()?
+        }
+    };
+    let session = view.upgrade()?;
     (!session.stopped()).then_some(session)
 }
 
@@ -157,5 +170,100 @@ pub(crate) fn display_relative(root: &Path, path: &Path) -> String {
         ".".into()
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    type Gate = (PathBuf, mpsc::Sender<()>, mpsc::Receiver<()>);
+
+    /// A lookup for the gated path signals the test on entering the
+    /// canonicalizing fallback, then waits until the test releases it.
+    fn gate() -> &'static Mutex<Option<Gate>> {
+        static GATE: OnceLock<Mutex<Option<Gate>>> = OnceLock::new();
+        GATE.get_or_init(Mutex::default)
+    }
+
+    pub(super) fn before_canonicalize(root: &Path) {
+        let mut gate = gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gate.as_ref().is_some_and(|(gated, _, _)| gated == root) {
+            let (_, entered, release) = gate.take().expect("checked above");
+            drop(gate);
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+    }
+
+    struct FakeParent(PathBuf);
+
+    impl ParentView for FakeParent {
+        fn root(&self) -> &Path {
+            &self.0
+        }
+        fn planes(&self) -> RequestedPlanes {
+            RequestedPlanes {
+                trigram: false,
+                semantic: false,
+                callgraph: false,
+            }
+        }
+        fn children(&self) -> Vec<Arc<Child>> {
+            Vec::new()
+        }
+        fn discovery(&self) -> Option<Arc<Discovery>> {
+            None
+        }
+        fn stopped(&self) -> bool {
+            false
+        }
+        fn note_child_failure(&self, _child: &Child, _plane: &'static str, error: &str) -> String {
+            error.to_string()
+        }
+    }
+
+    /// A registry miss canonicalizes its path, which can stall on a slow
+    /// mount. Meanwhile an exact hit and a withdrawal for another parent
+    /// must still complete.
+    #[test]
+    fn a_stalled_alias_lookup_does_not_block_other_parents() {
+        let folder = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(folder.path()).unwrap();
+        let first: Arc<dyn ParentView> = Arc::new(FakeParent(canonical.join("first")));
+        let second: Arc<dyn ParentView> = Arc::new(FakeParent(canonical.join("second")));
+        publish(Arc::clone(&first));
+        publish(Arc::clone(&second));
+        let alias = canonical.join("not-registered");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((alias.clone(), entered_tx, release_rx));
+        let stalled = std::thread::spawn(move || session_for_root(&alias).is_none());
+        entered_rx.recv().unwrap();
+
+        // The stalled lookup holds its gate until this thread reports back.
+        let (done_tx, done_rx) = mpsc::channel();
+        let first_root = first.root().to_path_buf();
+        let other = std::thread::spawn(move || {
+            let hit = session_for_root(&first_root).is_some();
+            withdraw(second.as_ref());
+            done_tx.send(hit).unwrap();
+        });
+        let finished = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            finished,
+            Ok(true),
+            "an exact hit and a withdrawal waited for another lookup's canonicalization"
+        );
+        other.join().unwrap();
+        assert!(stalled.join().unwrap());
+        withdraw(first.as_ref());
     }
 }

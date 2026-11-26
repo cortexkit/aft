@@ -218,6 +218,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
     }
+    write_result.append_rollback_skipped_to(&mut result);
     write_result.append_created_syntax_error_to(&mut result);
 
     if let Some(ref reason) = write_result.format_skipped_reason {
@@ -251,10 +252,11 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // "wrote, but no net change" instead of a bare "File updated". See
     // GitHub #45.
     let rolled_back = write_result.rolled_back;
+    let rollback_skipped = write_result.rollback_skipped_reason.is_some();
     let final_content = write_result
         .final_content(path.as_path())
         .unwrap_or(content);
-    if existed && original_bytes.as_ref() == final_content.as_bytes() {
+    if existed && !rollback_skipped && original_bytes.as_ref() == final_content.as_bytes() {
         result["no_op"] = serde_json::json!(true);
     }
 
@@ -268,7 +270,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
     if let Some(original) = original {
-        edit::attach_edit_diff(&mut result, &req.params, file, original, final_content);
+        edit::render_edit_diff(&mut result, &req.params, file, original, final_content);
     }
     Response::success(&req.id, result)
 }
@@ -276,6 +278,83 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 #[cfg(test)]
 mod audit_regressions {
     use super::*;
+
+    #[test]
+    fn syntax_rollback_keeps_a_later_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback.ts");
+        let invalid = "const value = {;\n";
+        let later = "const value = 2;\n";
+        std::fs::write(&path, "const value = 1;\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                storage_dir: Some(dir.path().join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let failed = serde_json::from_value(serde_json::json!({
+            "id": "invalid", "command": "write", "file": path, "content": invalid,
+        }))
+        .unwrap();
+        let hook_path = path.clone();
+        edit::BEFORE_SYNTAX_ROLLBACK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), invalid);
+                std::fs::write(&hook_path, later).unwrap();
+            }));
+        });
+        let response = handle_write(&failed, &ctx);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), later);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["syntax_valid"], false);
+        assert_eq!(response.data["rolled_back"], false);
+        assert_eq!(response.data["rollback_skipped_reason"], "file_changed");
+    }
+
+    #[test]
+    fn write_reports_one_validated_path_and_no_rolled_back_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("example.ts");
+        std::fs::write(&path, "const value = 0;\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(root.join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let reports = |content: &str| {
+            let req = serde_json::from_value(serde_json::json!({
+                "id": "display", "command": "write", "file": "example.ts", "content": content,
+            }))
+            .unwrap();
+            edit::REPORTED_FILES.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+            let reply = handle_write(&req, &ctx);
+            let files = edit::REPORTED_FILES.with(|capture| capture.borrow_mut().take().unwrap());
+            assert!(reply.success, "{reply:?}");
+            assert!(reply.data["metadata"]["diff"].is_string(), "{reply:?}");
+            files
+        };
+        let successful = reports("const value = 1;\n");
+        let rolled_back = reports("const value = {;\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "const value = 1;\n"
+        );
+        assert_eq!(
+            (successful, rolled_back),
+            (
+                vec![(path.to_string_lossy().into_owned(), "modified")],
+                vec![]
+            )
+        );
+    }
 
     #[test]
     fn backup_cancelled_rollback_restores_prior_success() {

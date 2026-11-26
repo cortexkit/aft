@@ -269,6 +269,18 @@ test("idle subc carriers evict and replay queued completions after recreation", 
     expect(delivered).toEqual(["completed-while-evicted"]);
     expect(pending.has("idle-3")).toBe(false);
     expect(client.routeOpens.length).toBe(42);
+
+    await pool.reapIdleSessions(Date.now() + 32 * 60_000);
+    expect(pool.__retainedSessionCountsForTests()).toEqual({
+      sessions: 0,
+      roots: 0,
+      routes: 0,
+      subscriptions: 0,
+      sweepTimers: 0,
+    });
+    expect(pool.__pendingSessionStartsForTests()).toBe(20);
+    await pool.closeSession(TEST_PROJECT_ROOT, "idle-3");
+    expect(pool.__pendingSessionStartsForTests()).toBe(19);
   } finally {
     await pool.shutdown();
   }
@@ -447,6 +459,37 @@ test("per-match ACK releases only removed watches and preserves sibling wake car
       await pool.reapIdleSessions(Date.now() + 16 * 60_000);
       expect(pool.__retainedSessionCountsForTests().subscriptions).toBe(i === 1 ? 1 : 0);
     }
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("a native preflight bash refusal leaves an idle session reapable", async () => {
+  const client = new FakeClient(async (_channel, rawBody) => {
+    if ((rawBody as { name: string }).name === "bash") {
+      return envelope({
+        success: false,
+        code: "invalid_request",
+        message: "'command' is required",
+        text: "",
+      });
+    }
+    return envelope({ success: true, text: "ok", bg_completions: [], pending_matches: [] });
+  });
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake",
+    harness: "pi",
+    connect: async () => client,
+    onBgEventsNudge: () => undefined,
+  });
+  try {
+    pool.observeSessionStart(TEST_PROJECT_ROOT, "fresh");
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    await bridge.send("bash", { session_id: "fresh" });
+    await bridge.send("read", { session_id: "fresh" });
+    await settleMicrotasks();
+    await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+    expect(pool.__retainedSessionCountsForTests().sessions).toBe(0);
   } finally {
     await pool.shutdown();
   }
@@ -2721,6 +2764,42 @@ describe("subc AbortSignal transport", () => {
     await pool.shutdown();
   });
 
+  test("cancels one caller during route admission without cancelling its sibling", async () => {
+    let release!: () => void;
+    const client = new FakeClient(async () => envelope({ success: true, text: "sibling" }));
+    client.routeOpenGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { pool } = poolWith(client);
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+    const controller = new AbortController();
+    const aborted = transport
+      .toolCall("session-abort-open", "read", {}, { abortSignal: controller.signal })
+      .catch((error: unknown) => error);
+    const sibling = transport.toolCall("session-abort-open", "read", {});
+
+    try {
+      await tick();
+      expect(client.routeOpens).toHaveLength(1);
+      controller.abort();
+      const outcome = await Promise.race([
+        aborted,
+        new Promise<string>((resolve) => setTimeout(() => resolve("still pending"), 20)),
+      ]);
+      expect(outcome).toMatchObject({ name: "AbortError" });
+      expect(client.requests).toHaveLength(0);
+      expect(client.closedRoutes).toEqual([]);
+
+      release();
+      await expect(sibling).resolves.toMatchObject({ text: "sibling" });
+      expect(client.requests).toHaveLength(1);
+    } finally {
+      release();
+      await Promise.allSettled([aborted, sibling]);
+      await pool.shutdown();
+    }
+  });
+
   test("does not dispatch a Rust call when the signal is already aborted", async () => {
     const client = new FakeClient(async () => envelope({ success: true, text: "unexpected" }));
     const { pool } = poolWith(client);
@@ -2733,7 +2812,8 @@ describe("subc AbortSignal transport", () => {
         .send("aft_search", { query: "needle" }, { abortSignal: controller.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
     expect(client.requests).toHaveLength(0);
-    expect(client.closedRoutes).toEqual([1]);
+    expect(client.routeOpens).toHaveLength(0);
+    expect(client.closedRoutes).toEqual([]);
 
     await pool.shutdown();
   });

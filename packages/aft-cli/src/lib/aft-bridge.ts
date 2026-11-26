@@ -22,6 +22,7 @@ export interface AftResponse {
  * first 5 lines are enough to tell what kind of binary it is.
  */
 const MAX_NOISE_LINES_IN_ERROR = 5;
+const STDERR_TAIL_MAX_BYTES = 64 * 1024;
 
 /**
  * Return true if `parsed` is an aft response keyed by one of the request ids
@@ -118,7 +119,9 @@ export async function sendAftRequests(
     // Only the first few noise lines are ever shown; the rest are counted.
     const noiseLines: string[] = [];
     let noiseLineCount = 0;
-    let stderr = "";
+    const stderrChunks: Buffer[] = [];
+    let stderrTailBytes = 0;
+    let stderrDroppedBytes = 0;
     let settled = false;
     let timedOut = false;
     const deadline = setTimeout(() => {
@@ -136,6 +139,12 @@ export async function sendAftRequests(
     };
 
     const expectedIds = new Set(requests.map((req) => req.id));
+    const stderrForError = (): string => {
+      const tail = Buffer.concat(stderrChunks).toString("utf8");
+      return stderrDroppedBytes > 0
+        ? `[... ${stderrDroppedBytes} bytes of earlier stderr omitted ...]\n${tail}`
+        : tail;
+    };
     const recordNoise = (line: string): void => {
       noiseLineCount += 1;
       if (noiseLines.length < MAX_NOISE_LINES_IN_ERROR) noiseLines.push(line);
@@ -185,9 +194,23 @@ export async function sendAftRequests(
       stdoutLines.push(chunk);
     });
 
-    child.stderr.setEncoding("utf-8");
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrChunks.push(chunk);
+      stderrTailBytes += chunk.length;
+      while (stderrTailBytes > STDERR_TAIL_MAX_BYTES) {
+        const first = stderrChunks[0];
+        if (!first) break;
+        const excess = stderrTailBytes - STDERR_TAIL_MAX_BYTES;
+        if (first.length <= excess) {
+          stderrChunks.shift();
+          stderrTailBytes -= first.length;
+          stderrDroppedBytes += first.length;
+        } else {
+          stderrChunks[0] = first.subarray(excess);
+          stderrTailBytes -= excess;
+          stderrDroppedBytes += excess;
+        }
+      }
     });
 
     child.on("error", (error) => {
@@ -211,7 +234,7 @@ export async function sendAftRequests(
         finish(() =>
           reject(
             new Error(
-              `aft request deadline exceeded; pending: ${pending.join(", ")}.\n${stderr.trim()}`,
+              `aft request deadline exceeded; pending: ${pending.join(", ")}.\n${stderrForError().trim()}`,
               { cause: { exitCode: code, signal: child.signalCode } },
             ),
           ),
@@ -220,7 +243,14 @@ export async function sendAftRequests(
       }
       finish(() =>
         reject(
-          buildBridgeError({ binaryPath, code, stderr, noiseLines, noiseLineCount, responses }),
+          buildBridgeError({
+            binaryPath,
+            code,
+            stderr: stderrForError(),
+            noiseLines,
+            noiseLineCount,
+            responses,
+          }),
         ),
       );
     });

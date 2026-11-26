@@ -2055,7 +2055,7 @@ pub(crate) fn validate_full_batch(
                 }
                 // A nonzero exit caused by another touched file does not make
                 // the clean members of the batch "unchecked".
-                if result.exit_code != 0 && !found_diagnostics {
+                if result.truncated || (result.exit_code != 0 && !found_diagnostics) {
                     log::debug!(
                         "validate: {} (skipped: error: {})",
                         batch.command,
@@ -2698,6 +2698,7 @@ fn short_output_tail(output: &str) -> Option<String> {
 /// Returns `(errors, skip_reason)`:
 /// - `(errors, None)` — checker ran, errors may be empty (= valid code)
 /// - `([], Some(reason))` — checker was skipped
+/// - `(errors, Some("error"))` — captured output was cut; errors are incomplete
 ///
 /// Skip reasons: `"unsupported_language"`, `"no_checker_configured"`,
 /// `"checker_not_installed"`, `"timeout"`, `"error"`
@@ -2776,7 +2777,7 @@ pub fn validate_full(
                 cmd,
                 errors.len()
             );
-            (errors, None)
+            (errors, result.truncated.then(|| "error".to_string()))
         }
         Err(FormatError::Timeout { .. }) => {
             crate::slog_error!("validate: {} (skipped: timeout)", path.display());
@@ -3190,6 +3191,58 @@ mod tests {
         crate::executable_cache::write_executable(&path, format!(
             "#!/bin/sh\nprintf 'run\\n' >> '{0}/{tool}-count'\nprintf '%s\\n' \"$@\" >> '{0}/{tool}-args'\nprintf '%s\\n' '{output}'\nexit {code}\n", root.display()
         ).as_bytes()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_checker_capture_retains_errors_and_marks_validation_incomplete() {
+        use crate::edit::tool_launcher::{ToolLauncher, ToolOutcome, ToolRefusal};
+        struct LimitedChecker;
+        impl ToolLauncher for LimitedChecker {
+            fn check(&self, _: &ToolCommand) -> Result<(), ToolRefusal> {
+                Ok(())
+            }
+
+            fn run(&self, _: ToolCommand) -> ToolOutcome {
+                let output = "one.ts(1,1): error TS1000: first diagnostic\n";
+                let mut command = Command::new("sh");
+                command.args([
+                    "-c",
+                    &format!("printf '%s' '{output}two.ts(1,1): error TS1001: second diagnostic\n'; exit 1"),
+                ]);
+                ToolOutcome::from_result(capture_bounded_command(
+                    command,
+                    "tsc",
+                    Instant::now() + Duration::from_secs(5),
+                    || false,
+                    output.len(),
+                    true,
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        counting_checker(dir.path(), "tsc", "", 0);
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            checker: [("typescript".to_string(), "tsc".to_string())].into(),
+            ..Config::default()
+        };
+        let paths = [dir.path().join("one.ts"), dir.path().join("two.ts")];
+        let (errors, skipped_reason) = validate_full(&LimitedChecker, &paths[0], &config);
+        let batch = validate_full_batch(&LimitedChecker, &paths, &config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("first diagnostic"));
+        assert_eq!(batch.files[0].errors.len(), 1);
+        assert!(batch.files[1].errors.is_empty());
+        assert_eq!(
+            (
+                skipped_reason.as_deref(),
+                batch.files[0].skipped_reason.as_deref(),
+                batch.files[1].skipped_reason.as_deref(),
+            ),
+            (Some("error"), Some("error"), Some("error"))
+        );
     }
 
     #[cfg(unix)]

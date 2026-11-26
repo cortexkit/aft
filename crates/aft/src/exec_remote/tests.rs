@@ -1634,6 +1634,60 @@ fn an_output_hole_before_a_large_counted_return_still_reports_output_lost() {
     assert!(!sink.return_gaps.is_empty());
 }
 
+/// Settling a lost gap removes each dropped returned-file marker in turn. The
+/// buffered byte total must be kept by subtraction, not by re-summing every
+/// remaining record after each removal, which made settlement quadratic.
+#[test]
+fn lost_gap_settlement_does_not_rescan_pending_records_per_removal() {
+    const TINY_CHUNKS: u64 = 2_000;
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(output(0, OutputStream::Stdout, b"kept"), &mut sink)
+        .unwrap();
+    let chunk = |seq: u64, len: usize| {
+        StreamRecord::ReturnChunk(ReturnChunk::new(
+            job_id(),
+            seq,
+            0,
+            0,
+            BytePayload(vec![42; len]),
+        ))
+    };
+    // Seq 1 is a hole. Many small chunks follow, then enough large ones to
+    // exceed the pending budget, which turns the buffered chunks into
+    // payload-free dropped markers.
+    for seq in 2..2 + TINY_CHUNKS {
+        consumer.consume(chunk(seq, 1), &mut sink).unwrap();
+    }
+    for seq in 2 + TINY_CHUNKS..2 + TINY_CHUNKS + 33 {
+        consumer
+            .consume(chunk(seq, RETURN_CHUNK_MAX_BYTES), &mut sink)
+            .unwrap();
+    }
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::Exit { code: 1 }), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    super::stream::reset_pending_recount_visits();
+    let mut verdict = None;
+    for _ in 0..3 {
+        consumer = StreamConsumer::resume(consumer.resume_point().unwrap());
+        if let Ok(found) = consumer.finish_recovery(&mut sink) {
+            verdict = Some(found);
+            break;
+        }
+    }
+    assert_eq!(verdict, Some(Verdict::Exited { code: 1 }));
+    assert!(!sink.return_gaps.is_empty());
+    let visits = super::stream::pending_recount_visits();
+    assert!(
+        visits <= TINY_CHUNKS as usize,
+        "settlement re-summed pending records {visits} times"
+    );
+}
+
 #[test]
 fn pending_output_and_manifest_metadata_share_the_byte_budget() {
     let mut consumer = StreamConsumer::new();

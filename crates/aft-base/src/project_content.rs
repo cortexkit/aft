@@ -314,7 +314,8 @@ pub fn is_excluded_with_file_type(path: &Path, file_type: Option<&std::fs::FileT
 /// a known non-directory; an unknown type must still trigger reconciliation.
 /// Unlike source walks, this check does not scan live SQLite identities.
 pub fn is_excluded_event(path: &Path) -> bool {
-    is_storage_path(path)
+    is_cortexkit_data_read_denied(path)
+        || is_storage_path(path)
         || crate::os_metadata::is_os_metadata_path(path)
         || crate::live_db_files::is_registered_file_path(path)
         || has_sqlite_suffix(path) && path.metadata().is_ok_and(|metadata| !metadata.is_dir())
@@ -327,11 +328,57 @@ pub fn is_excluded_event(path: &Path) -> bool {
 /// another scan already admitted and read, such as an index-store
 /// checkout's members.
 pub fn is_excluded_file_by_path(path: &Path) -> bool {
-    crate::watcher_markers::is_marker_path(path)
+    is_cortexkit_data_read_denied(path)
+        || crate::watcher_markers::is_marker_path(path)
         || is_storage_path(path)
         || crate::os_metadata::is_os_metadata_path(path)
         || has_sqlite_suffix(path)
         || crate::live_db_files::is_registered_file_path(path)
+}
+
+/// Source admission also applies while building indexes. Resolve the process's
+/// data roots and their worktree aliases once.
+pub fn is_cortexkit_data_read_denied(path: &Path) -> bool {
+    use crate::cortexkit_data::{self, HOME_DATA_DIR, WORKTREES};
+    use crate::policy_path::{contains_resolved, policy_path};
+
+    struct Roots {
+        data: Vec<PathBuf>,
+        worktrees: Vec<PathBuf>,
+    }
+    static ROOTS: std::sync::OnceLock<Roots> = std::sync::OnceLock::new();
+    let roots = ROOTS.get_or_init(|| {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+        let mut roots = Roots {
+            data: Vec::new(),
+            worktrees: Vec::new(),
+        };
+        for data in std::iter::once(home.join(HOME_DATA_DIR)).chain(
+            xdg.filter(|path| path.is_absolute())
+                .map(|path| path.join("cortexkit")),
+        ) {
+            let resolved = policy_path(&data);
+            roots.worktrees.push(policy_path(&data.join(WORKTREES)));
+            let lexical = crate::path_identity::normalize_path(&data);
+            if lexical.is_absolute() && lexical != resolved {
+                roots.data.push(lexical);
+            }
+            roots.data.push(resolved);
+        }
+        roots
+    });
+    roots
+        .data
+        .iter()
+        .any(|root| cortexkit_data::floor(root, path, false).is_some())
+        && !roots
+            .worktrees
+            .iter()
+            .any(|root| contains_resolved(path, root))
 }
 
 fn is_storage_path(path: &Path) -> bool {
@@ -466,7 +513,8 @@ fn admit(path: &Path, file_type: Option<&std::fs::FileType>) -> std::io::Result<
     // Walker types are enough for name/storage exclusions and for entries that
     // cannot alias SQLite. Regular files still need inode checks: a harmless
     // source name may be a hard link to a live database or a newly created sidecar.
-    if crate::watcher_markers::is_marker_path(path)
+    if is_cortexkit_data_read_denied(path)
+        || crate::watcher_markers::is_marker_path(path)
         || is_storage_path(path)
         || match file_type {
             Some(_) => is_excluded_file_with_metadata(path, file_type, None),

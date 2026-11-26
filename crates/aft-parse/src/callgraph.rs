@@ -1,13 +1,8 @@
-//! Call graph engine: cross-file call resolution and forward traversal.
-//!
-//! Builds a lazy, worktree-scoped call graph that resolves calls across files
-//! using import chains. Supports depth-limited forward traversal with cycle
-//! detection.
+//! Extract call-site facts and resolve source modules for the call graph and navigation.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
@@ -25,30 +20,22 @@ use crate::imports::{self, ImportBlock};
 use crate::parser::{detect_language, detect_language_from_source, LangId};
 use crate::symbols::{Range, Symbol, SymbolKind};
 
+mod live_cache;
+use live_cache::LiveCache;
+mod macro_body;
+#[cfg(test)]
+mod macro_body_tests;
+
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
 
-type WorkspacePackageCache = HashMap<(PathBuf, String), Option<PathBuf>>;
-// A cell per canonical root coalesces simultaneous parse-pool misses without
-// holding the process-wide map lock while traversing unrelated workspaces.
-type WorkspaceMemberDirsCache = HashMap<PathBuf, Arc<OnceLock<Arc<Vec<PathBuf>>>>>;
-type RustCrateInfoCache = HashMap<PathBuf, Option<RustCrateInfo>>;
-type RustWorkspaceCrateCache = HashMap<PathBuf, HashMap<String, RustCrateInfo>>;
-
-static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<WorkspacePackageCache>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-static WORKSPACE_MEMBER_DIRS_CACHE: LazyLock<RwLock<WorkspaceMemberDirsCache>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-static RUST_CRATE_INFO_CACHE: LazyLock<RwLock<RustCrateInfoCache>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-static RUST_WORKSPACE_CRATE_CACHE: LazyLock<RwLock<RustWorkspaceCrateCache>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<LiveCache<HashMap<String, PathBuf>>>> =
+    LazyLock::new(RwLock::default);
 
 // Cold builds retain one resolver memo across every staged reference window. The
 // entry and retained-weight ceilings keep that speedup inside the bounded-build
-// working-set contract: at most 9 MiB of estimated keys/values are retained here,
-// plus 4 MiB for canonical probe identities owned by the same snapshot.
+// working-set contract: at most 9 MiB of estimated keys and values are retained.
 const MODULE_RESOLUTION_MEMO_MAX_ENTRIES: usize = 32_768;
 const MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES: usize = 3 * 1024 * 1024;
 const JSON_VALUE_MEMO_MAX_ENTRIES: usize = 8_192;
@@ -694,15 +681,6 @@ impl FileCallData {
     }
 }
 
-/// Result of resolving a cross-file call edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EdgeResolution {
-    /// Successfully resolved to a specific file and symbol.
-    Resolved { file: PathBuf, symbol: String },
-    /// Could not resolve — callee name preserved for diagnostics.
-    Unresolved { callee_name: String },
-}
-
 test_support_visibility! {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedSymbol {
@@ -715,20 +693,6 @@ struct ResolvedSymbol {
 }
 
 #[derive(Debug, Clone)]
-struct RustCrateInfo {
-    package_root: PathBuf,
-    lib_name: String,
-    lib_root: Option<PathBuf>,
-    target_roots: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-struct RustModuleBase {
-    src_dir: PathBuf,
-    root_file: PathBuf,
-}
-
-#[derive(Debug, Clone)]
 struct RustUseEntry {
     module_path: String,
     local_name: String,
@@ -737,7 +701,7 @@ struct RustUseEntry {
 
 #[derive(Debug, Clone)]
 enum RustUseKind {
-    Item { imported_name: String },
+    Item,
     Module,
 }
 
@@ -989,18 +953,7 @@ pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
         Some(i) => i + 1,
         None => return Vec::new(),
     };
-    let end = match signature[start..].find(')') {
-        Some(i) => start + i,
-        None => return Vec::new(),
-    };
-
-    let params_str = &signature[start..end].trim();
-    if params_str.is_empty() {
-        return Vec::new();
-    }
-
-    // Split on commas, respecting nested generics/brackets
-    let parts = split_params(params_str);
+    let parts = split_params(&signature[start..], lang);
 
     let mut result = Vec::new();
     for part in parts {
@@ -1038,35 +991,54 @@ pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
     result
 }
 
-/// Split parameter string on commas, respecting nested brackets/generics.
-fn split_params(s: &str) -> Vec<String> {
+/// Split after the opening `(`, stopping at its matching `)`.
+fn split_params(s: &str, lang: LangId) -> Vec<&str> {
     let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-
-    for ch in s.chars() {
+    let mut start = 0;
+    let mut parens = 0usize;
+    let mut brackets = 0usize;
+    let mut angles = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, ch) in s.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
-            '<' | '[' | '{' | '(' => {
-                depth += 1;
-                current.push(ch);
+            '"' | '`' => quote = Some(ch),
+            '\'' if lang != LangId::Rust || rust_char_literal_follows(&s[i + 1..]) => {
+                quote = Some(ch)
             }
-            '>' | ']' | '}' | ')' => {
-                depth -= 1;
-                current.push(ch);
+            '(' => parens += 1,
+            ')' if parens == 0 => {
+                parts.push(&s[start..i]);
+                return parts;
             }
-            ',' if depth == 0 => {
-                parts.push(current.clone());
-                current.clear();
+            ')' => parens -= 1,
+            '[' | '{' => brackets += 1,
+            ']' | '}' => brackets = brackets.saturating_sub(1),
+            '<' if !matches!(lang, LangId::Python | LangId::JavaScript) => angles += 1,
+            '>' if !s[..i].ends_with(['-', '=']) => angles = angles.saturating_sub(1),
+            ',' if parens == 0 && brackets == 0 && angles == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
             }
-            _ => {
-                current.push(ch);
-            }
+            _ => {}
         }
     }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
+    Vec::new()
+}
+
+fn rust_char_literal_follows(after_quote: &str) -> bool {
+    // Rust lifetimes also start with an apostrophe but have no closing one.
+    after_quote.starts_with('\\') || after_quote.chars().nth(1) == Some('\'')
 }
 
 /// Extract the parameter name from a single parameter declaration.
@@ -1120,270 +1092,6 @@ fn extract_param_name(param: &str, lang: LangId) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// CallGraph
-// ---------------------------------------------------------------------------
-
-/// Worktree-scoped call graph with lazy per-file construction.
-///
-/// Files are parsed and analyzed on first access, then cached. The graph
-/// can resolve cross-file call edges using the import engine.
-pub struct CallGraph {
-    /// Cached per-file call data.
-    data: HashMap<PathBuf, FileCallData>,
-    /// Project root for relative path resolution.
-    project_root: PathBuf,
-}
-
-impl CallGraph {
-    /// Create a new call graph for a project.
-    pub fn new(project_root: PathBuf) -> Self {
-        clear_workspace_package_cache();
-        Self {
-            data: HashMap::new(),
-            project_root,
-        }
-    }
-
-    /// Get the project root directory.
-    pub fn project_root(&self) -> &Path {
-        &self.project_root
-    }
-
-    fn resolve_cross_file_edge_with_exports<F, D>(
-        full_callee: &str,
-        short_name: &str,
-        caller_file: &Path,
-        import_block: &ImportBlock,
-        mut file_exports_symbol: F,
-        mut file_default_export_symbol: D,
-    ) -> EdgeResolution
-    where
-        F: FnMut(&Path, &str) -> bool,
-        D: FnMut(&Path) -> Option<String>,
-    {
-        let caller_dir = caller_file.parent().unwrap_or(Path::new("."));
-        let disk = DiskFacts::new(caller_dir.ancestors().last().unwrap_or(caller_dir));
-        let facts = &FactPaths {
-            root: &disk.project_root,
-            facts: &disk,
-        };
-
-        // Rust uses `::` module paths rather than JS/TS specifiers. Keep this
-        // branch gated to `.rs` callers so the existing JS/TS resolver below
-        // remains unchanged.
-        if is_rust_source_file(caller_file) {
-            if let Some(target) = resolve_rust_cross_file_edge(
-                full_callee,
-                short_name,
-                caller_file,
-                import_block,
-                &mut file_exports_symbol,
-            ) {
-                return EdgeResolution::Resolved {
-                    file: target.file,
-                    symbol: target.symbol,
-                };
-            }
-        }
-
-        // Check namespace imports: "utils.foo" where utils is a namespace import
-        if full_callee.contains('.') {
-            let parts: Vec<&str> = full_callee.splitn(2, '.').collect();
-            if parts.len() == 2 {
-                let namespace = parts[0];
-                let member = parts[1];
-
-                for imp in &import_block.imports {
-                    if imp.namespace_import.as_deref() == Some(namespace) {
-                        if let Some(resolved_path) =
-                            resolve_module_path(caller_dir, &imp.module_path)
-                        {
-                            if let Some(target) = resolve_reexported_symbol(
-                                &resolved_path,
-                                member,
-                                &mut file_exports_symbol,
-                                &mut file_default_export_symbol,
-                            ) {
-                                return EdgeResolution::Resolved {
-                                    file: target.file,
-                                    symbol: target.symbol,
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check named imports (direct and aliased)
-        for imp in &import_block.imports {
-            // Direct named import: import { foo } from './utils'
-            if imp.names.iter().any(|name| name == short_name) {
-                if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
-                    let target = resolve_reexported_symbol(
-                        &resolved_path,
-                        short_name,
-                        &mut file_exports_symbol,
-                        &mut file_default_export_symbol,
-                    )
-                    .unwrap_or(ResolvedSymbol {
-                        file: resolved_path,
-                        symbol: short_name.to_owned(),
-                    });
-                    return EdgeResolution::Resolved {
-                        file: target.file,
-                        symbol: target.symbol,
-                    };
-                }
-            }
-
-            // Default import: import foo from './utils'
-            if imp.default_import.as_deref() == Some(short_name) {
-                if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
-                    let target = resolve_reexported_symbol(
-                        &resolved_path,
-                        "default",
-                        &mut file_exports_symbol,
-                        &mut file_default_export_symbol,
-                    )
-                    .unwrap_or_else(|| ResolvedSymbol {
-                        symbol: file_default_export_symbol(&resolved_path)
-                            .unwrap_or_else(|| synthetic_default_symbol(&resolved_path)),
-                        file: resolved_path,
-                    });
-                    return EdgeResolution::Resolved {
-                        file: target.file,
-                        symbol: target.symbol,
-                    };
-                }
-            }
-        }
-
-        // Check aliased imports by examining the raw import text.
-        // ImportStatement.names stores the original name (foo), but the local code
-        // uses the alias (bar). We need to parse `import { foo as bar }` to find
-        // that `bar` maps to `foo`.
-        if let Some((original_name, resolved_path)) =
-            resolve_aliased_import(short_name, import_block, caller_dir)
-        {
-            let target = resolve_reexported_symbol(
-                &resolved_path,
-                &original_name,
-                &mut file_exports_symbol,
-                &mut file_default_export_symbol,
-            )
-            .unwrap_or(ResolvedSymbol {
-                file: resolved_path,
-                symbol: original_name,
-            });
-            return EdgeResolution::Resolved {
-                file: target.file,
-                symbol: target.symbol,
-            };
-        }
-
-        // Try barrel file re-exports: if any import points to an index file,
-        // check if that file re-exports the symbol
-        for imp in &import_block.imports {
-            if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
-                // Check if the resolved path is a directory (barrel file)
-                if resolved_path.is_dir() {
-                    if let Some(index_path) = find_index_file(&resolved_path, facts) {
-                        // Check if the index file exports this symbol
-                        if file_exports_symbol(&index_path, short_name) {
-                            return EdgeResolution::Resolved {
-                                file: index_path,
-                                symbol: short_name.to_owned(),
-                            };
-                        }
-                    }
-                } else if file_exports_symbol(&resolved_path, short_name) {
-                    return EdgeResolution::Resolved {
-                        file: resolved_path,
-                        symbol: short_name.to_owned(),
-                    };
-                }
-            }
-        }
-
-        EdgeResolution::Unresolved {
-            callee_name: short_name.to_owned(),
-        }
-    }
-
-    /// Get or build the call data for a file.
-    pub fn build_file(&mut self, path: &Path) -> Result<&FileCallData, AftError> {
-        let canon = self.canonicalize(path)?;
-
-        if !self.data.contains_key(&canon) {
-            let file_data = build_file_data(&canon)?;
-            self.data.insert(canon.clone(), file_data);
-        }
-
-        Ok(&self.data[&canon])
-    }
-
-    /// Resolve a cross-file call edge.
-    ///
-    /// Given a callee expression and the calling file's import block,
-    /// determines which file and symbol the call targets.
-    pub fn resolve_cross_file_edge(
-        &mut self,
-        full_callee: &str,
-        short_name: &str,
-        caller_file: &Path,
-        import_block: &ImportBlock,
-    ) -> EdgeResolution {
-        let graph = RefCell::new(self);
-        Self::resolve_cross_file_edge_with_exports(
-            full_callee,
-            short_name,
-            caller_file,
-            import_block,
-            |path, symbol_name| graph.borrow_mut().file_exports_symbol(path, symbol_name),
-            |path| graph.borrow_mut().file_default_export_symbol(path),
-        )
-    }
-
-    /// Check if a file exports a given symbol name.
-    fn file_exports_symbol(&mut self, path: &Path, symbol_name: &str) -> bool {
-        match self.build_file(path) {
-            Ok(data) => data.exported_symbols.iter().any(|name| name == symbol_name),
-            Err(_) => false,
-        }
-    }
-
-    fn file_default_export_symbol(&mut self, path: &Path) -> Option<String> {
-        self.build_file(path)
-            .ok()
-            .and_then(|data| data.default_export_symbol.clone())
-    }
-
-    /// Invalidate a file by removing its cached call data.
-    pub fn invalidate_file(&mut self, path: &Path) {
-        // Remove from data cache (try both as-is and canonicalized)
-        self.data.remove(path);
-        if let Ok(canon) = self.canonicalize(path) {
-            self.data.remove(&canon);
-        }
-        clear_workspace_package_cache();
-    }
-
-    /// Canonicalize a path, falling back to the original if canonicalization fails.
-    fn canonicalize(&self, path: &Path) -> Result<PathBuf, AftError> {
-        // If the path is relative, resolve it against project_root
-        let full_path = if path.is_relative() {
-            self.project_root.join(path)
-        } else {
-            path.to_path_buf()
-        };
-
-        // Try canonicalize, fall back to the full path
-        Ok(std::fs::canonicalize(&full_path).unwrap_or(full_path))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // File-level building
 // ---------------------------------------------------------------------------
 
@@ -1410,6 +1118,7 @@ struct SymbolCallRange {
     symbol_index: usize,
     byte_start: usize,
     byte_end: usize,
+    callable_body: Option<std::ops::Range<usize>>,
 }
 
 test_support_visibility! {
@@ -1430,6 +1139,7 @@ fn collect_calls_by_symbol<'tree>(
         symbols,
         extract_calls_full_with(source, root, 0, source.len(), lang, nav),
         lang,
+        root,
     )
 }
 }
@@ -1447,7 +1157,7 @@ fn split_macro_body_calls(
     bodies: &[crate::calls::RustMacroBody],
 ) -> (Vec<crate::calls::CallTuple>, HashMap<String, Vec<CallSite>>) {
     let mut body_calls: HashMap<String, Vec<CallSite>> = HashMap::new();
-    if bodies.is_empty() {
+    if bodies.is_empty() || raw_calls.is_empty() {
         return (raw_calls, body_calls);
     }
     let symbol_ranges = symbols
@@ -1459,41 +1169,21 @@ fn split_macro_body_calls(
             )
         })
         .collect::<Vec<_>>();
-    // For each template, the items it defines itself.
-    let body_symbols = bodies
+    let arm_ranges = bodies
         .iter()
-        .map(|body| {
-            symbol_ranges
-                .iter()
-                .copied()
-                .filter(|(start, end)| body.byte_start <= *start && *end <= body.byte_end)
-                .collect::<Vec<_>>()
-        })
+        .map(|body| (body.byte_start, body.byte_end))
         .collect::<Vec<_>>();
 
+    let owners = macro_body::owners(&raw_calls, &arm_ranges, &symbol_ranges);
     let mut ordinary = Vec::with_capacity(raw_calls.len());
-    for call in raw_calls {
-        let (_, _, _, call_start, call_end) = call;
-        // Templates can nest; the innermost one holding the call owns it.
-        let innermost = bodies
-            .iter()
-            .enumerate()
-            .filter(|(_, body)| body.byte_start <= call_start && call_end <= body.byte_end)
-            .min_by_key(|(_, body)| body.byte_end - body.byte_start);
-        let Some((body_index, body)) = innermost else {
+    for (call, owner) in raw_calls.into_iter().zip(owners) {
+        let Some(body_index) = owner else {
             ordinary.push(call);
             continue;
         };
-        let inside_defined_item = body_symbols[body_index]
-            .iter()
-            .any(|(start, end)| *start <= call_start && call_end <= *end);
-        if inside_defined_item {
-            ordinary.push(call);
-            continue;
-        }
         let (full, short, line, byte_start, byte_end) = call;
         body_calls
-            .entry(format!("{}!", body.name))
+            .entry(format!("{}!", bodies[body_index].name))
             .or_default()
             .push(CallSite {
                 kind: CallSiteKind::Call,
@@ -1519,6 +1209,7 @@ fn collect_rust_value_refs_by_symbol<'tree>(
         symbols,
         extract_rust_value_references_with(source, root, nav),
         LangId::Rust,
+        root,
     );
     // A function item remains a reference whether it is passed to an API or
     // stored for later use. The resolver rejects non-callable value candidates.
@@ -1575,14 +1266,23 @@ fn attribute_sites_to_symbols(
     symbols: &[Symbol],
     raw_sites: Vec<(String, String, u32, usize, usize)>,
     lang: LangId,
+    root: Node<'_>,
 ) -> HashMap<String, Vec<CallSite>> {
     let mut ranges = symbols
         .iter()
         .enumerate()
-        .map(|(symbol_index, symbol)| SymbolCallRange {
-            symbol_index,
-            byte_start: line_index.byte_offset(symbol.range.start_line, symbol.range.start_col),
-            byte_end: line_index.byte_offset(symbol.range.end_line, symbol.range.end_col),
+        .map(|(symbol_index, symbol)| {
+            let byte_start =
+                line_index.byte_offset(symbol.range.start_line, symbol.range.start_col);
+            let byte_end = line_index.byte_offset(symbol.range.end_line, symbol.range.end_col);
+            let callable_body = matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+                .then(|| callable_body(root, byte_start, byte_end).unwrap_or(byte_start..byte_end));
+            SymbolCallRange {
+                symbol_index,
+                byte_start,
+                byte_end,
+                callable_body,
+            }
         })
         .collect::<Vec<_>>();
     ranges.sort_by(|left, right| {
@@ -1615,22 +1315,28 @@ fn attribute_sites_to_symbols(
             byte_start,
             byte_end,
         };
+        let callable = active_ranges
+            .iter()
+            .map(|index| &ranges[*index])
+            .filter(|range| {
+                range
+                    .callable_body
+                    .as_ref()
+                    .is_some_and(|body| body.start <= byte_start && byte_end <= body.end)
+            })
+            .min_by_key(|range| (range.byte_end - range.byte_start, range.symbol_index));
         let mut attributed = false;
         for range_index in &active_ranges {
             let range = &ranges[*range_index];
-            // Method bodies execute when the method is called, not when its class is constructed.
-            if symbols[range.symbol_index].kind == SymbolKind::Class
-                && active_ranges.iter().any(|index| {
-                    let callable = &ranges[*index];
-                    range.byte_start <= callable.byte_start
-                        && callable.byte_end <= range.byte_end
-                        && byte_end <= callable.byte_end
-                        && matches!(
-                            symbols[callable.symbol_index].kind,
-                            SymbolKind::Function | SymbolKind::Method
-                        )
-                })
-            {
+            // An enclosing function or class does not execute a nested callable's body.
+            if callable.is_some_and(|inner| {
+                range.symbol_index != inner.symbol_index
+                    && range.byte_start <= inner.byte_start
+                    && inner.byte_end <= range.byte_end
+            }) && matches!(
+                symbols[range.symbol_index].kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
+            ) {
                 continue;
             }
             if byte_end <= range.byte_end {
@@ -1662,6 +1368,19 @@ fn attribute_sites_to_symbols(
         calls_by_symbol.insert(TOP_LEVEL_SYMBOL.to_string(), top_level_sites);
     }
     calls_by_symbol
+}
+
+fn callable_body(root: Node<'_>, start: usize, end: usize) -> Option<std::ops::Range<usize>> {
+    let mut node = root.descendant_for_byte_range(end.checked_sub(1)?, end)?;
+    while node.start_byte() >= start && node.end_byte() <= end {
+        if node.end_byte() == end {
+            if let Some(body) = node.child_by_field_name("body") {
+                return Some(body.byte_range());
+            }
+        }
+        node = node.parent()?;
+    }
+    None
 }
 
 pub fn build_file_data_from_source_with_lang(
@@ -1819,9 +1538,28 @@ fn build_file_data_from_tree_observed<'tree>(
         let (raw_calls, body_calls) =
             split_macro_body_calls(line_index, &symbols, raw_calls, &macro_facts.bodies);
         macro_body_calls_by_macro = body_calls;
-        macro_mentions_by_symbol =
-            attribute_sites_to_symbols(line_index, &symbols, macro_facts.unparsed_mentions, lang);
-        attribute_sites_to_symbols(line_index, &symbols, raw_calls, lang)
+        macro_mentions_by_symbol = attribute_sites_to_symbols(
+            line_index,
+            &symbols,
+            macro_facts.unparsed_mentions,
+            lang,
+            root,
+        );
+        if macro_facts.unparsed_mentions_truncated {
+            let name = crate::calls::MACRO_MENTION_OVERFLOW_KEY;
+            macro_mentions_by_symbol
+                .entry(TOP_LEVEL_SYMBOL.into())
+                .or_default()
+                .push(CallSite {
+                    kind: CallSiteKind::Call,
+                    callee_name: name.into(),
+                    full_callee: name.into(),
+                    line: 1,
+                    byte_start: 0,
+                    byte_end: 0,
+                });
+        }
+        attribute_sites_to_symbols(line_index, &symbols, raw_calls, lang, root)
     } else {
         collect_calls_by_symbol(&source, root, lang, &symbols, line_index, nav)
     };
@@ -1850,6 +1588,7 @@ fn build_file_data_from_tree_observed<'tree>(
             &symbols,
             crate::calls::extract_go_value_references(source, root),
             lang,
+            root,
         )
     } else if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
         attribute_sites_to_symbols(
@@ -1857,6 +1596,7 @@ fn build_file_data_from_tree_observed<'tree>(
             &symbols,
             crate::calls::extract_js_callback_references_with(source, root, nav),
             lang,
+            root,
         )
     } else {
         HashMap::new()
@@ -2535,29 +2275,42 @@ fn resolve_relative_module_path(
 }
 
 fn resolve_file_like_path(base: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> {
-    let base = base.to_path_buf();
+    file_like_candidates(base)
+        .find(|candidate| facts.is_file(candidate))
+        .map(|candidate| facts.canonical(&candidate).unwrap_or(candidate))
+        .or_else(|| {
+            facts
+                .is_dir(base)
+                .then(|| find_index_file(base, facts))
+                .flatten()
+        })
+}
 
-    // Try exact path first
-    if facts.is_file(&base) {
-        return Some(facts.canonical(&base).unwrap_or(base));
-    }
+fn file_like_candidates(base: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    let runtime_extension = matches!(
+        base.extension().and_then(|extension| extension.to_str()),
+        Some("js" | "jsx" | "mjs" | "cjs")
+    );
+    let appended = JS_TS_EXTENSIONS.iter().map(move |extension| {
+        let mut path = base.as_os_str().to_os_string();
+        path.push(".");
+        path.push(extension);
+        PathBuf::from(path)
+    });
+    // A dot in a stem is literal (`user.service`), but a written JavaScript
+    // extension can name its source file (`user.service.js` -> `user.service.ts`).
+    let replaced = JS_TS_EXTENSIONS
+        .iter()
+        .filter(move |_| runtime_extension)
+        .map(move |extension| base.with_extension(extension));
+    std::iter::once(base.to_path_buf())
+        .chain(appended)
+        .chain(replaced)
+}
 
-    // Try common extensions, including ESM/CJS TypeScript pairs used by workspaces.
-    for ext in JS_TS_EXTENSIONS {
-        let with_ext = base.with_extension(ext);
-        if facts.is_file(&with_ext) {
-            return Some(facts.canonical(&with_ext).unwrap_or(with_ext));
-        }
-    }
-
-    // Try as directory with index file
-    if facts.is_dir(&base) {
-        if let Some(index) = find_index_file(&base, facts) {
-            return Some(index);
-        }
-    }
-
-    None
+/// Include nonexistent candidate paths so adding a target updates existing importers.
+pub(crate) fn relative_module_candidates(base: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    file_like_candidates(base).chain(JS_TS_INDEX_FILES.iter().map(move |name| base.join(name)))
 }
 
 fn resolve_workspace_module_path(
@@ -2569,178 +2322,6 @@ fn resolve_workspace_module_path(
     let (package_name, subpath) = split_package_import(module_path)?;
     let package_root = find_package_root_for_import(from_dir, &package_name, memo, facts)?;
     resolve_package_entry(&package_root, &subpath, memo, facts)
-}
-
-fn is_rust_source_file(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
-}
-
-fn resolve_rust_cross_file_edge<F>(
-    full_callee: &str,
-    short_name: &str,
-    caller_file: &Path,
-    import_block: &ImportBlock,
-    file_exports_symbol: &mut F,
-) -> Option<ResolvedSymbol>
-where
-    F: FnMut(&Path, &str) -> bool,
-{
-    if let Some(target) = resolve_rust_qualified_call(caller_file, full_callee, file_exports_symbol)
-    {
-        return Some(target);
-    }
-
-    resolve_rust_imported_call(
-        caller_file,
-        full_callee,
-        short_name,
-        import_block,
-        file_exports_symbol,
-    )
-}
-
-fn resolve_rust_qualified_call<F>(
-    caller_file: &Path,
-    full_callee: &str,
-    file_exports_symbol: &mut F,
-) -> Option<ResolvedSymbol>
-where
-    F: FnMut(&Path, &str) -> bool,
-{
-    if !full_callee.contains("::") {
-        return None;
-    }
-
-    let segments = rust_path_segments(full_callee)?;
-    resolve_rust_call_segments(caller_file, &segments, file_exports_symbol)
-}
-
-fn resolve_rust_imported_call<F>(
-    caller_file: &Path,
-    full_callee: &str,
-    short_name: &str,
-    import_block: &ImportBlock,
-    file_exports_symbol: &mut F,
-) -> Option<ResolvedSymbol>
-where
-    F: FnMut(&Path, &str) -> bool,
-{
-    let call_segments = rust_path_segments(full_callee).unwrap_or_default();
-    let bare_call_name = if call_segments.len() <= 1 {
-        call_segments
-            .first()
-            .map(String::as_str)
-            .unwrap_or(short_name)
-    } else {
-        short_name
-    };
-
-    for imp in &import_block.imports {
-        for entry in rust_use_entries(imp) {
-            match &entry.kind {
-                RustUseKind::Item { imported_name } if call_segments.len() <= 1 => {
-                    if entry.local_name != bare_call_name {
-                        continue;
-                    }
-                    let Some(file) = resolve_rust_module_path(caller_file, &entry.module_path)
-                    else {
-                        continue;
-                    };
-                    if file_exports_symbol(&file, imported_name) {
-                        return Some(ResolvedSymbol {
-                            file,
-                            symbol: imported_name.clone(),
-                        });
-                    }
-                }
-                RustUseKind::Module if call_segments.len() >= 2 => {
-                    if call_segments.first().map(String::as_str) != Some(entry.local_name.as_str())
-                    {
-                        continue;
-                    }
-                    let symbol = call_segments.last()?.clone();
-                    let mut module_path = entry.module_path.clone();
-                    for segment in &call_segments[1..call_segments.len().saturating_sub(1)] {
-                        module_path.push_str("::");
-                        module_path.push_str(segment);
-                    }
-                    let Some(file) = resolve_rust_module_path(caller_file, &module_path) else {
-                        continue;
-                    };
-                    if file_exports_symbol(&file, &symbol) {
-                        return Some(ResolvedSymbol { file, symbol });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    None
-}
-
-fn resolve_rust_call_segments<F>(
-    caller_file: &Path,
-    segments: &[String],
-    file_exports_symbol: &mut F,
-) -> Option<ResolvedSymbol>
-where
-    F: FnMut(&Path, &str) -> bool,
-{
-    if segments.len() < 2 {
-        return None;
-    }
-
-    let symbol = segments.last()?.clone();
-    let module_path = segments[..segments.len() - 1].join("::");
-    let file = resolve_rust_module_path(caller_file, &module_path)?;
-    if file_exports_symbol(&file, &symbol) {
-        Some(ResolvedSymbol { file, symbol })
-    } else {
-        None
-    }
-}
-
-fn resolve_rust_module_path(caller_file: &Path, module_path: &str) -> Option<PathBuf> {
-    let segments = rust_path_segments(module_path)?;
-    let first = segments.first()?.as_str();
-
-    match first {
-        "std" | "core" | "alloc" => None,
-        "crate" => {
-            let crate_root = find_rust_crate_root(caller_file)?;
-            let crate_info = rust_crate_info(&crate_root)?;
-            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
-            resolve_rust_module_segments(&base, &segments[1..])
-        }
-        "self" => {
-            let crate_root = find_rust_crate_root(caller_file)?;
-            let crate_info = rust_crate_info(&crate_root)?;
-            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
-            if segments.len() == 1 {
-                return Some(canonicalize_path(caller_file));
-            }
-            let mut target_segments = rust_module_segments_for_file(&base, caller_file)?;
-            target_segments.extend(segments[1..].iter().cloned());
-            resolve_rust_module_segments(&base, &target_segments)
-        }
-        "super" => {
-            let crate_root = find_rust_crate_root(caller_file)?;
-            let crate_info = rust_crate_info(&crate_root)?;
-            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
-            let mut target_segments = rust_module_segments_for_file(&base, caller_file)?;
-            target_segments.pop();
-            target_segments.extend(segments[1..].iter().cloned());
-            resolve_rust_module_segments(&base, &target_segments)
-        }
-        crate_name => {
-            let caller_dir = caller_file.parent().unwrap_or_else(|| Path::new("."));
-            let workspace_crates = rust_workspace_crates(caller_dir)?;
-            let crate_info = workspace_crates.get(crate_name)?;
-            let base = rust_lib_module_base(crate_info)?;
-            resolve_rust_module_segments(&base, &segments[1..])
-        }
-    }
 }
 
 fn rust_use_entries(imp: &imports::ImportStatement) -> Vec<RustUseEntry> {
@@ -2771,7 +2352,7 @@ pub fn rust_import_paths(raw: &str) -> Vec<(String, String)> {
         .into_iter()
         .filter_map(|entry| match entry.kind {
             RustUseKind::Module => Some((entry.local_name, entry.module_path)),
-            RustUseKind::Item { .. } => None,
+            RustUseKind::Item => None,
         })
         .collect()
 }
@@ -2894,9 +2475,7 @@ fn add_rust_use_leaf(path: &str, entries: &mut Vec<RustUseEntry>) {
         entries.push(RustUseEntry {
             module_path: segments[..segments.len() - 1].join("::"),
             local_name: local_name.clone(),
-            kind: RustUseKind::Item {
-                imported_name: imported_name.clone(),
-            },
+            kind: RustUseKind::Item,
         });
     }
 
@@ -2945,77 +2524,6 @@ fn rust_path_segments(path: &str) -> Option<Vec<String>> {
 
 fn rust_last_path_segment(path: &str) -> Option<String> {
     rust_path_segments(path)?.last().cloned()
-}
-
-fn find_rust_crate_root(from: &Path) -> Option<PathBuf> {
-    let mut current = if from.is_file() {
-        from.parent()
-    } else {
-        Some(from)
-    };
-    while let Some(dir) = current {
-        if dir.join("Cargo.toml").is_file() {
-            return Some(canonicalize_path(dir));
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-fn rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
-    let root = canonicalize_path(crate_root);
-    if let Some(cached) = RUST_CRATE_INFO_CACHE
-        .read()
-        .ok()
-        .and_then(|cache| cache.get(&root).cloned())
-    {
-        return cached;
-    }
-
-    let resolved = read_rust_crate_info(&root);
-    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
-        cache.insert(root, resolved.clone());
-    }
-    resolved
-}
-
-fn read_rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
-    let cargo = rust_manifest_value(&crate_root.join("Cargo.toml"))?;
-    let package = cargo.get("package")?;
-    let package_name = package.get("name")?.as_str()?;
-    let lib_name = cargo
-        .get("lib")
-        .and_then(|lib| lib.get("name"))
-        .and_then(|name| name.as_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| package_name.replace('-', "_"));
-
-    let lib_root = cargo
-        .get("lib")
-        .and_then(|lib| lib.get("path"))
-        .and_then(|path| path.as_str())
-        .map(|path| crate_root.join(path))
-        .unwrap_or_else(|| crate_root.join("src/lib.rs"));
-    let lib_root = lib_root.is_file().then(|| canonicalize_path(&lib_root));
-
-    Some(RustCrateInfo {
-        package_root: canonicalize_path(crate_root),
-        lib_name,
-        lib_root,
-        target_roots: rust_target_roots(
-            crate_root,
-            &cargo,
-            &FactPaths {
-                root: crate_root,
-                facts: &DiskFacts::new(crate_root),
-            },
-        ),
-    })
-}
-
-fn rust_manifest_value(path: &Path) -> Option<toml::Value> {
-    let source = crate::project_content::read_to_string(path).ok()?;
-    toml::from_str(&source).ok()
 }
 
 fn rust_target_roots(
@@ -3199,184 +2707,6 @@ pub fn rust_crate_root_file_for_caller(
     memo.root_file(project_root, caller_file, facts)
 }
 
-fn rust_module_base_for_caller(
-    crate_info: &RustCrateInfo,
-    caller_file: &Path,
-) -> Option<RustModuleBase> {
-    let caller = canonicalize_path(caller_file);
-    if crate_info.lib_root.as_ref() == Some(&caller) {
-        return rust_lib_module_base(crate_info);
-    }
-    crate_info
-        .target_roots
-        .iter()
-        .filter_map(|root_file| {
-            let src_dir = root_file.parent()?;
-            let default_main = *root_file == crate_info.package_root.join("src/main.rs");
-            (caller == *root_file || (!default_main && caller.starts_with(src_dir))).then(|| {
-                RustModuleBase {
-                    src_dir: src_dir.to_path_buf(),
-                    root_file: root_file.clone(),
-                }
-            })
-        })
-        .max_by_key(|base| (caller == base.root_file, base.src_dir.components().count()))
-        .or_else(|| rust_lib_module_base(crate_info))
-}
-
-fn rust_lib_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
-    let root_file = crate_info.lib_root.clone()?;
-    let src_dir = root_file.parent()?.to_path_buf();
-    Some(RustModuleBase { src_dir, root_file })
-}
-
-fn resolve_rust_module_segments(base: &RustModuleBase, segments: &[String]) -> Option<PathBuf> {
-    if segments.is_empty() {
-        return Some(base.root_file.clone());
-    }
-
-    let module_base = segments
-        .iter()
-        .fold(base.src_dir.clone(), |path, segment| path.join(segment));
-    let file_path = module_base.with_extension("rs");
-    if file_path.is_file() {
-        return Some(canonicalize_path(&file_path));
-    }
-
-    let mod_path = module_base.join("mod.rs");
-    if mod_path.is_file() {
-        return Some(canonicalize_path(&mod_path));
-    }
-
-    None
-}
-
-fn rust_module_segments_for_file(base: &RustModuleBase, file: &Path) -> Option<Vec<String>> {
-    let src_dir = canonicalize_path(&base.src_dir);
-    let file = canonicalize_path(file);
-    if file == canonicalize_path(&base.root_file) {
-        return Some(Vec::new());
-    }
-    let rel = file.strip_prefix(&src_dir).ok()?;
-    let mut parts: Vec<String> = rel
-        .components()
-        .filter_map(|component| component.as_os_str().to_str().map(ToOwned::to_owned))
-        .collect();
-    if parts.is_empty() {
-        return None;
-    }
-
-    let last = parts.pop()?;
-    if last == "lib.rs" || last == "main.rs" {
-        return Some(Vec::new());
-    }
-    if last == "mod.rs" {
-        return Some(parts);
-    }
-    let stem = Path::new(&last).file_stem()?.to_str()?.to_string();
-    parts.push(stem);
-    Some(parts)
-}
-
-fn rust_workspace_crates(from_dir: &Path) -> Option<HashMap<String, RustCrateInfo>> {
-    let workspace_root =
-        find_rust_workspace_root(from_dir).or_else(|| find_rust_crate_root(from_dir))?;
-    let workspace_root = canonicalize_path(&workspace_root);
-
-    if let Some(cached) = RUST_WORKSPACE_CRATE_CACHE
-        .read()
-        .ok()
-        .and_then(|cache| cache.get(&workspace_root).cloned())
-    {
-        return Some(cached);
-    }
-
-    let mut crates = HashMap::new();
-    for member in rust_workspace_member_dirs(&workspace_root) {
-        if let Some(info) = rust_crate_info(&member) {
-            if info.lib_root.is_some() {
-                crates.insert(info.lib_name.clone(), info);
-            }
-        }
-    }
-    if let Some(info) = rust_crate_info(&workspace_root) {
-        if info.lib_root.is_some() {
-            crates.insert(info.lib_name.clone(), info);
-        }
-    }
-
-    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
-        cache.insert(workspace_root, crates.clone());
-    }
-    Some(crates)
-}
-
-fn find_rust_workspace_root(from_dir: &Path) -> Option<PathBuf> {
-    let mut current = Some(from_dir);
-    while let Some(dir) = current {
-        let cargo = dir.join("Cargo.toml");
-        if rust_manifest_value(&cargo)
-            .and_then(|value| value.get("workspace").cloned())
-            .is_some()
-        {
-            return Some(canonicalize_path(dir));
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-fn rust_workspace_member_dirs(workspace_root: &Path) -> Vec<PathBuf> {
-    let Some(cargo) = rust_manifest_value(&workspace_root.join("Cargo.toml")) else {
-        return Vec::new();
-    };
-    let Some(members) = cargo
-        .get("workspace")
-        .and_then(|workspace| workspace.get("members"))
-        .and_then(|members| members.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut dirs = Vec::new();
-    for member in members.iter().filter_map(|member| member.as_str()) {
-        dirs.extend(expand_rust_workspace_member(workspace_root, member));
-    }
-    dirs.sort();
-    dirs.dedup();
-    dirs
-}
-
-fn expand_rust_workspace_member(workspace_root: &Path, member: &str) -> Vec<PathBuf> {
-    let member = member.trim();
-    if member.is_empty() {
-        return Vec::new();
-    }
-
-    if member.contains('*') || member.contains('?') || member.contains('[') {
-        let pattern = workspace_root.join(member).to_string_lossy().to_string();
-        return crate::walk_boundary::expand_glob_same_file_system(&pattern)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|path| path.join("Cargo.toml").is_file())
-            .map(|path| canonicalize_path(&path))
-            .collect();
-    }
-
-    let path = workspace_root.join(member);
-    if path.join("Cargo.toml").is_file() {
-        vec![canonicalize_path(&path)]
-    } else {
-        Vec::new()
-    }
-}
-
-test_support_visibility! {
-fn canonicalize_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-}
-
 fn resolve_tsconfig_path(
     from_dir: &Path,
     module_path: &str,
@@ -3430,13 +2760,8 @@ fn find_tsconfig_dir(from_dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> 
 }
 
 fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {
-    if let Some(star_index) = alias.find('*') {
-        let (prefix, suffix_with_star) = alias.split_at(star_index);
-        let suffix = &suffix_with_star[1..];
-        if module_path.starts_with(prefix) && module_path.ends_with(suffix) {
-            return Some(&module_path[prefix.len()..module_path.len() - suffix.len()]);
-        }
-        return None;
+    if let Some((prefix, suffix)) = alias.split_once('*') {
+        return module_path.strip_prefix(prefix)?.strip_suffix(suffix);
     }
 
     (alias == module_path).then_some("")
@@ -3512,40 +2837,12 @@ fn is_workspace_root(
         || !pnpm_workspace_patterns(dir, facts).is_empty()
 }
 
-/// Drop the workspace and crate caches for one project root only. The caches
-/// are process-wide and the daemon serves dozens of roots that bind about ten
-/// times a minute; clearing everything on each configure gave the caches a
-/// lifetime of seconds, so every Tier-2 rescan re-walked every workspace under
-/// every root. A configure is a signal about its own root's manifests, and
-/// the keys are canonical paths, so containment is the right scope.
+/// Drop cached workspace package results under the supplied root without
+/// discarding cached answers for other roots in the process.
 pub fn clear_workspace_package_cache_under(root: &Path) {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
-        cache.retain(|(workspace, _), _| !workspace.starts_with(&root));
-    }
-    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
-        cache.retain(|workspace, _| !workspace.starts_with(&root));
-    }
-    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
-        cache.retain(|dir, _| !dir.starts_with(&root));
-    }
-    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
-        cache.retain(|workspace, _| !workspace.starts_with(&root));
-    }
-}
-
-pub fn clear_workspace_package_cache() {
-    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
-        cache.clear();
+        cache.clear_under(&root);
     }
 }
 
@@ -3560,13 +2857,8 @@ fn resolve_workspace_package(
         .unwrap_or_else(|| workspace_root.to_path_buf());
     let cache_key = (workspace_root.clone(), package_name.to_string());
 
-    // The memo is a bounded per-pass layer; the process-wide cache is the
-    // durable one. Both are consulted whenever present: several call sites
-    // resolve with a memo that lives for a single import, and a memo alone
-    // turned every bare package import in a workspace monorepo into a full
-    // member-directory walk (realpath per directory) because the miss never
-    // reached the cache that already held the answer. Two daemon threads sat
-    // at 70% each in that walk during one-file Tier-2 rescans across roots.
+    // The per-pass memo replays the facts behind each cached answer. Direct
+    // navigation can also reuse the live map rather than walking member paths.
     if let Some(memo) = memo {
         if let Some(cached) = memo.workspace_package(&cache_key) {
             facts
@@ -3575,22 +2867,36 @@ fn resolve_workspace_package(
             return cached;
         }
     }
+    if facts.facts.uses_live_filesystem() {
+        let members =
+            LiveCache::get_or_build(&WORKSPACE_PACKAGE_CACHE, &workspace_root, |inputs| {
+                let observed = inputs.observe(facts);
+                let paths = FactPaths {
+                    root: facts.root,
+                    facts: &observed,
+                };
+                let mut members = HashMap::new();
+                for dir in workspace_member_dirs(&workspace_root, None, &paths) {
+                    if let Some(name) = package_json_name(&dir, None, &paths) {
+                        members
+                            .entry(name)
+                            .or_insert_with(|| paths.canonical(&dir).unwrap_or(dir));
+                    }
+                }
+                members
+            });
+        let resolved = members.get(package_name).cloned();
+        if let Some(memo) = memo {
+            memo.remember_workspace_package(cache_key, resolved.clone());
+        }
+        return resolved;
+    }
     if facts.facts.records_config_facts() {
         if let Some(cached) = facts.facts.workspace_package(&workspace_root, package_name) {
             facts
                 .facts
                 .memo_replay(&workspace_root, "package", package_name);
             return cached;
-        }
-    } else if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
-        if let Some(cached) = cache.get(&cache_key) {
-            if let Some(memo) = memo {
-                memo.remember_workspace_package(cache_key, cached.clone());
-            }
-            facts
-                .facts
-                .memo_replay(&workspace_root, "package", package_name);
-            return cached.clone();
         }
     }
 
@@ -3627,8 +2933,6 @@ fn resolve_workspace_package(
         facts
             .facts
             .remember_workspace_package(&workspace_root, package_name, resolved.clone());
-    } else if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
-        cache.insert(cache_key, resolved.clone());
     }
 
     resolved
@@ -3704,25 +3008,6 @@ fn cached_workspace_member_dirs(
             facts.facts.memo_replay(workspace_root, "members", "");
             return members;
         }
-    } else {
-        let cell = WORKSPACE_MEMBER_DIRS_CACHE
-            .write()
-            .expect("workspace member cache poisoned")
-            .entry(workspace_root.to_path_buf())
-            .or_default()
-            .clone();
-        let mut populated = false;
-        let members = cell.get_or_init(|| {
-            populated = true;
-            facts.facts.memo_start(workspace_root, "members", "");
-            let members = Arc::new(workspace_member_dirs(workspace_root, memo, facts));
-            facts.facts.memo_finish(workspace_root, "members", "");
-            members
-        });
-        if !populated {
-            facts.facts.memo_replay(workspace_root, "members", "");
-        }
-        return Arc::clone(members);
     }
     facts.facts.memo_start(workspace_root, "members", "");
     let members = Arc::new(workspace_member_dirs(workspace_root, memo, facts));
@@ -4036,15 +3321,15 @@ fn export_target_for_subpath(exports: &Value, subpath: Option<&str>) -> Option<S
 
 fn wildcard_export_target(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
     for (pattern, target) in map {
-        let Some(star_index) = pattern.find('*') else {
+        let Some((prefix, suffix)) = pattern.split_once('*') else {
             continue;
         };
-        let (prefix, suffix_with_star) = pattern.split_at(star_index);
-        let suffix = &suffix_with_star[1..];
-        if !key.starts_with(prefix) || !key.ends_with(suffix) {
+        let Some(matched) = key
+            .strip_prefix(prefix)
+            .and_then(|part| part.strip_suffix(suffix))
+        else {
             continue;
-        }
-        let matched = &key[prefix.len()..key.len() - suffix.len()];
+        };
         if let Some(target_pattern) = export_condition_target(target) {
             return Some(target_pattern.replace('*', matched));
         }
@@ -4352,46 +3637,6 @@ fn find_index_file(dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Resolve an aliased import: `import { foo as bar } from './utils'`
-/// where `local_name` is "bar". Returns `(original_name, resolved_file_path)`.
-fn resolve_aliased_import(
-    local_name: &str,
-    import_block: &ImportBlock,
-    caller_dir: &Path,
-) -> Option<(String, PathBuf)> {
-    for imp in &import_block.imports {
-        // Parse the raw text to find "as <alias>" patterns
-        // This handles: import { foo as bar, baz as qux } from './mod'
-        if let Some(original) = find_alias_original(&imp.raw_text, local_name) {
-            if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
-                return Some((original, resolved_path));
-            }
-        }
-    }
-    None
-}
-
-test_support_visibility! {
-/// Parse import raw text to find the original name for an alias.
-/// Given raw text like `import { foo as bar, baz } from './utils'` and
-/// local_name "bar", returns Some("foo").
-fn find_alias_original(raw_import: &str, local_name: &str) -> Option<String> {
-    // Look for pattern: <original> as <alias>
-    // This is a simple text-based search; handles the common TS/JS pattern
-    let search = format!(" as {}", local_name);
-    if let Some(pos) = raw_import.find(&search) {
-        // Walk backwards from `pos` to find the original name
-        let before = &raw_import[..pos];
-        // The original name is the last word-like token before " as "
-        let original = before
-            .rsplit(|c: char| c == '{' || c == ',' || c.is_whitespace())
-            .find(|s| !s.is_empty())?;
-        return Some(original.to_string());
-    }
-    None
-}
 }
 
 // ---------------------------------------------------------------------------
@@ -4721,30 +3966,26 @@ mod rust_use_regressions {
         let actual: Vec<_> = entries
             .iter()
             .map(|entry| {
-                let imported = match &entry.kind {
-                    RustUseKind::Item { imported_name } => Some(imported_name.as_str()),
-                    RustUseKind::Module => None,
-                };
                 (
                     entry.module_path.as_str(),
                     entry.local_name.as_str(),
-                    imported,
+                    matches!(entry.kind, RustUseKind::Item),
                 )
             })
             .collect();
         assert_eq!(
             actual,
             [
-                ("root", "first", Some("first")),
-                ("root::first", "first", None),
-                ("root::branch", "branch", None),
-                ("root::branch::nested", "Renamed", Some("Leaf")),
-                ("root::branch::nested::Leaf", "Renamed", None),
-                ("root::branch", "after", Some("after")),
-                ("root::branch::after", "after", None),
-                ("root", "root", None),
-                ("root", "Tail", Some("last")),
-                ("root::last", "Tail", None),
+                ("root", "first", true),
+                ("root::first", "first", false),
+                ("root::branch", "branch", false),
+                ("root::branch::nested", "Renamed", true),
+                ("root::branch::nested::Leaf", "Renamed", false),
+                ("root::branch", "after", true),
+                ("root::branch::after", "after", false),
+                ("root", "root", false),
+                ("root", "Tail", true),
+                ("root::last", "Tail", false),
             ]
         );
     }

@@ -113,20 +113,22 @@ pub fn extract(source: &str, root: Node<'_>) -> Extraction {
             .calls
             .iter()
             .map(|(call, scope)| {
-                let mut owners = vec![extractor.scopes[*scope].owner.clone()];
-                let mut parent = extractor.scopes[*scope].parent;
-                // Like other languages, retain enclosing callable edges for nested
-                // bodies. Start from the lexical scope so declaration headers still
-                // belong to their defining scope, never the declared function.
-                while let Some(id) = parent {
-                    let enclosing = &extractor.scopes[id];
-                    if !enclosing.class
-                        && enclosing.owner != super::TOP_LEVEL_SYMBOL
-                        && !owners.contains(&enclosing.owner)
-                    {
-                        owners.push(enclosing.owner.clone());
+                let scope = &extractor.scopes[*scope];
+                let mut owners = vec![scope.owner.clone()];
+                // Defining a class executes its body in the enclosing scope;
+                // defining a function does not execute its body.
+                if scope.class {
+                    let mut parent = scope.parent;
+                    while let Some(id) = parent {
+                        let enclosing = &extractor.scopes[id];
+                        if !enclosing.class {
+                            if enclosing.owner != super::TOP_LEVEL_SYMBOL {
+                                owners.push(enclosing.owner.clone());
+                            }
+                            break;
+                        }
+                        parent = enclosing.parent;
                     }
-                    parent = enclosing.parent;
                 }
                 (call.start_byte(), owners)
             })

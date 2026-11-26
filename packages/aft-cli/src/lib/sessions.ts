@@ -1,4 +1,13 @@
-import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  closeSync,
+  type Dirent,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
@@ -27,6 +36,7 @@ interface SqliteDatabase {
 }
 
 const MAX_RECENT_SESSIONS = 5;
+const PI_SESSION_HEAD_BYTES = 64 * 1024;
 
 export function listRecentSessions(adapter: HarnessAdapter): RecentSession[] {
   try {
@@ -118,22 +128,41 @@ export function listPiSessionsFromDir(sessionsDir: string): RecentSession[] {
         }
       })
       .filter((entry): entry is { filePath: string; mtimeMs: number } => entry !== null)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, MAX_RECENT_SESSIONS * 4);
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
 
     const sessions: RecentSession[] = [];
     for (const file of files) {
-      const parsed = parsePiSessionJsonl(
-        readFileSync(file.filePath, "utf8"),
-        basename(file.filePath),
-      );
-      if (!parsed) continue;
-      sessions.push({ ...parsed, lastActivity: file.mtimeMs });
-      if (sessions.length >= MAX_RECENT_SESSIONS) break;
+      try {
+        const path = file.filePath;
+        const filename = basename(path);
+        const head = parsePiSessionJsonl(readPiSessionHead(path), filename);
+        // Preserve late titles in older logs, but avoid the full read when the
+        // head already contains both the session id and a real user title.
+        const parsed =
+          head && head.title !== head.id
+            ? head
+            : parsePiSessionJsonl(readFileSync(path, "utf8"), filename);
+        if (!parsed) continue;
+        sessions.push({ ...parsed, lastActivity: file.mtimeMs });
+        if (sessions.length >= MAX_RECENT_SESSIONS) break;
+      } catch {
+        // Ignore a candidate that disappears or becomes unreadable.
+      }
     }
     return sessions;
   } catch {
     return [];
+  }
+}
+
+function readPiSessionHead(path: string): string {
+  const descriptor = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(PI_SESSION_HEAD_BYTES);
+    const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    closeSync(descriptor);
   }
 }
 

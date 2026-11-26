@@ -1375,6 +1375,40 @@ fn callgraph_aliased_import_follows_reexport_barrel() {
 }
 
 #[test]
+fn callgraph_namespace_barrel_rejects_unexported_members() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("app.ts"),
+        "import * as api from './barrel';\nexport function run() { api.exposed(); api.hidden(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("barrel.ts"),
+        "export { exposed } from './leaf';\n",
+    )
+    .unwrap();
+    let leaf = root.join("leaf.ts");
+    fs::write(
+        &leaf,
+        "export function exposed() {}\nfunction hidden() {}\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    for (id, symbol, callers) in [(1, "exposed", 1), (2, "hidden", 0)] {
+        let response = aft.send(&format!(
+            r#"{{"id":"{id}","command":"callers","file":{},"symbol":"{symbol}","depth":1}}"#,
+            crate::helpers::json_string(&leaf.display())
+        ));
+        assert_eq!(response["success"], true, "{response:?}");
+        assert_eq!(response["total_callers"], callers, "{response:?}");
+    }
+    aft.shutdown();
+}
+
+#[test]
 fn callgraph_default_reexport_resolves_real_default_symbol() {
     let temp = tempdir().unwrap();
     let root = temp.path();

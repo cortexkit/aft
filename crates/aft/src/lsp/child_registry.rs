@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 
 use crate::lsp::registry::ServerKind;
 
+mod process_group;
+pub(super) use process_group::TrackedProcess;
+use process_group::{GroupOutcome, GroupSignal};
+
 /// How long a freshly spawned child may wait for its `LspClient` to claim it
 /// before the orphan sweep treats it as abandoned. Claiming normally takes
 /// microseconds; the window only has to outlast a slow fork under load while
@@ -82,6 +86,7 @@ pub struct LspChildHealth {
 /// can reap children that no live client still references.
 #[derive(Clone, Debug, Default)]
 struct TrackedChild {
+    process: TrackedProcess,
     health_probe: Arc<health_probes::HealthProbeCache>,
     root: Option<PathBuf>,
     server_root: Option<PathBuf>,
@@ -110,6 +115,7 @@ enum ForceKillPhase {
     AfterCleanup,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReapSignal {
     Sigterm,
@@ -148,6 +154,7 @@ impl LspChildRegistry {
             children.insert(
                 pid,
                 TrackedChild {
+                    process: TrackedProcess::new(pid, kind),
                     health_probe: Arc::default(),
                     root: root.map(Path::to_path_buf),
                     server_root: server_root.map(Path::to_path_buf),
@@ -174,21 +181,23 @@ impl LspChildRegistry {
         root: Option<&Path>,
     ) -> io::Result<Child> {
         self.spawn_tracked_child(command, root, None, None)
+            .map(|(child, _)| child)
     }
 
     /// Spawn and register a child with reclaim-marker root plus server identity.
-    pub fn spawn_tracked_child(
+    pub(super) fn spawn_tracked_child(
         &self,
         command: &mut Command,
         root: Option<&Path>,
         server_root: Option<&Path>,
         kind: Option<&ServerKind>,
-    ) -> io::Result<Child> {
+    ) -> io::Result<(Child, TrackedProcess)> {
         let mut children = self
             .inner
             .lock()
             .map_err(|_| io::Error::other("LSP child registry mutex poisoned"))?;
         let child = command.spawn()?;
+        let process = TrackedProcess::new(child.id(), kind);
         // The caller is about to wrap this child in an `LspClient`. Until it
         // calls `mark_client_live`, the child must not look like an orphan:
         // a maintenance sweep blocked on this lock during the fork would
@@ -197,6 +206,7 @@ impl LspChildRegistry {
         children.insert(
             child.id(),
             TrackedChild {
+                process: process.clone(),
                 health_probe: Arc::default(),
                 root: root.map(Path::to_path_buf),
                 server_root: server_root.map(Path::to_path_buf),
@@ -206,7 +216,7 @@ impl LspChildRegistry {
                 },
             },
         );
-        Ok(child)
+        Ok((child, process))
     }
 
     /// Mark that a returned `LspClient` owns a tracked child.
@@ -221,12 +231,52 @@ impl LspChildRegistry {
     /// Leave a tracked PID visible to the reaper after its client disappears.
     /// This is primarily a crash/leak backstop: normal client teardown kills and
     /// untracks its child immediately, while a failed teardown remains observable.
+    #[cfg(test)]
     pub(crate) fn mark_client_gone(&self, pid: u32) {
         if let Ok(mut children) = self.inner.lock() {
             if let Some(child) = children.get_mut(&pid) {
                 child.ownership = ClientOwnership::Gone;
             }
         }
+    }
+
+    pub(super) fn finish_client(&self, process: &TrackedProcess) {
+        self.update_process(process, GroupSignal::Observe, |child| {
+            child.ownership = ClientOwnership::Gone;
+            true
+        });
+    }
+
+    #[cfg(unix)]
+    pub(super) fn signal_client(&self, process: &TrackedProcess, force: bool) {
+        let signal = if force {
+            GroupSignal::Kill
+        } else {
+            GroupSignal::Maintain(Instant::now())
+        };
+        self.update_process(process, signal, |_| true);
+    }
+
+    pub(super) fn try_wait_client(
+        &self,
+        process: &TrackedProcess,
+        child: &mut Child,
+    ) -> io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(unix)]
+        if !process.exit_observed()? {
+            return Ok(None);
+        } else {
+            // Kill lingering descendants before releasing the observed leader's
+            // PID. The registry mutex is never held across the eventual reap.
+            self.signal_client(process, true);
+        }
+        let status = process.reap(child)?;
+        if status.is_some() {
+            // Keep the entry through the final group signal, but not past
+            // the owner's confirmed wait.
+            self.finish_client(process);
+        }
+        Ok(status)
     }
 
     /// Forget a PID (called when the client is dropped or shut down gracefully).
@@ -242,6 +292,12 @@ impl LspChildRegistry {
             .into_iter()
             .map(|(pid, _)| pid)
             .collect()
+    }
+
+    pub(crate) fn has_children_without_waiting(&self) -> bool {
+        self.inner
+            .try_lock()
+            .is_ok_and(|children| !children.is_empty())
     }
 
     fn tracked_children(&self) -> Vec<(u32, TrackedChild)> {
@@ -268,36 +324,56 @@ impl LspChildRegistry {
             .collect()
     }
 
-    /// Kill and untrack the given PIDs. Used to reap children that are still
-    /// registered after their `LspClient` was dropped without a kill.
-    pub fn reap_pids(&self, pids: &[u32]) -> usize {
-        let mut reaped = 0;
-        for pid in pids {
-            if kill_child_process_group(*pid) {
-                self.untrack(*pid);
-                reaped += 1;
+    /// Signal unreferenced children from a previous start of this server.
+    pub(super) fn reap_server_orphans(
+        &self,
+        root: &Path,
+        kind: &ServerKind,
+        live: &std::collections::HashSet<u32>,
+    ) {
+        let now = Instant::now();
+        for (pid, child) in self.tracked_children() {
+            if !live.contains(&pid)
+                && child.server_root.as_deref() == Some(root)
+                && child.kind.as_ref() == Some(kind)
+            {
+                self.update_process(&child.process, GroupSignal::Maintain(now), |_| true);
             }
         }
-        reaped
     }
 
-    /// Force-kill the process groups of the given PIDs and untrack them,
-    /// without waiting for any of them to exit. Exit-time LSP shutdown uses
-    /// this once its graceful window has passed: the caller's deadline has to
-    /// cover both these kills and the wait for them to take effect, so a slow
-    /// termination of one server must not delay the kill of the next.
-    /// Returns how many groups were sent the kill (or were already gone).
-    pub fn force_kill_pids(&self, pids: &[u32]) -> usize {
+    pub(super) fn tracked_processes(&self) -> Vec<TrackedProcess> {
+        self.tracked_children()
+            .into_iter()
+            .map(|(_, child)| child.process)
+            .collect()
+    }
+
+    pub(super) fn force_kill_server(&self, root: &Path, kind: &ServerKind) {
+        for (_, child) in self.tracked_children() {
+            if child.server_root.as_deref() == Some(root) && child.kind.as_ref() == Some(kind) {
+                self.update_process(&child.process, GroupSignal::Kill, |_| true);
+            }
+        }
+    }
+
+    /// Dispatch to captured instances before taking the registry lock. A slow
+    /// spawn must not delay the entire deadline batch, and a graceful worker
+    /// may already have reaped its child despite not reporting completion yet.
+    pub(super) fn force_kill_processes(&self, processes: &[TrackedProcess]) {
         #[cfg(test)]
         if let Some(hook) = &self.force_kill_hook {
             hook(ForceKillPhase::BeforeSignals);
         }
-        let mut killed = Vec::new();
-        for pid in pids {
-            if force_kill_child_process_group_nowait(*pid) {
-                killed.push(*pid);
-            }
-        }
+        let finished = processes
+            .iter()
+            .filter(|process| {
+                matches!(
+                    process.signal(GroupSignal::Kill),
+                    GroupOutcome::Gone | GroupOutcome::Unproven
+                )
+            })
+            .collect::<Vec<_>>();
         // Spawning a child holds the registry mutex across process creation.
         // Send every kill before cleanup can block on that mutex, otherwise a
         // slow fork can leave the remaining servers running without a signal.
@@ -305,14 +381,36 @@ impl LspChildRegistry {
         if let Some(hook) = &self.force_kill_hook {
             hook(ForceKillPhase::BeforeCleanup);
         }
-        for pid in &killed {
-            self.untrack(*pid);
+        for process in finished {
+            self.update_process(process, GroupSignal::Observe, |_| true);
         }
         #[cfg(test)]
         if let Some(hook) = &self.force_kill_hook {
             hook(ForceKillPhase::AfterCleanup);
         }
-        killed.len()
+    }
+
+    fn update_process(
+        &self,
+        process: &TrackedProcess,
+        signal: GroupSignal,
+        eligible: impl FnOnce(&mut TrackedChild) -> bool,
+    ) -> GroupOutcome {
+        let Ok(mut children) = self.inner.lock() else {
+            return GroupOutcome::Retain;
+        };
+        let std::collections::hash_map::Entry::Occupied(mut entry) = children.entry(process.pid())
+        else {
+            return GroupOutcome::Retain;
+        };
+        if !entry.get().process.same_entry(process) || !eligible(entry.get_mut()) {
+            return GroupOutcome::Retain;
+        }
+        let result = entry.get().process.signal(signal);
+        if matches!(result, GroupOutcome::Gone | GroupOutcome::Unproven) {
+            entry.remove();
+        }
+        result
     }
 
     /// Snapshot tracked children without holding the registry lock across CWD
@@ -334,13 +432,23 @@ impl LspChildRegistry {
         Some(health_for_children(children))
     }
 
-    /// Kill children that are still tracked but no longer have a live client.
-    /// The registry snapshot is copied before signal delivery so a slow process
-    /// group does not block an LSP spawn or health observation.
+    /// Signal children that no longer have a client and count groups now gone.
     pub fn reap_children_without_client(&self) -> usize {
-        self.reap_children_without_client_using(kill_child_process_group)
+        self.reap_orphans_at(Instant::now())
     }
 
+    fn reap_orphans_at(&self, now: Instant) -> usize {
+        self.tracked_processes()
+            .into_iter()
+            .filter(|process| {
+                self.update_process(process, GroupSignal::Maintain(now), |tracked| {
+                    tracked.ownership.is_orphan(now)
+                }) == GroupOutcome::Gone
+            })
+            .count()
+    }
+
+    #[cfg(test)]
     fn reap_children_without_client_using<Terminate>(&self, mut terminate: Terminate) -> usize
     where
         Terminate: FnMut(u32) -> bool,
@@ -369,25 +477,39 @@ impl LspChildRegistry {
         }
     }
 
-    /// Kill and untrack every child whose working directory no longer exists.
+    /// Signal each child whose working directory no longer exists.
     /// This is a crash/leak backstop; ordinary root teardown still drops the
     /// owning `LspClient` and performs its normal process-group cleanup.
     pub fn reap_children_with_gone_cwd(&self) -> usize {
-        self.reap_children_without_client()
-            + self.reap_children_using(false, |pid, _| kill_child_process_group(pid))
+        self.reap_for_maintenance(false)
     }
 
-    /// Kill and untrack children with a deleted cwd or a reclaimed project root.
+    /// Signal children with a deleted cwd or a reclaimed project root.
     ///
     /// Alfonso leaves `<worktree>.reclaimed` beside a settled worktree before
     /// removing its directory. Checking the root registered at spawn time lets
     /// this periodic sweep release the analyzer immediately instead of waiting
     /// for the idle-root TTL or for the directory itself to disappear.
     pub fn reap_children_with_gone_cwd_or_reclaimed_root(&self) -> usize {
-        self.reap_children_without_client()
-            + self.reap_children_using(true, |pid, _| kill_child_process_group(pid))
+        self.reap_for_maintenance(true)
     }
 
+    fn reap_for_maintenance(&self, include_reclaimed_roots: bool) -> usize {
+        let now = Instant::now();
+        self.tracked_children()
+            .into_iter()
+            .filter(|(pid, tracked)| {
+                let root_ended = matches!(child_cwd_state(*pid), ChildCwdState::Gone)
+                    || (include_reclaimed_roots
+                        && tracked.root.as_deref().is_some_and(root_has_reclaim_marker));
+                self.update_process(&tracked.process, GroupSignal::Maintain(now), |child| {
+                    root_ended || child.ownership.is_orphan(now)
+                }) == GroupOutcome::Gone
+            })
+            .count()
+    }
+
+    #[cfg(test)]
     fn reap_children_using<Terminate>(
         &self,
         include_reclaimed_roots: bool,
@@ -426,23 +548,12 @@ impl LspChildRegistry {
     /// so `pgid == child.id()`.
     #[cfg(unix)]
     pub fn kill_all(&self) -> usize {
-        use std::os::raw::c_int;
-        let pids = self.pids();
-        let mut killed = 0;
-        for pid in pids {
-            // SIGKILL = 9. We use the raw libc call rather than crossbeam
-            // because we're inside a signal-handler context where allocator
-            // and channel use is risky.
-            // SAFETY: killpg(2) is async-signal-safe.
-            unsafe {
-                let pgid = pid as libc::pid_t;
-                let rc = libc::killpg(pgid, 9 as c_int);
-                if rc == 0 {
-                    killed += 1;
-                }
-            }
-        }
-        killed
+        self.tracked_processes()
+            .into_iter()
+            .filter(|process| {
+                self.update_process(process, GroupSignal::Kill, |_| true) == GroupOutcome::Signalled
+            })
+            .count()
     }
 
     /// Windows fallback: best-effort kill via `taskkill /F /T`. The `/T`
@@ -785,74 +896,110 @@ fn child_cwd(_pid: u32) -> io::Result<PathBuf> {
     ))
 }
 
-#[cfg(unix)]
-fn kill_child_process_group(pid: u32) -> bool {
-    let Ok(pgid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // Ask before insisting. A language server given SIGTERM flushes its caches
-    // and releases its files; SIGKILL leaves whatever it was mid-write. When
-    // 280 leaked servers were reaped by hand on a loaded machine, every one
-    // exited on SIGTERM within eight seconds and none needed escalation, so
-    // the polite signal is not a theoretical courtesy here.
-    //
-    // The escalation is deliberately absent rather than forgotten: this sweep
-    // runs periodically, so a child that ignores SIGTERM is simply signalled
-    // again on the next pass, and a process that survives repeated SIGTERMs is
-    // wedged in a way SIGKILL from a maintenance tick should not paper over.
-    // The SIGKILL path stays where it belongs — process exit, where there is no
-    // next pass. LspClient creates a session per child, so the child PID is
-    // also its PGID.
-    // SAFETY: killpg does not dereference pointers and SIGTERM needs no handler.
-    let result = unsafe { libc::killpg(pgid, libc::SIGTERM) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-}
-
-/// SIGKILL a child's process group. Unlike the maintenance sweep's SIGTERM,
-/// this cannot be ignored: it is only used at the end of a shutdown whose
-/// graceful request the server already failed to honour. `killpg` returns
-/// without waiting for the processes to die, so killing several groups in a
-/// row costs no more than a few system calls.
-#[cfg(unix)]
-fn force_kill_child_process_group_nowait(pid: u32) -> bool {
-    let Ok(pgid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: killpg does not dereference pointers.
-    let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-}
-
-/// Windows has no process groups to signal; `taskkill /F /T` forcibly ends
-/// the process tree instead. It is a separate program that can take a while
-/// to start and finish, so each one runs on its own detached thread: every
-/// kill starts at once and none of them holds up the caller's deadline.
-#[cfg(not(unix))]
-fn force_kill_child_process_group_nowait(pid: u32) -> bool {
-    std::thread::Builder::new()
-        .name("aft-lsp-force-kill".to_string())
-        .spawn(move || {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        })
-        .is_ok()
-}
-
-#[cfg(not(unix))]
-fn kill_child_process_group(pid: u32) -> bool {
-    std::process::Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_keeps_sigterm_ignoring_group_visible_to_shutdown() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        use std::process::Stdio;
+
+        let registry = LspChildRegistry::new();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "trap '' TERM; echo ready; read ignored"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut child = registry.spawn_tracked(&mut command).unwrap();
+        let pid = child.id();
+        let mut readiness = String::new();
+        let ready = BufReader::new(child.stdout.take().unwrap()).read_line(&mut readiness);
+        registry.mark_client_gone(pid);
+
+        let now = Instant::now();
+        let reaped = registry.reap_orphans_at(now);
+        let tracked = registry.pids();
+        let grace = crate::bash_background::process::TERMINATE_GRACE;
+        let during_grace = registry.reap_orphans_at(now + grace / 2);
+        let before_wait = registry.reap_orphans_at(now + grace);
+        // Close stdin even on a missed escalation so the fixture always exits.
+        let status = child.wait().unwrap();
+        let confirmed = registry.reap_children_without_client();
+
+        assert!(ready.is_ok());
+        assert_eq!(readiness.trim(), "ready");
+        assert_eq!(reaped, 0, "sending SIGTERM did not reap the group");
+        assert_eq!(tracked, vec![pid]);
+        assert_eq!(during_grace, 0);
+        assert_eq!(before_wait, 0, "SIGKILL delivery is not a reap either");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(confirmed, 1);
+        assert!(registry.pids().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_does_not_signal_a_group_with_a_different_start_time() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let registry = LspChildRegistry::new();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "read line; exit 0"])
+            .stdin(Stdio::piped())
+            .process_group(0);
+        let mut child = registry.spawn_tracked(&mut command).unwrap();
+        let process = registry.tracked_processes().pop().unwrap();
+        process.replace_start_time_for_test();
+        registry.mark_client_gone(child.id());
+        let reaped = registry.reap_children_without_client();
+        let tracked = registry.pids();
+        let status = child.wait().unwrap();
+        assert_eq!(reaped, 0);
+        assert!(tracked.is_empty());
+        assert!(
+            status.success(),
+            "a different leader identity was signalled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_dispatch_leaves_group_alone_after_its_leader_was_reaped() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let registry = LspChildRegistry::new();
+        let mut leader = Command::new("sh");
+        leader
+            .args(["-c", "read line; exit 0"])
+            .stdin(Stdio::piped())
+            .process_group(0);
+        let mut leader = registry.spawn_tracked(&mut leader).unwrap();
+        let mut member = Command::new("sh")
+            .args(["-c", "read line; exit 0"])
+            .stdin(Stdio::piped())
+            .process_group(leader.id() as i32)
+            .spawn()
+            .unwrap();
+        let snapshot = registry.tracked_processes();
+        let leader_status = leader.wait().unwrap();
+
+        registry.force_kill_processes(&snapshot);
+
+        let member_status = member.wait().unwrap();
+        assert!(leader_status.success());
+        assert!(
+            member_status.success(),
+            "a group without its leader was signalled"
+        );
+        assert!(registry.pids().is_empty());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -984,8 +1131,8 @@ mod tests {
         let pid = child.id();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let owner = std::thread::spawn(move || {
-            // Keep the killed child waitable after the kill dispatcher has
-            // untracked it. A successful signal is not evidence of a reap.
+            // Keep the killed child waitable after the dispatcher signals it.
+            // A successful signal is not evidence of a reap.
             let released = release_rx.recv_timeout(Duration::from_secs(10)).is_ok();
             child.wait().unwrap();
             released
@@ -1002,10 +1149,10 @@ mod tests {
                 deadlines.push(until.duration_since(started));
                 if deadlines.len() == 2 {
                     // Simulate the final timeout only after the real dispatcher
-                    // has killed and untracked the still-waitable child. The
+                    // has signalled the still-waitable child. The
                     // ten-second waits are deadlock guards, not timing oracles.
                     killed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                    assert!(registry.pids().is_empty());
+                    assert_eq!(registry.pids(), vec![pid]);
                     assert!(crate::process_identity::is_process_alive(pid));
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout)
@@ -1023,7 +1170,7 @@ mod tests {
         assert_eq!(outcome.forced, 1, "{outcome:?}");
         assert_eq!(
             outcome.unreaped, 1,
-            "untracking must not hide a waitable child"
+            "a signal must not hide a waitable child"
         );
         assert!(!crate::process_identity::is_process_alive(pid));
     }
@@ -1184,7 +1331,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn maintenance_reaps_child_whose_cwd_was_deleted() {
-        use std::os::unix::process::CommandExt;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
 
         let root = tempfile::tempdir().expect("tempdir");
         let reg = LspChildRegistry::new();
@@ -1212,8 +1359,15 @@ mod tests {
         assert_eq!(health.cwd_gone, 1);
         assert_eq!(health.children_with_deleted_cwd, 1);
         assert_eq!(health.children_without_client, 0);
-        assert_eq!(reg.reap_children_with_gone_cwd(), 1);
-        child.wait().expect("reap child");
+        assert_eq!(reg.reap_children_with_gone_cwd(), 0);
+        assert_eq!(
+            child.wait().expect("reap child").signal(),
+            Some(libc::SIGTERM)
+        );
+        reg.mark_client_gone(child.id());
+        // The kernel can still report the group present after wait. The
+        // registry must drop it without claiming a confirmed group reap.
+        reg.reap_children_without_client();
         assert_eq!(reg.health_snapshot(), LspChildHealth::default());
     }
 
@@ -1347,7 +1501,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut child = reg
+        let (mut child, _) = reg
             .spawn_tracked_child(&mut command, None, None, None)
             .expect("spawn child");
         let pid = child.id();

@@ -76,6 +76,7 @@ impl SessionAggregateKey {
 struct CachedAggregate {
     aggregate: CompressionAggregate,
     watermark: i64,
+    rolled_up_events: i64,
 }
 
 #[derive(Debug, Default)]
@@ -136,32 +137,31 @@ impl CompressionAggregateCache {
             }
             reset_for_connection_change(&mut inner, conn);
             (
-                inner
-                    .projects
-                    .get(&project_key)
-                    .filter(|cached| cached.watermark == watermark)
-                    .map(|cached| cached.aggregate),
-                inner
-                    .sessions
-                    .get(&session_key)
-                    .filter(|cached| cached.watermark == watermark)
-                    .map(|cached| cached.aggregate),
+                inner.projects.get(&project_key).copied(),
+                inner.sessions.get(&session_key).copied(),
             )
         };
         // Do not hold the cache mutex during SQL: a busy-connection status
         // reader must be able to serve the last exact values immediately.
-        let project = match cached_project {
+        let project = match current_aggregate(conn, cached_project, &project_key, None, watermark)?
+        {
             Some(project) => project,
             None => {
                 self.note_aggregate_scan();
-                aggregate_for_project(conn, harness, &project_key.project_key)?
+                read_aggregate(conn, &project_key, None, watermark)?
             }
         };
-        let session = match cached_session {
+        let session = match current_aggregate(
+            conn,
+            cached_session,
+            &project_key,
+            Some(session_id),
+            watermark,
+        )? {
             Some(session) => session,
             None => {
                 self.note_aggregate_scan();
-                aggregate_for_session(conn, harness, &project_key.project_key, session_id)?
+                read_aggregate(conn, &project_key, Some(session_id), watermark)?
             }
         };
         if let Some(read) = read {
@@ -171,26 +171,14 @@ impl CompressionAggregateCache {
         if inner.connection_identity == Some(conn as *const Connection as usize)
             && self.epoch.load(std::sync::atomic::Ordering::Acquire) == epoch
         {
-            inner.projects.insert(
-                project_key,
-                CachedAggregate {
-                    aggregate: project,
-                    watermark,
-                },
-            );
-            inner.sessions.insert(
-                session_key,
-                CachedAggregate {
-                    aggregate: session,
-                    watermark,
-                },
-            );
+            inner.projects.insert(project_key, project);
+            inner.sessions.insert(session_key, session);
         }
-        Ok((project, session))
+        Ok((project.aggregate, session.aggregate))
     }
 
-    /// Validate warm totals with one indexed watermark lookup, never aggregate
-    /// on the push thread. A miss is recomputed by `refresh_for_status`.
+    /// Validate warm totals without reading historical event payloads. A
+    /// cold or changed key is recomputed by `refresh_for_status`.
     pub fn validated_for_status(
         &self,
         conn: &Connection,
@@ -198,18 +186,40 @@ impl CompressionAggregateCache {
         project_key: &str,
         session_id: &str,
     ) -> rusqlite::Result<Option<(CompressionAggregate, CompressionAggregate)>> {
+        let read = conn
+            .is_autocommit()
+            .then(|| conn.unchecked_transaction())
+            .transpose()?;
         let watermark = compression_event_watermark(conn)?;
         let project_key = ProjectAggregateKey::new(harness, project_key);
         let session_key = SessionAggregateKey::new(harness, &project_key.project_key, session_id);
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let (project, session) = {
+            let mut inner = self.inner.lock();
+            reset_for_connection_change(&mut inner, conn);
+            (
+                inner.projects.get(&project_key).copied(),
+                inner.sessions.get(&session_key).copied(),
+            )
+        };
+        let project = current_aggregate(conn, project, &project_key, None, watermark)?;
+        let session = current_aggregate(conn, session, &project_key, Some(session_id), watermark)?;
+        if let Some(read) = read {
+            read.commit()?;
+        }
         let mut inner = self.inner.lock();
-        reset_for_connection_change(&mut inner, conn);
-        Ok(inner
-            .projects
-            .get(&project_key)
-            .zip(inner.sessions.get(&session_key))
-            .filter(|(project, session)| {
-                project.watermark == watermark && session.watermark == watermark
-            })
+        if inner.connection_identity == Some(conn as *const Connection as usize)
+            && self.epoch.load(std::sync::atomic::Ordering::Acquire) == epoch
+        {
+            if let Some(project) = project {
+                inner.projects.insert(project_key, project);
+            }
+            if let Some(session) = session {
+                inner.sessions.insert(session_key, session);
+            }
+        }
+        Ok(project
+            .zip(session)
             .map(|(project, session)| (project.aggregate, session.aggregate)))
     }
 
@@ -375,27 +385,13 @@ pub fn aggregate_for_project(
     harness: &str,
     project_key: &str,
 ) -> rusqlite::Result<CompressionAggregate> {
-    conn.query_row(
-        r#"
-        SELECT SUM(events), SUM(original), SUM(compressed) FROM (
-            SELECT COUNT(*) AS events,
-                   COALESCE(SUM(original_tokens), 0) AS original,
-                   COALESCE(SUM(compressed_tokens), 0) AS compressed
-            FROM compression_events WHERE harness = ?1 AND project_key = ?2
-            UNION ALL
-            SELECT events, original_tokens, compressed_tokens
-            FROM compression_event_rollups WHERE harness = ?1 AND project_key = ?2
-        )
-        "#,
-        params![harness, project_key],
-        |row| {
-            Ok(CompressionAggregate {
-                events: row.get::<_, i64>(0)? as u64,
-                original_tokens: row.get::<_, i64>(1)? as u64,
-                compressed_tokens: row.get::<_, i64>(2)? as u64,
-            })
-        },
-    )
+    Ok(read_aggregate(
+        conn,
+        &ProjectAggregateKey::new(harness, project_key),
+        None,
+        0,
+    )?
+    .aggregate)
 }
 
 pub fn aggregate_for_session(
@@ -404,30 +400,124 @@ pub fn aggregate_for_session(
     project_key: &str,
     session_id: &str,
 ) -> rusqlite::Result<CompressionAggregate> {
-    // Without statistics the planner can prefer the project index, visiting
-    // every session in the project instead of just the requested session.
-    conn.query_row(
-        r#"
-        SELECT SUM(events), SUM(original), SUM(compressed) FROM (
-            SELECT COUNT(*) AS events,
-                   COALESCE(SUM(original_tokens), 0) AS original,
-                   COALESCE(SUM(compressed_tokens), 0) AS compressed
-            FROM compression_events INDEXED BY idx_compression_session
-            WHERE harness = ?1 AND project_key = ?2 AND session_id = ?3
-            UNION ALL
-            SELECT events, original_tokens, compressed_tokens
-            FROM compression_event_rollups
-            WHERE harness = ?1 AND project_key = ?2 AND session_is_null = 0 AND session_id = ?3
-        )
-        "#,
-        params![harness, project_key, session_id],
-        |row| {
-            Ok(CompressionAggregate {
+    Ok(read_aggregate(
+        conn,
+        &ProjectAggregateKey::new(harness, project_key),
+        Some(session_id),
+        0,
+    )?
+    .aggregate)
+}
+
+const PROJECT_AGGREGATE_SQL: &str = "
+    SELECT SUM(events), SUM(original), SUM(compressed), SUM(folded) FROM (
+        SELECT COUNT(*) AS events, COALESCE(SUM(original_tokens), 0) AS original,
+               COALESCE(SUM(compressed_tokens), 0) AS compressed, 0 AS folded
+        FROM compression_events INDEXED BY idx_compression_project_key
+        WHERE harness = ?1 AND project_key = ?2
+        UNION ALL
+        SELECT events, original_tokens, compressed_tokens, events
+        FROM compression_event_rollups WHERE harness = ?1 AND project_key = ?2
+    )";
+
+const SESSION_AGGREGATE_SQL: &str = "
+    SELECT SUM(events), SUM(original), SUM(compressed), SUM(folded) FROM (
+        SELECT COUNT(*) AS events, COALESCE(SUM(original_tokens), 0) AS original,
+               COALESCE(SUM(compressed_tokens), 0) AS compressed, 0 AS folded
+        FROM compression_events INDEXED BY idx_compression_session
+        WHERE harness = ?1 AND project_key = ?2 AND session_id = ?3
+        UNION ALL
+        SELECT events, original_tokens, compressed_tokens, events
+        FROM compression_event_rollups
+        WHERE harness = ?1 AND project_key = ?2 AND session_is_null = 0 AND session_id = ?3
+    )";
+
+fn read_aggregate(
+    conn: &Connection,
+    key: &ProjectAggregateKey,
+    session: Option<&str>,
+    watermark: i64,
+) -> rusqlite::Result<CachedAggregate> {
+    let read = |row: &rusqlite::Row<'_>| {
+        Ok(CachedAggregate {
+            aggregate: CompressionAggregate {
                 events: row.get::<_, i64>(0)? as u64,
                 original_tokens: row.get::<_, i64>(1)? as u64,
                 compressed_tokens: row.get::<_, i64>(2)? as u64,
-            })
-        },
+            },
+            rolled_up_events: row.get(3)?,
+            watermark,
+        })
+    };
+    // Without statistics the planner can prefer the project index, visiting
+    // every session in the project instead of just the requested session.
+    if let Some(session) = session {
+        conn.prepare_cached(SESSION_AGGREGATE_SQL)?
+            .query_row(params![key.harness, key.project_key, session], read)
+    } else {
+        conn.prepare_cached(PROJECT_AGGREGATE_SQL)?
+            .query_row(params![key.harness, key.project_key], read)
+    }
+}
+
+const PROJECT_RAW_ADVANCED_SQL: &str = "SELECT EXISTS (
+    SELECT 1 FROM compression_events INDEXED BY idx_compression_project_key
+    WHERE harness = ?1 AND project_key = ?2 AND id > ?3
+)";
+const SESSION_RAW_ADVANCED_SQL: &str = "SELECT EXISTS (
+    SELECT 1 FROM compression_events INDEXED BY idx_compression_session
+    WHERE harness = ?1 AND project_key = ?2 AND id > ?3 AND session_id = ?4
+)";
+
+fn current_aggregate(
+    conn: &Connection,
+    cached: Option<CachedAggregate>,
+    key: &ProjectAggregateKey,
+    session: Option<&str>,
+    watermark: i64,
+) -> rusqlite::Result<Option<CachedAggregate>> {
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    if cached.watermark == watermark {
+        return Ok(Some(cached));
+    }
+    let read_bool = |row: &rusqlite::Row<'_>| row.get::<_, bool>(0);
+    let raw_advanced = if let Some(session) = session {
+        conn.prepare_cached(SESSION_RAW_ADVANCED_SQL)?.query_row(
+            params![key.harness, key.project_key, cached.watermark, session],
+            read_bool,
+        )?
+    } else {
+        conn.prepare_cached(PROJECT_RAW_ADVANCED_SQL)?.query_row(
+            params![key.harness, key.project_key, cached.watermark],
+            read_bool,
+        )?
+    };
+    if raw_advanced {
+        return Ok(None);
+    }
+    // Retention can fold a newly inserted, backdated event before a reader
+    // observes it. Folded counts only grow and the primary key bounds this
+    // check to one row per relevant rolled-up session, not raw event history.
+    let rolled_up_events = if let Some(session) = session {
+        conn.prepare_cached("SELECT COALESCE((SELECT events FROM compression_event_rollups
+             WHERE harness = ?1 AND project_key = ?2 AND session_is_null = 0 AND session_id = ?3), 0)")?
+            .query_row(params![key.harness, key.project_key, session], |row| row.get::<_, i64>(0))?
+    } else {
+        conn.prepare_cached(
+            "SELECT COALESCE(SUM(events), 0) FROM compression_event_rollups
+             WHERE harness = ?1 AND project_key = ?2",
+        )?
+        .query_row(params![key.harness, key.project_key], |row| {
+            row.get::<_, i64>(0)
+        })?
+    };
+    Ok(
+        (rolled_up_events == cached.rolled_up_events).then_some(CachedAggregate {
+            watermark,
+            ..cached
+        }),
     )
 }
 
@@ -597,6 +687,20 @@ const RETENTION_CANDIDATES: &str = "
     WHERE (created_at, id) > (?1, ?2) AND created_at < ?3
     ORDER BY created_at, id LIMIT ?4";
 
+const OLD_COMPRESSION_EVENT_EXISTS: &str = "SELECT EXISTS (
+    SELECT 1 FROM compression_events INDEXED BY idx_compression_created
+    WHERE created_at < ?1 AND id <> ?2
+)";
+
+fn compression_retention_due(conn: &Connection, now_ms: i64) -> rusqlite::Result<bool> {
+    let watermark = compression_event_watermark(conn)?;
+    conn.prepare_cached(OLD_COMPRESSION_EVENT_EXISTS)?
+        .query_row(
+            params![now_ms.saturating_sub(RETENTION_AGE_MS), watermark],
+            |row| row.get(0),
+        )
+}
+
 /// Fold and remove at most 500 old events in one atomic transaction.
 ///
 /// The cursor bounds rows examined as well as rows deleted, so long-running
@@ -607,6 +711,9 @@ const RETENTION_CANDIDATES: &str = "
 /// the retention window no longer participates in duplicate suppression.
 pub fn prune_compression_events(conn: &mut Connection, now_ms: i64) -> rusqlite::Result<usize> {
     use rusqlite::TransactionBehavior;
+    if !compression_retention_due(conn, now_ms)? {
+        return Ok(0);
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let deleted = prune_compression_events_in_transaction(&tx, now_ms)?;
     tx.commit()?;
@@ -618,6 +725,9 @@ fn prune_compression_events_in_transaction(
     now_ms: i64,
 ) -> rusqlite::Result<usize> {
     use rusqlite::OptionalExtension;
+    if !compression_retention_due(conn, now_ms)? {
+        return Ok(0);
+    }
     let (created_at, event_id) = conn
         .query_row(
             "SELECT created_at, event_id FROM compression_retention_cursor WHERE singleton = 1",
@@ -682,6 +792,9 @@ fn prune_compression_events_in_transaction(
         .last()
         .map(|row| (row.1, row.0))
         .unwrap_or((i64::MIN, 0));
+    if (next_created, next_id) == (created_at, event_id) {
+        return Ok(deleted);
+    }
     conn.execute(
         "INSERT INTO compression_retention_cursor VALUES (1, ?1, ?2)
          ON CONFLICT(singleton) DO UPDATE SET created_at = excluded.created_at, event_id = excluded.event_id",
@@ -1180,7 +1293,7 @@ pub fn prune_retention_sweep_observed(
 /// minute, or a few seconds after a sweep skipped for lack of the mutex.
 pub fn maybe_spawn_retention(
     db: Option<std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>>,
-    guard: RetentionGuard,
+    guard: impl FnOnce() -> RetentionGuard,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1194,6 +1307,7 @@ pub fn maybe_spawn_retention(
     }
     *next_due = Some(Instant::now() + crate::db::maintenance_interval());
     drop(next_due);
+    let guard = guard();
     if let Err(error) = std::thread::Builder::new()
         .name("aft-retention".into())
         .spawn(move || {
@@ -1201,11 +1315,9 @@ pub fn maybe_spawn_retention(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            match prune_retention_sweep(
-                &db,
-                i64::try_from(now).unwrap_or(i64::MAX),
-                &guard,
-            ) {
+            let now_ms = i64::try_from(now).unwrap_or(i64::MAX);
+            if heavy_retention_due(&db, now_ms) {
+                match prune_retention_sweep(&db, now_ms, &guard) {
                 Ok(RetentionSweepOutcome::Completed(sweep)) => {
                     RETENTION_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
                     log_completed_retention_sweep(&sweep);
@@ -1230,51 +1342,75 @@ pub fn maybe_spawn_retention(
                         );
                     }
                 }
-                Err(error) => crate::slog_warn!("retention failed: {}", error),
+                    Err(error) => crate::slog_warn!("retention failed: {}", error),
+                }
+            } else {
+                record_retention_sweep_skip(&db, None);
+                RETENTION_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
             }
             // Revoked bot-write authorities: bounded by its own time budget.
-            crate::db::gh_speech::retention::run_tick(
-                &db,
-                i64::try_from(now).unwrap_or(i64::MAX),
-            );
+            crate::db::gh_speech::retention::run_tick(&db, now_ms);
             // These sweeps write, so they take the same short busy budget as the
             // other maintenance writes: under another process's write lock they
             // defer to the next run instead of holding the connection mutex for
             // the steady busy timeout, which would stall every request's reads.
-            let budget = crate::db::maintenance_busy_budget(RETENTION_MUTATION_BUSY_WAIT);
-            let now_ms = i64::try_from(now).unwrap_or(i64::MAX);
-            let report = |what: &str, outcome: Result<(), crate::db::MaintenanceWriteError>| {
-                match outcome {
-                    Ok(()) | Err(crate::db::MaintenanceWriteError::MutexHeld) => {}
-                    Err(crate::db::MaintenanceWriteError::Busy(error)) => {
-                        crate::slog_debug!("{what} retention deferred: {error}");
-                    }
-                    Err(crate::db::MaintenanceWriteError::Poisoned) => {
-                        log::warn!("{what} retention skipped: database mutex poisoned");
-                    }
-                    Err(crate::db::MaintenanceWriteError::Failed(error)) => {
-                        crate::slog_warn!("{what} retention failed: {error}");
-                    }
-                }
-            };
-            report(
-                "display record",
-                crate::db::maintenance_write(&db, budget, |conn| {
-                    crate::db::display_records::sweep(conn, now_ms).map(|_| ())
-                }),
-            );
-            report(
-                "codemode runner snapshot",
-                crate::db::maintenance_write(&db, budget, |conn| {
-                    crate::db::codemode_owners::sweep(conn, now_ms)
-                }),
-            );
+            run_write_chores(&db, i64::try_from(now).unwrap_or(i64::MAX));
             IN_FLIGHT.store(false, Ordering::Release);
         })
     {
         IN_FLIGHT.store(false, Ordering::Release);
         crate::slog_warn!("compression retention worker failed: {}", error);
     }
+}
+
+/// One bounded pass of the retention sweeps that delete expired or excess rows.
+pub(crate) fn run_write_chores(db: &std::sync::Mutex<crate::db::TrackedConnection>, now_ms: i64) {
+    let budget = crate::db::maintenance_busy_budget(RETENTION_MUTATION_BUSY_WAIT);
+    let report = |what: &str, outcome: Result<(), crate::db::MaintenanceWriteError>| match outcome {
+        Ok(()) | Err(crate::db::MaintenanceWriteError::MutexHeld) => {}
+        Err(crate::db::MaintenanceWriteError::Busy(error)) => {
+            crate::slog_debug!("{what} retention deferred: {error}");
+        }
+        Err(crate::db::MaintenanceWriteError::Poisoned) => {
+            log::warn!("{what} retention skipped: database mutex poisoned");
+        }
+        Err(crate::db::MaintenanceWriteError::Failed(error)) => {
+            crate::slog_warn!("{what} retention failed: {error}");
+        }
+    };
+    report(
+        "display record",
+        crate::db::maintenance_write(db, budget, |conn| {
+            crate::db::display_records::sweep(conn, now_ms).map(|_| ())
+        }),
+    );
+    report(
+        "codemode runner snapshot",
+        crate::db::maintenance_write(db, budget, |conn| {
+            crate::db::codemode_owners::sweep(conn, now_ms)
+        }),
+    );
+    report(
+        "GitHub read cache",
+        crate::db::maintenance_write(db, budget, |conn| {
+            crate::db::github_read_cache::sweep(conn, now_ms).map(|_| ())
+        }),
+    );
+}
+
+fn heavy_retention_due(db: &SharedDb, now_ms: i64) -> bool {
+    let Ok(conn) = db.try_lock() else {
+        // Let the normal sweep report contention and schedule a retry.
+        return true;
+    };
+    let due = || -> rusqlite::Result<bool> {
+        Ok(
+            crate::db::bash_tasks::terminal_retention_due(&conn, now_ms)?
+                || compression_retention_due(&conn, now_ms)?
+                || crate::db::rich_ui::preset_retention_due(&conn, now_ms)?,
+        )
+    };
+    due().unwrap_or(true)
 }
 
 fn log_completed_retention_sweep(sweep: &RetentionSweep) {
@@ -1765,6 +1901,144 @@ pub mod tests {
                 .unwrap(),
             Some(warm)
         );
+    }
+
+    #[test]
+    fn status_compression_does_not_rescan_for_unrelated_watermark_advances() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let status = crate::db::open(&path).unwrap();
+        let external = crate::db::open(&path).unwrap();
+        let cache = CompressionAggregateCache::default();
+        insert_compression_event(&external, &row("project-a", "ours", 100, 40, 1)).unwrap();
+        let warm = cache
+            .aggregates_for_session(&status, "opencode", "project-a", "session-1")
+            .unwrap();
+        let before = cache.aggregate_scan_count_for_test();
+        // Insert one event per second for a different project over a minute.
+        for second in 1..=60 {
+            insert_compression_event(
+                &external,
+                &row("project-b", &format!("other-{second}"), 90, 30, second),
+            )
+            .unwrap();
+            assert_eq!(
+                cache
+                    .aggregates_for_session(&status, "opencode", "project-a", "session-1")
+                    .unwrap(),
+                warm
+            );
+        }
+        assert_eq!(cache.aggregate_scan_count_for_test() - before, 0);
+    }
+
+    #[test]
+    fn status_compression_reads_use_keyed_indexes() {
+        let dir = tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        for (sql, parameters, index, tail) in [
+            (
+                PROJECT_AGGREGATE_SQL,
+                params!["opencode", "project-a"],
+                "idx_compression_project_key",
+                false,
+            ),
+            (
+                SESSION_AGGREGATE_SQL,
+                params!["opencode", "project-a", "session-1"],
+                "idx_compression_session",
+                false,
+            ),
+            (
+                PROJECT_RAW_ADVANCED_SQL,
+                params!["opencode", "project-a", 100],
+                "idx_compression_project_key",
+                true,
+            ),
+            (
+                SESSION_RAW_ADVANCED_SQL,
+                params!["opencode", "project-a", 100, "session-1"],
+                "idx_compression_session",
+                true,
+            ),
+        ] {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(parameters, |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with("SEARCH compression_events ")
+                        && detail.contains(index)
+                        && (!tail || detail.contains("rowid>?"))),
+                "{plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compression_retention_does_not_write_when_no_old_events_are_due() {
+        let dir = tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        insert_compression_event(&conn, &row("project-a", "recent", 100, 40, 100)).unwrap();
+        let before = conn.total_changes();
+        for now in 1..=60 {
+            assert_eq!(prune_compression_events(&mut conn, now).unwrap(), 0);
+        }
+        assert_eq!(conn.total_changes() - before, 0);
+    }
+
+    #[test]
+    fn idle_retention_ignores_the_watermark_without_loading_its_candidate_row() {
+        let dir = tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let watermark = insert_compression_event(&conn, &row("project-a", "only", 100, 40, 1))
+            .unwrap()
+            .unwrap();
+        let now = RETENTION_AGE_MS + 100;
+        let age_cutoff = now - RETENTION_AGE_MS;
+
+        // Before the due check, the full candidate projection read this row
+        // only to discard it as the watermark.
+        let candidates = conn
+            .prepare(RETENTION_CANDIDATES)
+            .unwrap()
+            .query_map(params![i64::MIN, 0, age_cutoff, RETENTION_BATCH], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(candidates, [watermark]);
+        let due_plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {OLD_COMPRESSION_EVENT_EXISTS}"
+            ))
+            .unwrap()
+            .query_map(params![age_cutoff, watermark], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            due_plan.contains("COVERING INDEX idx_compression_created (created_at<?)"),
+            "{due_plan}"
+        );
+        assert!(!compression_retention_due(&conn, now).unwrap());
+        let before = conn.total_changes();
+        assert_eq!(prune_compression_events(&mut conn, now).unwrap(), 0);
+        assert_eq!(conn.total_changes(), before);
+
+        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        assert!(!heavy_retention_due(&db, now));
+        insert_compression_event(&db.lock().unwrap(), &row("project-b", "new", 10, 5, now))
+            .unwrap();
+        assert!(heavy_retention_due(&db, now));
     }
 
     fn row<'a>(

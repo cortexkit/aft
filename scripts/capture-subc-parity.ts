@@ -501,7 +501,7 @@ function formatStatus(response: Record<string, unknown>): string {
 
 const TRANSLATE_CASES: TranslateCase[] = [
   { name: "status_empty", tool_name: "status", agent_args: {} },
-  { name: "read_offset_limit", tool_name: "read", agent_args: { filePath: "src/../README.md", offset: 2, limit: 3 } },
+  { name: "read_offset_limit", tool_name: "read", agent_args: { filePath: "README.md", offset: 2, limit: 3 } },
   { name: "write_default_diagnostics", tool_name: "write", agent_args: { filePath: "src/new.ts", content: "export {};\n" } },
   { name: "write_diagnostics_true", tool_name: "write", diagnostics_on_edit: true, agent_args: { filePath: "src/new.ts", content: "export {};\n" } },
   { name: "edit_append", tool_name: "edit", diagnostics_on_edit: true, agent_args: { filePath: "src/main.ts", appendContent: "\nexport {};\n" } },

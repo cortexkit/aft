@@ -43,6 +43,7 @@ import {
   type PatternMatchEntry,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
+  setActiveSessionId,
   trackBgTask,
 } from "../bg-notifications.js";
 import type { PluginContext } from "../types.js";
@@ -1107,6 +1108,52 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(ackCalls).toHaveLength(1);
     expect(ackCalls[0]?.params).toEqual({ session_id: "s1", task_ids: ["task-erased"] });
     expect(events.indexOf("deliver")).toBeLessThan(events.indexOf("bash_ack_completions"));
+  });
+
+  test("a session switch during wake debounce preserves the wake for replay", async () => {
+    const sessionID = "s-switch-wake";
+    const match: PatternMatchEntry = {
+      task_id: "task-switch",
+      session_id: sessionID,
+      watch_id: "watch-switch",
+      match_text: "READY",
+      match_offset: 7,
+      context: "server READY",
+      once: true,
+      reason: "pattern_match",
+      ackCompletionOnDelivery: true,
+    };
+    let pending = [match];
+    const acks: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: pending };
+      if (command === "bash_ack_completions") {
+        acks.push(params);
+        pending = [];
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sendUserMessage = mock(() => {});
+    const context = { ctx, directory: "/project", sessionID, runtime: { sendUserMessage } };
+
+    setActiveSessionId(sessionID);
+    await handlePushedPatternMatch(context, match);
+    setActiveSessionId("s-other");
+    await sleep(250);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(acks).toEqual([]);
+
+    setActiveSessionId(sessionID);
+    await handleSubcBgEventsNudge(context);
+    await waitUntil(() => sendUserMessage.mock.calls.length === 1 && acks.length === 1, 2_000);
+
+    expect(sendUserMessage.mock.calls[0][0]).toContain('task task-switch matched "READY"');
+    expect(acks[0]).toEqual({
+      session_id: sessionID,
+      matches: [{ task_id: "task-switch", watch_id: "watch-switch", match_offset: 7 }],
+    });
   });
 
   test("a forced drain delivers and acknowledges a durable pattern match", async () => {

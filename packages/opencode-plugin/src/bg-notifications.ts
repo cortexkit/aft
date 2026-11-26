@@ -252,6 +252,8 @@ export interface BgNotificationDelivery {
     sessionID: string | undefined,
     match: import("@cortexkit/aft-bridge").BashPatternMatchAck,
   ): void;
+  /** A confirmed task-level acknowledgement of a drained completion. */
+  completionAcked?(sessionID: string | undefined, taskId: string): void;
   /** Durable absence also retires state when an acknowledgement response was lost. */
   patternMatchesPending?(
     sessionID: string | undefined,
@@ -393,8 +395,8 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
 export async function markBgCompletionDelivered(
   drainContext: DrainContext,
   taskId: string,
-): Promise<void> {
-  // C-#1 site 5: an inline bash_watch wait already delivered this task's result
+): Promise<boolean> {
+  // An inline bash_watch wait already delivered this task's result
   // in its tool output. Mark it awaiting-ack so a forced drain racing this ack
   // re-acks rather than re-delivering, then confirm/keep on the ack result. (Do
   // NOT route this through consumedTaskIds — that set is also used pre-delivery
@@ -403,6 +405,7 @@ export async function markBgCompletionDelivered(
   markDeliveredAwaitingAck(state, [taskId]);
   const acked = await ackCompletions(drainContext, [{ task_id: taskId }]);
   if (acked) confirmAcked(state, [taskId]);
+  return acked;
 }
 
 /**
@@ -616,7 +619,7 @@ export function ingestBgCompletions(
       queuePendingPatternMatch(state, completionToExitPattern(completion, sessionID, true));
       continue;
     }
-    // C-#1: skip a task whose delivery is in flight / awaiting ack — a late push
+    // Skip a task whose delivery is in flight / awaiting ack — a late push
     // for an already-departing completion would otherwise re-queue a duplicate.
     if (isDeliveringOrAwaitingAck(state, completion.task_id)) {
       state.outstandingTaskIds.delete(completion.task_id);
@@ -709,8 +712,8 @@ export async function appendInTurnBgCompletions(
   if (reminder) output.output = appendReminder(output.output ?? "", reminder);
   state.batchAdmissions.admit(deliveredPatternMatches);
   cancelSatisfiedAdmissions(state, inTurnTasks);
-  // Trace #7 of 7: reminder went out as part of an existing tool result
-  // instead of through promptAsync. NO wake_prompt_async_start event
+  // Wake-chain log, in-turn branch: the reminder went out as part of an
+  // existing tool result instead of through promptAsync. NO wake_prompt_async_start event
   // accompanies this branch — that's the diagnostic signal that the
   // reminder reached the model via tool-result piggyback.
   sessionLog(drainContext.sessionID, `${LOG_PREFIX} in-turn append`, {
@@ -733,7 +736,7 @@ export async function appendInTurnBgCompletions(
   state.retryDelayMs = null;
   state.wakeRetryAttempts = 0;
   state.wakeHardStopped = false;
-  // C-#1 site 4: this path delivers via the tool-result piggyback (already
+  // The in-turn path delivers via the tool-result piggyback (already
   // written to output.output above — delivery cannot fail here), so mark the
   // ack-target ids awaiting-ack directly, then confirm/keep on the ack result.
   const inTurnAckIds = completionAcks.map(bashAckKey);
@@ -1860,7 +1863,7 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
       count: drainedTaskIds.length,
       task_ids: drainedTaskIds,
     });
-    // C-#3 / R2-T3: reconcile the awaiting-ack set against the drain snapshot
+    // Reconcile the awaiting-ack set against the drain snapshot
     // (daemon truth). A task the drain still returns is held unacked → re-ack it
     // so the registry drops it and the nudges stop (self-terminating). A task the
     // drain no longer returns was already dropped daemon-side → reconcile forgets
@@ -1929,12 +1932,13 @@ async function ackCompletions(
     for (const target of completions) {
       if ("watch_id" in target)
         drainContext.delivery?.patternMatchAcked?.(drainContext.sessionID, target);
+      else drainContext.delivery?.completionAcked?.(drainContext.sessionID, target.task_id);
     }
     stateFor(drainContext.sessionID).batchAdmissions.confirmed(completions);
-    // Trace #6 of 7: bash_ack_completions succeeded on the Rust side.
+    // Wake-chain log, last step: bash_ack_completions succeeded on the Rust side.
     // Closes the wake chain: scheduled → fire → start → ok → ack_ok.
     // Note: ack also runs from appendInTurnBgCompletions without a
-    // deliveryID — that path uses trace #7 (in_turn_append) instead, so
+    // deliveryID — that path logs in_turn_append instead, so
     // ack_ok carries delivery_id only when present.
     logPerTaskDeliveryHop(drainContext, "ack-ok", "ack ok", taskIds, {
       event: "bash_completion_ack_ok",
@@ -2037,7 +2041,7 @@ function scheduleWake(
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   const delay = state.retryDelayMs ?? Math.max(0, (state.scheduledFireAt ?? now) - now);
 
-  // Trace #1 of 7 for the wake-delivery chain. Pairs with bash_completion_wake_fire.
+  // Wake-chain log, first step. Pairs with bash_completion_wake_fire.
   // When the OpenCode DB later shows N assistant children for one parent
   // user message, the matching count of wake_scheduled / wake_fire /
   // wake_prompt_async_start events for the same task_ids tells us whether
@@ -2079,7 +2083,7 @@ function scheduleWake(
       state.batchAdmissions.unseen(pendingPatternMatches),
     );
 
-    // Trace #2 of 7: timer actually fired and we captured a non-empty
+    // Wake-chain log, second step: timer actually fired and we captured a non-empty
     // pending set. The matching wake_prompt_async_start MUST follow within
     // ~milliseconds — its absence means sendWake threw synchronously
     // before reaching client.session.promptAsync.
@@ -2104,7 +2108,7 @@ function scheduleWake(
       (item) => !pendingPatternMatches.includes(item),
     );
     const completionAcks = completionAcksForDelivery(pending, pendingPatternMatches);
-    // C-#1 site 1: mark ALL ack-target ids (completions + ack-on-delivery pattern
+    // Mark ALL ack-target ids (completions + ack-on-delivery pattern
     // matches, not just `pending`) as delivery-in-flight at the same synchronous
     // tick they leave the queues, BEFORE the sendWake await. Ingest skips them so
     // a forced drain in the delivery window can't re-accept them.
@@ -2176,7 +2180,7 @@ function scheduleWake(
           onSendFailure(err, true);
           return;
         }
-        // C-#1 site 3: delivery failed BEFORE departing (sendWake only rejects on
+        // Delivery failed BEFORE departing (sendWake only rejects on
         // getInProcessClient/sendPrompt throw, which is before the awaiting-ack
         // move — ackCompletions never throws). Clear the in-flight marks so the
         // re-prepended tasks are redeliverable on the retry.
@@ -2272,10 +2276,10 @@ function ingestDrainedBgCompletions(
     // Suppress completions for tasks already consumed inline by a
     // bash_status wait (same dedupe as ingestBgCompletions push path).
     if (state.consumedTaskIds.has(completion.task_id)) continue;
-    // C-#1: a completion mid-delivery (in flight) or delivered-but-not-yet-acked
+    // A completion mid-delivery (in flight) or delivered-but-not-yet-acked
     // must NOT be re-accepted as a fresh delivery, or a forced drain in that
     // window double-delivers it. The drainCompletions caller separately re-acks
-    // the awaiting-ack ones (C-#3) so the module's re-nudge loop terminates.
+    // the awaiting-ack ones so the module's re-nudge loop terminates.
     if (isDeliveringOrAwaitingAck(state, completion.task_id)) continue;
     if (
       !state.pendingCompletions.some((pending) => pending.task_id === completion.task_id) &&
@@ -2420,9 +2424,9 @@ function clearAwaitingAck(state: SessionBgState, taskIds: readonly string[]): vo
 }
 
 /**
- * Reconcile the awaiting-ack set against a forced drain's snapshot (R2-T3, the
+ * Reconcile the awaiting-ack set against a forced drain's snapshot (the
  * daemon is the source of truth). For each awaiting-ack task: if the drain
- * STILL returns it, the daemon holds it unacked → RE-ACK it (C-#3 close). If the
+ * STILL returns it, the daemon holds it unacked → RE-ACK it, so its re-nudges stop. If the
  * drain does NOT return it, the daemon already dropped it (a prior ack landed or
  * it was consumed elsewhere) → forget it. Returns the ids to re-ack; the caller
  * acks then confirms. This replaces a timer-based eviction that could drop a

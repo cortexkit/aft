@@ -8,6 +8,11 @@ pub const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 pub const GH_SHIM_TICKET_ENV: &str = "AFT_GH_SHIM_TICKET";
 /// Restriction hint added only by worker launch planning. It cannot grant identity.
 pub const GH_SHIM_WORKER_ENV: &str = "AFT_GH_SHIM_WORKER";
+/// Set to `1` by the daemon exactly when its resolved configuration (which
+/// honours `harnesses.<name>.github.shim`) put the shim on a child's `PATH`.
+/// The shim treats only `1` as meaningful: the child's shell can set any
+/// variable, so no value of this variable may switch governance off.
+pub const GH_SHIM_ENABLED_ENV: &str = "AFT_GH_SHIM_ENABLED";
 
 /// Render the Windows command wrapper separately so its quoting contract can be
 /// checked on every development platform; `cmd.exe` dispatch still requires

@@ -292,6 +292,12 @@ fn prepare_snapshot(
     let report = roots
         .reconcile(&config)
         .map_err(|error| IndexError::validation(error.to_string()))?;
+    // One refused root (for example a symlink that now resolves elsewhere)
+    // fails the whole command, so `aft index` never presents a partial
+    // snapshot as complete.
+    if let Some(refusal) = report.refused.first() {
+        return Err(IndexError::validation(refusal.error.clone()));
+    }
     if report
         .active_entries
         .iter()

@@ -481,7 +481,10 @@ fn shim_command(
         .env_remove("GH_ENTERPRISE_TOKEN")
         .env_remove("GH_REPO")
         .env_remove("GH_SHIM_RENAME_PUBLISHED")
-        .env_remove("GH_SHIM_BYPASS");
+        .env_remove("GH_SHIM_BYPASS")
+        // A test run from an AFT-governed shell inherits the daemon's enable
+        // marker, which would override the config these fixtures write.
+        .env_remove("AFT_GH_SHIM_ENABLED");
     shim
 }
 

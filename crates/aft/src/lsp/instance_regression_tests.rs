@@ -92,7 +92,7 @@ fn frame(message: Value) -> String {
 
 fn diagnostics(file: &Path, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
-        "uri": uri_for_path(file).unwrap(), "version": 0, "diagnostics": [{
+        "uri": uri_for_path(file).unwrap(), "version": FIRST_VERSION, "diagnostics": [{
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
             "severity": 1, "message": message
         }]
@@ -272,7 +272,7 @@ fn current_reader_events_still_apply() {
     let mut manager = LspManager::new();
     std::fs::write(&file, "const value = 1;\n").unwrap();
     let file = canonicalize_for_lsp(&file).unwrap();
-    manager.sync_document_version_for_test(&key(dir.path()), &file, 0);
+    manager.sync_document_version_for_test(&key(dir.path()), &file, FIRST_VERSION);
     let instance = ServerInstanceId::next();
     let pause = Pause::install(instance, Stage::Reader);
     let command = format!(
@@ -344,7 +344,7 @@ fn unversioned_push_queued_before_the_latest_text_sync_is_not_current() {
         .unwrap();
     assert_eq!(
         manager.version_for_unversioned_push(&key(dir.path()), &file, Some(sync_order + 1)),
-        Some(1),
+        Some(2),
         "control: a later receipt with matching content can certify this push-only file"
     );
     drop(pause);
@@ -422,7 +422,7 @@ fn unversioned_push_authority_tracks_disk_content_and_dynamic_pull_registration(
     manager.ingest_document_report(
         &key,
         &file,
-        Some(0),
+        Some(FIRST_VERSION),
         None,
         serde_json::from_value(json!({"kind":"full", "items":[]})).unwrap(),
     );
@@ -475,7 +475,7 @@ fn startup_replay_preserves_reader_instance() {
     let mut manager = LspManager::new();
     std::fs::write(&file, "const value = 1;\n").unwrap();
     let file = canonicalize_for_lsp(&file).unwrap();
-    manager.sync_document_version_for_test(&key(dir.path()), &file, 0);
+    manager.sync_document_version_for_test(&key(dir.path()), &file, FIRST_VERSION);
     let instance = ServerInstanceId::next();
     let pause = Pause::install(instance, Stage::Reader);
     let command = format!(

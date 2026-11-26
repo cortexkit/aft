@@ -25,13 +25,15 @@ use allocator::CachedAllocatorObservation;
 mod demand;
 #[path = "health/legacy_root.rs"]
 mod legacy_root;
+#[path = "health/reply_tracking.rs"]
+mod reply_tracking;
 mod root_evidence;
+pub(super) use reply_tracking::bash_watch_warning_wait_ms;
+use reply_tracking::UnansweredTool;
 use root_evidence::{health_failure_evidence, health_failure_field, health_nondefault};
 
 const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
     "executor scheduler state could not be snapshotted without contention";
-const UNANSWERED_TOOL_DEADLINE: Duration = Duration::from_secs(25);
-const BASH_WATCH_UNANSWERED_GRACE: Duration = Duration::from_secs(5);
 
 /// Why the idle reaper kept an existing, unbound root that is past its idle
 /// TTL. Deleted roots are counted separately in the census's `blockers`.
@@ -696,197 +698,6 @@ impl DispatchPathMetrics {
             scoped_routes_with_tool_calls: AtomicU64::new(0),
             scope_descriptions: StdMutex::new(super::route_census::ScopeDescriptions::default()),
             scope_background_tasks: Default::default(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn tool_received(&self, frame: &super::Frame, received_at: Instant) {
-        let body = serde_json::from_slice::<Value>(&frame.body).ok();
-        self.tool_received_value(frame, received_at, body.as_ref());
-    }
-
-    pub(super) fn tool_received_decoded(&self, decoded: &super::DecodedFrame) {
-        self.tool_received_value(
-            &decoded.frame,
-            decoded.phase_trace.received_at(),
-            decoded.body().ok(),
-        );
-    }
-
-    fn tool_received_value(
-        &self,
-        frame: &super::Frame,
-        received_at: Instant,
-        body: Option<&Value>,
-    ) {
-        // bg_events is a held-open subscription, not a unary call awaiting a
-        // response. Its StreamEnd is sent when the subscription is drained.
-        if is_long_lived_subscription(body) {
-            return;
-        }
-        let name = body
-            .and_then(|body| {
-                body.get("name")
-                    .or_else(|| body.get("op"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| "undecoded".into());
-        let client_deadline = if name == "bash" {
-            body.and_then(client_deadline)
-        } else {
-            None
-        };
-        let client_deadline_supplied = name == "bash"
-            && body
-                .and_then(|body| body.get("deadline_ms"))
-                .and_then(Value::as_u64)
-                .is_some();
-        let (deadline, deadline_class_ms) = if name == "bash" {
-            let deadline = client_deadline.or_else(|| {
-                if client_deadline_supplied {
-                    None
-                } else {
-                    received_at.checked_add(UNANSWERED_TOOL_DEADLINE)
-                }
-            });
-            let class_ms = deadline.map(|deadline| {
-                deadline
-                    .saturating_duration_since(received_at)
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64
-            });
-            (deadline, class_ms)
-        } else if name == "bash_watch" {
-            // The dispatch layer replaces this with the role-specific watch
-            // window once the route's worker limit and config are available.
-            (None, None)
-        } else {
-            (
-                received_at.checked_add(UNANSWERED_TOOL_DEADLINE),
-                Some(UNANSWERED_TOOL_DEADLINE.as_millis() as u64),
-            )
-        };
-        if let Ok(mut tools) = self.unanswered_tools.lock() {
-            tools.insert(
-                (
-                    super::route_key(frame.header.channel, frame.header.epoch),
-                    frame.header.corr,
-                ),
-                UnansweredTool {
-                    received_at,
-                    name,
-                    deadline,
-                    deadline_class_ms,
-                    client_deadline_supplied,
-                    warned: false,
-                },
-            );
-        }
-    }
-
-    pub(super) fn set_bash_unanswered_deadline(
-        &self,
-        route: super::RouteChannel,
-        corr: u64,
-        deadline: Instant,
-    ) {
-        let Ok(mut tools) = self.unanswered_tools.lock() else {
-            return;
-        };
-        let Some(tool) = tools.get_mut(&(route, corr)) else {
-            return;
-        };
-        if tool.name != "bash" || tool.client_deadline_supplied {
-            return;
-        }
-        tool.deadline = Some(deadline);
-        tool.deadline_class_ms = Some(
-            deadline
-                .saturating_duration_since(tool.received_at)
-                .as_millis()
-                .min(u64::MAX as u128) as u64,
-        );
-    }
-
-    /// Replace the generic 25-second watchdog window with bash_watch's own
-    /// synchronous wait plus a short margin for polling and response delivery.
-    pub(super) fn set_bash_watch_unanswered_wait(
-        &self,
-        route: super::RouteChannel,
-        corr: u64,
-        wait_ms: u64,
-    ) {
-        let Ok(mut tools) = self.unanswered_tools.lock() else {
-            return;
-        };
-        let Some(tool) = tools.get_mut(&(route, corr)) else {
-            return;
-        };
-        if tool.name != "bash_watch" {
-            return;
-        }
-        let warning_window =
-            Duration::from_millis(wait_ms).saturating_add(BASH_WATCH_UNANSWERED_GRACE);
-        tool.deadline = tool.received_at.checked_add(warning_window);
-        tool.deadline_class_ms = tool.deadline.map(|deadline| {
-            deadline
-                .saturating_duration_since(tool.received_at)
-                .as_millis()
-                .min(u64::MAX as u128) as u64
-        });
-    }
-
-    /// Called by the independent watchdog thread, not by an executor job or
-    /// the frame runtime. A call that never finishes must still leave evidence.
-    pub(super) fn warn_unanswered_tools(&self) {
-        self.warn_unanswered_tools_with(Instant::now(), &|line| log::warn!("{line}"));
-    }
-
-    fn warn_unanswered_tools_with(&self, now: Instant, log: &dyn Fn(&str)) {
-        let Ok(mut tools) = self.unanswered_tools.try_lock() else {
-            return;
-        };
-        for (&(route, corr), tool) in tools.iter_mut() {
-            if !tool.warned && tool.deadline.is_some_and(|deadline| now >= deadline) {
-                tool.warned = true;
-                log(&format!(
-                    "tool_call unanswered past client deadline class name={} channel={} epoch={} corr={} elapsed_ms={} deadline_class_ms={}",
-                    tool.name,
-                    route.channel,
-                    route.epoch,
-                    corr,
-                    now.saturating_duration_since(tool.received_at).as_millis(),
-                    tool.deadline_class_ms.unwrap_or_default()
-                ));
-            }
-        }
-    }
-
-    pub(super) fn tool_replied(&self, frame: &super::Frame) {
-        self.tool_replied_with(frame, Instant::now(), &|line| log::info!("{line}"));
-    }
-
-    fn tool_replied_with(&self, frame: &super::Frame, now: Instant, log: &dyn Fn(&str)) {
-        if matches!(
-            frame.header.ty,
-            super::FrameType::Response | super::FrameType::Error
-        ) {
-            if let Ok(mut tools) = self.unanswered_tools.lock() {
-                let key = (
-                    super::route_key(frame.header.channel, frame.header.epoch),
-                    frame.header.corr,
-                );
-                if let Some(tool) = tools.remove(&key) {
-                    // Bash does not travel through the ordinary phase tracer.
-                    // Record the actual socket handoff, not merely queueing a
-                    // completion, so a later client timeout can be localized to
-                    // AFT or to the daemon/consumer leg of the connection.
-                    if tool.name == "bash" || tool.name == "powershell" {
-                        log(&format!("tool_call reply written name={} channel={} epoch={} corr={} total_ms={} destination=subc_daemon", tool.name, key.0.channel, key.0.epoch, key.1, now.saturating_duration_since(tool.received_at).as_millis()));
-                    }
-                }
-            }
         }
     }
 
@@ -1618,34 +1429,6 @@ impl DispatchPathMetrics {
     }
 }
 
-struct UnansweredTool {
-    received_at: Instant,
-    name: String,
-    deadline: Option<Instant>,
-    deadline_class_ms: Option<u64>,
-    client_deadline_supplied: bool,
-    warned: bool,
-}
-
-fn is_long_lived_subscription(body: Option<&Value>) -> bool {
-    body.and_then(|body| body.get("op"))
-        .and_then(Value::as_str)
-        .is_some_and(|operation| operation == "bg_events")
-}
-
-fn client_deadline(body: &Value) -> Option<Instant> {
-    let deadline_ms = body.get("deadline_ms")?.as_u64()?;
-    // Pair the clocks here: the reader's receipt instant can predate this
-    // wall-clock sample by time spent queued for dispatch.
-    let now = Instant::now();
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64;
-    now.checked_add(Duration::from_millis(deadline_ms.saturating_sub(now_ms)))
-}
-
 pub(super) struct DeferredBashWaitGuard {
     metrics: Arc<DispatchPathMetrics>,
 }
@@ -1929,7 +1712,7 @@ const HEALTH_RETENTION_COUNT_MAX_AGE_MS: u64 = 30_000;
 /// no `memory.census` read asked for a new one. Measuring it renders an
 /// uncapped row for every actor root, and only `memory.census` reads it; the
 /// compact memory figures in the health reply are measured on every rollup.
-/// A read asks the next rollup for a fresh census, and a read that finds the
+/// A read can ask the next rollup for a fresh census, and a read that finds the
 /// census older than one rollup interval (`HEALTH_ROLLUP_TTL`) wakes the
 /// rollup and waits for a census measured after it (see
 /// [`fresh_memory_census`]). Only if none is published before the request's
@@ -3697,15 +3480,14 @@ impl Drop for CensusWaiter<'_> {
 /// [`MEMORY_CENSUS_REPLY_MARGIN`]. If none arrives in time, the census served
 /// then is returned with its age, as any census is.
 pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Instant) -> Value {
-    let ticket = cache.request_census();
-    let answered = |snapshot: &HealthDiagnosticRollup| snapshot.memory_census_answers >= ticket;
     let snapshot = cache.published_snapshot();
     let current = cache
         .census_age_ms(&snapshot)
         .is_some_and(|age| age <= duration_millis_u64(HEALTH_ROLLUP_TTL));
-    if (current || answered(&snapshot)) && !cache.allocator_breakdown_due() {
+    if current && !cache.allocator_breakdown_due() {
         return cache.render_memory_census(&snapshot);
     }
+    let ticket = cache.request_census();
     let Some(wait_until) = deadline.checked_sub(MEMORY_CENSUS_REPLY_MARGIN) else {
         return cache.render_memory_census(&snapshot);
     };
@@ -3716,7 +3498,7 @@ pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Ins
     cache.wake_for_census();
     loop {
         let snapshot = cache.published_snapshot();
-        if answered(&snapshot) {
+        if snapshot.memory_census_answers >= ticket {
             return cache.render_memory_census(&snapshot);
         }
         match tokio::time::timeout_at(
@@ -3735,7 +3517,7 @@ pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Ins
 /// When a `memory.census` request must be answered by: its `deadline_ms`, or
 /// [`MEMORY_CENSUS_DEFAULT_BUDGET`] after `received_at` when it names none.
 pub(super) fn memory_census_deadline(body: Option<&Value>, received_at: Instant) -> Instant {
-    body.and_then(client_deadline)
+    body.and_then(reply_tracking::client_deadline)
         .unwrap_or_else(|| received_at + MEMORY_CENSUS_DEFAULT_BUDGET)
 }
 
@@ -3992,6 +3774,7 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
         })
         .collect::<serde_json::Map<String, Value>>()
         .into();
+    let relief = crate::memory::last_allocator_relief();
     let result = json!({
         "status": snapshot.roots_status,
         "roots": per_root,
@@ -4005,10 +3788,9 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
         "allocator_slack_kind": ALLOCATOR_SLACK_KIND,
         "allocator_slack_measured": snapshot.process.allocator_slack_measured,
         "allocator_observation_age_ms": snapshot.process.allocator_observation_age_ms,
-        // The latest periodic relief pass, as two labelled figures: the
-        // allocator's own accounting and the RSS drop the process showed.
-        "last_relief_allocator_accounting_bytes": crate::memory::last_allocator_relief_accounting_bytes(),
-        "last_relief_rss_drop_bytes": crate::memory::last_allocator_relief_rss_drop_bytes(),
+        // Allocator accounting is separate from the observed RSS drop.
+        "last_relief_allocator_accounting_bytes": relief.accounting_bytes,
+        "last_relief_rss_drop_bytes": relief.rss_drop_bytes,
         // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
@@ -7323,18 +7105,18 @@ mod tests {
         metrics.tool_received(&frame, now);
         let lines = RefCell::new(Vec::new());
         let sink = |line: &str| lines.borrow_mut().push(line.to_string());
-        metrics.tool_replied_with(&frame, now, &sink);
+        metrics.tool_replied_with(&frame, false, now, &sink);
         assert!(
             lines.borrow().is_empty(),
             "ingress cannot stand in for actual egress"
         );
         frame.header.ty = crate::subc::FrameType::Response;
-        metrics.tool_replied_with(&frame, now + super::Duration::from_millis(12), &sink);
+        metrics.tool_replied_with(&frame, false, now + super::Duration::from_millis(12), &sink);
         assert_eq!(lines.borrow().len(), 1);
         assert!(lines.borrow()[0]
             .contains("channel=1280 epoch=1 corr=1335 total_ms=12 destination=subc_daemon"));
         assert!(metrics.unanswered_tools.lock().unwrap().is_empty());
-        metrics.tool_replied_with(&frame, now, &sink);
+        metrics.tool_replied_with(&frame, false, now, &sink);
         assert_eq!(
             lines.borrow().len(),
             1,
@@ -7377,82 +7159,8 @@ mod tests {
         );
         let mut reply = request;
         reply.header.ty = crate::subc::FrameType::Response;
-        metrics.tool_replied(&reply);
+        metrics.tool_replied(&reply, false);
         assert!(metrics.unanswered_tools.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn bash_call_without_submission_keeps_fallback_watchdog_deadline() {
-        use std::cell::RefCell;
-
-        let metrics = super::DispatchPathMetrics::new();
-        let now = super::Instant::now();
-        let request = crate::subc::Frame::build_with_version(
-            crate::subc::PROTOCOL_VERSION,
-            crate::subc::FrameType::Request,
-            crate::subc::control_flags(),
-            24,
-            1,
-            1187,
-            serde_json::to_vec(&serde_json::json!({"name":"bash"})).unwrap(),
-        )
-        .unwrap();
-        metrics.tool_received(&request, now);
-
-        let lines = RefCell::new(Vec::new());
-        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(24), &sink);
-        assert!(lines.borrow().is_empty());
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(25), &sink);
-        assert_eq!(lines.borrow().len(), 1);
-        assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1187"));
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(30), &sink);
-        assert_eq!(
-            lines.borrow().len(),
-            1,
-            "warn only once per unanswered call"
-        );
-    }
-
-    #[test]
-    fn bash_client_deadline_watchdog_does_not_double_count_reader_queue_time() {
-        use std::cell::RefCell;
-
-        let metrics = super::DispatchPathMetrics::new();
-        let now = super::Instant::now();
-        let now_ms = super::SystemTime::now()
-            .duration_since(super::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let request = crate::subc::Frame::build_with_version(
-            crate::subc::PROTOCOL_VERSION,
-            crate::subc::FrameType::Request,
-            crate::subc::control_flags(),
-            24,
-            1,
-            1190,
-            serde_json::to_vec(&serde_json::json!({
-                "name": "bash",
-                "deadline_ms": now_ms + 10_000,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        metrics.tool_received(&request, now - super::Duration::from_secs(5));
-
-        let lines = RefCell::new(Vec::new());
-        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(9), &sink);
-        assert!(
-            lines.borrow().is_empty(),
-            "reader queue time must not shorten the client's remaining ten seconds: {:?}",
-            lines.borrow()
-        );
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(11), &sink);
-        assert_eq!(lines.borrow().len(), 1);
-        assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1190"));
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(12), &sink);
-        assert_eq!(lines.borrow().len(), 1, "each call warns only once");
     }
 
     #[test]
@@ -7495,7 +7203,7 @@ mod tests {
 
         let worker_limit_ms = 180_000;
         let primary_cap_ms = 120_000;
-        let requested_ms = super::super::bash_watch_warning_wait_ms(
+        let requested_ms = super::bash_watch_warning_wait_ms(
             &serde_json::json!({"timeout_ms": 60_000}),
             false,
             worker_limit_ms,
@@ -7504,7 +7212,7 @@ mod tests {
         .unwrap();
         assert_eq!(requested_ms, 60_000);
         assert_eq!(
-            super::super::bash_watch_warning_wait_ms(
+            super::bash_watch_warning_wait_ms(
                 &serde_json::json!({"timeoutMs": 60_000}),
                 false,
                 worker_limit_ms,
@@ -7513,7 +7221,7 @@ mod tests {
             Some(60_000)
         );
         assert_eq!(
-            super::super::bash_watch_warning_wait_ms(
+            super::bash_watch_warning_wait_ms(
                 &serde_json::json!({}),
                 true,
                 worker_limit_ms,
@@ -7522,7 +7230,7 @@ mod tests {
             Some(worker_limit_ms)
         );
         assert_eq!(
-            super::super::bash_watch_warning_wait_ms(
+            super::bash_watch_warning_wait_ms(
                 &serde_json::json!({}),
                 false,
                 worker_limit_ms,
@@ -7531,7 +7239,7 @@ mod tests {
             Some(crate::commands::bash_watch::DEFAULT_PRIMARY_WATCH_TIMEOUT_MS)
         );
         assert_eq!(
-            super::super::bash_watch_warning_wait_ms(
+            super::bash_watch_warning_wait_ms(
                 &serde_json::json!({"background": true, "timeout_ms": 60_000}),
                 true,
                 worker_limit_ms,
@@ -7568,61 +7276,59 @@ mod tests {
         assert!(lines.borrow()[0].contains("name=bash_watch"));
     }
 
-    #[test]
-    fn bash_deadline_watchdog_uses_each_calls_effective_deadline() {
+    #[tokio::test(start_paused = true)]
+    async fn bash_deadline_watchdog_uses_the_internal_reply_budget() {
+        use crate::commands::blocking_wait::ReplyBudget;
         use std::cell::RefCell;
 
-        let metrics = super::DispatchPathMetrics::new();
-        let now = super::Instant::now();
-        let request = |corr, arguments| {
-            crate::subc::Frame::build_with_version(
+        let metrics = DispatchPathMetrics::new();
+        let now = || tokio::time::Instant::now().into_std();
+        let receipt = now();
+        let route = super::super::route_key(24, 1);
+        let request = |corr, body: Value| {
+            Frame::build_with_version(
                 crate::subc::PROTOCOL_VERSION,
                 crate::subc::FrameType::Request,
                 crate::subc::control_flags(),
-                24,
-                1,
+                route.channel,
+                route.epoch,
                 corr,
-                serde_json::to_vec(&serde_json::json!({
-                    "name": "bash",
-                    "arguments": arguments,
-                }))
-                .unwrap(),
+                serde_json::to_vec(&body).unwrap(),
             )
             .unwrap()
         };
-
-        let waiting = request(1188, serde_json::json!({"wait": true}));
-        let waiting_deadline = super::super::bash::unanswered_bash_reply_deadline(
-            now, 120_000, 15_000, None, 1_800_000,
-        );
-        metrics.tool_received(&waiting, now);
-        metrics.set_bash_unanswered_deadline(
-            super::super::route_key(24, 1),
+        let fallback = request(
             1188,
-            waiting_deadline,
+            json!({"name":"bash", "arguments":{"wait":true,"timeout":40000}}),
         );
-
-        let expiring = request(1189, serde_json::json!({"timeout": 5_000}));
-        let expiring_deadline =
-            super::super::bash::unanswered_bash_reply_deadline(now, 20_000, 20_000, None, 5_000);
-        metrics.tool_received(&expiring, now);
-        metrics.set_bash_unanswered_deadline(
-            super::super::route_key(24, 1),
-            1189,
-            expiring_deadline,
-        );
+        metrics.tool_received(&fallback, receipt);
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let explicit = request(1189, json!({"name":"bash", "deadline_ms":wall + 60_000}));
+        metrics.tool_received(&explicit, receipt);
+        let admitted = ReplyBudget::new(receipt, Some(receipt + Duration::from_secs(60)));
+        metrics.set_bash_unanswered_deadline(route, 1189, admitted.deadline);
 
         let lines = RefCell::new(Vec::new());
-        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(26), &sink);
+        let sink = |line: &str| lines.borrow_mut().push(line.to_owned());
+        tokio::time::advance(Duration::from_millis(29_999)).await;
+        metrics.warn_unanswered_tools_with(now(), &sink);
+        assert!(lines.borrow().is_empty());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        metrics.warn_unanswered_tools_with(now(), &sink);
         assert_eq!(lines.borrow().len(), 1);
-        assert!(lines.borrow()[0].contains("corr=1189"));
-
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(121), &sink);
+        assert!(lines.borrow()[0].contains("corr=1189 elapsed_ms=30000 deadline_class_ms=30000"));
+        tokio::time::advance(Duration::from_millis(1_805_999)).await;
+        metrics.warn_unanswered_tools_with(now(), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        metrics.warn_unanswered_tools_with(now(), &sink);
         assert_eq!(lines.borrow().len(), 2);
-        assert!(lines.borrow()[1].contains("corr=1188"));
-        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(130), &sink);
-        assert_eq!(lines.borrow().len(), 2, "each call warns only once");
+        assert!(
+            lines.borrow()[1].contains("corr=1188 elapsed_ms=1836000 deadline_class_ms=1836000")
+        );
     }
     use super::super::test_support::{test_ctx, test_root};
     use super::super::{Lane, Response};
@@ -9895,6 +9601,30 @@ mod tests {
             .expect("census test runtime")
     }
 
+    #[test]
+    fn a_fresh_census_read_does_not_force_the_next_rollup_to_resample() {
+        let (_dir, root) = test_root("census-fresh-hit");
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, test_ctx()));
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        // Populate the allocator cache too; a first breakdown is a cache miss
+        // even when the last memory census is fresh.
+        cache.request_census();
+        cache.refresh_for_test(&executor, &app);
+        assert!(!cache.allocator_breakdown_due());
+        let builds_before = cache.census_builds_for_test();
+
+        cache.clock_ms.store(1, Ordering::Relaxed);
+        let census = census_runtime().block_on(fresh_memory_census(&cache, Instant::now()));
+        assert_eq!(census["health_rollup_tick"]["age_ms"], 1);
+        cache.clock_ms.store(2, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        assert_eq!(cache.census_builds_for_test() - builds_before, 0);
+        assert_eq!(cache.published_snapshot().memory_census_at_ms, Some(0));
+    }
+
     /// After a quiet period longer than the census interval, the served
     /// census is old. The first read must not get it: it starts a rollup and
     /// receives a census measured after the read began.
@@ -9982,41 +9712,6 @@ mod tests {
         let census = runtime.block_on(fresh_memory_census(&cache, started));
         assert_eq!(census["health_rollup_tick"]["age_ms"], 31_000);
         assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    /// The call-graph build breaker under `callgraph/<key>/` belongs to the
-    /// stores AFT 0.64 no longer builds, and `aft cache prune-legacy` deletes
-    /// it. Health must not read it: a stale file would report suspended
-    /// domains for builds that never run.
-    #[test]
-    fn rollup_never_opens_the_legacy_callgraph_breaker() {
-        let (storage, root) = test_root("health-breaker-cache");
-        let mut config = crate::config::Config::default();
-        config.storage_dir = Some(storage.path().join("state"));
-        let ctx = Arc::new(AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            config,
-        ));
-        let executor = Executor::new();
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let key = crate::root_identity::key::artifact_cache_key(root.as_path());
-        let path = ctx
-            .storage_dir()
-            .join("callgraph")
-            .join(&key)
-            .join("build-breaker.sqlite");
-        crate::build_breaker::BuildDeathBreaker::open(path).expect("create fixture breaker");
-        crate::build_breaker::BuildDeathBreaker::reset_open_calls_for_test();
-
-        let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
-        cache.refresh(&executor, &app);
-        cache.refresh(&executor, &app);
-        assert_eq!(
-            crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
-            0,
-            "the health rollup opened the legacy call-graph breaker"
-        );
     }
 
     #[test]

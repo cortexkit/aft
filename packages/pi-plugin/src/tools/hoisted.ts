@@ -225,14 +225,14 @@ async function splitSearchPathArg(cwd: string, raw: string): Promise<SearchPathA
     return { paths: [raw], missing: [] };
   }
 
-  return { paths: existing, missing };
+  return { paths: fragments, missing };
 }
 
-async function bridgeSearchPathArg(cwd: string, split: SearchPathArgSplit): Promise<string> {
+async function bridgeSearchPathArg(cwd: string, split: SearchPathArgSplit): Promise<string[]> {
   if (split.paths.length === 1 && split.missing.length === 0) {
-    return await resolvePathArg(cwd, split.paths[0]);
+    return [await resolvePathArg(cwd, split.paths[0])];
   }
-  return split.paths.map((target) => absoluteSearchPath(cwd, target)).join(" ");
+  return split.paths.map((target) => absoluteSearchPath(cwd, target));
 }
 
 function formatSkippedSearchPaths(missing: string[]): string | undefined {

@@ -165,6 +165,109 @@ fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
     assert!(text.contains("searchable"));
 }
 
+#[test]
+fn audit_resolution_invalid_utf8_caller_is_a_named_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let target = write(&root, "target.py", "def target():\n    pass\n");
+    let source = write(
+        &root,
+        "caller.py",
+        "# coding: latin-1\n# café\nfrom target import target\ndef caller():\n    target()\n",
+    );
+    let root = std::fs::canonicalize(root).unwrap();
+    let ctx = context(&root, &dir.path().join("storage"));
+    let ready = ctx.data_checkout().unwrap();
+    let view = match ready.fresh_view(Duration::from_secs(60)) {
+        super::runtime::Fresh::Ready(view) => view,
+        _ => panic!("call graph did not become ready"),
+    };
+    assert!(view.callgraph_has_file("caller.py"));
+    let query = || ask(&ctx, "callers", json!({"file": target, "symbol": "target"}));
+    let valid = query();
+    assert_eq!(valid.data["total_callers"], 1, "{:?}", valid.data);
+    std::fs::write(
+        &source,
+        b"# coding: latin-1\n# caf\xe9\nfrom target import target\ndef caller():\n    target()\n",
+    )
+    .unwrap();
+    ready
+        .checkout()
+        .record_paths(&[b"caller.py".to_vec()])
+        .unwrap();
+    let invalid = query();
+    assert!(invalid.success, "{:?}", invalid.data);
+    assert_eq!(invalid.data["total_callers"], 0, "{:?}", invalid.data);
+    assert_eq!(invalid.data["complete"], false, "{:?}", invalid.data);
+    assert_eq!(
+        invalid.data["gaps"][0]["path"],
+        json!(root.join("caller.py"))
+    );
+    assert_eq!(invalid.data["gaps"][0]["message"], "not valid UTF-8");
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_resolution_literal_backslash_and_directory_are_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    write(&root, r"src\lib.rs", "pub fn literal() {}\n");
+    write(&root, "src/lib.rs", "pub fn nested() {}\n");
+    let root = root.canonicalize().unwrap();
+    let checkout = bind(&root, &dir.path().join("store"));
+    checkout.build().unwrap();
+    let view = checkout.view().unwrap();
+    for (path, symbol) in [(r"src\lib.rs", "literal"), ("src/lib.rs", "nested")] {
+        assert!(crate::commands::data_callgraph::covers(
+            &view,
+            &root.join(path)
+        ));
+        let result = crate::data_layer::callgraph_store_adapter::callers_result(
+            &view.callgraph(),
+            &root.join(path),
+            symbol,
+            1,
+            true,
+        );
+        assert!(
+            result.is_ok(),
+            "failed to find {symbol} in {path}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn audit_resolution_macro_mention_overflow_discloses_file_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let target = write(&root, "src/lib.rs", "mod caller;\npub fn dsl_target() {}\n");
+    let mut caller = String::from("pub fn caller() {\n");
+    for n in 0..520 {
+        caller.push_str(&format!("dsl!(distractor_{n} => state);\n"));
+    }
+    caller.push_str("dsl!(dsl_target => state);\n}\n");
+    write(&root, "src/caller.rs", caller);
+    let root = root.canonicalize().unwrap();
+    let ctx = context(&root, &dir.path().join("storage"));
+    let checkout = ctx.data_checkout().unwrap();
+    assert!(matches!(
+        checkout.fresh_view(Duration::from_secs(60)),
+        super::runtime::Fresh::Ready(_)
+    ));
+    let reply = ask(
+        &ctx,
+        "callers",
+        json!({"file": target, "symbol": "dsl_target"}),
+    );
+    assert!(reply.success, "{:?}", reply.data);
+    assert_eq!(reply.data["total_callers"], 0, "{:?}", reply.data);
+    assert_eq!(reply.data["complete"], false, "{:?}", reply.data);
+    assert_eq!(
+        reply.data["gaps"][0]["path"],
+        json!(root.join("src/caller.rs"))
+    );
+}
+
 #[cfg(feature = "wasm-grammars")]
 fn callers(view: &CheckoutView, file: &str) -> Value {
     serde_json::to_value(
@@ -186,7 +289,7 @@ fn luau_s4_keyed_language_preserves_every_builtin_key() {
     // Pins the shared extractor version so that a Luau change can never move a
     // built-in language's record keys. Update it only together with a deliberate
     // record-format change for the built-in extractors.
-    const ORIGINAL_EXTRACTOR: &str = "ruled-callgraph-v14-resolver-precision+record-23";
+    const ORIGINAL_EXTRACTOR: &str = "ruled-callgraph-v14-resolver-precision+record-24";
     assert_eq!(super::content::EXTRACTOR_VERSION, ORIGINAL_EXTRACTOR);
     for language in [
         "typescript",

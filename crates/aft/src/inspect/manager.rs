@@ -22,9 +22,9 @@ use super::job::{
 };
 use super::oxc_engine::LivenessVerdict;
 use super::oxc_engine::{
-    analyze_file_facts, analyze_files_with_cache, normalize_input_path, AnalyzeOptions,
-    DynamicImportFact, ExportFact, FileFacts, FileId, ImportFact, OxcEngineResult, OxcFactsCache,
-    ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
+    analyze_collected_facts, analyze_file_facts, collect_facts_with_cache, normalize_input_path,
+    AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId, ImportFact, OxcEngineResult,
+    OxcFactsCache, ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph_store::{
@@ -32,6 +32,9 @@ use crate::callgraph_store::{
     MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
+use shared_flight::{builder_attempt_terminal, BuilderAttemptTerminal};
+
+mod shared_flight;
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -67,6 +70,7 @@ type Tier2PermitSlot = Arc<Mutex<Option<cold_build_limiter::ColdBuildPermit>>>;
 #[derive(Clone)]
 struct Waiter {
     tx: WaiterTx,
+    cancellation: Option<crate::executor::JobCancellation>,
 }
 
 #[derive(Default)]
@@ -228,8 +232,6 @@ pub(crate) enum InspectBuilderState {
     WaitingForCacheWriterLease,
     QueuedBehindColdBuilds,
     GatedBySemanticSeed,
-    #[cfg(test)]
-    Suspended,
     BuildDenied,
     Absent,
 }
@@ -241,8 +243,6 @@ impl InspectBuilderState {
             Self::WaitingForCacheWriterLease => "waiting_for_inspect_cache_writer_lease",
             Self::QueuedBehindColdBuilds => "queued_behind_cold_builds",
             Self::GatedBySemanticSeed => "gated_by_semantic_seed",
-            #[cfg(test)]
-            Self::Suspended => "suspended",
             Self::BuildDenied => "build_denied (borrow-only)",
             Self::Absent => "absent",
         }
@@ -264,7 +264,6 @@ struct BuilderStateEntry {
     first_attempt_unix: u64,
     attempt_count: u64,
     last_failure: Option<String>,
-    suspension: Option<crate::build_breaker::BuildSuspension>,
     progress: String,
 }
 
@@ -278,7 +277,6 @@ impl BuilderStateEntry {
             first_attempt_unix: now,
             attempt_count: 0,
             last_failure: None,
-            suspension: None,
             progress: "checking cached analysis".into(),
         }
     }
@@ -296,7 +294,6 @@ impl BuilderStateEntry {
 
     fn begin_attempt(&mut self, state: InspectBuilderState) {
         self.state = Some(state);
-        self.suspension = None;
         self.started_at = Instant::now();
         self.started_unix = unix_now_secs();
         if self.attempt_count == 0 && self.last_failure.is_none() {
@@ -307,14 +304,12 @@ impl BuilderStateEntry {
     /// Record a failed attempt.
     fn record_failure(&mut self, terminal: String) {
         self.state = None;
-        self.suspension = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_failure = Some(terminal);
     }
 
     fn record_cache_writer_wait(&mut self) {
         self.state = Some(InspectBuilderState::WaitingForCacheWriterLease);
-        self.suspension = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_failure = None;
     }
@@ -323,20 +318,10 @@ impl BuilderStateEntry {
     /// locked. The lock says nothing about the inputs, so it is not a failure.
     fn record_view_busy_wait(&mut self) {
         self.state = None;
-        self.suspension = None;
         self.last_failure = None;
     }
 
-    fn detail_at(&self, now_ms: u64) -> String {
-        if let Some(suspension) = self.suspension.as_ref() {
-            return format!(
-                "suspended domain={} deaths={} age_s={} reason={}",
-                suspension.domain.as_str(),
-                suspension.death_count,
-                suspension.age_seconds_at(now_ms),
-                suspension.reason,
-            );
-        }
+    fn detail(&self) -> String {
         if let Some(terminal) = self.last_failure.as_deref() {
             return format!(
                 "last attempt failed: {terminal} (attempt {}, first at {})",
@@ -375,7 +360,7 @@ fn run_tier2_pass_with_deadline<T>(
     action: impl FnOnce() -> T,
 ) -> (T, bool) {
     let cancellation = crate::executor::JobCancellation::new().with_root(project_root);
-    let parent_cancellation = crate::executor::current_job_cancellation();
+    let parent_cancelled = shared_flight::current();
     let deadline_cancellation = cancellation.clone();
     let root = project_root.to_path_buf();
     let timed_out = Arc::new(AtomicBool::new(false));
@@ -384,10 +369,7 @@ fn run_tier2_pass_with_deadline<T>(
     let timer = std::thread::spawn(move || {
         let deadline = Instant::now() + timeout;
         loop {
-            if parent_cancellation
-                .as_ref()
-                .is_some_and(|token| token.cancel_requested_before_commit())
-            {
+            if parent_cancelled() {
                 deadline_cancellation.request_cancel();
                 return;
             }
@@ -422,41 +404,6 @@ fn run_tier2_pass_with_deadline<T>(
     let _ = done_tx.send(());
     let _ = timer.join();
     (result, timed_out.load(Ordering::Acquire))
-}
-
-enum BuilderAttemptTerminal {
-    Succeeded,
-    CacheWriterLeaseWait,
-    /// The published call graph view's database was locked.
-    ViewBusyWait,
-    Failed(String),
-    Inconclusive,
-}
-
-fn builder_attempt_terminal(outcome: &JobOutcome) -> BuilderAttemptTerminal {
-    match outcome {
-        JobOutcome::Fresh { payload }
-            if payload["status"] == "pending" && payload["code"] == "callgraph_building" =>
-        {
-            BuilderAttemptTerminal::ViewBusyWait
-        }
-        JobOutcome::Fresh { payload } if payload["status"] == "pending" => {
-            BuilderAttemptTerminal::Inconclusive
-        }
-        JobOutcome::Fresh { payload } if callgraph_unavailable_payload(payload) => {
-            BuilderAttemptTerminal::Failed("callgraph_unavailable".to_string())
-        }
-        JobOutcome::Fresh { .. } => BuilderAttemptTerminal::Succeeded,
-        JobOutcome::Failed { message } if message.contains("writer_lease_timeout:") => {
-            BuilderAttemptTerminal::CacheWriterLeaseWait
-        }
-        JobOutcome::Failed { message } => {
-            BuilderAttemptTerminal::Failed(builder_failure_terminal(message))
-        }
-        JobOutcome::Stale { .. } | JobOutcome::Pending { .. } => {
-            BuilderAttemptTerminal::Inconclusive
-        }
-    }
 }
 
 fn callgraph_unavailable_payload(payload: &Value) -> bool {
@@ -995,10 +942,7 @@ impl InspectManager {
             "explicit inspect Tier-2 run",
             request,
             || self.heavy_root_work_allowed(),
-            || {
-                crate::executor::current_job_cancellation()
-                    .is_some_and(|token| token.cancel_requested_before_commit())
-            },
+            shared_flight::current(),
         )?;
         permits.insert(job.project_root.clone(), permit.downgrade());
         Some(Arc::new(Mutex::new(Some(permit))))
@@ -1028,12 +972,6 @@ impl InspectManager {
         let Ok(mut states) = self.builder_states.lock() else {
             return;
         };
-        if states
-            .get(key)
-            .is_some_and(|entry| entry.suspension.is_some())
-        {
-            return;
-        }
         match builder_attempt_terminal(outcome) {
             BuilderAttemptTerminal::Succeeded => {
                 states.remove(key);
@@ -1187,7 +1125,13 @@ impl InspectManager {
     }
 
     pub(crate) fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
-        self.tier2_builder_state_detail_at(category, unix_millis_now())
+        let key = JobKey::for_project_category(category);
+        if let Ok(states) = self.builder_states.lock() {
+            if let Some(entry) = states.get(&key) {
+                return entry.detail();
+            }
+        }
+        self.tier2_builder_state(category).as_str().to_string()
     }
 
     pub(crate) fn dead_code_build_is_pending(&self) -> bool {
@@ -1291,7 +1235,7 @@ impl InspectManager {
                     if kind == "view_pending" {
                         reason
                     } else {
-                        entry.detail_at(unix_millis_now())
+                        entry.detail()
                     },
                     entry.progress
                 );
@@ -1337,20 +1281,6 @@ impl InspectManager {
         }
         payload["gaps"] = serde_json::json!([{"kind": kind, "reason": reason}]);
         payload
-    }
-
-    pub(crate) fn tier2_builder_state_detail_at(
-        &self,
-        category: InspectCategory,
-        now_ms: u64,
-    ) -> String {
-        let key = JobKey::for_project_category(category);
-        if let Ok(states) = self.builder_states.lock() {
-            if let Some(entry) = states.get(&key) {
-                return entry.detail_at(now_ms);
-            }
-        }
-        self.tier2_builder_state(category).as_str().to_string()
     }
 
     fn builder_state_detail_for_job(&self, job: &InspectJob) -> String {
@@ -1478,7 +1408,7 @@ impl InspectManager {
         let wait_budget = deadline.saturating_duration_since(wait_started);
         if !category.is_active() {
             return JobOutcome::Failed {
-                message: format!("inspect category '{category}' is disabled in v0.33"),
+                message: format!("inspect category '{category}' is disabled"),
             };
         }
         if Self::category_needs_heavy_root_work(category) && !self.heavy_root_work_allowed() {
@@ -1537,9 +1467,7 @@ impl InspectManager {
             return Err(format!("inspect.categories.{} is off", category.as_str()));
         }
         if !category.is_active() {
-            return Err(format!(
-                "inspect category '{category}' is disabled in v0.33"
-            ));
+            return Err(format!("inspect category '{category}' is disabled"));
         }
         if Self::category_needs_heavy_root_work(category) && !self.heavy_root_work_allowed() {
             return Err(Self::heavy_root_work_block_message(category));
@@ -1645,19 +1573,17 @@ impl InspectManager {
         }
     }
 
-    /// Estimate inspect's resident aggregate maps without waiting on active
-    /// scans. SQLite allocations are measured process-wide; OXC fact payload
-    /// bytes remain an explicit gap.
+    /// Estimate resident aggregates and OXC facts without waiting on scans.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
         let caches = match self.caches.try_lock() {
             Ok(caches) => caches.values().cloned().collect::<Vec<_>>(),
             Err(_) => return crate::memory::MemoryEstimate::busy(),
         };
-        let facts_entries = match self.oxc_facts_cache.try_lock() {
-            Ok(facts) => facts.len(),
+        let (facts_entries, facts_bytes) = match self.oxc_facts_cache.try_lock() {
+            Ok(facts) => (facts.len(), facts.estimated_payload_bytes()),
             Err(_) => return crate::memory::MemoryEstimate::busy(),
         };
-        let mut bytes = 0u64;
+        let mut bytes = facts_bytes;
         let mut memory_aggregates = 0u64;
         for cache in &caches {
             let estimate = cache.estimated_memory();
@@ -1676,8 +1602,9 @@ impl InspectManager {
         crate::memory::MemoryEstimate::partial(bytes)
             .count("open_generation_handles", caches.len())
             .count("oxc_fact_entries", facts_entries)
+            .count_u64("oxc_fact_payload_bytes", facts_bytes)
             .count_u64("memory_aggregates", memory_aggregates)
-            .gap("oxc_fact_bytes")
+            .gap("oxc_nested_fact_payloads_and_cache_indexes")
     }
 
     pub(crate) fn dead_code_snapshot_census() -> DeadCodeSnapshotCensus {
@@ -2239,17 +2166,19 @@ impl InspectManager {
             entry_reachability: job.category == InspectCategory::DeadCode,
         };
 
-        let mut cache = self
-            .oxc_facts_cache
-            .lock()
-            .map_err(|_| "inspect oxc facts cache lock poisoned".to_string())?;
-        let _files = self
-            .file_progress
-            .get(&job.category)
-            .map(|progress| progress.enter());
-        analyze_files_with_cache(&job.project_root, files, options, &mut cache)
-            .map(Some)
-            .map_err(|message| format!("oxc analyze failed: {message}"))
+        // The cache lock covers reading per-file facts, not the graph work.
+        let collected = {
+            let mut cache = self
+                .oxc_facts_cache
+                .lock()
+                .map_err(|_| "inspect oxc facts cache lock poisoned".to_string())?;
+            let _files = self
+                .file_progress
+                .get(&job.category)
+                .map(|progress| progress.enter());
+            collect_facts_with_cache(&job.project_root, files, &options, &mut cache)
+        };
+        Ok(Some(analyze_collected_facts(collected, options)))
     }
 
     fn scan_with_file_progress(
@@ -2435,14 +2364,14 @@ impl InspectManager {
             .lock()
             .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
         if let Some(registration) = in_flight.get_mut(key) {
-            registration.waiters.push(Waiter { tx: waiter_tx });
+            registration.waiters.push(Waiter::new(waiter_tx));
             self.in_flight_changed.notify_all();
             return Ok(false);
         }
 
         in_flight.insert(
             key.clone(),
-            InFlightRegistration::new(vec![Waiter { tx: waiter_tx }]),
+            InFlightRegistration::new(vec![Waiter::new(waiter_tx)]),
         );
         drop(in_flight);
         self.record_flight_start(key);
@@ -2456,9 +2385,13 @@ impl InspectManager {
         self.record_flight_start(&job.key);
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
-        let cancellation = crate::executor::current_job_cancellation();
+        // The flight serves every caller that joins it, so it runs under its
+        // own token (the root's lifecycle, not this caller's request) and
+        // stops only when all joined callers are cancelled.
+        let cancellation = crate::executor::current_job_cancellation().map(|token| token.fresh());
         pool.spawn_fifo(move || {
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
+            let _callers = shared_flight::enter(&manager, job.key.clone());
             let _flight = manager.tier2_flight_exit_guard(job.key.clone());
             let result = manager.tier2_run_with_reuse_job_result_catching(job, options, None);
             manager.route_tier2_reuse_completion(result);
@@ -2730,7 +2663,7 @@ impl InspectManager {
         if !job.category.is_active() {
             let result = InspectResult::failed(
                 &job,
-                format!("inspect category '{}' is disabled in v0.33", job.category),
+                format!("inspect category '{}' is disabled", job.category),
                 started.elapsed(),
             );
             log_tier2_benchmark_category_end(&result);
@@ -2792,14 +2725,16 @@ impl InspectManager {
                     self.data_layer_dead_code
                         .inventory(&job.project_root)
                         .unwrap_or_else(|| {
-                            super::inventory::InspectInventory::collect(&job.project_root, || {
-                                !crate::executor::current_job_cancelled()
-                            })
+                            let cancelled = shared_flight::current();
+                            super::inventory::InspectInventory::collect(
+                                &job.project_root,
+                                move || !cancelled(),
+                            )
                         }),
                 )
             });
         let _inventory = inventory.install();
-        if crate::executor::current_job_cancelled() {
+        if shared_flight::cancelled() {
             return InspectResult::failed(
                 &job,
                 "tier2 pass cancelled before incremental scan",
@@ -3632,13 +3567,13 @@ impl InspectManager {
             .lock()
             .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
         if let Some(registration) = in_flight.get_mut(&key) {
-            registration.waiters.push(Waiter { tx: waiter_tx });
+            registration.waiters.push(Waiter::new(waiter_tx));
             return Ok(());
         }
 
         in_flight.insert(
             key.clone(),
-            InFlightRegistration::new(vec![Waiter { tx: waiter_tx }]),
+            InFlightRegistration::new(vec![Waiter::new(waiter_tx)]),
         );
         drop(in_flight);
         self.record_flight_start(&key);
@@ -3951,7 +3886,7 @@ impl Default for InspectManager {
 fn validate_tier2_read_category(category: InspectCategory) -> Result<(), JobOutcome> {
     if !category.is_active() {
         return Err(JobOutcome::Failed {
-            message: format!("inspect category '{category}' is disabled in v0.33"),
+            message: format!("inspect category '{category}' is disabled"),
         });
     }
     if !category.is_tier2() {
@@ -7896,6 +7831,35 @@ export function bannerUnused() {}
         }
     }
 
+    /// Module resolution and verdicts can wait on the filesystem. They run
+    /// after the facts cache is released, so another category scanning the
+    /// same root can read cached facts meanwhile.
+    #[test]
+    fn oxc_graph_work_runs_without_the_facts_cache_lock() {
+        let (_dir, root, paths) = generated_unused_exports_fixture();
+        let job = unused_exports_job(&root, paths);
+        let manager = Arc::new(InspectManager::new());
+        let hook_manager = Arc::clone(&manager);
+        let cache_free = Arc::new(Mutex::new(None));
+        let hook_cache_free = Arc::clone(&cache_free);
+        super::super::oxc_engine::CROSS_FILE_ANALYSIS_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let free = hook_manager.oxc_facts_cache.try_lock().is_ok();
+                *hook_cache_free.lock().unwrap() = Some(free);
+            }));
+        });
+        let result = manager
+            .oxc_result_for_scan(&job, &job.scope_files, &[])
+            .expect("oxc scan succeeds")
+            .expect("unused exports uses oxc");
+        assert!(!result.facts.is_empty());
+        assert_eq!(
+            *cache_free.lock().unwrap(),
+            Some(true),
+            "cross-file analysis ran while holding the facts cache lock"
+        );
+    }
+
     #[test]
     fn unused_exports_oxc_cached_rollup_preserves_generated_exclusions() {
         let (_dir, root, paths) = generated_unused_exports_fixture();
@@ -10389,5 +10353,136 @@ mod tier2_unreadable_source_tests {
         assert!(published);
         assert!(waiters.is_some());
         assert!(!manager.tier2_any_in_flight());
+    }
+}
+
+#[cfg(test)]
+mod shared_flight_cancellation_tests {
+    use super::*;
+    use crate::cold_build_limiter::{
+        test_limiter, try_acquire_classified_with_limiter, ColdBuildAdmissionClass,
+        ColdBuildAdmissionRequest, ColdBuildPermit,
+    };
+    use crate::config::Config;
+    use crate::parser::SymbolCache;
+    use std::sync::RwLock;
+
+    struct QueuedFlight {
+        _dir: tempfile::TempDir,
+        manager: Arc<InspectManager>,
+        snapshot: InspectSnapshot,
+        held_slot: ColdBuildPermit,
+        starter_cancellation: crate::executor::JobCancellation,
+        starter_rx: std::sync::mpsc::Receiver<JobOutcome>,
+    }
+
+    /// A duplicates flight started by a caller with its own request
+    /// cancellation, waiting at cold-build admission (the only slot is held).
+    fn queued_flight() -> QueuedFlight {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::path_identity::canonicalize_normalized(dir.path());
+        std::fs::write(root.join("lib.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-cache").join("inspect"),
+            Arc::new(Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            }),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let manager = Arc::new(InspectManager::new());
+        let limiter = test_limiter(1);
+        manager.set_cold_build_limiter(limiter.clone());
+        let held_slot = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::new("held-test-slot", ColdBuildAdmissionClass::Maintenance),
+        )
+        .unwrap();
+        let starter_cancellation = crate::executor::JobCancellation::new().with_root(&root);
+        let (starter_tx, starter_rx) = std::sync::mpsc::channel();
+        let (starter_manager, starter_snapshot, starter_token) = (
+            Arc::clone(&manager),
+            snapshot.clone(),
+            starter_cancellation.clone(),
+        );
+        std::thread::spawn(move || {
+            let _cancellation = crate::executor::install_job_cancellation(starter_token);
+            let scope = JobScope::for_project(starter_snapshot.project_root.clone());
+            let outcome = starter_manager.tier2_run_with_reuse_blocking(
+                starter_snapshot,
+                InspectCategory::Duplicates,
+                scope,
+            );
+            let _ = starter_tx.send(outcome);
+        });
+        // The bound only stops a broken build from hanging the suite.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while manager.tier2_builder_state(InspectCategory::Duplicates)
+            != InspectBuilderState::QueuedBehindColdBuilds
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the flight never queued for admission"
+            );
+            std::thread::yield_now();
+        }
+        QueuedFlight {
+            _dir: dir,
+            manager,
+            snapshot,
+            held_slot,
+            starter_cancellation,
+            starter_rx,
+        }
+    }
+
+    /// Two callers share one Tier-2 flight. Cancelling the caller that started
+    /// it must not fail the flight for the other, nor record a builder failure.
+    #[test]
+    fn a_cancelled_caller_does_not_fail_the_shared_tier2_flight() {
+        let flight = queued_flight();
+        let key = flight
+            .manager
+            .tier2_reuse_job(flight.snapshot.clone(), InspectCategory::Duplicates, None)
+            .key;
+        let (joined_tx, joined_rx) = bounded(1);
+        assert!(
+            !flight
+                .manager
+                .register_tier2_reuse_waiter(&key, joined_tx)
+                .unwrap(),
+            "the second caller joins the running flight"
+        );
+        flight.starter_cancellation.request_cancel();
+        drop(flight.held_slot);
+
+        let joined = joined_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the shared flight completes");
+        assert!(matches!(joined, JobOutcome::Fresh { .. }), "{joined:?}");
+        let detail = flight
+            .manager
+            .tier2_builder_state_detail(InspectCategory::Duplicates);
+        assert!(!detail.contains("failed"), "{detail}");
+        let _ = flight.starter_rx.recv_timeout(Duration::from_secs(60));
+    }
+
+    /// When every caller of a flight is cancelled the flight stops, and the
+    /// stop is not recorded as a failed build.
+    #[test]
+    fn a_flight_whose_callers_all_cancelled_stops_without_a_builder_failure() {
+        let flight = queued_flight();
+        flight.starter_cancellation.request_cancel();
+        let outcome = flight
+            .starter_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the cancelled flight ends");
+        assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+        let detail = flight
+            .manager
+            .tier2_builder_state_detail(InspectCategory::Duplicates);
+        assert!(!detail.contains("failed"), "{detail}");
+        drop(flight.held_slot);
     }
 }

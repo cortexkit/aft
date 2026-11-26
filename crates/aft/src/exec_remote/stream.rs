@@ -37,6 +37,22 @@ const MAX_GAP_REATTACHES: u8 = 3;
 // an entire large return in memory while later chunks wait for replay.
 pub(super) const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    /// Pending records visited by full re-sums of the buffered byte total.
+    static PENDING_RECOUNT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_pending_recount_visits() {
+    PENDING_RECOUNT_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn pending_recount_visits() -> usize {
+    PENDING_RECOUNT_VISITS.with(std::cell::Cell::get)
+}
+
 impl ResumePoint {
     pub fn attach_request(&self) -> Result<AttachRequest, super::Error> {
         let from_seq = match self.last_seq {
@@ -518,6 +534,8 @@ impl StreamConsumer {
     }
 
     fn recount_pending(&mut self) {
+        #[cfg(test)]
+        PENDING_RECOUNT_VISITS.with(|visits| visits.set(visits.get() + self.pending.len()));
         self.pending_bytes = self.pending.values().map(Pending::buffer_bytes).sum();
     }
 
@@ -629,8 +647,11 @@ impl StreamConsumer {
                 }
                 sink.unknown_output(before, &[])?;
                 self.point.as_mut().unwrap().last_seq = Some(before);
-                self.pending.remove(&before);
-                self.recount_pending();
+                // Subtract this record alone; re-summing the remaining map per
+                // removal made settling many markers quadratic.
+                if let Some(removed) = self.pending.remove(&before) {
+                    self.pending_bytes -= removed.buffer_bytes();
+                }
                 self.drain(sink)?;
                 continue;
             }

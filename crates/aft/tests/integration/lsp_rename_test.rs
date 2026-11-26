@@ -232,5 +232,5 @@ fn test_rename_notifies_lsp() {
 
     let changed = custom_event(&ctx, "custom/documentChanged");
     assert_eq!(changed["uri"], expected_uri);
-    assert_eq!(changed["version"], 1);
+    assert_eq!(changed["version"], 2);
 }

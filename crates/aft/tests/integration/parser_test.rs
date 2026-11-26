@@ -127,48 +127,53 @@ fn python_decorated_function_range_includes_decorators() {
 }
 
 #[test]
-fn symbol_cache_trusts_matching_size_and_mtime_until_invalidated() {
-    // Freshness policy: a warm cache hit trusts matching size + mtime without
-    // re-reading or hashing the file (the same trust the trigram index's
-    // stat-first warm verification applies). A same-size edit that also
-    // preserves mtime is therefore NOT detected by the freshness check alone —
-    // only mtime-preserving tools (rsync --times, explicit utimes) produce
-    // that shape, and the file watcher's cache reset is the invalidation
-    // path that covers them.
+fn symbol_cache_revalidates_same_size_and_mtime_rewrites() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let file = tmp.path().join("cached.rs");
     std::fs::write(&file, "pub fn alpha() {}\n").expect("write rust file");
-    let original_mtime = std::fs::metadata(&file)
-        .expect("stat rust file")
-        .modified()
-        .expect("mtime");
+    let mtime = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(&file, mtime).expect("set original mtime");
+    let before = std::fs::metadata(&file).expect("stat rust file");
 
     let mut parser = FileParser::new();
     let first = parser
         .extract_symbols(&file)
         .expect("extract first symbols");
     assert!(first.iter().any(|symbol| symbol.name == "alpha"));
+    let warm = parser.extract_symbols(&file).expect("extract warm symbols");
+    assert!(warm.iter().any(|symbol| symbol.name == "alpha"));
 
-    std::fs::write(&file, "pub fn bravo() {}\n").expect("rewrite rust file same size");
-    filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(original_mtime))
-        .expect("restore original mtime");
+    let rewrite = || {
+        std::fs::write(&file, "pub fn bravo() {}\n").expect("rewrite rust file same size");
+        filetime::set_file_mtime(&file, mtime).expect("restore original mtime");
+        std::fs::metadata(&file).expect("stat rewritten rust file")
+    };
+    let after = rewrite();
+    #[cfg(unix)]
+    let after = {
+        use std::os::unix::fs::MetadataExt;
+        let ctime = |meta: &std::fs::Metadata| (meta.ctime(), meta.ctime_nsec());
+        let after = if ctime(&before) == ctime(&after) {
+            // A coarse filesystem clock can put both writes in the same tick.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            rewrite()
+        } else {
+            after
+        };
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_ne!(ctime(&before), ctime(&after));
+        after
+    };
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
 
+    // Unix uses ctime to detect this rewrite; Windows revalidates the bytes
+    // without trusting a metadata-only cache hit. Neither needs invalidation.
     let second = parser
         .extract_symbols(&file)
         .expect("extract second symbols");
-    assert!(
-        second.iter().any(|symbol| symbol.name == "alpha"),
-        "matching size+mtime is trusted: the cached symbols are served"
-    );
-
-    // Watcher-driven invalidation is the correctness path for
-    // mtime-preserving edits: after it, the new content must be parsed.
-    parser.invalidate_symbols(&file);
-    let third = parser
-        .extract_symbols(&file)
-        .expect("extract third symbols");
-    assert!(third.iter().any(|symbol| symbol.name == "bravo"));
-    assert!(!third.iter().any(|symbol| symbol.name == "alpha"));
+    assert!(second.iter().any(|symbol| symbol.name == "bravo"));
+    assert!(!second.iter().any(|symbol| symbol.name == "alpha"));
 }
 
 #[test]

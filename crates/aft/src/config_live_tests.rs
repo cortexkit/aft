@@ -945,7 +945,7 @@ fn project_watcher_signals_a_config_edit_under_a_target_ancestor() {
             },
         );
     });
-    let raw_tx: std::sync::mpsc::Sender<notify::Result<notify::Event>> =
+    let raw_tx: crate::watcher_filter::RawEventSender =
         raw_sender_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     raw_tx
         .send(Ok(notify::Event::new(notify::EventKind::Modify(

@@ -158,13 +158,13 @@ fn runon_read_only_note_ignores_stdout_and_local_tasks() {
         TerminalRecord::new(id(), Outcome::Exit { code: 1 }, 1, 0, 0).with_source_read_only(true),
     );
     let mut text = "original output".to_owned();
-    append_source_read_only_note(&mut text, &metadata, &state.buffer);
+    read_only_status::append_source_read_only_note(&mut text, &metadata, &state.buffer);
     assert_eq!(text, "original output", "stdout alone is not error output");
     metadata.remote = None;
     drop(state);
     sink.output(2, OutputStream::Stderr, error).unwrap();
     state = task.state.lock().unwrap();
-    append_source_read_only_note(&mut text, &metadata, &state.buffer);
+    read_only_status::append_source_read_only_note(&mut text, &metadata, &state.buffer);
     assert_eq!(
         text, "original output",
         "local jobs have no remote lock proof"
@@ -6095,7 +6095,7 @@ fn exec_remote_bash_restart_replays_uncheckpointed_output() {
     );
 }
 
-fn persist_accepted_with_snapshot(
+pub(super) fn persist_accepted_with_snapshot(
     dir: &Path,
     connection: PathBuf,
     command: &str,

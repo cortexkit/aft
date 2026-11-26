@@ -49,12 +49,13 @@ pub(crate) struct DiskCheck {
     pub added: usize,
     /// Files whose current content the corpus holds.
     pub reread: usize,
-    /// Walked files not read before the read deadline.
+    /// Walked files whose contents could not be resolved.
     pub not_reread: usize,
+    pub time_limit_reached: bool,
 }
 
 impl DiskCheck {
-    /// True when the walk finished and every reached file had a read attempted.
+    /// True when the walk finished and every reached file was resolved.
     pub(super) fn verified(&self) -> bool {
         self.walk_complete && self.not_reread == 0
     }
@@ -107,7 +108,7 @@ struct WalkedFile {
     path: PathBuf,
     size: u64,
     modified: SystemTime,
-    /// A read was attempted before the deadline.
+    /// The index accounted for the file, including binary/size exclusions.
     resolved: bool,
 }
 
@@ -117,22 +118,37 @@ struct WalkedFile {
 pub(super) fn collect_bounded_corpus(root: &Path) -> CheckedIndex {
     let budgets = budgets();
     let walk_deadline = Instant::now() + budgets.walk;
-    let stop_requested =
-        |deadline: Instant| Instant::now() >= deadline || crate::executor::current_job_cancelled();
+    let file_limit = crate::grep_executor::fallback_walk_limit();
     let mut check = DiskCheck::default();
+    let coverage = crate::grep_executor::WalkCoverage::default();
     let mut walked = Vec::new();
     check.walk_complete = true;
-    for entry in crate::search_index::project_walk_builder(root).build() {
-        if stop_requested(walk_deadline) {
+    for entry in crate::search_index::checked_project_walk_builder(root, coverage.clone()).build() {
+        check.time_limit_reached = Instant::now() >= walk_deadline;
+        if check.time_limit_reached || crate::executor::current_job_cancelled() {
             check.walk_complete = false;
             break;
         }
-        let Ok(entry) = entry else { continue };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                coverage.record_error(root, error);
+                continue;
+            }
+        };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
+        if walked.len() == file_limit {
+            check.walk_complete = false;
+            break;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                coverage.record_error(entry.path(), error);
+                continue;
+            }
         };
         walked.push(WalkedFile {
             path: entry.path().to_path_buf(),
@@ -141,6 +157,7 @@ pub(super) fn collect_bounded_corpus(root: &Path) -> CheckedIndex {
             resolved: false,
         });
     }
+    check.walk_complete &= coverage.complete();
     check.files_examined = walked.len();
     let mut work: Vec<usize> = (0..walked.len()).collect();
     work.sort_by_cached_key(|&i| (classify_file(&walked[i].path), walked[i].path.clone()));
@@ -148,19 +165,21 @@ pub(super) fn collect_bounded_corpus(root: &Path) -> CheckedIndex {
     let mut index = SearchIndex::empty_ready_for_root(root);
     let mut remaining = work_limit();
     for &i in &work {
-        if stop_requested(deadline) || remaining == 0 {
+        let timed_out = Instant::now() >= deadline;
+        check.time_limit_reached |= timed_out;
+        if timed_out || crate::executor::current_job_cancelled() || remaining == 0 {
             break;
         }
         remaining -= 1;
         index.update_file(&walked[i].path);
-        walked[i].resolved = true;
+        walked[i].resolved = index.path_to_id.contains_key(&walked[i].path);
     }
     let mut digest_entries = Vec::new();
     for file in &walked {
         if !file.resolved {
             check.not_reread += 1;
             check.added += 1;
-        } else if index.path_to_id.contains_key(&file.path) {
+        } else {
             check.added += 1;
             check.reread += 1;
             digest_entries.push((&file.path, file.size, file.modified));
@@ -203,6 +222,50 @@ mod tests {
             std::fs::write(path, content).expect("write file");
         }
         (dir, root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_search_unpublished_corpus_discloses_unreadable_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, root) = project(&[
+            ("open.rs", "needle"),
+            ("denied.rs", "needle"),
+            ("closed/hidden.rs", "needle"),
+        ]);
+        let file = root.join("denied.rs");
+        let closed = root.join("closed");
+        let deny = || std::fs::Permissions::from_mode(0o000);
+        std::fs::set_permissions(&file, deny()).unwrap();
+        std::fs::set_permissions(&closed, deny()).unwrap();
+        let denied = std::fs::File::open(&file).is_err() && std::fs::read_dir(&closed).is_err();
+        let checked = denied.then(|| collect_bounded_corpus(&root));
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Some(checked) = checked else {
+            eprintln!("permission fixture requires an unprivileged user");
+            return;
+        };
+        assert!(!checked.check.verified());
+        assert!(!checked.check.walk_complete);
+        assert!(!checked.check.time_limit_reached);
+        assert_eq!(checked.check.reread, 1);
+        assert_eq!(checked.check.not_reread, 1);
+    }
+
+    #[test]
+    fn review_search_unpublished_corpus_stops_at_the_fallback_file_limit() {
+        let (_dir, root) = project(&[("a.rs", "needle"), ("b.rs", "needle"), ("c.rs", "needle")]);
+        let run =
+            |limit| crate::grep_executor::with_walk_limit(limit, || collect_bounded_corpus(&root));
+        let capped = run(2);
+        assert_eq!(capped.check.files_examined, 2);
+        assert_eq!(capped.check.reread, 2);
+        assert!(!capped.check.walk_complete);
+        assert!(!capped.check.verified());
+        assert!(!capped.check.time_limit_reached);
+        assert!(run(3).check.verified());
     }
 
     #[test]

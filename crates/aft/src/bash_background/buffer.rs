@@ -100,6 +100,9 @@ pub struct BoundedRead {
     pub text: String,
     pub truncated: bool,
     pub total_bytes: u64,
+    /// One disclosure line per capture that could not be opened or read, so a
+    /// failed read is never mistaken for a command that printed nothing.
+    pub read_gaps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -347,10 +350,16 @@ impl BgBuffer {
     }
 
     pub(super) fn stderr_reader(&self) -> Option<impl io::BufRead> {
-        self.source(StreamKind::Stderr)?
-            .open()
-            .ok()
-            .map(io::BufReader::new)
+        let source = self.source(StreamKind::Stderr)?;
+        #[cfg(test)]
+        record_stderr_scan(source.path(), 0, true);
+        source.open().ok().map(|file| {
+            io::BufReader::new(ScanReader {
+                inner: file,
+                #[cfg(test)]
+                path: source.path().to_path_buf(),
+            })
+        })
     }
 
     /// Notice redaction needs contiguous input: a head/tail join could cut an
@@ -463,6 +472,7 @@ fn empty_bounded_read() -> BoundedRead {
         text: String::new(),
         truncated: false,
         total_bytes: 0,
+        read_gaps: Vec::new(),
     }
 }
 
@@ -501,6 +511,47 @@ pub(crate) fn tail_read_count(path: &Path) -> usize {
         .lock()
         .ok()
         .and_then(|reads| reads.get(path).copied())
+        .unwrap_or_default()
+}
+
+/// A stderr capture opened for a whole-stream scan. Tests count its opens and
+/// the bytes read through it.
+struct ScanReader<R> {
+    inner: R,
+    #[cfg(test)]
+    path: PathBuf,
+}
+
+impl<R: io::Read> io::Read for ScanReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        #[cfg(test)]
+        record_stderr_scan(&self.path, read as u64, false);
+        Ok(read)
+    }
+}
+
+#[cfg(test)]
+static STDERR_SCANS: OnceLock<Mutex<std::collections::HashMap<PathBuf, (usize, u64)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn record_stderr_scan(path: &Path, bytes: u64, opened: bool) {
+    if let Ok(mut scans) = STDERR_SCANS.get_or_init(Default::default).lock() {
+        let entry = scans.entry(path.to_path_buf()).or_default();
+        entry.0 += usize::from(opened);
+        entry.1 += bytes;
+    }
+}
+
+/// Opens of `path` for a stderr scan, and the bytes read through them.
+#[cfg(all(test, unix))]
+pub(crate) fn take_stderr_scans(path: &Path) -> (usize, u64) {
+    STDERR_SCANS
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|mut scans| scans.remove(path))
         .unwrap_or_default()
 }
 
@@ -548,6 +599,7 @@ fn read_source_bounded(source: &ArtifactSource, max_bytes: usize) -> io::Result<
                 text: String::new(),
                 truncated: true,
                 total_bytes,
+                read_gaps: Vec::new(),
             });
         }
         return read_single_file_head_tail(
@@ -562,6 +614,7 @@ fn read_source_bounded(source: &ArtifactSource, max_bytes: usize) -> io::Result<
         text: String::from_utf8_lossy(&bytes).into_owned(),
         truncated: false,
         total_bytes,
+        read_gaps: Vec::new(),
     })
 }
 
@@ -583,6 +636,7 @@ fn read_single_file_head_tail(
             text: String::from_utf8_lossy(&bytes).into_owned(),
             truncated: false,
             total_bytes,
+            read_gaps: Vec::new(),
         });
     }
     let head_len = head_bytes.min(max_bytes) as u64;
@@ -594,6 +648,7 @@ fn read_single_file_head_tail(
         text: join_head_tail_bytes(head, tail, total_bytes.saturating_sub(head_len + tail_len)),
         truncated: true,
         total_bytes,
+        read_gaps: Vec::new(),
     })
 }
 
@@ -604,35 +659,62 @@ fn read_two_file_head_tail(
     head_bytes: usize,
     tail_bytes: usize,
 ) -> (BoundedRead, usize) {
-    let (mut first_file, first_len) = first
-        .sampled()
-        .map(|(file, len)| (Some(file), len))
-        .unwrap_or((None, 0));
-    let (mut second_file, second_len) = second
-        .sampled()
-        .map(|(file, len)| (Some(file), len))
-        .unwrap_or((None, 0));
+    // `first` is stdout and `second` stderr. A failed open or read still
+    // renders as an empty stream, but is named in `read_gaps`.
+    let mut gaps: [Option<String>; 2] = [None, None];
+    let mut note = |index: usize, error: &io::Error| {
+        gaps[index].get_or_insert_with(|| {
+            let stream = ["stdout", "stderr"][index];
+            format!("[{stream} could not be read ({error}); the output above may be incomplete]")
+        });
+    };
+    let (mut first_file, first_len) = match first.sampled() {
+        Ok((file, len)) => (Some(file), len),
+        Err(error) => {
+            note(0, &error);
+            (None, 0)
+        }
+    };
+    let (mut second_file, second_len) = match second.sampled() {
+        Ok((file, len)) => (Some(file), len),
+        Err(error) => {
+            note(1, &error);
+            (None, 0)
+        }
+    };
     let total_bytes = first_len.saturating_add(second_len);
     if total_bytes <= max_bytes as u64 {
-        let first_bytes = first_file
-            .as_mut()
-            .map(|file| first.read_range(file, 0, first_len))
-            .transpose()
-            .map(Option::unwrap_or_default)
-            .unwrap_or_default();
-        let second_bytes = second_file
-            .as_mut()
-            .map(|file| second.read_range(file, 0, second_len))
-            .transpose()
-            .map(Option::unwrap_or_default)
-            .unwrap_or_default();
+        let mut read_all = |index: usize,
+                            source: &ArtifactSource,
+                            file: Option<&mut ValidatedArtifact>,
+                            len: u64| {
+            file.map(|file| source.read_range(file, 0, len))
+                .transpose()
+                .unwrap_or_else(|error| {
+                    note(index, &error);
+                    None
+                })
+                .unwrap_or_default()
+        };
+        let first_bytes = read_all(0, first, first_file.as_mut(), first_len);
+        let second_bytes = read_all(1, second, second_file.as_mut(), second_len);
         let first_text = String::from_utf8_lossy(&first_bytes);
+        let second_text = String::from_utf8_lossy(&second_bytes);
         let boundary = first_text.len();
+        // Like the capped join, never let stderr continue stdout's unfinished
+        // last line; a stdout that ends its line needs no separator.
+        let separator =
+            if !first_text.is_empty() && !second_text.is_empty() && !first_text.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
         return (
             BoundedRead {
-                text: format!("{first_text}{}", String::from_utf8_lossy(&second_bytes)),
+                text: format!("{first_text}{separator}{second_text}"),
                 truncated: false,
                 total_bytes,
+                read_gaps: gaps.into_iter().flatten().collect(),
             },
             boundary,
         );
@@ -646,16 +728,23 @@ fn read_two_file_head_tail(
         split_stream_budget(first_remaining, second_remaining, tail_budget);
     let first_read =
         read_single_file_head_tail(first, first_head + first_tail, first_head, first_tail)
-            .unwrap_or_else(|_| empty_bounded_read());
+            .unwrap_or_else(|error| {
+                note(0, &error);
+                empty_bounded_read()
+            });
     let second_read =
         read_single_file_head_tail(second, second_head + second_tail, second_head, second_tail)
-            .unwrap_or_else(|_| empty_bounded_read());
+            .unwrap_or_else(|error| {
+                note(1, &error);
+                empty_bounded_read()
+            });
     let boundary = first_read.text.len();
     (
         BoundedRead {
             text: combine_streams(&first_read.text, &second_read.text),
             truncated: true,
             total_bytes,
+            read_gaps: gaps.into_iter().flatten().collect(),
         },
         boundary,
     )
@@ -1080,6 +1169,34 @@ stderr final
         assert_eq!(split_read, read);
         assert!(split_read.text[..boundary].ends_with("ERROR: stdout final\n"));
         assert!(split_read.text[boundary..].ends_with("stderr final\n"));
+    }
+
+    /// The two captures are concatenated, so stderr must start on its own line
+    /// when stdout's last record has no newline, whether or not the combined
+    /// read is capped. A stdout that already ends its line gets no blank line.
+    #[test]
+    fn combined_read_keeps_stderr_on_its_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout");
+        let stderr_path = dir.path().join("stderr");
+        std::fs::write(&stdout_path, "one").unwrap();
+        std::fs::write(&stderr_path, "two\n").unwrap();
+        let buffer = BgBuffer::new(stdout_path.clone(), stderr_path.clone());
+
+        let (read, boundary) = buffer.read_combined_head_tail_with_boundary(1024, 512, 512);
+        assert!(!read.truncated);
+        assert_eq!(read.text, "one\ntwo\n");
+        assert_eq!(&read.text[..boundary], "one");
+
+        std::fs::write(&stderr_path, format!("two\n{}\nlast\n", "y".repeat(256))).unwrap();
+        let capped = buffer.read_combined_head_tail(64, 32, 32);
+        assert!(capped.truncated);
+        assert!(capped.text.starts_with("one\n"), "{:?}", capped.text);
+
+        std::fs::write(&stdout_path, "one\n").unwrap();
+        std::fs::write(&stderr_path, "two\n").unwrap();
+        let read = buffer.read_combined_head_tail(1024, 512, 512);
+        assert_eq!(read.text, "one\ntwo\n");
     }
 
     #[test]

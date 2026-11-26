@@ -422,6 +422,9 @@ describe("auto-update-checker/index", () => {
     expect(isNewerVersion("0.58.0-beta.2", "0.58.0")).toBe(false);
     expect(isNewerVersion("0.58.0-beta.10", "0.58.0-beta.2")).toBe(true);
     expect(isNewerVersion("not-a-version", "0.58.0")).toBe(false);
+    expect(isNewerVersion("1.2.3-01", "1.2.3")).toBe(false);
+    expect(isNewerVersion("1.2.3-a..b", "1.2.3")).toBe(false);
+    expect(isNewerVersion("01.2.3", "1.2.3")).toBe(false);
   });
 
   test("shows install failure toast without telling users to restart", async () => {

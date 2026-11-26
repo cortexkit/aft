@@ -147,7 +147,10 @@ where
             }
             replies.insert(reference.clone(), ends);
         }
-        if replies[&reference] {
+        // A watch may have taken over while the describe was in flight. Its
+        // cleanup must settle earlier admissions on the CallLedger lane;
+        // the saved-grant transaction does not run on that lane.
+        if replies[&reference] && !covered(&request) {
             let db = db.clone();
             match tokio::task::spawn_blocking(move || {
                 let conn = db

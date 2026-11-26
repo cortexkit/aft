@@ -480,14 +480,14 @@ pub(crate) fn disclose_index_gaps(
     });
 }
 
-/// Adds only host-owned grammar diagnostics, preserving gap-free responses.
+/// Adds named parse gaps without changing gap-free responses.
 pub(super) fn disclose_parse_gaps(
     view: &super::checkout::CheckoutView,
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,
     include: impl Fn(&Path) -> bool,
 ) {
-    if !cfg!(feature = "wasm-grammars") || view.current_state().skipped_parses().is_empty() {
+    if view.current_state().skipped_parses().is_empty() {
         return;
     }
     let fence = crate::context::confinement::capture();
@@ -1490,8 +1490,24 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
             estimate = estimate
                 .count_u64("symbol_table_bytes", tables.bytes)
                 .count_u64("symbol_tables", tables.tables)
-                .count_u64("symbol_table_kept_bytes", tables.kept_bytes)
-                .count_u64("symbol_table_budget_bytes", tables.budget_bytes)
+                .count_u64("symbol_table_kept_bytes", tables.keep_set_payload_bytes)
+                .count_u64("symbol_table_budget_bytes", tables.keep_set_budget_bytes)
+                .count_u64(
+                    "symbol_table_keep_set_budget_bytes",
+                    tables.keep_set_budget_bytes,
+                )
+                .count_u64(
+                    "symbol_table_keep_set_payload_bytes",
+                    tables.keep_set_payload_bytes,
+                )
+                .count_u64(
+                    "symbol_table_live_outside_keep_set_payload_bytes",
+                    tables.live_outside_keep_set_payload_bytes,
+                )
+                .count_u64(
+                    "symbol_table_registry_bookkeeping_bytes",
+                    tables.registry_bookkeeping_bytes,
+                )
                 .count_u64("symbol_table_hits", tables.hits)
                 .count_u64("symbol_table_misses", tables.misses);
         }
@@ -1846,6 +1862,8 @@ pub fn fill_root(
     loop {
         match meaning.round(&checkout) {
             Round::More => {}
+            Round::Waiting => super::vectors::wait_for_other_fill(checkout.family_dir())
+                .map_err(|error| error.to_string())?,
             Round::Done => break,
             Round::Idle => return Err("the checkout has nothing published to fill".to_string()),
             Round::Failed(failure) => return Err(failure.message().to_string()),
@@ -2763,6 +2781,21 @@ mod tests {
         assert_eq!(cache.bytes_status, "estimated");
         assert!(cache.counts["budget_bytes"] > 0);
         assert!(cache.counts["blocks"] > 0);
+        assert_eq!(cache.counts["symbol_table_keep_set_budget_bytes"], 64 << 20);
+        assert_eq!(
+            cache.counts["symbol_table_budget_bytes"],
+            cache.counts["symbol_table_keep_set_budget_bytes"]
+        );
+        assert_eq!(
+            cache.counts["symbol_table_kept_bytes"],
+            cache.counts["symbol_table_keep_set_payload_bytes"]
+        );
+        assert_eq!(
+            cache.counts["symbol_table_bytes"],
+            cache.counts["symbol_table_keep_set_payload_bytes"]
+                + cache.counts["symbol_table_live_outside_keep_set_payload_bytes"]
+                + cache.counts["symbol_table_registry_bookkeeping_bytes"]
+        );
         assert!(
             cache.estimated_bytes.unwrap() > cache.counts["resident_bytes"],
             "the cache's figure is its blocks and its tables: {cache:?}"
@@ -2793,6 +2826,7 @@ mod tests {
             planes_sum
                 + snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0)
                 + process.data_layer_block_cache_bytes.unwrap()
+                + process.reusable_parser_pools.estimated_bytes.unwrap()
                 + process.embedding_model_bytes
                 + process.sqlite.memory_used_bytes
         );

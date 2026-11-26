@@ -35,7 +35,7 @@ use crate::search_index::{
     WalkBound,
 };
 
-/// Maximum files enumerated during grep/glob index-unavailable fallback walks.
+/// Maximum files enumerated during filesystem search fallback walks.
 pub(crate) const MAX_FALLBACK_WALK_FILES: usize = 50_000;
 
 #[cfg(test)]
@@ -84,7 +84,7 @@ pub(crate) fn note_fallback_walk_for_test() {
     FALLBACK_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
-fn fallback_walk_limit() -> usize {
+pub(crate) fn fallback_walk_limit() -> usize {
     #[cfg(test)]
     {
         WALK_LIMIT.with(|limit| limit.get())
@@ -828,11 +828,12 @@ pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Optio
         if !crate::data_layer::read_fence::admits_walk_root(&root.search_root) {
             continue;
         }
-        // An explicitly-named existing file is always in scope (it's searched
-        // directly even if gitignored / .aftignored), so don't report it as
-        // "no files matched scope".
+        // Naming a file overrides ignore files, not request path filters.
         if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-            return Some(true);
+            if explicit_file_matches(&root.filter_root, &root.search_root, filters) {
+                return Some(true);
+            }
+            continue;
         }
         match bounded_scope_has_files(
             &root.filter_root,
@@ -906,10 +907,10 @@ fn scope_has_files_unbounded(
     ignored_target: bool,
     deadline: Instant,
 ) -> Option<bool> {
-    let skipped = Arc::new(AtomicUsize::new(0));
+    let coverage = WalkCoverage::default();
     let Some(builder) = fallback_target_walk_builder(
         search_root,
-        Arc::clone(&skipped),
+        coverage.clone(),
         ignored_target,
         false,
         Some(filter_root),
@@ -926,7 +927,7 @@ fn scope_has_files_unbounded(
             return None;
         }
         let Ok(entry) = entry else {
-            continue;
+            return None;
         };
         if entry.file_type().is_some_and(|kind| kind.is_file())
             && filters.matches(filter_root, entry.path())
@@ -934,7 +935,7 @@ fn scope_has_files_unbounded(
             return Some(true);
         }
     }
-    (skipped.load(Ordering::Relaxed) == 0).then_some(false)
+    coverage.complete().then_some(false)
 }
 
 pub fn execute(
@@ -1087,6 +1088,16 @@ fn resolve_roots(
     }
 }
 
+fn explicit_file_matches(filter_root: &Path, file: &Path, filters: &PathFilters) -> bool {
+    // A file used as its own filter root would have an empty relative path.
+    let base = if filter_root == file {
+        file.parent().unwrap_or(file)
+    } else {
+        filter_root
+    };
+    filters.matches(base, file)
+}
+
 fn execute_root_profiled(
     ctx: &impl IndexHost,
     pattern: &CompiledPattern,
@@ -1116,8 +1127,7 @@ fn execute_root_profiled(
         } else {
             IndexStatus::Fallback
         };
-        let result = if (root.authorized_task_artifact
-            && !filters.matches(&root.filter_root, &root.search_root))
+        let result = if !explicit_file_matches(&root.filter_root, &root.search_root, filters)
             || params
                 .path_exclusion
                 .is_some_and(|exclude| exclude(&root.search_root, project_root))
@@ -1515,22 +1525,67 @@ fn merge_grep_results_with_canonicalizer(
     }
 }
 
+/// Observations made inside the walker predicate, where rejected entries
+/// cannot be recovered from the iterator.
+#[derive(Clone, Default)]
+pub(crate) struct WalkCoverage {
+    foreign_mounts: Arc<AtomicUsize>,
+    first_error: Arc<Mutex<Option<String>>>,
+}
+
+impl WalkCoverage {
+    pub(crate) fn skipped_foreign_mounts(&self) -> usize {
+        self.foreign_mounts.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn error(&self) -> Option<String> {
+        self.first_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record_error(&self, path: &Path, error: impl std::fmt::Display) {
+        let reason = error.to_string();
+        crate::bounded_io::note_skipped_file(path, &reason);
+        self.first_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(reason);
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        self.skipped_foreign_mounts() == 0 && self.error().is_none()
+    }
+
+    pub(crate) fn allows_device(
+        &self,
+        path: &Path,
+        boundary: Option<&crate::walk_boundary::DeviceBoundary>,
+    ) -> bool {
+        match boundary.map(|boundary| boundary.should_descend(path)) {
+            Some(Ok(false)) => {
+                self.foreign_mounts.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Some(Err(error)) => {
+                self.record_error(path, error);
+                false
+            }
+            _ => true,
+        }
+    }
+}
+
 /// The whole-project walker semantic search sweeps with. Confined calls never
 /// run semantic search, so this walk does not check its starting path; grep,
 /// glob and their scope probes use [`fallback_target_walk_builder`], which
 /// does.
 pub(crate) fn fallback_project_walk_builder(
     search_root: &Path,
-    skipped_foreign_mounts: Arc<AtomicUsize>,
+    coverage: WalkCoverage,
 ) -> WalkBuilder {
-    target_walk_builder(
-        search_root,
-        skipped_foreign_mounts,
-        false,
-        false,
-        Some(search_root),
-        None,
-    )
+    target_walk_builder(search_root, coverage, false, false, Some(search_root), None)
 }
 
 /// The grep/glob directory walker for `search_root`, or `None` when a
@@ -1540,7 +1595,7 @@ pub(crate) fn fallback_project_walk_builder(
 /// treat `None` as a walk that found nothing.
 fn fallback_target_walk_builder(
     search_root: &Path,
-    skipped_foreign_mounts: Arc<AtomicUsize>,
+    coverage: WalkCoverage,
     ignored_target: bool,
     ignore_ancestors: bool,
     filter_root: Option<&Path>,
@@ -1550,7 +1605,7 @@ fn fallback_target_walk_builder(
     }
     Some(target_walk_builder(
         search_root,
-        skipped_foreign_mounts,
+        coverage,
         ignored_target,
         ignore_ancestors,
         filter_root,
@@ -1562,7 +1617,7 @@ fn fallback_target_walk_builder(
 /// every entry below the starting path, but not the starting path itself.
 fn target_walk_builder(
     search_root: &Path,
-    skipped_foreign_mounts: Arc<AtomicUsize>,
+    coverage: WalkCoverage,
     ignored_target: bool,
     ignore_ancestors: bool,
     filter_root: Option<&Path>,
@@ -1571,7 +1626,9 @@ fn target_walk_builder(
     #[cfg(test)]
     TARGET_WALK_BUILDERS.with(|count| count.set(count.get() + 1));
     let mut builder = WalkBuilder::new(search_root);
-    let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
+    let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root)
+        .inspect_err(|error| coverage.record_error(search_root, error))
+        .ok();
     // A confined walk loads none of the crate's ignore files (see
     // `apply_project_ignore_rules`); it applies the confined root's own
     // ignore files here and checks every entry against the read policy.
@@ -1622,19 +1679,6 @@ fn target_walk_builder(
             return false;
         }
         let is_dir = file_type.as_ref().is_some_and(std::fs::FileType::is_dir);
-        if entry.depth() > 0 && is_dir {
-            match boundary
-                .as_ref()
-                .map(|boundary| boundary.should_descend(entry.path()))
-            {
-                Some(Ok(false)) => {
-                    skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-                Some(Err(_)) => return false,
-                _ => {}
-            }
-        }
         let name = entry.file_name().to_string_lossy();
         let keep = if is_dir {
             !is_fallback_skipped_directory_name(&name)
@@ -1663,9 +1707,13 @@ fn target_walk_builder(
         // A directory at the depth limit is only named, never opened.
         // Probing its contents would turn a shallow ignore comparison
         // into extra reads below the searched folder.
-        !is_dir
-            || max_depth.is_some_and(|depth| entry.depth() >= depth)
-            || crate::bounded_io::probe_walk_directory(&permission_root, entry.path()).is_ok()
+        if !is_dir || max_depth.is_some_and(|depth| entry.depth() >= depth) {
+            return true;
+        }
+        (entry.depth() == 0 || coverage.allows_device(entry.path(), boundary.as_ref()))
+            && crate::bounded_io::probe_walk_directory(&permission_root, entry.path())
+                .inspect_err(|error| coverage.record_error(entry.path(), error))
+                .is_ok()
     });
     if ignored_target {
         // Like outline, an explicitly ignored target also honors Git rules
@@ -1845,10 +1893,10 @@ fn ignored_entries_in_folder(
     if !within_budget() {
         return None;
     }
-    let skipped = Arc::new(AtomicUsize::new(0));
+    let coverage = WalkCoverage::default();
     let builder = target_walk_builder(
         search_root,
-        Arc::clone(&skipped),
+        coverage.clone(),
         false,
         false,
         Some(filter_root),
@@ -1868,7 +1916,7 @@ fn ignored_entries_in_folder(
         }
         accepted.insert(entry.file_name().to_os_string());
     }
-    if skipped.load(Ordering::Relaxed) > 0 {
+    if !coverage.complete() {
         return None;
     }
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
@@ -1966,7 +2014,7 @@ fn diagnose_scope_counts_unbounded(
     ignored_target: bool,
     deadline: Instant,
 ) -> Option<ScopeFileCounts> {
-    let skipped = Arc::new(AtomicUsize::new(0));
+    let coverage = WalkCoverage::default();
     let mut counts = ScopeFileCounts::default();
     let within_budget = |visited: usize| {
         visited < MAX_FALLBACK_WALK_FILES.saturating_mul(8)
@@ -1980,8 +2028,7 @@ fn diagnose_scope_counts_unbounded(
     }
     if search_root.is_file() {
         counts.examined = 1;
-        let root = search_root.parent().unwrap_or(search_root);
-        if filters.matches(root, search_root) {
+        if explicit_file_matches(filter_root, search_root, filters) {
             counts.eligible = 1;
         } else {
             counts.filtered = 1;
@@ -1990,7 +2037,7 @@ fn diagnose_scope_counts_unbounded(
     }
     let Some(builder) = fallback_target_walk_builder(
         search_root,
-        Arc::clone(&skipped),
+        coverage.clone(),
         ignored_target,
         false,
         Some(filter_root),
@@ -2017,7 +2064,7 @@ fn diagnose_scope_counts_unbounded(
             directories.entry(entry.into_path()).or_default();
         }
     }
-    if skipped.load(Ordering::Relaxed) > 0 {
+    if !coverage.complete() {
         return None;
     }
     for (directory, accepted) in directories {
@@ -2121,11 +2168,11 @@ pub(crate) fn source_first_fallback_walk_files(
     let started = Instant::now();
     let mut files = Vec::new();
     let mut entries_visited = 0;
-    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let coverage = WalkCoverage::default();
     let mut walk_truncated = false;
     let mut walk_time_limit_reached = false;
     'phases: for source_phase in [true, false] {
-        let builder = fallback_project_walk_builder(root, Arc::clone(&skipped_foreign_mounts));
+        let builder = fallback_project_walk_builder(root, coverage.clone());
         for entry in builder.build() {
             entries_visited += 1;
             crate::tool_progress::report();
@@ -2152,7 +2199,7 @@ pub(crate) fn source_first_fallback_walk_files(
         walk_truncated,
         walk_time_limit_reached,
         walk_entry_limit_reached: false,
-        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+        skipped_foreign_mounts: coverage.skipped_foreign_mounts(),
         entries_visited,
     };
     log_walk_outcome("source_first", "unknown", root, started, &outcome);
@@ -2279,11 +2326,11 @@ fn walk_files_unbounded(
     sort_metadata_delay: Duration,
     progress: &crate::bounded_io::WalkProgress<FallbackWalkOutcome>,
 ) -> FallbackWalkOutcome {
-    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let coverage = WalkCoverage::default();
     // Built before the file test below, which would stat the starting path.
     let Some(builder) = fallback_target_walk_builder(
         search_root,
-        Arc::clone(&skipped_foreign_mounts),
+        coverage.clone(),
         ignored_target,
         ignore_ancestors,
         Some(filter_root),
@@ -2309,7 +2356,6 @@ fn walk_files_unbounded(
     let mut walk_entry_limit_reached = false;
     let mut entries_visited = 0usize;
     let mut walker = builder.build();
-    let mut error = None;
 
     loop {
         // Stop between entries; if `next` blocks, the caller can still take
@@ -2325,7 +2371,7 @@ fn walk_files_unbounded(
         entries_visited += 1;
         progress.update(|snapshot| {
             snapshot.entries_visited = entries_visited;
-            snapshot.skipped_foreign_mounts = skipped_foreign_mounts.load(Ordering::Relaxed);
+            snapshot.skipped_foreign_mounts = coverage.skipped_foreign_mounts();
         });
         if entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
@@ -2335,8 +2381,8 @@ fn walk_files_unbounded(
         let entry = match entry {
             Ok(entry) => entry,
             Err(cause) => {
-                error.get_or_insert_with(|| cause.to_string());
-                progress.update(|snapshot| snapshot.error.clone_from(&error));
+                coverage.record_error(search_root, cause);
+                progress.update(|snapshot| snapshot.error = coverage.error());
                 continue;
             }
         };
@@ -2369,12 +2415,12 @@ fn walk_files_unbounded(
         sort_walked_paths_by_mtime_desc(&mut files, filter_root);
     }
     FallbackWalkOutcome {
-        error,
+        error: coverage.error(),
         files,
         walk_truncated,
         walk_time_limit_reached,
         walk_entry_limit_reached,
-        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+        skipped_foreign_mounts: coverage.skipped_foreign_mounts(),
         entries_visited,
     }
 }
@@ -2464,10 +2510,10 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
     let started = Instant::now();
     let mut files_seen = 0usize;
     let mut counts = ScopeFileCounts::default();
-    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let coverage = WalkCoverage::default();
     let Some(builder) = fallback_target_walk_builder(
         search_root,
-        Arc::clone(&skipped_foreign_mounts),
+        coverage.clone(),
         ignored_target,
         false,
         Some(filter_root),
@@ -2478,14 +2524,13 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         };
     };
     let mut walker = builder.build();
-    let mut error = None;
 
     loop {
         if snapshot.stopped() {
             return FallbackWalkProgress {
-                error,
+                error: coverage.error(),
                 bound: Some(WalkBound::TimeBudget),
-                skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+                skipped_foreign_mounts: coverage.skipped_foreign_mounts(),
                 counts,
             };
         }
@@ -2495,29 +2540,29 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         counts.entries_visited += 1;
         snapshot.update(|state| {
             state.1.counts = counts;
-            state.1.skipped_foreign_mounts = skipped_foreign_mounts.load(Ordering::Relaxed);
+            state.1.skipped_foreign_mounts = coverage.skipped_foreign_mounts();
         });
         let entry = match entry {
             Ok(entry) => entry,
             Err(cause) => {
-                error.get_or_insert_with(|| cause.to_string());
-                snapshot.update(|state| state.1.error.clone_from(&error));
+                coverage.record_error(search_root, cause);
+                snapshot.update(|state| state.1.error = coverage.error());
                 continue;
             }
         };
         if cancellation.is_some_and(|token| token.cancel_requested_before_commit()) {
             return FallbackWalkProgress {
-                error,
+                error: coverage.error(),
                 bound: Some(WalkBound::Cancelled),
-                skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+                skipped_foreign_mounts: coverage.skipped_foreign_mounts(),
                 counts,
             };
         }
         if started.elapsed() >= budget {
             return FallbackWalkProgress {
-                error,
+                error: coverage.error(),
                 bound: Some(WalkBound::TimeBudget),
-                skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+                skipped_foreign_mounts: coverage.skipped_foreign_mounts(),
                 counts,
             };
         }
@@ -2540,9 +2585,9 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
             files_seen += 1;
             if files_seen > max_files {
                 return FallbackWalkProgress {
-                    error,
+                    error: coverage.error(),
                     bound: Some(WalkBound::FileLimit(max_files)),
-                    skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+                    skipped_foreign_mounts: coverage.skipped_foreign_mounts(),
                     counts,
                 };
             }
@@ -2552,9 +2597,9 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         }
     }
     FallbackWalkProgress {
-        error,
+        error: coverage.error(),
         bound: None,
-        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+        skipped_foreign_mounts: coverage.skipped_foreign_mounts(),
         counts,
     }
 }
@@ -2997,6 +3042,11 @@ fn fallback_search_file(
             if error.kind() == std::io::ErrorKind::TimedOut {
                 engine_capped.store(true, Ordering::Relaxed);
             }
+            if !crate::large_read::is_ceiling_error(&error)
+                && !crate::search_index::is_binary_grep_input(&error)
+            {
+                crate::bounded_io::note_skipped_file(file, &error.to_string());
+            }
             return Vec::new();
         }
     };
@@ -3333,6 +3383,7 @@ fn fallback_search_file_streamed(
             if error.kind() == std::io::ErrorKind::TimedOut {
                 engine_capped.store(true, Ordering::Relaxed);
             }
+            crate::bounded_io::note_skipped_file(file, &error.to_string());
             return Vec::new();
         }
     }
@@ -4704,7 +4755,7 @@ mod tests {
             .build()
             .map(|entry| entry.unwrap().into_path())
             .collect::<Vec<_>>();
-        let actual = fallback_project_walk_builder(root, Arc::new(AtomicUsize::new(0)))
+        let actual = fallback_project_walk_builder(root, WalkCoverage::default())
             .build()
             .map(|entry| entry.unwrap().into_path())
             .collect::<Vec<_>>();
@@ -4716,7 +4767,7 @@ mod tests {
         // walk exposes exactly the file set the repository walk did (#403).
         let in_repository = actual;
         std::fs::remove_dir(root.join(".git")).unwrap();
-        let mut actual = fallback_project_walk_builder(root, Arc::new(AtomicUsize::new(0)))
+        let mut actual = fallback_project_walk_builder(root, WalkCoverage::default())
             .build()
             .map(|entry| entry.unwrap().into_path())
             .collect::<Vec<_>>();

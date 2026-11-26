@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aft::commands::callgraph_store_adapter::callgraph_surface::{
-    build_callgraph_envelope, build_impact_envelope, cap_items, hub_selector_activated,
-    HUB_SUMMARY_LIMIT,
+    build_callers_macro_cut_envelope, build_callgraph_envelope, build_impact_envelope, cap_items,
+    hub_selector_activated, HUB_SUMMARY_LIMIT,
 };
 use aft::commands::callgraph_store_adapter::{
     StoreCallTreeNode, StoreCallerEntry, StoreCallerGroup, StoreCallersResult, StoreHubSummary,
@@ -244,7 +244,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         list_id: "payload.callers",
         unit: Unit::Items,
         narrow: &["depth", "includeTests"],
-        reasons: CAP_DEPTH,
+        reasons: DEPTH_BUDGET_CAP,
     },
     SurfaceSpec {
         requires: None,
@@ -476,6 +476,14 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
                 has(Reason::Budget),
             )
         }
+        ("callgraph", "callers") if has(Reason::Budget) => {
+            let total = if has(Reason::Cap) { 21 } else { 15 };
+            Some(build_callers_macro_cut_envelope(
+                15,
+                total,
+                usize::from(has(Reason::Depth)),
+            ))
+        }
         ("callgraph", "callers" | "call_tree") => {
             let total = if has(Reason::Cap) { 21 } else { 15 };
             let truncated = usize::from(has(Reason::Depth));
@@ -592,7 +600,7 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
         ("ast_search", "matches") => Total::Exact(24000),
-        ("callgraph", "impact") if has(Reason::Budget) => {
+        ("callgraph", "impact" | "callers") if has(Reason::Budget) => {
             Total::AtLeast(if has(Reason::Cap) { 21 } else { 15 })
         }
         ("callgraph", "impact" | "callers" | "call_tree") => {

@@ -38,7 +38,7 @@ const SCAN_BATCH: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OVERLAP_MS: i64 = 10_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const LIVE_SCAN_SQL: &str = "SELECT rowid,settled_at,seq,CASE WHEN acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0) THEN custodian END,carrier,call_key,event_id,outcome FROM call_ledger WHERE state='Settled' AND (settled_at,rowid)>(?1,?2) ORDER BY settled_at,rowid LIMIT ?3";
+const LIVE_SCAN_SQL: &str = "SELECT rowid,settled_at,seq,CASE WHEN late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0) THEN custodian END,carrier,call_key,event_id,outcome FROM call_ledger WHERE state='Settled' AND (settled_at,rowid)>(?1,?2) ORDER BY settled_at,rowid LIMIT ?3";
 use crate::db::call_ledger::SETTLED;
 static DISPLAY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static HEALTH: LazyLock<parking_lot::Mutex<BusHealth>> = LazyLock::new(Default::default);
@@ -525,7 +525,7 @@ fn replay(
     let limit = SCAN_BATCH.min(LATE_RESULTS_PAGE_MAX as usize).min(capacity);
     // This is the terminal half of late_results' custodian/seq seek, without
     // loading result bodies or the separate non-terminal held-update entries.
-    let mut stmt = conn.prepare("SELECT rowid,settled_at,seq,custodian,carrier,call_key,event_id,outcome FROM call_ledger WHERE custodian=?1 AND seq>?2 AND late_entry IS NOT NULL AND acked=0 AND (settled_at,rowid)<=(?3,?4) ORDER BY seq LIMIT ?5")?;
+    let mut stmt = conn.prepare("SELECT rowid,settled_at,seq,custodian,carrier,call_key,event_id,outcome FROM call_ledger WHERE custodian=?1 AND seq>?2 AND late_entry IS NOT NULL AND (settled_at,rowid)<=(?3,?4) ORDER BY seq LIMIT ?5")?;
     let mut rows = stmt.query(params![
         reader,
         seq,
@@ -550,7 +550,7 @@ fn replay(
 }
 
 fn is_retained(conn: &Connection, notice: &Notice) -> rusqlite::Result<bool> {
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND event_id=?3 AND state='Settled' AND acked=0 AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0))", params![notice.key.carrier, notice.key.call_key, notice.event_id], |row| row.get(0))
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND event_id=?3 AND state='Settled' AND late_entry IS NOT NULL AND seq>COALESCE((SELECT through_seq FROM call_ledger_ack WHERE custodian=call_ledger.custodian),0))", params![notice.key.carrier, notice.key.call_key, notice.event_id], |row| row.get(0))
 }
 
 trait Publisher {

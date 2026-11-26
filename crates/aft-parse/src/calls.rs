@@ -1,7 +1,7 @@
 //! Shared call-site extraction helpers.
 //!
-//! Extracted from `commands/zoom.rs` so both the zoom command and the
-//! call-graph engine can reuse the same AST-walking logic.
+//! `aft_zoom` and call-graph extraction use the same syntax walkers to
+//! identify call sites.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -1332,8 +1332,12 @@ pub type CallTuple = (String, String, u32, usize, usize);
 
 /// Upper bound on unanalyzed macro mentions recorded for one file. A file full
 /// of DSL macros (SQL, HTML templates) would otherwise record every word in
-/// them; past this many the note on `callers` output is already clear enough.
+/// them. Record that coverage is incomplete when the cap stops collection.
 const MAX_UNPARSED_MACRO_MENTIONS_PER_FILE: usize = 512;
+
+/// Not a Rust identifier. A macro-mention posting with this key records a
+/// file-wide extraction gap, not a mention of any particular symbol.
+pub const MACRO_MENTION_OVERFLOW_KEY: &str = "<macro-mention-overflow>";
 
 /// The template of one `macro_rules!` arm, located in the original source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1359,14 +1363,15 @@ pub struct RustMacroFacts {
     /// file is enough to point a reader at the macro, and macro-heavy
     /// files would otherwise record every local variable many times over.
     pub unparsed_mentions: Vec<CallTuple>,
+    pub unparsed_mentions_truncated: bool,
     mention_names: HashSet<String>,
 }
 
 impl RustMacroFacts {
     fn push_mention(&mut self, mention: CallTuple) {
-        if self.unparsed_mentions.len() < MAX_UNPARSED_MACRO_MENTIONS_PER_FILE
-            && self.mention_names.insert(mention.1.clone())
-        {
+        if self.unparsed_mentions.len() == MAX_UNPARSED_MACRO_MENTIONS_PER_FILE {
+            self.unparsed_mentions_truncated |= !self.mention_names.contains(&mention.1);
+        } else if self.mention_names.insert(mention.1.clone()) {
             self.unparsed_mentions.push(mention);
         }
     }
@@ -1637,6 +1642,7 @@ fn collect_rust_token_tree_calls(
         )
     };
     results.extend(fragment_calls.into_iter().map(remap));
+    facts.unparsed_mentions_truncated |= fragment_facts.unparsed_mentions_truncated;
     facts
         .bodies
         .extend(fragment_facts.bodies.into_iter().map(|body| RustMacroBody {
@@ -1666,10 +1672,14 @@ fn collect_unparsed_mentions(
     // macro input and can nest deeply.
     let mut pending = vec![(root, false)];
     while let Some((node, in_error)) = pending.pop() {
+        let in_error = in_error || node.is_error();
+        if !in_error && !node.has_error() {
+            continue;
+        }
         if facts.unparsed_mentions.len() >= MAX_UNPARSED_MACRO_MENTIONS_PER_FILE {
+            facts.unparsed_mentions_truncated = true;
             return;
         }
-        let in_error = in_error || node.is_error();
         if in_error && node.kind() == "identifier" {
             if let Some(name) = fragment.get(node.byte_range()) {
                 if !callee_names.contains(name) {
@@ -1682,10 +1692,6 @@ fn collect_unparsed_mentions(
                     ));
                 }
             }
-            continue;
-        }
-        // Only subtrees that contain an error can hold an unparsed mention.
-        if !in_error && !node.has_error() {
             continue;
         }
         let mut cursor = node.walk();

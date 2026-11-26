@@ -456,15 +456,31 @@ pub(crate) fn shared_onnx_reranker(model: Option<&str>) -> Result<Arc<OnnxRerank
     shared_onnx_reranker_in(model, None, None)
 }
 
-/// Keep the legacy process-wide model when no cache location is configured.
-/// Configured namespaces share only with the same path and directory identity;
-/// weak entries let their workers retire after the last context stops using them.
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn default_cache_reranker_retires_after_last_handle() {
+        let model = Some("gte-reranker-modernbert-base");
+        let first = shared_onnx_reranker(model).unwrap();
+        let second = shared_onnx_reranker(model).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let previous = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        assert!(previous.upgrade().is_none());
+    }
+}
+
+/// Share models within the default cache, or by configured cache path and
+/// lease root key. Workers retire when their last user leaves.
 pub(crate) fn shared_onnx_reranker_in(
     model: Option<&str>,
     cache_dir: Option<PathBuf>,
     lease: Option<std::sync::Weak<crate::root_cache::CacheLease>>,
 ) -> Result<Arc<OnnxReranker>, String> {
-    static DEFAULT_BACKENDS: OnceLock<Mutex<HashMap<&'static str, Arc<OnnxReranker>>>> =
+    static DEFAULT_BACKENDS: OnceLock<Mutex<HashMap<&'static str, std::sync::Weak<OnnxReranker>>>> =
         OnceLock::new();
     type ScopedKey = (&'static str, PathBuf, Option<(u64, u64)>);
     static SCOPED_BACKENDS: OnceLock<Mutex<HashMap<ScopedKey, std::sync::Weak<OnnxReranker>>>> =
@@ -484,10 +500,15 @@ pub(crate) fn shared_onnx_reranker_in(
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        return Ok(backends
-            .entry(allowed.name)
-            .or_insert_with(|| make(None, None))
-            .clone());
+        if let Some(backend) = backends
+            .get(allowed.name)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(backend);
+        }
+        let backend = make(None, None);
+        backends.insert(allowed.name, Arc::downgrade(&backend));
+        return Ok(backend);
     };
     let identity = lease
         .as_ref()

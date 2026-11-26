@@ -1,6 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import {
   mkdirSync,
   mkdtempSync,
@@ -451,6 +452,72 @@ describe("watchAftConfigFiles", () => {
     }
   });
 
+  test("the revalidation poll backs off while nothing changes and speeds up on an event", () => {
+    const dir = tempDir();
+    const file = join(dir, "aft.jsonc");
+    writeFileSync(file, "{}");
+    let listener: ((event: string, filename: string | null) => void) | undefined;
+    // A watch that never reports on its own; the test sends its one event.
+    const fakeWatch = ((
+      _path: string,
+      _options: unknown,
+      onEvent: (event: string, filename: string | null) => void,
+    ) => {
+      listener = onEvent;
+      return Object.assign(new EventEmitter(), { close: () => {} });
+    }) as unknown as typeof watch;
+    // Capture timers instead of running them, so each poll is driven by hand
+    // and its delay can be read.
+    const pending: Array<{ delay: number; run: () => void; cleared: boolean }> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const realSetInterval = globalThis.setInterval;
+    const fakeTimer = (run: () => void, delay: number) => {
+      const timer = { delay, run, cleared: false, unref: () => timer };
+      pending.push(timer);
+      return timer;
+    };
+    globalThis.setTimeout = fakeTimer as unknown as typeof setTimeout;
+    // An interval fires again at the same delay after each run.
+    globalThis.setInterval = ((run: () => void, delay: number) => {
+      const rearm = () => {
+        run();
+        pending.push(Object.assign(timer, { run: rearm }));
+      };
+      const timer = fakeTimer(rearm, delay);
+      return timer;
+    }) as unknown as typeof setInterval;
+    globalThis.clearTimeout = ((timer: { cleared: boolean } | undefined) => {
+      if (timer) timer.cleared = true;
+    }) as unknown as typeof clearTimeout;
+    // Polls are the timers of 2 s or more; the change check waits at most 1 s.
+    const nextPoll = () => {
+      const poll = pending.find((timer) => !timer.cleared && timer.delay >= 2_000);
+      if (!poll) throw new Error("no revalidation poll armed");
+      pending.splice(pending.indexOf(poll), 1);
+      return poll;
+    };
+    let stop = () => {};
+    try {
+      stop = watchAftConfigFiles({ paths: [file], watchImpl: fakeWatch, onChange: () => {} });
+      const delays: number[] = [];
+      for (let tick = 0; tick < 6; tick++) {
+        const poll = nextPoll();
+        delays.push(poll.delay);
+        poll.run();
+      }
+      expect(delays).toEqual([2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+
+      listener?.("change", "aft.jsonc");
+      expect(nextPoll().delay).toBe(2_000);
+    } finally {
+      stop();
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+      globalThis.setInterval = realSetInterval;
+    }
+  });
+
   test("an edit, and a config directory created later, call onChange", async () => {
     const dir = tempDir();
     const file = join(dir, ".cortexkit", "aft.jsonc");
@@ -730,14 +797,17 @@ describe("watchAftConfigFiles registration and retries", () => {
 test("fresh filesystem events supersede rejected config retry timers", () => {
   const file = join(tempDir(), "aft.jsonc");
   writeFileSync(file, "{}");
-  const pending = new Map<object, () => void>();
+  // The revalidation poll (2 s or more) is a timer too; this test counts only
+  // the change-check and retry timers, which wait at most 1 s.
+  const pending = new Map<object, { callback: () => void; delay: number }>();
+  const checks = () => [...pending].filter(([, entry]) => entry.delay < 2_000);
   const originalSet = globalThis.setTimeout;
   const originalClear = globalThis.clearTimeout;
   let emit!: () => void;
   let stop: (() => void) | undefined;
-  globalThis.setTimeout = ((callback: () => void) => {
+  globalThis.setTimeout = ((callback: () => void, delay: number) => {
     const timer = { unref() {} };
-    pending.set(timer, callback);
+    pending.set(timer, { callback, delay });
     return timer;
   }) as unknown as typeof setTimeout;
   globalThis.clearTimeout = ((timer: object) => {
@@ -754,13 +824,13 @@ test("fresh filesystem events supersede rejected config retry timers", () => {
         return { close() {}, on() {} };
       }) as unknown as typeof import("node:fs").watch,
     });
-    expect(pending.size).toBe(1);
+    expect(checks()).toHaveLength(1);
     emit();
-    expect(pending.size).toBe(1);
-    const [timer, check] = pending.entries().next().value!;
+    expect(checks()).toHaveLength(1);
+    const [timer, entry] = checks()[0]!;
     pending.delete(timer);
-    check();
-    expect(pending.size).toBe(1);
+    entry.callback();
+    expect(checks()).toHaveLength(1);
     stop();
     expect(pending.size).toBe(0);
   } finally {

@@ -25,7 +25,7 @@ const FLUSH_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone)]
 enum NativeEventSender {
-    Events(mpsc::Sender<notify::Result<Event>>),
+    Events(crate::watcher_filter::RawEventSender),
     Batches(mpsc::Sender<Message>),
 }
 
@@ -102,10 +102,11 @@ impl ProjectWatcher {
     pub(crate) fn create(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,
-        tx: mpsc::Sender<notify::Result<Event>>,
+        tx: impl Into<crate::watcher_filter::RawEventSender>,
         matcher: SharedGitignore,
         matcher_generation: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
+        let tx = tx.into();
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         // Same rule as the inotify backend: the exclusion set describes the
         // matcher at this generation, so the generation is captured beside it
@@ -369,7 +370,7 @@ fn replace_stream_exclusions(
     root: &Path,
     paths: &[PathBuf],
     last_delivered_id: &Arc<AtomicU64>,
-    tx: &mpsc::Sender<notify::Result<Event>>,
+    tx: &crate::watcher_filter::RawEventSender,
 ) -> notify::Result<()> {
     let since_when = last_delivered_id.load(Ordering::Acquire);
     #[cfg(test)]
@@ -420,12 +421,12 @@ pub(crate) struct DirectoryWatcher {
 
 impl DirectoryWatcher {
     pub(crate) fn new(
-        sender: mpsc::Sender<notify::Result<Event>>,
+        sender: impl Into<crate::watcher_filter::RawEventSender>,
         counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> Self {
         Self {
             stream: None,
-            sender: NativeEventSender::Events(sender),
+            sender: NativeEventSender::Events(sender.into()),
             counters,
         }
     }
@@ -532,14 +533,14 @@ impl FsEventsStream {
     fn start(
         root: &Path,
         exclusions: &[PathBuf],
-        sender: mpsc::Sender<notify::Result<Event>>,
+        sender: impl Into<crate::watcher_filter::RawEventSender>,
         since_when: fs::FSEventStreamEventId,
         last_delivered_id: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
         Self::start_with_sender(
             root,
             exclusions,
-            NativeEventSender::Events(sender),
+            NativeEventSender::Events(sender.into()),
             since_when,
             last_delivered_id,
         )
@@ -1696,7 +1697,7 @@ mod tests {
         let (sender, rx) = mpsc::channel();
         let mut context = CallbackContext {
             release_calls: Arc::new(AtomicU64::new(0)),
-            sender: NativeEventSender::Events(sender),
+            sender: NativeEventSender::Events(sender.into()),
             last_delivered_id: Arc::new(AtomicU64::new(0)),
             nonrecursive_paths: Some(vec![root.clone()]),
             replay_stream: false,

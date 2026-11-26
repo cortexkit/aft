@@ -1,8 +1,7 @@
-//! Project-safe, redacted edit details for the Occipital Diff component.
+//! Structured diff hunks for edit display details.
 use serde_json::{json, Value};
 use similar::{ChangeTag, DiffTag};
 
-use crate::log_redact::SecretValues;
 use crate::patch::matcher::{self, NearestMissSearch};
 use std::path::Path;
 
@@ -17,13 +16,16 @@ pub(crate) fn capture_no_match(path: &Path, source: &str, sought: &str, index: u
         }
         let (mut record, _) = super::file_bodies(&capture, false);
         record["reason"] = json!("no_match");
-        let detail = super::relative(&capture.root, path)
-            .zip(capture.masker.as_ref())
-            .and_then(|(path, masker)| {
-                let mut body = json!({"schema":"aft/files-detail/1","revision":1,"noMatchChange":index+1,"path":path});
-                no_match(masker, source, sought).attach(&mut body);
-                super::records::cut_detail(body, crate::edit::DIFF_RESPONSE_BUDGET)
+        let detail = super::relative(&capture.root, path).and_then(|path| {
+            let mut body = json!({
+                "schema": "aft/files-detail/1",
+                "revision": 1,
+                "noMatchChange": index + 1,
+                "path": path
             });
+            no_match(source, sought).attach(&mut body);
+            super::records::cut_detail(body, crate::edit::DIFF_RESPONSE_BUDGET)
+        });
         capture.file_snapshot = Some((record, detail));
     });
 }
@@ -86,19 +88,8 @@ fn bytes(value: &Value) -> usize {
     serde_json::to_vec(value).expect("JSON value").len()
 }
 
-fn redacted<'a>(masker: &SecretValues, text: &'a str) -> Option<std::borrow::Cow<'a, str>> {
-    // Redact the whole snapshot, not individual lines: exact secrets and some
-    // credential patterns can span several lines. Don't attach line numbers
-    // to a snapshot if redaction changed the number of lines.
-    let safe = masker.redact(text);
-    (safe.lines().count() == text.lines().count()).then_some(safe)
-}
-
-pub(super) fn diff(hunks: &mut Hunks, masker: &SecretValues, before: &str, after: &str) {
-    let (Some(old), Some(new)) = (redacted(masker, before), redacted(masker, after)) else {
-        return;
-    };
-    let diff = crate::edit::construct_diff(&old, &new);
+pub(super) fn diff(hunks: &mut Hunks, before: &str, after: &str) {
+    let diff = crate::edit::construct_diff(before, after);
     let mut long_line = false;
     for group in diff.grouped_ops(3) {
         let updated = group.iter().filter(|op| op.tag() != DiffTag::Equal);
@@ -146,26 +137,18 @@ fn line_prefix(text: &str) -> &str {
     &text[..end]
 }
 
-pub(super) fn no_match(masker: &SecretValues, source: &str, sought: &str) -> Hunks {
+fn no_match(source: &str, sought: &str) -> Hunks {
     let mut hunks = Hunks::default();
-    let looked_for = masker.redact(sought);
     let found = if source.len() <= matcher::NEAREST_MISS_MAX_FILE_BYTES
         && sought.len() <= matcher::NEAREST_MISS_MAX_FILE_BYTES
     {
         let lines: Vec<_> = source.lines().collect();
         let pattern: Vec<_> = sought.lines().collect();
         match matcher::find_nearest_miss(&lines, &pattern, source.len()) {
-            NearestMissSearch::Found(candidate) => {
-                // Redact in the whole file before slicing: a secret can
-                // cross the boundary of the candidate region.
-                redacted(masker, source).map(|safe| {
-                    let lines: Vec<_> = safe.lines().collect();
-                    (
-                        candidate.start + 1,
-                        lines[candidate.start..candidate.end].join("\n"),
-                    )
-                })
-            }
+            NearestMissSearch::Found(candidate) => Some((
+                candidate.start + 1,
+                lines[candidate.start..candidate.end].join("\n"),
+            )),
             _ => None,
         }
     } else {
@@ -178,12 +161,12 @@ pub(super) fn no_match(masker: &SecretValues, source: &str, sought: &str) -> Hun
         .flat_map(|(_, text)| text.lines());
     hunks.push(
         json!({"title":"Looked for","lines":[]}),
-        looked_for
+        sought
             .lines()
             .map(|line| plain(line, other.next(), &mut clipped)),
     );
     if let Some((start, text)) = found {
-        let mut other = looked_for.lines();
+        let mut other = sought.lines();
         hunks.push(
             json!({"title":format!("Closest text in the file · line {start}"),"lines":[]}),
             text.split('\n')
@@ -227,7 +210,6 @@ mod tests {
         let mut hunks = Hunks::default();
         diff(
             &mut hunks,
-            &SecretValues::from_environment([]),
             "0\n1\n2\n3\nold\n5\n6\n7\n8\n",
             "0\n1\n2\n3\nnew\nadded\n5\n6\n7\n8\n",
         );
@@ -248,12 +230,7 @@ mod tests {
     fn edit_hunks_keep_a_visible_prefix_within_the_escaped_byte_budget() {
         let mut hunks = Hunks::default();
         let after = "\"é".repeat(1_000) + "\n";
-        diff(
-            &mut hunks,
-            &SecretValues::from_environment([]),
-            "old\n",
-            &after.repeat(100),
-        );
+        diff(&mut hunks, "old\n", &after.repeat(100));
         assert!(hunks.truncated);
         let mut detail = json!({"schema":"aft/files-detail/1"});
         hunks.attach(&mut detail);

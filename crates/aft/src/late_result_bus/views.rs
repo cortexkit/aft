@@ -90,10 +90,10 @@ impl<'a> Publication<'a> {
     async fn sync(
         &mut self,
         writer: &mut impl Writer,
-        values: Vec<(String, Vec<u8>)>,
+        values: &[(String, Vec<u8>)],
     ) -> Result<(), &'static str> {
         for (pin, bytes) in values {
-            let identity = (pin.clone(), blake3::hash(&bytes));
+            let identity = (pin.clone(), blake3::hash(bytes));
             if bytes.len() > declaration().max_value_bytes as usize {
                 if pin.starts_with("nv1:") {
                     self.notice_views.fail("notice_view_oversized");
@@ -102,7 +102,7 @@ impl<'a> Publication<'a> {
                     HEALTH.lock().views.skips += 1;
                     log::warn!(
                         "bus views KV skipping oversized pin={} bytes={} cap={}",
-                        key(&pin),
+                        key(pin),
                         bytes.len(),
                         declaration().max_value_bytes
                     );
@@ -112,7 +112,7 @@ impl<'a> Publication<'a> {
             if self.written.contains(&identity) {
                 continue;
             }
-            tokio::time::timeout(IO_TIMEOUT, writer.put(&key(&pin), bytes))
+            tokio::time::timeout(IO_TIMEOUT, writer.put(&key(pin), bytes.clone()))
                 .await
                 .map_err(|_| "views_put_timeout")??;
             self.written.insert(identity);

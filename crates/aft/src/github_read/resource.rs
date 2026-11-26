@@ -32,6 +32,14 @@ impl GithubResourceKind {
             Self::PullRequest => "Pull request",
         }
     }
+
+    /// Lowercase name used mid-sentence, as in "GitHub issue data".
+    pub const fn data_label(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull request",
+        }
+    }
 }
 
 /// An item in a discussion comment selector.

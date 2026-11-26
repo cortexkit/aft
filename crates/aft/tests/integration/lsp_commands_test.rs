@@ -486,6 +486,8 @@ fn cold_server_start_leaves_the_lsp_manager_free_and_is_shared() {
 /// the old contents.
 #[test]
 fn edit_notification_reaches_the_server_after_a_busy_manager_frees() {
+    use aft::lsp::document::FIRST_VERSION_FOR_TEST;
+
     let (_temp_dir, main_rs) = rust_workspace_with_file();
     let ctx = app_context_with_fake_lsp();
     let canonical = fs::canonicalize(&main_rs).expect("canonical main.rs");
@@ -510,14 +512,18 @@ fn edit_notification_reaches_the_server_after_a_busy_manager_frees() {
     );
     drop(held);
 
+    let changed_version = FIRST_VERSION_FOR_TEST + 1;
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut delivered = false;
     while std::time::Instant::now() < deadline {
         {
             let mut lsp = ctx.lsp();
             lsp.drain_events();
-            delivered =
-                published_document_version_reached(lsp.diagnostics_store_for_test(), &canonical, 1);
+            delivered = published_document_version_reached(
+                lsp.diagnostics_store_for_test(),
+                &canonical,
+                changed_version,
+            );
         }
         if delivered {
             break;
@@ -526,7 +532,7 @@ fn edit_notification_reaches_the_server_after_a_busy_manager_frees() {
     }
     assert!(
         delivered,
-        "the server never published for document version 1: the queued didChange was lost"
+        "the server never published for document version {changed_version}: the queued didChange was lost"
     );
     let drained_deadline = std::time::Instant::now() + Duration::from_secs(5);
     while ctx.lsp_pending_changes_for_test() && std::time::Instant::now() < drained_deadline {

@@ -40,6 +40,7 @@ pub struct OxcFactsCache {
     entries_by_hash: BTreeMap<String, FileFacts>,
     entries_by_path: BTreeMap<PathBuf, OxcFactsPathEntry>,
     references_by_hash: BTreeMap<String, usize>,
+    payload_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,13 @@ impl OxcFactsCache {
 
     pub fn is_empty(&self) -> bool {
         self.entries_by_hash.is_empty()
+    }
+
+    /// Size of cached facts and their top-level collections, not the indexes
+    /// around them. Maintain the subtotal on writes so a census never walks
+    /// the facts cache while holding the inspect manager's lock.
+    pub(crate) fn estimated_payload_bytes(&self) -> u64 {
+        self.payload_bytes
     }
 
     fn facts_for_file(
@@ -162,6 +170,9 @@ impl OxcFactsCache {
 
         stats.misses += 1;
         let facts = parse_file_facts(file_id, path, source, content_hash, source_type);
+        self.payload_bytes = self
+            .payload_bytes
+            .saturating_add(facts.estimated_payload_bytes());
         self.entries_by_hash
             .insert(cache_key.clone(), facts.clone());
         if let Some((mtime, size)) = metadata {
@@ -192,7 +203,11 @@ impl OxcFactsCache {
                 *count -= 1;
                 if *count == 0 {
                     self.references_by_hash.remove(&previous.cache_key);
-                    self.entries_by_hash.remove(&previous.cache_key);
+                    if let Some(facts) = self.entries_by_hash.remove(&previous.cache_key) {
+                        self.payload_bytes = self
+                            .payload_bytes
+                            .saturating_sub(facts.estimated_payload_bytes());
+                    }
                 }
             }
         }
@@ -248,6 +263,27 @@ pub fn analyze_files_with_cache(
     options: AnalyzeOptions,
     cache: &mut OxcFactsCache,
 ) -> Result<OxcEngineResult, String> {
+    let collected = collect_facts_with_cache(project_root, files, &options, cache);
+    Ok(analyze_collected_facts(collected, options))
+}
+
+/// Per-file facts read through an [`OxcFactsCache`], before any cross-file
+/// work. Holding the cache is needed only to produce these; module resolution
+/// and verdicts ([`analyze_collected_facts`]) run without it.
+pub(crate) struct CollectedFacts {
+    project_root: PathBuf,
+    facts: Vec<FileFacts>,
+    cache_stats: OxcFactsCacheStats,
+    errors: Vec<OxcEngineError>,
+    skipped_outside_root: Vec<PathBuf>,
+}
+
+pub(crate) fn collect_facts_with_cache(
+    project_root: &Path,
+    files: &[PathBuf],
+    options: &AnalyzeOptions,
+    cache: &mut OxcFactsCache,
+) -> CollectedFacts {
     // De-verbatim the canonical root (Windows \\?\ form) so strip_prefix
     // against normalize_path-built module paths keeps working.
     let project_root = fs::canonicalize(project_root)
@@ -286,14 +322,27 @@ pub fn analyze_files_with_cache(
         }
     }
 
-    Ok(analyze_preparsed_facts(
+    CollectedFacts {
         project_root,
         facts,
-        options,
         cache_stats,
         errors,
         skipped_outside_root,
-    ))
+    }
+}
+
+pub(crate) fn analyze_collected_facts(
+    collected: CollectedFacts,
+    options: AnalyzeOptions,
+) -> OxcEngineResult {
+    analyze_preparsed_facts(
+        collected.project_root,
+        collected.facts,
+        options,
+        collected.cache_stats,
+        collected.errors,
+        collected.skipped_outside_root,
+    )
 }
 
 pub(crate) fn analyze_file_facts(
@@ -302,6 +351,8 @@ pub(crate) fn analyze_file_facts(
     options: AnalyzeOptions,
     skipped_outside_root: Vec<PathBuf>,
 ) -> OxcEngineResult {
+    #[cfg(test)]
+    ANALYZE_FILE_FACTS_CALLS.with(|calls| calls.set(calls.get() + 1));
     // Same de-verbatim rule as analyze_files_with_cache: FileFacts paths are
     // normalize_path-built, so the root they are relativized against must be too.
     let project_root = fs::canonicalize(project_root)
@@ -317,6 +368,16 @@ pub(crate) fn analyze_file_facts(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `analyze_file_facts` calls made on this thread.
+    pub(crate) static ANALYZE_FILE_FACTS_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Runs once on this thread when cross-file analysis starts.
+    pub(crate) static CROSS_FILE_ANALYSIS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn analyze_preparsed_facts(
     project_root: PathBuf,
     mut facts: Vec<FileFacts>,
@@ -325,6 +386,10 @@ fn analyze_preparsed_facts(
     mut errors: Vec<OxcEngineError>,
     skipped_outside_root: Vec<PathBuf>,
 ) -> OxcEngineResult {
+    #[cfg(test)]
+    if let Some(hook) = CROSS_FILE_ANALYSIS_HOOK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     // Preserve dense FileId indexing when unreadable files were skipped or facts
     // were reconstructed from contribution records.
     for (idx, fact) in facts.iter_mut().enumerate() {
@@ -482,6 +547,45 @@ fn is_ts_js_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod audit_tests {
+    #[test]
+    fn memory_census_tracks_oxc_facts_until_last_path_is_replaced() {
+        use super::*;
+        let mut cache = OxcFactsCache::new();
+        let mut stats = OxcFactsCacheStats::default();
+        let mut cache_source = |cache: &mut OxcFactsCache, path: &str, source: &str| {
+            let path = Path::new(path);
+            let kind = SourceType::from_path(path).unwrap();
+            cache.facts_for_source_with_metadata(
+                FileId(0),
+                path,
+                source,
+                kind,
+                source_type_cache_key(kind),
+                Some((std::time::UNIX_EPOCH, source.len() as u64)),
+                &mut stats,
+            );
+        };
+        assert_eq!(cache.estimated_payload_bytes(), 0);
+        let with_exports = "export const first = 1; export const second = 2;";
+        cache_source(&mut cache, "a.ts", with_exports);
+        let first_bytes = cache.estimated_payload_bytes();
+        assert!(
+            first_bytes
+                >= (std::mem::size_of::<FileFacts>() + 2 * std::mem::size_of::<ExportFact>())
+                    as u64
+        );
+        cache_source(&mut cache, "b.ts", with_exports);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.estimated_payload_bytes(), first_bytes);
+        cache_source(&mut cache, "a.ts", "");
+        let both_bytes = cache.estimated_payload_bytes();
+        assert_eq!(cache.len(), 2);
+        assert!(both_bytes > first_bytes);
+        cache_source(&mut cache, "b.ts", "");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.estimated_payload_bytes(), both_bytes - first_bytes);
+    }
+
     #[test]
     fn inspect_script_return_cache_keeps_strict_extensions_separate_when_warm() {
         use super::*;

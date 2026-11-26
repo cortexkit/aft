@@ -185,7 +185,7 @@ fn handle_file_mode(
         .filter(|key| key.kind == ServerKind::Rust)
         .cloned()
         .collect();
-    let still_checking = wait_for_rust_check(ctx, &rust_servers, wait_deadline);
+    let mut still_checking = wait_for_rust_check(ctx, &rust_servers, wait_deadline);
 
     // Step 3: pull diagnostics from every server that supports it. Track
     // which servers we got a fresh result for. The manager lock is released
@@ -205,6 +205,13 @@ fn handle_file_mode(
             }
         }
     };
+    repair_unproven_rust_checks(
+        ctx,
+        &canonical,
+        &rust_servers,
+        wait_deadline,
+        &mut still_checking,
+    );
     update_status_with_pull(&mut server_status, &pull_results);
 
     // Step 4: for servers that didn't support pull, drain push events for
@@ -504,6 +511,48 @@ fn collect_directory_diagnostics(
         .filter(|diagnostic| severity_filter.matches(diagnostic.severity))
         .cloned()
         .collect()
+}
+
+fn repair_unproven_rust_checks(
+    ctx: &AppContext,
+    file: &Path,
+    servers: &[ServerKey],
+    deadline: Instant,
+    still_checking: &mut Vec<(ServerKey, &'static str)>,
+) {
+    if servers.is_empty() {
+        return;
+    }
+    // The pull has opened the file. A check started while it was closed can
+    // publish errors without a document version; do not lend those rows the
+    // version of the new pull. Ask once with the document now open instead.
+    let started = {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events();
+        servers
+            .iter()
+            .filter(|key| {
+                Instant::now() < deadline
+                    && !still_checking.iter().any(|(busy, _)| busy == *key)
+                    && lsp.recheck_unproven_rust_file(key, file)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if !started.is_empty() {
+        still_checking.extend(wait_for_rust_check(ctx, &started, deadline));
+    }
+    let lsp = ctx.lsp();
+    for key in servers {
+        if lsp.rust_compiler_report_unproven(key, file)
+            && !still_checking.iter().any(|(busy, _)| busy == key)
+        {
+            still_checking.push((
+                key.clone(),
+                crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON,
+            ));
+        }
+    }
 }
 
 /// Wait, until `deadline`, for the given rust-analyzer servers to finish

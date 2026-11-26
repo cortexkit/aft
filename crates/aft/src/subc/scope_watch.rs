@@ -1,5 +1,6 @@
 //! Scope lifecycle subscriptions on AFT's existing registered connection.
 use super::*;
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use subc_client_rs::{ScopeWatchEvent, ScopeWatchSelector};
 use subc_protocol::scope::ScopeStamp;
 
@@ -337,7 +338,7 @@ pub(super) struct Health {
     pub(super) prefrontal_continuity_holds: usize,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct Coverage {
     // Poll protection includes a bounded replacement handoff, not just health.
     pub(super) keys: HashSet<Key>,
@@ -365,8 +366,16 @@ pub(super) struct Watches {
     epochs: HashMap<Key, u64>,
     metrics: Arc<DispatchPathMetrics>,
     retiring: Vec<oneshot::Receiver<()>>,
+    retirement_barrier: Option<Shared<BoxFuture<'static, ()>>>,
 }
 impl Watches {
+    #[cfg(test)]
+    pub(super) fn pause_retirement_for_test(&mut self) -> oneshot::Sender<()> {
+        let (resume, queued) = oneshot::channel();
+        self.retiring.push(queued);
+        resume
+    }
+
     pub(super) fn new(metrics: Arc<DispatchPathMetrics>) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         Self {
@@ -380,6 +389,7 @@ impl Watches {
             epochs: HashMap::new(),
             metrics,
             retiring: vec![],
+            retirement_barrier: None,
         }
     }
     pub(super) fn healthy_keys(&self) -> HashSet<Key> {
@@ -398,6 +408,21 @@ impl Watches {
             .collect();
         let all = keys.len() == total;
         Coverage { keys, all }
+    }
+
+    /// Membership changes arrive separately from the inventory. Between them,
+    /// only shard health or an expired handoff can change the schedule.
+    pub(super) fn schedule_state(&self) -> (u16, u16) {
+        self.shards
+            .iter()
+            .enumerate()
+            .fold((0, 0), |(healthy, protected), (index, shard)| {
+                let bit = 1 << index;
+                (
+                    healthy | if shard.healthy { bit } else { 0 },
+                    protected | if shard.protects() { bit } else { 0 },
+                )
+            })
     }
     pub(super) fn fallback(&mut self, key: &Key, interval: Duration) {
         for shard in &mut self.shards {
@@ -419,12 +444,7 @@ impl Watches {
             self.health.fallbacks += 1;
         }
     }
-    pub(super) fn reconcile(
-        &mut self,
-        scopes: &HashMap<Key, ScopeStamp>,
-        control: &Arc<readiness::DaemonControl>,
-        interval: Duration,
-    ) {
+    pub(super) fn update_membership(&mut self, scopes: &HashMap<Key, ScopeStamp>) {
         self.epochs.retain(|key, _| scopes.contains_key(key));
         let mut unassigned: std::collections::BTreeSet<_> = scopes.keys().cloned().collect();
         for shard in &mut self.shards {
@@ -463,10 +483,43 @@ impl Watches {
             if old_len != shard.keys.len() {
                 shard.reopen(&mut self.retiring);
             }
-            if shard.keys.is_empty()
-                || shard.task.is_some()
-                || shard.retry_at > tokio::time::Instant::now()
-            {
+        }
+        if !unassigned.is_empty() && !self.warned_capacity {
+            log::warn!(
+                "scope.watch connection capacity reached; polling {} excess scopes",
+                unassigned.len()
+            );
+            self.warned_capacity = true;
+        }
+    }
+
+    pub(super) fn open_due(
+        &mut self,
+        scopes: &HashMap<Key, ScopeStamp>,
+        control: &Arc<readiness::DaemonControl>,
+        interval: Duration,
+    ) {
+        // Collect every retirement before opening replacements. Keep the
+        // barrier here so aborting a replacement cannot discard its waits.
+        if !self.retiring.is_empty() {
+            let retiring = std::mem::take(&mut self.retiring);
+            let previous = self.retirement_barrier.take();
+            self.retirement_barrier = Some(
+                async move {
+                    if let Some(previous) = previous {
+                        previous.await;
+                    }
+                    for closed in retiring {
+                        let _ = closed.await;
+                    }
+                }
+                .boxed()
+                .shared(),
+            );
+        }
+        let now = tokio::time::Instant::now();
+        for (index, shard) in self.shards.iter_mut().enumerate() {
+            if shard.keys.is_empty() || shard.task.is_some() || shard.retry_at > now {
                 continue;
             }
             if !control.advertises(subc_control::ops::SCOPE_WATCH) {
@@ -503,15 +556,15 @@ impl Watches {
             }
             let control = control.clone();
             let sender = self.sender.clone();
-            let retiring = std::mem::take(&mut self.retiring);
+            let retirement_barrier = self.retirement_barrier.clone();
             let (cancelled, closed) = oneshot::channel();
             shard.cancelled = Some(closed);
             shard.task = Some(tokio::spawn(async move {
                 // Queue cancellation before replacement requests, including at
                 // the 16-watch ceiling. Opening first can transiently exceed
                 // the daemon's connection limit even when the final set fits.
-                for closed in retiring {
-                    let _ = closed.await;
+                if let Some(barrier) = retirement_barrier {
+                    barrier.await;
                 }
                 let result: Result<(), readiness::ControlError> = async {
                     let mut subscription = control.scope_watch(selectors, cancelled).await?;
@@ -561,14 +614,18 @@ impl Watches {
             }));
             shard.retry_at = tokio::time::Instant::now() + interval;
         }
-        if !unassigned.is_empty() && !self.warned_capacity {
-            log::warn!(
-                "scope.watch connection capacity reached; polling {} excess scopes",
-                unassigned.len()
-            );
-            self.warned_capacity = true;
-        }
         self.refresh(scopes.len());
+    }
+
+    #[cfg(test)]
+    pub(super) fn reconcile(
+        &mut self,
+        scopes: &HashMap<Key, ScopeStamp>,
+        control: &Arc<readiness::DaemonControl>,
+        interval: Duration,
+    ) {
+        self.update_membership(scopes);
+        self.open_due(scopes, control, interval);
     }
     pub(super) fn rebind(&mut self, key: &Key, epoch: u64) -> bool {
         if self.epochs.get(key).copied().unwrap_or(key.2) == epoch {

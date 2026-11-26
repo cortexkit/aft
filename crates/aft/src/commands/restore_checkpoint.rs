@@ -38,16 +38,18 @@ fn handle_restore_checkpoint_impl(
     };
 
     let requested_paths = requested_restore_paths(req, ctx)?;
-    let mut checkpoint_store = ctx.checkpoint().lock();
-    let checkpoint_paths = checkpoint_store
-        .file_paths(req.session(), name)
-        .map_err(|error| {
-            checkpoint_not_found_response(
-                &req.id,
-                error,
-                checkpoint_store.session_is_empty(req.session()),
-            )
-        })?;
+    let checkpoint_paths = {
+        let mut checkpoint_store = ctx.checkpoint().lock();
+        checkpoint_store
+            .file_paths(req.session(), name)
+            .map_err(|error| {
+                checkpoint_not_found_response(
+                    &req.id,
+                    error,
+                    checkpoint_store.session_is_empty(req.session()),
+                )
+            })?
+    };
     let restore_paths = if let Some(requested_paths) = requested_paths {
         for path in &requested_paths {
             if !checkpoint_paths.contains(path) {
@@ -74,7 +76,11 @@ fn handle_restore_checkpoint_impl(
         ctx,
         restore_paths.iter().map(|path| path.as_path()),
     );
-    match checkpoint_store.restore_validated(req.session(), name, &restore_paths) {
+    match ctx
+        .checkpoint()
+        .lock()
+        .restore_validated(req.session(), name, &restore_paths)
+    {
         Ok(info) => {
             let storage_path = info
                 .storage_path
@@ -187,6 +193,8 @@ fn validate_restore_paths(
     ctx: &AppContext,
     file_paths: &[std::path::PathBuf],
 ) -> Result<Vec<std::path::PathBuf>, Response> {
+    #[cfg(test)]
+    super::undo::authorization_hook_for_test(req_id);
     for path in file_paths {
         // The restore writes to the stored keys themselves, so each must be
         // the absolute location the validator checks. A relative key would be
@@ -208,4 +216,48 @@ fn validate_restore_paths(
     // The restore writer removes a final-component symlink before materializing
     // the snapshot, so the stored location is both the lookup and write target.
     Ok(file_paths.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_review_opus_9_checkpoint_restore_probes_without_checkpoint_mutex() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("original.txt");
+        let ctx = std::sync::Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        ));
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "restore-lock", "command": "restore_checkpoint", "name": "before",
+        }))
+        .unwrap();
+        std::fs::write(&path, b"before").unwrap();
+        {
+            let mut store = ctx.checkpoint().lock();
+            store.set_storage_dir_for_harness(
+                root.path().join("checkpoints"),
+                crate::harness::Harness::Opencode,
+            );
+            store
+                .create_for_files(req.session(), "before", vec![path.clone()])
+                .unwrap();
+        }
+        std::fs::write(&path, b"after").unwrap();
+        let checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _hook = super::super::undo::install_authorization_hook_for_test(&req.id, {
+            let ctx = ctx.clone();
+            let checked = checked.clone();
+            std::sync::Arc::new(move || {
+                assert!(ctx.checkpoint().try_lock().is_some());
+                checked.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        });
+        let response = handle_restore_checkpoint(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(checked.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(std::fs::read(path).unwrap(), b"before");
+    }
 }

@@ -734,6 +734,54 @@ fn a_reader_binding_during_a_scan_keeps_its_lease_and_data() {
     );
 }
 
+fn owner_markers(dir: &Path) -> usize {
+    names(&dir.join("leases"))
+        .iter()
+        .filter(|name| name.ends_with(".owner"))
+        .count()
+}
+
+/// A process that reopens a family only to read it, again and again,
+/// leaves no owner marker behind for each open: the marker goes with the
+/// last snapshot or handle that could lease through it, and not before.
+#[test]
+fn reopening_a_family_for_reads_leaves_no_owner_markers_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(&open(dir.path()), b"one", b"state one");
+    let before = owner_markers(dir.path());
+    for _ in 0..4 {
+        let family = open(dir.path());
+        let snapshot = family.snapshot().unwrap();
+        assert_eq!(read_section(&snapshot), b"one");
+        drop((snapshot, family));
+    }
+    assert_eq!(
+        owner_markers(dir.path()),
+        before,
+        "each read-only open left an owner marker"
+    );
+
+    // A snapshot that outlives its family handle keeps the marker, which
+    // its lease needs to read as live.
+    let family = open(dir.path());
+    let snapshot = family.snapshot().unwrap();
+    drop(family);
+    assert_eq!(owner_markers(dir.path()), before + 1);
+    let report = open(dir.path())
+        .try_write()
+        .unwrap()
+        .unwrap()
+        .reclaim()
+        .unwrap();
+    assert_eq!(
+        report.removed_leases, 0,
+        "a live reader's lease was removed"
+    );
+    assert_eq!(read_section(&snapshot), b"one");
+    drop(snapshot);
+    assert_eq!(owner_markers(dir.path()), before);
+}
+
 #[test]
 fn the_newest_generation_is_read_without_a_lease() {
     let dir = tempfile::tempdir().unwrap();

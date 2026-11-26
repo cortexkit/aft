@@ -42,8 +42,12 @@ pub(super) fn strip_ansi_cow(input: &str) -> std::borrow::Cow<'_, str> {
                 cursor += 1;
             }
             cursor
+        } else if matches!(next, b']' | b'P' | b'X' | b'^' | b'_') {
+            control_string_end(bytes, index + 2)
         } else if (0x40..=0x5f).contains(&next) {
             index + 2
+        } else if let Some(end) = designator_end(bytes, index + 1) {
+            end
         } else {
             index += 1;
             continue;
@@ -56,6 +60,42 @@ pub(super) fn strip_ansi_cow(input: &str) -> std::borrow::Cow<'_, str> {
 
     output.push_str(&input[last_kept..]);
     std::borrow::Cow::Owned(output)
+}
+
+/// End of an OSC, DCS, SOS, PM or APC string whose payload starts at `start`:
+/// just past its BEL or `ESC \` terminator. A string still open at a newline
+/// ends there, leaving the newline, so one malformed sequence cannot swallow
+/// the rest of the output.
+fn control_string_end(bytes: &[u8], start: usize) -> usize {
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            0x07 => return cursor + 1,
+            0x1b if bytes.get(cursor + 1) == Some(&b'\\') => return cursor + 2,
+            b'\n' => return cursor,
+            _ => cursor += 1,
+        }
+    }
+    cursor
+}
+
+/// End of an escape such as the charset designator `ESC ( B`: intermediate
+/// bytes (0x20-0x2f) starting at `start`, then one final byte (0x30-0x7e).
+fn designator_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| (0x20..=0x2f).contains(byte))
+    {
+        cursor += 1;
+    }
+    if cursor == start {
+        return None;
+    }
+    bytes
+        .get(cursor)
+        .is_some_and(|byte| (0x30..=0x7e).contains(byte))
+        .then_some(cursor + 1)
 }
 
 pub fn dedup_consecutive(input: &str) -> String {
@@ -229,5 +269,26 @@ mod tests {
         assert!(compressed.len() > 5 * 1024);
         assert!(compressed.contains("unique-line-0000"));
         assert!(compressed.contains("unique-line-0899"));
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_strings_and_charset_designators() {
+        // Window title ended by BEL, and OSC 8 hyperlinks ended by ESC \.
+        assert_eq!(strip_ansi("\x1b]0;my window title\x07hello"), "hello");
+        assert_eq!(
+            strip_ansi("see \x1b]8;;https://example.com/doc\x1b\\the docs\x1b]8;;\x1b\\ now"),
+            "see the docs now"
+        );
+        // `tput sgr0` on xterm-like terminals emits the designator ESC ( B.
+        assert_eq!(strip_ansi("\x1b[1mbold\x1b(B\x1b[m plain"), "bold plain");
+        // A device control string is removed up to its ESC \ terminator.
+        assert_eq!(strip_ansi("a\x1bPq#0;2\x1b\\b"), "ab");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_text_after_an_unterminated_osc_line() {
+        // A string that never terminates ends at its line, so later output is
+        // not swallowed.
+        assert_eq!(strip_ansi("\x1b]0;title\nnext line"), "\nnext line");
     }
 }

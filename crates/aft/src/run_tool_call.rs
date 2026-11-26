@@ -10,6 +10,8 @@ use crate::protocol::{RawRequest, Response};
 mod backup_bookkeeping_tests;
 #[cfg(test)]
 mod outline_wait_probe;
+#[cfg(test)]
+mod pipeline_path_tests;
 pub(crate) use crate::clock::ThreadCpuSample;
 pub(crate) use crate::tool_progress as progress;
 
@@ -29,25 +31,7 @@ pub fn is_read_only_request(request: &RawRequest) -> bool {
     } else {
         &request.command
     };
-    matches!(
-        command.strip_prefix("aft_").unwrap_or(command),
-        "outline"
-            | "zoom"
-            | "read"
-            | "grep"
-            | "glob"
-            | "search"
-            | "semantic_search"
-            | "callgraph"
-            | "callers"
-            | "call_tree"
-            | "impact"
-            | "trace_to"
-            | "trace_to_symbol"
-            | "trace_data"
-            | "version"
-            | "ping"
-    )
+    crate::subc::manifest::is_read_only_command(command.strip_prefix("aft_").unwrap_or(command))
 }
 
 /// Finalizes a formatted tool result. It receives the agent-visible text so the finalizer can
@@ -85,6 +69,7 @@ pub struct PhaseTrace {
     launch_restore_wait: std::time::Duration,
     executor_submitted: Option<Instant>,
     job_admitted: Option<Instant>,
+    queue_observation: Option<crate::executor::QueueObservation>,
     setup_done: Option<Instant>,
     translate_done: Option<Instant>,
     execute_done: Option<Instant>,
@@ -125,6 +110,8 @@ struct PhaseCpuTrace {
     execute_suspended: bool,
 }
 
+pub(crate) mod read_trace;
+
 pub use crate::tool_progress::{ToolCallPhaseCpu, ToolCallPhaseDurations, WaitingOn};
 
 impl PhaseTrace {
@@ -146,6 +133,7 @@ impl PhaseTrace {
             launch_restore_wait: std::time::Duration::ZERO,
             executor_submitted: None,
             job_admitted: None,
+            queue_observation: None,
             setup_done: None,
             translate_done: None,
             execute_done: None,
@@ -172,6 +160,7 @@ impl PhaseTrace {
         let now = Instant::now();
         self.cpu.job_admitted = ThreadCpuSample::now();
         self.job_admitted = Some(now);
+        self.queue_observation = crate::executor::current_queue_observation();
         if let Some(submitted) = self.executor_submitted {
             crate::logging::note_tool_call_queue_ms(
                 now.duration_since(submitted)
@@ -287,6 +276,7 @@ impl PhaseTrace {
                 egress_prepare: egress.prepare_cpu,
             },
             queue: job_admitted.duration_since(executor_submitted),
+            queue_observation: self.queue_observation,
             setup: setup_done.duration_since(job_admitted),
             translate: translate_done.saturating_duration_since(setup_done),
             execute: execute_done.duration_since(translate_done),
@@ -761,7 +751,11 @@ impl RepeatObservation {
     /// afterward would make identical results appear different forever and
     /// silently prevent the breaker from firing.
     pub(crate) fn observe(self, app_ctx: &AppContext, response: &mut Response, text: &mut String) {
-        let output_hash = crate::response_finalize::repeat_breaker::output_hash(text);
+        let output_hash = if self.call.is_reset_only() {
+            0
+        } else {
+            crate::response_finalize::repeat_breaker::output_hash(text)
+        };
         if let Some(intervention) =
             app_ctx
                 .repeat_breaker()
@@ -799,7 +793,57 @@ pub fn run_tool_call(
     app_ctx: &AppContext,
     dispatch: &DispatchFn<'_>,
     finalizer: Option<&FinalizeFn<'_>>,
+    phase_trace: Option<&mut PhaseTrace>,
+) -> ToolCallOutcome {
+    run_tool_call_with_origin(
+        bare_name,
+        args,
+        format_context,
+        ctx,
+        app_ctx,
+        dispatch,
+        finalizer,
+        phase_trace,
+        CallOrigin::Agent,
+    )
+}
+
+pub(crate) fn run_carrier_tool_call(
+    bare_name: &str,
+    args: Value,
+    format_context: &crate::subc_format::FormatContext,
+    ctx: &ToolCallContext,
+    app_ctx: &AppContext,
+    dispatch: &DispatchFn<'_>,
+) -> ToolCallOutcome {
+    run_tool_call_with_origin(
+        bare_name,
+        args,
+        format_context,
+        ctx,
+        app_ctx,
+        dispatch,
+        None,
+        None,
+        CallOrigin::Carrier,
+    )
+}
+
+enum CallOrigin {
+    Agent,
+    Carrier,
+}
+
+fn run_tool_call_with_origin(
+    bare_name: &str,
+    args: Value,
+    format_context: &crate::subc_format::FormatContext,
+    ctx: &ToolCallContext,
+    app_ctx: &AppContext,
+    dispatch: &DispatchFn<'_>,
+    finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
+    origin: CallOrigin,
 ) -> ToolCallOutcome {
     // The allocation tracer attributes what the call allocates, including
     // pool work that carries the label, to the tool.
@@ -815,16 +859,19 @@ pub fn run_tool_call(
         .session_id
         .as_deref()
         .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    let repeat = RepeatObservation::for_agent_call(
-        session_id,
-        bare_name,
-        &args,
-        ctx.preview,
-        ctx.worker_session,
-        format_context
-            .bash_watch_available
-            .unwrap_or(ctx.worker_session),
-    );
+    let repeat = match origin {
+        CallOrigin::Agent => RepeatObservation::for_agent_call(
+            session_id,
+            bare_name,
+            &args,
+            ctx.preview,
+            ctx.worker_session,
+            format_context
+                .bash_watch_available
+                .unwrap_or(ctx.worker_session),
+        ),
+        CallOrigin::Carrier => None,
+    };
     // Only a dispatched call is finalized; a translation or request-shape refusal never was.
     let mut finalize_after_breaker = false;
     let mut result = match prepare_tool_call(
@@ -841,6 +888,10 @@ pub fn run_tool_call(
             let arg_shape = phase_trace
                 .is_some()
                 .then(|| tool_call_arg_shape(&prepared.request));
+            let read_shape = phase_trace
+                .is_some()
+                .then(|| read_trace::Scope::begin(&prepared.request))
+                .flatten();
             let reports_outcome = is_edit_command(&prepared.request.command);
             let reports_search_plan = prepared.request.command == "semantic_search";
             // Named search waits ride on the slow-call line beside the plan
@@ -851,17 +902,6 @@ pub fn run_tool_call(
             // Keep these clocks on the diagnostic path, not in response text.
             let outline_started =
                 (prepared.request.command == "outline" && phase_trace.is_some()).then(Instant::now);
-            let backup_bookkeeping = !is_read_only_request(&prepared.request);
-            let skipped_before = backup_bookkeeping
-                .then(|| {
-                    app_ctx.backup().lock().latest_skipped_order(
-                        ctx.session_id
-                            .as_deref()
-                            .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
-                    )
-                })
-                .flatten();
-            let outline_backup_before = outline_started.map(|at| at.elapsed());
             let (watcher_pending, callgraph_pending) =
                 crate::response_finalize::query_pending(app_ctx, &prepared.request.command);
             // URL fetch times ride on the slow-call line of the commands that
@@ -885,27 +925,6 @@ pub fn run_tool_call(
                 &mut response,
                 callgraph_pending.as_ref(),
             );
-            if backup_bookkeeping
-                && response.success
-                && response.data.get("backup_skipped_reason").is_none()
-            {
-                let session = ctx
-                    .session_id
-                    .as_deref()
-                    .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-                if let Some(reason) = app_ctx
-                    .backup()
-                    .lock()
-                    .skipped_reason_after(session, skipped_before)
-                {
-                    if let Some(object) = response.data.as_object_mut() {
-                        object.insert(
-                            "backup_skipped_reason".to_string(),
-                            Value::String(reason.as_str().to_string()),
-                        );
-                    }
-                }
-            }
             let outline_after = outline_after_started.map(|at| at.elapsed());
             let url_fetch_times = url_fetch_times.and_then(|scope| scope.finish());
             if let Some(trace) = phase_trace.as_mut() {
@@ -927,13 +946,15 @@ pub fn run_tool_call(
                         shape.push(' ');
                         shape.push_str(&times.render());
                     }
-                    if let Some(before) = outline_backup_before {
+                    if let Some(handler) = outline_handler {
                         shape.push_str(&format!(
-                            " outline_backup_before_ms={:.3} outline_handler_ms={:.3} outline_after_ms={:.3}",
-                            before.as_secs_f64() * 1000.0,
-                            outline_handler.unwrap_or_default().as_secs_f64() * 1000.0,
+                            " outline_handler_ms={:.3} outline_after_ms={:.3}",
+                            handler.as_secs_f64() * 1000.0,
                             outline_after.unwrap_or_default().as_secs_f64() * 1000.0,
                         ));
+                    }
+                    if let Some(read_shape) = read_shape {
+                        read_shape.append(&mut shape);
                     }
                     trace.note_arg_shape(shape);
                 }
@@ -1164,23 +1185,6 @@ pub(crate) fn strip_agent_preview_arg_owned(mut args: Value) -> Value {
     args
 }
 
-fn tool_call_result_from_response(
-    bare_name: &str,
-    format_context: &crate::subc_format::FormatContext,
-    mut response: Response,
-    surface_downgraded: bool,
-) -> ToolCallResult {
-    if surface_downgraded {
-        attach_hashline_downgrade(&mut response);
-    }
-    let mut text =
-        crate::subc_format::format_response_with_context(bare_name, &response, format_context);
-    if surface_downgraded {
-        append_hashline_downgrade_text(&mut text);
-    }
-    ToolCallResult { text, response }
-}
-
 fn refusal_result(
     bare_name: &str,
     format_context: &crate::subc_format::FormatContext,
@@ -1192,18 +1196,41 @@ fn refusal_result(
         trace.mark_translate_done();
         trace.mark_execute_done();
     }
-    let result =
-        tool_call_result_from_response(bare_name, format_context, response, surface_downgraded);
-    if let Some(trace) = phase_trace.as_mut() {
-        trace.mark_format_done();
-        trace.mark_finalize_done();
-    }
-    result
+    finish_tool_call_response(
+        bare_name,
+        format_context,
+        response,
+        surface_downgraded,
+        None,
+        phase_trace,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_delivers_pending_notice_without_rewording() {
+        use crate::subc::runner_notices::notice_templates::{Notice, Target};
+
+        let mut response = Response::error_with_data(
+            "refused",
+            "invalid_request",
+            "Request refused.",
+            json!({"text": "details"}),
+        );
+        response.notices.items.push(Notice::template(
+            "test.notice",
+            json!({}),
+            "pending notice".into(),
+            Target::Text,
+        ));
+        let result = refusal_result("read", &Default::default(), response, false, None);
+        assert_eq!(result.text, "Request refused.");
+        assert_eq!(result.response.data["text"], "details\n\npending notice");
+        assert!(result.response.notices.items.is_empty());
+    }
 
     fn finish_cpu_phase(mut trace: PhaseTrace) -> ToolCallPhaseDurations {
         trace.mark_execute_done();
@@ -1439,6 +1466,138 @@ mod tests {
         let mut lines = crate::logging::take_slow_tool_call_logs_for_test();
         assert_eq!(lines.len(), 1, "{lines:?}");
         lines.remove(0)
+    }
+
+    #[test]
+    fn slow_read_lines_report_counts_and_authorized_sizes_without_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let file = "PRIVATE_TARGET.ts";
+        let source = "function hiddenAlpha() { return 'SECRET_BODY'; }\nfunction hiddenBeta() {}\n";
+        std::fs::write(root.join(file), source).unwrap();
+        for (tool, args, symbols, callgraph) in [
+            (
+                "zoom",
+                json!({"batch": [{"target": file, "symbols": "hiddenAlpha, hiddenBeta"}], "callgraph": true}),
+                2,
+                true,
+            ),
+            ("outline", json!({"target": file}), 0, false),
+            ("read", json!({"path": file}), 0, false),
+        ] {
+            let line = slow_tool_line(&ctx, &root, tool, args, &|req, ctx| {
+                let response = match req.command.as_str() {
+                    "zoom" => crate::commands::zoom::handle_zoom(&req, ctx),
+                    "outline" => crate::commands::outline::handle_outline(&req, ctx),
+                    "read" => crate::commands::read::handle_read(&req, ctx),
+                    command => panic!("unexpected dispatch of {command}"),
+                };
+                assert!(response.success, "{:?}", response.data);
+                response
+            });
+            assert!(line.contains(&format!(" cmd={tool} target=file")), "{line}");
+            assert!(
+                line.contains(&format!(
+                    " symbols={symbols} callgraph={callgraph} file_bytes={}",
+                    source.len()
+                )),
+                "{line}"
+            );
+            for private in [file, "hiddenAlpha", "hiddenBeta", "SECRET_BODY"] {
+                assert!(!line.contains(private), "{private} leaked into {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn slow_read_line_distinguishes_root_capacity_from_active_writer() {
+        use crate::executor::{Executor, ExecutorConfig, Lane};
+
+        for (occupied, blocker) in [
+            (Lane::PureRead, "root_capacity"),
+            (Lane::Mutating, "writer"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let root = crate::path_identity::canonicalize_normalized(temp.path());
+            let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
+            let ctx = std::sync::Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(root.clone()),
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    ..Default::default()
+                },
+            ));
+            let ex = Executor::with_config(ExecutorConfig {
+                pool_size: 2,
+                actor_cap: 1,
+                read_cap: 1,
+                ..Default::default()
+            });
+            assert!(ex.register_actor(root_id.clone(), ctx));
+
+            let limit = Duration::from_secs(5);
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            let (_holder, _) = ex.submit_cancellable_async(
+                root_id.clone(),
+                occupied,
+                "holder".into(),
+                Box::new(move |_| {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(limit);
+                    Response::success("holder", json!({}))
+                }),
+            );
+            entered_rx.recv_timeout(limit).expect("holder started");
+            let (line_tx, line_rx) = crossbeam_channel::bounded(1);
+            let (_reader, _) = ex.submit_cancellable_async(
+                root_id,
+                Lane::PureRead,
+                "waiting-outline".into(),
+                Box::new(move |ctx| {
+                    let line = slow_tool_line(
+                        ctx,
+                        &root,
+                        "outline",
+                        json!({"target":"missing.ts"}),
+                        &|req, ctx| crate::commands::outline::handle_outline(&req, ctx),
+                    );
+                    line_tx.send(line).unwrap();
+                    Response::success("waiting-outline", json!({}))
+                }),
+            );
+
+            // The census publishes its queued count after the scheduler has
+            // tried admission, so there is no timing guess before release.
+            let deadline = Instant::now() + limit;
+            while !ex
+                .try_dispatch_liveness_snapshot()
+                .is_some_and(|s| s.interactive.queued == 1)
+            {
+                assert!(Instant::now() < deadline, "reader never queued");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release_tx.send(()).unwrap();
+            let line = line_rx.recv_timeout(limit).expect("outline completed");
+            assert!(
+                line.contains(&format!(
+                    " queue_lane=pure_read queue_waited_on={blocker} queue_epoch_ms="
+                )),
+                "{line}"
+            );
+            assert!(line.contains(" file_bytes=- "), "{line}");
+        }
     }
 
     #[test]
@@ -1847,6 +2006,7 @@ mod tests {
             launch_restore_wait: Duration::ZERO,
             executor_submitted: Some(t0 + Duration::from_millis(1)),
             job_admitted: Some(t0 + Duration::from_millis(3)),
+            queue_observation: None,
             setup_done: None,
             translate_done: Some(t0 + Duration::from_millis(6)),
             execute_done: Some(t0 + Duration::from_millis(10)),

@@ -56,7 +56,7 @@ use aft_store::vector::{ChunkMapKey, ModelId, TextDigest, VectorSegment};
 
 /// The data layer's `EXTRACTOR_VERSION` (crates/aft/src/data_layer/content.rs)
 /// in the build that wrote the store being read.
-const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-23";
+const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-24";
 
 /// The plane a section kind belongs to, by the kind's high byte: text,
 /// content, graph, vector, or anything else.

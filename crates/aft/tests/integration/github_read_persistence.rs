@@ -43,6 +43,7 @@ fn write_entry(
         ),
         text,
         fetched_at_ms,
+        false,
     )
     .expect("persist cache entry");
 }
@@ -57,7 +58,7 @@ fn github_read_cache_round_trips_canonical_text_and_refresh_timestamp() {
         "principal:alice",
     );
 
-    upsert_github_read_cache_entry(&conn, &cache_key, "# Original\n", 1_000)
+    upsert_github_read_cache_entry(&conn, &cache_key, "# Original\n", 1_000, false)
         .expect("insert cache entry");
     assert_eq!(
         lookup_github_read_cache_entry(
@@ -75,12 +76,13 @@ fn github_read_cache_round_trips_canonical_text_and_refresh_timestamp() {
         "# Original\n"
     );
 
-    upsert_github_read_cache_entry(&conn, &cache_key, "# Refreshed\n", 2_000)
+    upsert_github_read_cache_entry(&conn, &cache_key, "# Refreshed\n", 2_000, true)
         .expect("refresh cache entry");
     let entry = lookup_github_read_cache_entry(&conn, &cache_key)
         .expect("read refreshed entry")
         .expect("refreshed entry exists");
     assert_eq!(entry.canonical_text, "# Refreshed\n");
+    assert_eq!(entry.document_gap, Some(true));
     assert_eq!(entry.fetched_at_ms, 2_000);
     assert_eq!(entry.updated_at_ms, 2_000);
 }
@@ -101,7 +103,7 @@ fn github_read_cache_never_satisfies_one_identity_with_anothers_entry() {
         "principal:bob",
     );
 
-    upsert_github_read_cache_entry(&conn, &alice, "# Alice view\n", 1_000)
+    upsert_github_read_cache_entry(&conn, &alice, "# Alice view\n", 1_000, false)
         .expect("persist Alice entry");
     assert!(
         lookup_github_read_cache_entry(&conn, &bob)
@@ -110,7 +112,8 @@ fn github_read_cache_never_satisfies_one_identity_with_anothers_entry() {
         "a cache entry cannot cross authentication identities"
     );
 
-    upsert_github_read_cache_entry(&conn, &bob, "# Bob view\n", 1_100).expect("persist Bob entry");
+    upsert_github_read_cache_entry(&conn, &bob, "# Bob view\n", 1_100, false)
+        .expect("persist Bob entry");
     assert_eq!(
         lookup_github_read_cache_entry(&conn, &alice)
             .expect("read Alice entry")
@@ -231,7 +234,7 @@ fn github_read_cache_invalidation_leaves_unrelated_resources_intact() {
         (&different_kind, "# Other kind\n"),
         (&different_repository, "# Other repository\n"),
     ] {
-        upsert_github_read_cache_entry(&conn, entry_key, text, 1_000)
+        upsert_github_read_cache_entry(&conn, entry_key, text, 1_000, false)
             .expect("persist unrelated entry");
     }
 

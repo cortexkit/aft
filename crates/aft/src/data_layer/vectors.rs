@@ -417,11 +417,23 @@ fn survey(
         {
             continue;
         }
+        let downloaded = downloaded_language(&record.path);
         let gap = (!view.planes().callgraph)
-            .then(|| downloaded_language(&record.path))
+            .then_some(downloaded)
             .flatten()
             .map(super::grammar::meaning_callgraph_off_reason)
-            .or_else(|| state.skipped_parses().get(&record.path).cloned());
+            .or_else(|| {
+                // Built-in chunking can embed text without a call-graph parse;
+                // downloaded grammars need a valid stored outline instead.
+                state
+                    .skipped_parses()
+                    .get(&record.path)
+                    .filter(|reason| {
+                        downloaded.is_some()
+                            || reason.as_str() != super::grammar::INVALID_UTF8_REASON
+                    })
+                    .cloned()
+            });
         let admitted = gap.is_none() && applicable < max_files;
         if gap.is_none() {
             applicable += 1;
@@ -822,6 +834,62 @@ impl MeaningSnapshot {
         self.members.members.len()
     }
 
+    /// Score only this file's members without disturbing the filtered-search cache.
+    pub(crate) fn best_file_score(
+        &self,
+        query: &[f32],
+        path: &Path,
+    ) -> Result<Option<f32>, DataError> {
+        let (Some(shared), Ok(relative)) = (&self.loaded.shared, path.strip_prefix(&self.root))
+        else {
+            return Ok(None);
+        };
+        if query.len() != self.dimensions || query.iter().any(|value| !value.is_finite()) {
+            return Ok(None);
+        }
+        // The checkout stores relative path bytes, with `/` on every platform.
+        let mut key = Vec::new();
+        for component in relative.components() {
+            if !key.is_empty() {
+                key.push(b'/');
+            }
+            key.extend_from_slice(component.as_os_str().as_encoded_bytes());
+        }
+        let members = &self.members;
+        let Ok(file) = members.files.binary_search_by(|file| file.path.cmp(&key)) else {
+            return Ok(None);
+        };
+        let file_index = file as u32;
+        let start = members.file_of.partition_point(|&id| id < file_index);
+        let end = members.file_of.partition_point(|&id| id <= file_index);
+        let index = shared.index();
+        let set = index
+            .member_set(members.members[start..end].to_vec())
+            .map_err(store_error)?;
+        let found = index
+            .search(
+                &set,
+                &SearchRequest {
+                    query,
+                    k: 1,
+                    rescore_limit: None,
+                },
+            )
+            .map_err(store_error)?;
+        let Some(hit) = found.hits.first() else {
+            return Ok(None);
+        };
+        let file = &members.files[file];
+        let details = Loaded::details(&index, file.holder, file.content, &file.path)?;
+        let detail = &details.chunks[members.chunk_of[start + hit.member as usize] as usize];
+        if kind_of(detail.kind).is_none() {
+            return Err(DataError::Store(
+                "a chunk's kind code is unknown".to_string(),
+            ));
+        }
+        Ok(Some(hit.score))
+    }
+
     /// The `top_k` chunks closest to `query`, among files whose absolute
     /// path `include` accepts: today's `search_filtered` answer over the
     /// same vectors, as its rows. As today, a query of another dimension or
@@ -956,7 +1024,7 @@ const FILL_WAIT: Duration = Duration::from_secs(600);
 /// The file in a family's folder whose lock a fill round holds while it
 /// embeds and publishes (see [`FillLock`]). The store ignores names it does
 /// not write.
-const FILL_LOCK: &str = "vector-fill.lock";
+pub(super) const FILL_LOCK: &str = "vector-fill.lock";
 
 /// One fill round's hold on its repository: while one round, in any
 /// process, embeds texts and publishes them, every other round of the
@@ -1031,6 +1099,29 @@ impl FillLock {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// Blocks until no other fill holds the fill lock of the family in `dir`,
+/// without polling, then lets it go at once: for a fill that stopped because
+/// another fill held the lock, so it can start again once that one is done.
+///
+/// # Errors
+///
+/// When the lock file cannot be opened or locked.
+pub(super) fn wait_for_other_fill(dir: &Path) -> Result<(), DataError> {
+    let path = dir.join(FILL_LOCK);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|error| DataError::Store(format!("{}: {error}", path.display())))?;
+    file.lock()
+        .map_err(|error| DataError::Store(format!("{}: {error}", path.display())))
 }
 
 /// How far a fill has come, reported after each round it publishes, and
@@ -1118,6 +1209,10 @@ pub struct FillReport {
     pub merge_ms: f64,
     /// Why the fill stopped before finishing; what it published stands.
     pub error: Option<String>,
+    /// A round that may not wait found another fill of the repository
+    /// holding its lock, and stopped before reading any file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub blocked_by_other_fill: bool,
 }
 
 fn no_files(value: &usize) -> bool {
@@ -1697,6 +1792,36 @@ impl VectorPlane {
         rounds: usize,
         progress: &mut dyn FnMut(FillProgress),
     ) -> Result<FillReport, DataError> {
+        self.fill_rounds_with(embed, budget, rounds, true, progress)
+    }
+
+    /// One round of [`Self::fill_rounds`] that never waits for another fill
+    /// of the repository: it takes the repository's fill lock before it
+    /// reads or cuts any file, and when another fill holds it, the round
+    /// stops at once with [`FillReport::blocked_by_other_fill`] set. A
+    /// running AFT's fill pool has few places for every root, and a round
+    /// waiting there for minutes held one of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::fill`].
+    pub(super) fn fill_round_unless_blocked(
+        &self,
+        embed: &mut dyn FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        budget: FillBudget,
+        progress: &mut dyn FnMut(FillProgress),
+    ) -> Result<FillReport, DataError> {
+        self.fill_rounds_with(embed, budget, 1, false, progress)
+    }
+
+    fn fill_rounds_with(
+        &self,
+        embed: &mut dyn FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        budget: FillBudget,
+        rounds: usize,
+        wait: bool,
+        progress: &mut dyn FnMut(FillProgress),
+    ) -> Result<FillReport, DataError> {
         check_cancelled()?;
         let mut report = FillReport::default();
         let Some(view) = self.checkout.view() else {
@@ -1744,6 +1869,21 @@ impl VectorPlane {
                 break;
             }
             rounds_run += 1;
+
+            // A round that may not wait takes the fill lock first, and reads
+            // what other fills published before it, as a waiting round does
+            // once it has the lock.
+            let mut early_lock = None;
+            if !wait {
+                let Some(lock) = FillLock::try_take(self.checkout.family_dir())? else {
+                    report.blocked_by_other_fill = true;
+                    report.files_left += queue.pending.len();
+                    break;
+                };
+                early_lock = Some(lock);
+                loaded = self.load()?;
+                reusable &= queue.segments == vector_membership(&loaded);
+            }
 
             // Cut the round's files, and collect the texts no segment holds:
             // those the old meaning index has vectors for, and the rest,
@@ -1834,7 +1974,9 @@ impl VectorPlane {
             // Wait for any other fill of the repository to publish, then
             // leave out what it published: its texts' vectors, and the files
             // whose chunk maps it finished.
-            let round_lock = if wanted.is_empty() && imported.is_empty() {
+            let round_lock = if early_lock.is_some() {
+                early_lock.take()
+            } else if wanted.is_empty() && imported.is_empty() {
                 None
             } else {
                 let started = Instant::now();
@@ -2689,6 +2831,41 @@ mod tests {
             .unwrap()
     }
 
+    /// A round that may not wait, finding another fill of the repository
+    /// holding its lock, stops before reading or embedding anything, so its
+    /// fill-pool place is free at once; once the lock is free it fills.
+    #[test]
+    fn a_round_blocked_by_another_fill_stops_before_any_work() {
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        let other = FillLock::try_take(checkout.family_dir())
+            .unwrap()
+            .expect("no fill holds the lock yet");
+        let mut recorder = Recorder::default();
+        let budget = FillBudget {
+            max_batch: 5,
+            files_per_round: 100,
+        };
+        let blocked = plane
+            .fill_round_unless_blocked(&mut |texts| recorder.embed(texts), budget, &mut |_| {})
+            .unwrap();
+        assert!(blocked.blocked_by_other_fill, "{blocked:?}");
+        assert!(blocked.files_left > 0, "{blocked:?}");
+        assert_eq!(blocked.chunks, 0, "a blocked round cut files: {blocked:?}");
+        assert!(recorder.texts.is_empty(), "a blocked round embedded texts");
+
+        drop(other);
+        let filled = plane
+            .fill_round_unless_blocked(&mut |texts| recorder.embed(texts), budget, &mut |_| {})
+            .unwrap();
+        assert!(!filled.blocked_by_other_fill, "{filled:?}");
+        assert!(filled.files_filled > 0, "{filled:?}");
+        assert!(!recorder.texts.is_empty());
+    }
+
     #[test]
     fn vectors_discard_members_built_for_a_superseded_generation() {
         let store = tempfile::tempdir().unwrap();
@@ -3164,6 +3341,58 @@ mod tests {
         let epoch = checkout.memory_epoch();
         plane.search(&view, &vector_of_tie(), 5, &include).unwrap();
         assert_eq!(checkout.memory_epoch(), epoch);
+    }
+
+    #[test]
+    fn single_file_scores_preserve_the_warm_filtered_meaning_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        project(&root);
+        let checkout = bind(store.path(), &root);
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000);
+        assert_eq!(fill(&plane, &mut Recorder::default(), 2).error, None);
+        let view = checkout.view().unwrap();
+        let meaning = plane.snapshot(&view).unwrap();
+        let query = vector_of_tie();
+        let paths = [
+            root.join("src/lib.rs"),
+            root.join("src/util.rs"),
+            root.join("missing.rs"),
+        ];
+        let expected: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                meaning
+                    .search(&query, 1, &|file| file == path)
+                    .unwrap()
+                    .first()
+                    .map(|hit| hit.score.to_bits())
+            })
+            .collect();
+        assert!(expected[0].is_some() && expected[1].is_some() && expected[2].is_none());
+        let include = |path: &Path| path.starts_with(root.join("src"));
+        let warm = meaning.search(&query, 5, &include).unwrap();
+        let epoch = checkout.memory_epoch();
+        let actual: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                meaning
+                    .best_file_score(&query, path)
+                    .unwrap()
+                    .map(f32::to_bits)
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            rows(&meaning.search(&query, 5, &include).unwrap()),
+            rows(&warm)
+        );
+        assert_eq!(
+            checkout.memory_epoch(),
+            epoch,
+            "file lookups rebuilt the filtered subset"
+        );
     }
 
     /// Every chunk text of the semantic files under `root`, as a fill cuts

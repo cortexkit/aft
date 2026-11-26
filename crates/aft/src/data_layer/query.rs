@@ -26,6 +26,53 @@ use crate::parser::LangId;
 mod impact_budget_tests {
     use super::*;
 
+    #[test]
+    fn audit_resolution_luau_callers_count_luau_unresolved_sites() {
+        use crate::data_layer::{callgraph::resolve_checkout, incremental_tests::checkout};
+
+        let root = tempfile::tempdir().unwrap();
+        let inputs = checkout(
+            &[(
+                "calls.ts",
+                "function target() {}\nfunction caller() { unknown.missing(); }\n",
+            )],
+            &[],
+        );
+        let (_, parse) = inputs.parses.read("calls.ts").unwrap();
+        let mut parse = (*parse).clone();
+        let mut resolutions = resolve_checkout(&inputs, 1).unwrap();
+        parse.language = "luau".into();
+        // Model an already stored Luau record without downloading its grammar.
+        let mut slices = MemorySlices::default();
+        slices.insert(FileSlice::build(
+            "calls.luau",
+            "test",
+            &parse,
+            &resolutions.remove("calls.ts").unwrap(),
+        ));
+        let reader = SliceReader::new(slices, root.path().to_path_buf(), "test".into());
+        assert_eq!(
+            reader
+                .unresolved_call_site_count(LangId::Luau, true)
+                .unwrap(),
+            1
+        );
+        let result = crate::data_layer::callgraph_store_adapter::callers_result(
+            &reader,
+            &root.path().join("calls.luau"),
+            "target",
+            1,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 0);
+        let note = result
+            .incomplete
+            .expect("Luau caller answer must report incomplete coverage");
+        assert_eq!(note.unresolved_call_sites, 1);
+        assert!(note.incomplete_reason.contains("Luau"));
+    }
+
     fn graph() -> (tempfile::TempDir, SliceReader<MemorySlices>) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -104,6 +151,130 @@ mod impact_budget_tests {
             super::super::slice::EDGE_WALKS.with(std::cell::Cell::get),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod ref_site_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::callgraph_store::{MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND};
+
+    /// Counts how many slices queries read.
+    struct Counting {
+        inner: MemorySlices,
+        reads: AtomicUsize,
+    }
+
+    impl aft_store::heap::HeapBytes for Counting {
+        fn heap_bytes(&self, _seen: &mut aft_store::heap::Seen) -> usize {
+            0
+        }
+    }
+
+    impl SliceSource for Counting {
+        fn slice(&self, path: &str) -> Option<Arc<FileSlice>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.slice(path)
+        }
+        fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String> {
+            self.inner.caller_files(target_file, target_symbol)
+        }
+        fn files_with_ref_name(&self, short_name: &str) -> BTreeSet<String> {
+            self.inner.files_with_ref_name(short_name)
+        }
+        fn files_with_symbol_name(&self, name: &str) -> BTreeSet<String> {
+            self.inner.files_with_symbol_name(name)
+        }
+        fn files_of_language(&self, language: &str) -> BTreeSet<String> {
+            self.inner.files_of_language(language)
+        }
+        fn files(&self) -> Vec<String> {
+            self.inner.files()
+        }
+    }
+
+    const FILES: usize = 40;
+
+    /// `dsl_target` is mentioned inside a macro tree-sitter cannot parse in
+    /// each of `FILES` files.
+    fn mentions() -> (tempfile::TempDir, SliceReader<Counting>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src/dsl")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn dsl_target() {}\n").unwrap();
+        for index in 0..FILES {
+            std::fs::write(
+                dir.path().join(format!("src/dsl/m{index:03}.rs")),
+                "pub fn f() {\n    my_dsl! { when ready then dsl_target @ 3 }\n}\n",
+            )
+            .unwrap();
+        }
+        let reader = crate::data_layer::trace_measure::memory_reader(dir.path());
+        let counting = Counting {
+            inner: reader.source().clone(),
+            reads: AtomicUsize::new(0),
+        };
+        let reader = SliceReader::new(counting, dir.path().to_path_buf(), "test".to_string());
+        (dir, reader)
+    }
+
+    fn reads(reader: &SliceReader<Counting>) -> usize {
+        reader.source().reads.swap(0, Ordering::Relaxed)
+    }
+
+    /// A limited lookup stops reading slices once it holds its limit, rather
+    /// than reading every file of the name and trimming afterwards.
+    #[test]
+    fn ref_sites_named_stops_reading_slices_at_its_limit() {
+        let (_dir, reader) = mentions();
+        let lookup = |limit| {
+            reader
+                .ref_sites_named("dsl_target", &[(MACRO_MENTION_REF_KIND, limit)])
+                .unwrap()
+                .remove(0)
+        };
+        let all = lookup(usize::MAX);
+        assert_eq!(all.len(), FILES);
+        assert_eq!(reads(&reader), FILES);
+
+        let first = lookup(5);
+        assert_eq!(first, all[..5]);
+        assert_eq!(
+            reads(&reader),
+            5,
+            "a lookup limited to 5 sites read more slices than it kept"
+        );
+    }
+
+    /// `callers` asks for two kinds of one name; asked together they read
+    /// each file once, where two lookups read it twice.
+    #[test]
+    fn ref_sites_named_reads_each_file_once_for_every_kind() {
+        let (_dir, reader) = mentions();
+        let kinds = [
+            (MACRO_BODY_CALL_REF_KIND, 51),
+            (MACRO_MENTION_REF_KIND, 101),
+        ];
+        let separate = kinds
+            .iter()
+            .map(|kind| {
+                reader
+                    .ref_sites_named("dsl_target", std::slice::from_ref(kind))
+                    .unwrap()
+                    .remove(0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads(&reader), 2 * FILES);
+
+        let together = reader.ref_sites_named("dsl_target", &kinds).unwrap();
+        assert_eq!(together, separate);
+        assert_eq!(reads(&reader), FILES);
     }
 }
 
@@ -315,7 +486,12 @@ impl<S: SliceSource> SliceReader<S> {
 
     fn rel(&self, file_rel: &Path) -> Result<String> {
         let absolute = normalize_file_path(&self.project_root, file_rel)?;
-        Ok(relative_path(&self.project_root, &absolute))
+        relative_path(&self.project_root, &absolute).ok_or_else(|| {
+            AftError::FileNotFound {
+                path: absolute.display().to_string(),
+            }
+            .into()
+        })
     }
 }
 
@@ -1156,12 +1332,21 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
 
     fn ref_sites_named(
         &self,
-        kind: &str,
         short_name: &str,
-        limit: usize,
-    ) -> Result<Vec<StoreRefSite>> {
-        let mut sites = Vec::new();
+        kinds: &[(&str, usize)],
+    ) -> Result<Vec<Vec<StoreRefSite>>> {
+        let mut found: Vec<Vec<(_, StoreRefSite)>> = kinds.iter().map(|_| Vec::new()).collect();
+        // Files come in path order and each kind's answer is in (file, line,
+        // ref id) order, so once every kind holds its limit no later file can
+        // add a site that would be kept: stop reading slices there.
         for file in self.source.files_with_ref_name(short_name) {
+            if found
+                .iter()
+                .zip(kinds)
+                .all(|(sites, (_, limit))| sites.len() >= *limit)
+            {
+                break;
+            }
             let Some(slice) = self.source.slice(&file) else {
                 continue;
             };
@@ -1169,13 +1354,21 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
             let Some(name) = slice.find_string(short_name) else {
                 continue;
             };
+            let starts = found.iter().map(Vec::len).collect::<Vec<_>>();
             for reference in slice.references() {
-                if reference.short_name_index() != Some(name) || reference.kind() != kind {
+                if reference.short_name_index() != Some(name) {
+                    continue;
+                }
+                let Some(slot) = kinds.iter().position(|(kind, _)| reference.kind() == *kind)
+                else {
+                    continue;
+                };
+                if starts[slot] >= kinds[slot].1 {
                     continue;
                 }
                 let caller = reference.caller().and_then(|handle| slice.node(handle));
-                sites.push((
-                    (file.clone(), reference.line(), reference.ref_id()),
+                found[slot].push((
+                    (reference.line(), reference.ref_id()),
                     StoreRefSite {
                         is_test: caller.and_then(|node| node.is_test()),
                         file: file.clone(),
@@ -1185,10 +1378,18 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
                     },
                 ));
             }
+            for (sites, start) in found.iter_mut().zip(starts) {
+                sites[start..].sort_by(|a, b| a.0.cmp(&b.0));
+            }
         }
-        sites.sort_by(|a, b| a.0.cmp(&b.0));
-        sites.truncate(limit);
-        Ok(sites.into_iter().map(|(_, site)| site).collect())
+        Ok(found
+            .into_iter()
+            .zip(kinds)
+            .map(|(mut sites, (_, limit))| {
+                sites.truncate(*limit);
+                sites.into_iter().map(|(_, site)| site).collect()
+            })
+            .collect())
     }
 
     fn unresolved_method_sites_named(

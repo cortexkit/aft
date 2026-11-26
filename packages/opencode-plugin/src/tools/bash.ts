@@ -156,7 +156,7 @@ async function abortForegroundWhenRegistered(
   // Every outcome is logged, not only the timeout. An interrupted call whose
   // task row later lacks `call_aborted` can then be read back as "the abort
   // never ran", "it ran and Rust found nothing to kill", or "the call ended on
-  // its own first". The line is flushed at once because a host often shuts
+  // its own first". The line is flushed and awaited because a host often shuts
   // down right after an interruption, before a buffered line would be written.
   sessionLog(runtime.sessionID, `[bash] foreground abort ${outcome}`, {
     attempts,
@@ -166,7 +166,7 @@ async function abortForegroundWhenRegistered(
     last_response: lastResponse,
     last_error: lastError,
   });
-  flushLog();
+  await flushLog();
 }
 
 const ABORT_ATTEMPT_RESULTS_KEPT = 20;

@@ -68,9 +68,9 @@ pub fn prune_retention_sweep(
 /// minute, or a few seconds after a sweep skipped for lack of the mutex.
 pub fn maybe_spawn_retention(
     db: Option<Arc<Mutex<TrackedConnection>>>,
-    registries: Option<Vec<BgTaskRegistry>>,
+    registries: impl FnOnce() -> Option<Vec<BgTaskRegistry>>,
 ) {
-    compression_events::maybe_spawn_retention(db, guard(registries.as_deref()));
+    compression_events::maybe_spawn_retention(db, || guard(registries().as_deref()));
 }
 
 #[cfg(test)]

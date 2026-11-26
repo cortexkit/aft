@@ -13,7 +13,7 @@
 //! For an identifier the useful answer is every line that contains it, so this
 //! module finds those lines directly:
 //!
-//! - files are enumerated once, under a deadline checked at every walk entry,
+//! - files are enumerated once, under a file limit and a deadline checked at each entry,
 //!   then searched source first, documentation and other text second, data
 //!   (JSON, logs, minified bundles, ...) last;
 //! - a file whose size and modification time still match the borrowed index is
@@ -31,8 +31,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::extensions::{RawQuery, Token};
@@ -204,10 +202,12 @@ pub(super) struct SweepOutcome {
     pub files_discovered: usize,
     /// Files whose outcome is known: ruled out by the index or read from disk.
     pub files_checked: usize,
-    /// The walk itself stopped at the deadline, so the file total is unknown.
+    /// The walk stopped early, so the file total is unknown.
     pub enumeration_stopped: bool,
-    /// Reading stopped at the deadline before every discovered file was checked.
+    /// Reading stopped before every discovered file was checked.
     pub scan_stopped: bool,
+    file_limit_reached: bool,
+    time_limit_reached: bool,
     /// Whether a borrowed index was consulted.
     pub used_index: bool,
     pub index_read_gap: Option<String>,
@@ -218,6 +218,9 @@ pub(super) struct SweepOutcome {
     pub files_read: usize,
     /// Files skipped because they exceed [`SWEEP_MAX_FILE_BYTES`].
     pub oversized_skipped: usize,
+    read_failed: usize,
+    walk_incomplete: bool,
+    skipped_foreign_mounts: usize,
 }
 
 impl SweepOutcome {
@@ -226,6 +229,8 @@ impl SweepOutcome {
         !self.enumeration_stopped
             && !self.scan_stopped
             && self.oversized_skipped == 0
+            && self.read_failed == 0
+            && !self.walk_incomplete
             && self.index_read_gap.is_none()
     }
 
@@ -271,16 +276,29 @@ impl SweepOutcome {
                     self.files_checked, self.files_discovered
                 )
             };
+            let limit = if self.file_limit_reached {
+                ", file limit"
+            } else if self.time_limit_reached {
+                ", time limit"
+            } else {
+                ""
+            };
             format!(
-                "exact pass: bounded ({} files, time limit); checked {coverage} ({source}){oversized}; source code and other files under {} not fully searched; use grep for an exhaustive check",
+                "exact pass: bounded ({} files{limit}); checked {coverage} ({source}){oversized}; source code and other files under {} not fully searched; use grep for an exhaustive check",
                 self.files_checked,
                 root.display()
             )
-        } else if self.oversized_skipped > 0 {
+        } else if !self.fully_covered() {
+            let coverage = if self.walk_incomplete {
+                format!(
+                    "{} of {} discovered files",
+                    self.files_checked, self.files_discovered
+                )
+            } else {
+                format!("{} of {} files", self.files_checked, self.files_discovered)
+            };
             format!(
-                "exact pass: checked {} of {} files under {} ({source}){oversized}; use grep for an exhaustive check",
-                self.files_checked,
-                self.files_discovered,
+                "exact pass: checked {coverage} under {} ({source}){oversized}; use grep for an exhaustive check",
                 root.display()
             )
         } else {
@@ -330,15 +348,23 @@ fn sweep_after_metadata(
 
     // Enumerate first, checking the deadline at every walk entry (directories
     // and rejected entries included), so a huge tree cannot hold the request.
-    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
-    let walker = crate::grep_executor::fallback_project_walk_builder(root, skipped_foreign_mounts);
+    let coverage = crate::grep_executor::WalkCoverage::default();
+    let walker = crate::grep_executor::fallback_project_walk_builder(root, coverage.clone());
+    let file_limit = crate::grep_executor::fallback_walk_limit();
     let mut files: Vec<(FileClass, PathBuf)> = Vec::new();
     for entry in walker.build() {
-        if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
+        outcome.time_limit_reached = Instant::now() >= deadline;
+        if outcome.time_limit_reached || crate::executor::current_job_cancelled() {
             outcome.enumeration_stopped = true;
             break;
         }
-        let Ok(entry) = entry else { continue };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                coverage.record_error(root, error);
+                continue;
+            }
+        };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
@@ -346,8 +372,15 @@ fn sweep_after_metadata(
         if !super::path_allowed_by_include_tests(&path, root, include_tests) {
             continue;
         }
+        if files.len() == file_limit {
+            outcome.enumeration_stopped = true;
+            outcome.file_limit_reached = true;
+            break;
+        }
         files.push((classify_file(&path), path));
     }
+    outcome.walk_incomplete = !coverage.complete();
+    outcome.skipped_foreign_mounts = coverage.skipped_foreign_mounts();
     outcome.files_discovered = files.len();
 
     order_for_search(&mut files, root);
@@ -367,7 +400,8 @@ fn sweep_after_metadata(
     };
     let mut hits = Vec::new();
     for (class, path) in &files {
-        if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
+        outcome.time_limit_reached |= Instant::now() >= deadline;
+        if outcome.time_limit_reached || crate::executor::current_job_cancelled() {
             outcome.scan_stopped = true;
             break;
         }
@@ -384,10 +418,18 @@ fn sweep_after_metadata(
                 }
             }
         }
-        let Ok(metadata) = std::fs::metadata(path) else {
-            // Gone since enumeration: nothing left to search.
-            outcome.files_checked += 1;
-            continue;
+        let metadata = match crate::bounded_io::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Gone since enumeration: nothing left to search.
+                outcome.files_checked += 1;
+                continue;
+            }
+            Err(error) => {
+                outcome.read_failed += 1;
+                crate::bounded_io::note_skipped_file(path, &error.to_string());
+                continue;
+            }
         };
         if metadata.len() > SWEEP_MAX_FILE_BYTES {
             let _ = crate::large_read::allow_whole(
@@ -399,19 +441,21 @@ fn sweep_after_metadata(
             continue;
         }
         after_metadata(path);
-        let content = read_sweep_text(path);
-        if content
-            .as_ref()
-            .is_err_and(crate::large_read::is_ceiling_error)
-        {
-            outcome.oversized_skipped += 1;
-            continue;
-        }
+        let content = match read_sweep_text(path) {
+            Ok(content) => content,
+            Err(error) if crate::large_read::is_ceiling_error(&error) => {
+                outcome.oversized_skipped += 1;
+                continue;
+            }
+            Err(error) => {
+                outcome.read_failed += 1;
+                crate::bounded_io::note_skipped_file(path, &error.to_string());
+                continue;
+            }
+        };
         outcome.files_read += 1;
         outcome.files_checked += 1;
-        // Binary and non-UTF-8 files are checked but cannot hold a text hit.
-        if let Ok(Some(content)) = content {
-            crate::large_read::record_whole(crate::large_read::Site::ExternalSweep, content.len());
+        if let Some(content) = content {
             scan_content(path, &content, *class, terms, &mut hits);
         }
     }
@@ -429,7 +473,11 @@ fn read_sweep_text(path: &Path) -> std::io::Result<Option<String>> {
     if crate::search_index::is_binary_bytes(&bytes) {
         return Ok(None);
     }
-    Ok(String::from_utf8(bytes).ok())
+    crate::large_read::record_whole(crate::large_read::Site::ExternalSweep, bytes.len());
+    // Non-UTF-8 text can still contain the ASCII identifier being searched.
+    Ok(Some(String::from_utf8(bytes).unwrap_or_else(|error| {
+        String::from_utf8_lossy(error.as_bytes()).into_owned()
+    })))
 }
 
 /// Source before text before data, so a sweep that runs out of time has read
@@ -684,7 +732,7 @@ pub(super) fn reply(
         "variants": terms.variants,
         "exact_lines": exact_count,
         "variant_lines": total - exact_count,
-        "files_discovered": if outcome.enumeration_stopped {
+        "files_discovered": if outcome.enumeration_stopped || outcome.walk_incomplete {
             serde_json::Value::Null
         } else {
             serde_json::json!(outcome.files_discovered)
@@ -703,6 +751,9 @@ pub(super) fn reply(
     });
     if let Some(reason) = &outcome.index_read_gap {
         summary["index_read_gap"] = serde_json::json!(reason);
+    }
+    if outcome.skipped_foreign_mounts > 0 {
+        summary["skipped_foreign_mounts"] = serde_json::json!(outcome.skipped_foreign_mounts);
     }
     SweepReply {
         results,
@@ -816,6 +867,65 @@ mod tests {
     #[test]
     fn audit1432_external_exact_growth_is_skipped_not_counted_as_checked() {
         audit1432_oversized_sweep(true);
+    }
+
+    #[test]
+    fn review_search_exact_sweep_finds_ascii_identifiers_in_non_utf8_text() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("utf8.rs"), IDENTIFIER).unwrap();
+        let bytes = [b"caf\xe9 ".as_slice(), IDENTIFIER.as_bytes()].concat();
+        std::fs::write(root.path().join("legacy.rs"), bytes).unwrap();
+
+        let outcome = sweep(root.path(), &terms(), None, true, far_deadline());
+        assert!(outcome.fully_covered());
+        assert_eq!(outcome.files_checked, 2);
+        assert_eq!(outcome.files_with_hits(), 2);
+    }
+
+    #[test]
+    fn review_search_exact_sweep_does_not_count_a_failed_open() {
+        let root = tempfile::tempdir().unwrap();
+        let open = root.path().join("open.rs");
+        let removed = root.path().join("removed.rs");
+        std::fs::write(&open, IDENTIFIER).unwrap();
+        std::fs::write(&removed, IDENTIFIER).unwrap();
+
+        let outcome =
+            sweep_after_metadata(root.path(), &terms(), None, true, far_deadline(), |path| {
+                if path == removed {
+                    std::fs::remove_file(path).unwrap();
+                }
+            });
+        assert_eq!(outcome.files_discovered, 2);
+        assert_eq!(outcome.files_checked, 1);
+        assert_eq!(outcome.files_read, 1);
+        assert_eq!(outcome.files_with_hits(), 1);
+        assert!(!outcome.fully_covered());
+        assert!(!outcome
+            .coverage_line(root.path())
+            .contains("exact pass: complete"));
+    }
+
+    #[test]
+    fn review_search_exact_sweep_stops_at_the_fallback_file_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(root.path().join(name), IDENTIFIER).unwrap();
+        }
+        let run = |limit| {
+            crate::grep_executor::with_walk_limit(limit, || {
+                sweep(root.path(), &terms(), None, true, far_deadline())
+            })
+        };
+        let capped = run(2);
+        assert_eq!(capped.files_discovered, 2);
+        assert_eq!(capped.files_checked, 2);
+        assert!(capped.enumeration_stopped);
+        assert!(!capped.fully_covered());
+        assert!(capped
+            .coverage_line(root.path())
+            .contains("2 files, file limit"));
+        assert!(run(3).fully_covered());
     }
 
     const IDENTIFIER: &str = "requireCredentialStamps";

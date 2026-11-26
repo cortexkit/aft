@@ -342,6 +342,20 @@ def is_cache_save(step: dict[str, Any]) -> bool:
     return isinstance(uses, str) and uses.strip().startswith("actions/cache/save@")
 
 
+def is_cache_prune(job_id: str, job: dict[str, Any]) -> bool:
+    """The cache-retention job is maintenance, not a train check."""
+    steps = job.get("steps")
+    return (
+        job_id == "rust-cache-prune"
+        and job.get("if") == "${{ !cancelled() && github.ref == 'refs/heads/main' }}"
+        and isinstance(steps, list)
+        and len(steps) == 2
+        and all(isinstance(step, dict) for step in steps)
+        and steps[0].get("uses") == "actions/checkout@v5"
+        and steps[1].get("run") == "python3 scripts/prune-rust-cache.py"
+    )
+
+
 def classify(condition: str) -> str | None:
     """ref = provably dead under trains, warn = depends on the landing path."""
     if "github.ref" in condition:
@@ -379,7 +393,7 @@ def scan(path: str) -> tuple[list[str], list[str], str]:
         for job_id, job in jobs.items():
             if not isinstance(job, dict):
                 continue
-            entries = [("", job.get("if"))]
+            entries = [] if is_cache_prune(job_id, job) else [("", job.get("if"))]
             steps = job.get("steps")
             if isinstance(steps, list):
                 entries += [

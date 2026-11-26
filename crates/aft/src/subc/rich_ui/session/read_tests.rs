@@ -111,6 +111,35 @@ pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fi
 }
 
 #[tokio::test]
+async fn session_read_carrier_does_not_count_as_an_agent_repeat() {
+    use crate::response_finalize::repeat_breaker::RepeatCall;
+    use std::time::{Duration, Instant};
+
+    let _manifest =
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let f = indexed_fixture("head");
+    let args = json!({"path":"main.rs"});
+    for _ in 0..3 {
+        let body = query_with(&f, "read", args.clone(), dispatch).await;
+        assert_eq!(body["isError"], false, "{body}");
+    }
+
+    let first = Instant::now() + Duration::from_secs(30);
+    let call = RepeatCall::new("read", &args);
+    let observe = |seconds| {
+        f.ctx.repeat_breaker().observe_at(
+            &f.policy.session,
+            &call,
+            0,
+            first + Duration::from_secs(seconds),
+        )
+    };
+    assert!(observe(0).is_none(), "the agent has only read once");
+    assert!(observe(15).is_none());
+    assert_eq!(observe(30).unwrap().count, 3);
+}
+
+#[tokio::test]
 async fn session_reads_serve_all_seven_from_heads_workers_and_flow_heads() {
     let _manifest =
         super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));

@@ -78,7 +78,9 @@ impl ViewCallGraph {
             let Ok(relative) = file.strip_prefix(root) else {
                 continue;
             };
-            let store_path = relative.to_string_lossy().replace('\\', "/");
+            let Some(store_path) = crate::callgraph_store::facts::utf8_path_key(relative) else {
+                continue;
+            };
             if !source.has_file(&store_path) {
                 continue;
             }

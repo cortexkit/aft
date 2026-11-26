@@ -785,11 +785,26 @@ pub fn callers_result(
     }
 
     let is_rust = target.representative.lang == crate::parser::LangId::Rust;
-    let via_entries = if is_rust {
-        macro_via_entries(store, &target, include_tests, &listed)?
+    // Template calls and unanalyzed mentions of the name are read in one
+    // pass over the files that use it. Each asks for one more row than it
+    // keeps, which tells an exact answer from a cut one.
+    let (template_calls, mention_rows) = if is_rust {
+        let mut rows = store.ref_sites_named(
+            &target.representative.name,
+            &[
+                (MACRO_BODY_CALL_REF_KIND, MACRO_VIA_ENTRY_LIMIT + 1),
+                (MACRO_MENTION_REF_KIND, MACRO_MENTION_COUNT_LIMIT + 1),
+            ],
+        )?;
+        let mentions = rows.pop().unwrap_or_default();
+        (rows.pop().unwrap_or_default(), mentions)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+    let MacroVia {
+        entries: via_entries,
+        capped: via_capped,
+    } = macro_via_entries(store, &target, include_tests, &listed, template_calls)?;
     let via_count = via_entries.len();
     let unknown_macro_callers = via_entries
         .iter()
@@ -800,18 +815,24 @@ pub fn callers_result(
     for (file, entry) in via_entries {
         groups.entry(file).or_default().push(entry);
     }
-    let macro_note = if is_rust {
-        unanalyzed_macro_note(store, &target.representative.name, include_tests)?
-    } else {
-        None
-    };
+    let macro_note =
+        unanalyzed_macro_note(&target.representative.name, include_tests, mention_rows);
 
-    let callers_list_envelope = build_callgraph_envelope(
-        Unit::Items,
-        shown + via_count,
-        post_filter_count + via_count,
-        truncated.max(usize::from(depth_limited)),
-    );
+    let depth_cut = truncated.max(usize::from(depth_limited));
+    let callers_list_envelope = if via_capped {
+        Some(build_callers_macro_cut_envelope(
+            shown + via_count,
+            post_filter_count + via_count,
+            depth_cut,
+        ))
+    } else {
+        build_callgraph_envelope(
+            Unit::Items,
+            shown + via_count,
+            post_filter_count + via_count,
+            depth_cut,
+        )
+    };
 
     let unresolved_callers = if post_filter_count + via_count == 0 {
         let (total, sites) = store.unresolved_call_sites_named(
@@ -881,19 +902,30 @@ pub fn callers_result(
 /// Templates, invocations and the target are all matched by name only, so
 /// every entry is marked name-resolved. When several symbols share the
 /// target's name no entries are produced, because nothing tells which of them
-/// a template calls. Only macros defined in the project have template refs,
-/// and the entry count is capped at `MACRO_VIA_ENTRY_LIMIT` by the queries.
+/// a template calls. Only macros defined in the project have template refs.
+/// At most `MACRO_VIA_ENTRY_LIMIT` entries are listed; `capped` says more
+/// rows may exist past that, so the count is a lower bound.
+struct MacroVia {
+    entries: Vec<(String, StoreCallerEntry)>,
+    capped: bool,
+}
+
+/// `template_calls` are the target name's template call rows, fetched with
+/// one more than `MACRO_VIA_ENTRY_LIMIT` so a cut shows.
 fn macro_via_entries(
     store: &impl CallGraphRead,
     target: &ResolvedStoreSymbol,
     include_tests: bool,
     listed: &HashSet<(String, u32)>,
-) -> StoreAdapterResult<Vec<(String, StoreCallerEntry)>> {
+    template_calls: Vec<crate::callgraph_store::StoreRefSite>,
+) -> StoreAdapterResult<MacroVia> {
+    let none = MacroVia {
+        entries: Vec::new(),
+        capped: false,
+    };
     let name = &target.representative.name;
-    let template_calls =
-        store.ref_sites_named(MACRO_BODY_CALL_REF_KIND, name, MACRO_VIA_ENTRY_LIMIT)?;
     if template_calls.is_empty() {
-        return Ok(Vec::new());
+        return Ok(none);
     }
     let namesakes = store
         .nodes_matching(name)?
@@ -901,7 +933,7 @@ fn macro_via_entries(
         .filter(|node| node.name == *name && !target.nodes.contains(node))
         .count();
     if namesakes > 0 {
-        return Ok(Vec::new());
+        return Ok(none);
     }
 
     let name_match = |symbol: String, line: u32, via: Option<String>, test_status_unknown: bool| {
@@ -917,7 +949,8 @@ fn macro_via_entries(
     };
     let mut entries = Vec::new();
     let mut macros = BTreeSet::new();
-    for site in template_calls {
+    let mut capped = template_calls.len() > MACRO_VIA_ENTRY_LIMIT;
+    for site in template_calls.into_iter().take(MACRO_VIA_ENTRY_LIMIT) {
         let Some(macro_name) = site.local_name else {
             continue;
         };
@@ -931,11 +964,17 @@ fn macro_via_entries(
         macros.insert(macro_name);
     }
     for macro_name in macros {
-        let remaining = MACRO_VIA_ENTRY_LIMIT.saturating_sub(entries.len());
-        if remaining == 0 {
+        if capped {
             break;
         }
-        for site in store.ref_sites_named("call", &macro_name, remaining)? {
+        let remaining = MACRO_VIA_ENTRY_LIMIT.saturating_sub(entries.len());
+        // One row more than fits tells whether invocations are left out.
+        let sites = store
+            .ref_sites_named(&macro_name, &[("call", remaining + 1)])?
+            .pop()
+            .unwrap_or_default();
+        capped = sites.len() > remaining;
+        for site in sites.into_iter().take(remaining) {
             if (!include_tests && (is_test_file(&site.file) || site.is_test == Some(true)))
                 || listed.contains(&(site.file.clone(), site.line))
             {
@@ -951,21 +990,24 @@ fn macro_via_entries(
             ));
         }
     }
-    Ok(entries)
+    Ok(MacroVia { entries, capped })
 }
 
 /// A note naming where the target's name occurs inside Rust macro token trees
 /// that could not be parsed as Rust. Calls there are invisible to the call
 /// graph, so without the note an empty or short caller list would read as
-/// complete when it may not be.
+/// complete when it may not be. `rows` are the name's mention rows, fetched
+/// with one more than `MACRO_MENTION_COUNT_LIMIT`.
 fn unanalyzed_macro_note(
-    store: &impl CallGraphRead,
     name: &str,
     include_tests: bool,
-) -> StoreAdapterResult<Option<StoreMacroNote>> {
-    // One more than the limit tells an exact count from a lower bound.
-    let rows =
-        store.ref_sites_named(MACRO_MENTION_REF_KIND, name, MACRO_MENTION_COUNT_LIMIT + 1)?;
+    rows: Vec<crate::callgraph_store::StoreRefSite>,
+) -> Option<StoreMacroNote> {
+    // The fetch stopped at one more than the limit, so more rows than the
+    // limit means more mentions may exist past it. Judge that on the rows
+    // as fetched: test files and repeated lines dropped below must not make
+    // a cut count read as exact.
+    let mentions_is_lower_bound = rows.len() > MACRO_MENTION_COUNT_LIMIT;
     let mut seen = BTreeSet::new();
     let mut sites = Vec::new();
     for row in rows {
@@ -977,9 +1019,8 @@ fn unanalyzed_macro_note(
         }
     }
     if sites.is_empty() {
-        return Ok(None);
+        return None;
     }
-    let mentions_is_lower_bound = sites.len() > MACRO_MENTION_COUNT_LIMIT;
     sites.truncate(MACRO_MENTION_COUNT_LIMIT);
     let mentions = sites.len();
     sites.truncate(MACRO_MENTION_SHOWN);
@@ -994,14 +1035,59 @@ fn unanalyzed_macro_note(
     } else {
         sites.join(", ")
     };
-    Ok(Some(StoreMacroNote {
+    Some(StoreMacroNote {
         message: format!(
             "{count} {noun} of `{name}` inside macros could not be analyzed (one location per file): {listed}"
         ),
         mentions,
         mentions_is_lower_bound,
         sites,
-    }))
+    })
+}
+
+pub(crate) fn macro_gap_paths(
+    store: &impl CallGraphRead,
+    file: &str,
+) -> StoreAdapterResult<Vec<std::path::PathBuf>> {
+    if Path::new(file).extension().and_then(|ext| ext.to_str()) != Some("rs") {
+        return Ok(Vec::new());
+    }
+    let fence = crate::context::confinement::capture();
+    let sites = store
+        .ref_sites_named(
+            crate::calls::MACRO_MENTION_OVERFLOW_KEY,
+            &[(MACRO_MENTION_REF_KIND, super::surfaces::INDEX_GAP_PREVIEW)],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    Ok(sites
+        .into_iter()
+        .map(|site| store.project_root().join(site.file))
+        .filter(|path| fence.admits_walk_entry(path))
+        .collect())
+}
+
+pub(crate) fn disclose_macro_gaps(response: &mut Response, paths: Vec<std::path::PathBuf>) {
+    if !response.success || paths.is_empty() {
+        return;
+    }
+    response.data["complete"] = false.into();
+    let gaps = response
+        .data
+        .as_object_mut()
+        .expect("callers response")
+        .entry("gaps")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(gaps) = gaps.as_array_mut() {
+        gaps.extend(paths.into_iter().map(|path| {
+            serde_json::json!({
+                "kind": "macro_mention_overflow",
+                "path": path,
+                "message": "1 file could not be analyzed",
+            })
+        }));
+    }
 }
 
 pub fn call_tree_result(
@@ -1573,7 +1659,7 @@ pub fn trace_to_symbol_result(
     include_tests: bool,
 ) -> StoreAdapterResult<StoreTraceToSymbolResult> {
     let origin = resolve_symbol_query(store, file, symbol)?;
-    let target_file = to_file.map(|path| relative_file(store, path));
+    let target_file = to_file.map(|path| relative_file(store, path)).transpose()?;
     let effective_max = if max_depth == 0 {
         10
     } else {
@@ -1738,7 +1824,7 @@ pub fn trace_data_result(
     symbol_cache: SharedSymbolCache,
 ) -> StoreAdapterResult<callgraph::TraceDataResult> {
     let origin_path = absolute_file(store, file);
-    let origin_file = relative_file(store, &origin_path);
+    let origin_file = relative_file(store, &origin_path)?;
     let origin_symbol = resolve_symbol_query_with_cache(&origin_path, symbol, &symbol_cache)?;
 
     let mut hops = Vec::new();
@@ -1837,7 +1923,7 @@ fn trace_data_inner(
     depth_limited: &mut bool,
     visited: &mut HashSet<(String, String, String, bool)>,
 ) -> StoreAdapterResult<()> {
-    let rel_file = relative_file(store, file);
+    let rel_file = relative_file(store, file)?;
     let visit_key = (
         rel_file.clone(),
         symbol.to_string(),
@@ -2595,20 +2681,37 @@ pub(crate) fn response_with_view(
     view: Option<&crate::data_layer::checkout::CheckoutView>,
     queried_paths: &[&Path],
 ) -> Response {
-    // Missing callers in downloaded grammars only affect traversals in those languages.
-    let languages: std::collections::BTreeSet<_> = queried_paths
-        .iter()
-        .filter_map(|path| super::grammar::downloaded_language(path))
-        .collect();
-    if !languages.is_empty() {
-        if let Some(view) = view {
+    if let Some(view) = view {
+        let language = |path: &Path| {
+            let relative = crate::callgraph_store::relative_path(view.root(), path)?;
+            Some(
+                view.current_state()
+                    .get(relative.as_bytes())?
+                    .language
+                    .as_str(),
+            )
+        };
+        let family = |label: &str| match label {
+            "typescript" | "tsx" | "javascript" => 0,
+            "c" | "cpp" | "cuda" | "metal" | "objc" => 1,
+            _ => 2,
+        };
+        let languages: BTreeSet<_> = queried_paths
+            .iter()
+            .filter_map(|path| language(path))
+            .collect();
+        if !languages.is_empty() {
             crate::data_layer::surfaces::disclose_parse_gaps(
                 view,
                 &[view.root().to_path_buf()],
                 &mut response,
                 |path| {
-                    super::grammar::downloaded_language(path)
-                        .is_some_and(|language| languages.contains(language))
+                    language(path).is_some_and(|label| {
+                        languages.iter().any(|queried| {
+                            *queried == label
+                                || (family(label) != 2 && family(label) == family(queried))
+                        })
+                    })
                 },
             );
         }
@@ -2828,9 +2931,6 @@ pub fn index_refusal_response(
             note_callgraph_building(ctx, operation);
             building_response(req_id, operation)
         }
-        CallgraphStoreAccess::Suspended(suspension) => {
-            suspended_response(req_id, operation, suspension)
-        }
         CallgraphStoreAccess::Unavailable | CallgraphStoreAccess::Error(_) => {
             unavailable_for(req_id, operation, ctx)
         }
@@ -2857,42 +2957,6 @@ pub fn building_response(req_id: &str, operation: &str) -> Response {
         "callgraph_building",
         format!("{operation}: callgraph store is building in the background; retry shortly"),
         IndexObservation::building(),
-    )
-}
-
-/// A tripped breaker is terminal for this request: the store is configured,
-/// but its builder was suspended. The index is unavailable with the
-/// `build_suspended` cause; the message says how to resume.
-pub fn suspended_response(
-    req_id: &str,
-    operation: &str,
-    suspension: &crate::build_breaker::BuildSuspension,
-) -> Response {
-    suspended_response_at(
-        req_id,
-        operation,
-        suspension,
-        crate::callgraph_store::unix_millis_now(),
-    )
-}
-
-pub(crate) fn suspended_response_at(
-    req_id: &str,
-    operation: &str,
-    suspension: &crate::build_breaker::BuildSuspension,
-    now_ms: u64,
-) -> Response {
-    let age_ms = suspension.age_millis_at(now_ms);
-    callgraph_index_refusal(
-        req_id,
-        "callgraph_unavailable",
-        format!(
-            "{operation}: build_suspended domain={} deaths={} age_ms={age_ms} reason={}; run doctor reset-build-breaker to resume",
-            suspension.domain.as_str(),
-            suspension.death_count,
-            suspension.reason,
-        ),
-        IndexObservation::unavailable(cause::BUILD_SUSPENDED),
     )
 }
 
@@ -3603,9 +3667,13 @@ fn display_file_for_error(store: &impl CallGraphRead, file: &Path) -> String {
     absolute_file(store, file).display().to_string()
 }
 
-fn relative_file(store: &impl CallGraphRead, file: &Path) -> String {
+fn relative_file(store: &impl CallGraphRead, file: &Path) -> Result<String, AftError> {
     let absolute = absolute_file(store, file);
-    crate::callgraph_store::relative_path(store.project_root(), &absolute)
+    crate::callgraph_store::relative_path(store.project_root(), &absolute).ok_or_else(|| {
+        AftError::FileNotFound {
+            path: absolute.display().to_string(),
+        }
+    })
 }
 
 fn absolute_file(store: &impl CallGraphRead, file: &Path) -> PathBuf {
@@ -3643,7 +3711,7 @@ mod trace_to_tests {
                 plain.join("source.luau"),
                 verbatim.join("source.luau"),
             ] {
-                assert_eq!(relative_file(&store, &file), "source.luau");
+                assert_eq!(relative_file(&store, &file).unwrap(), "source.luau");
             }
         }
     }

@@ -7,15 +7,18 @@ use parking_lot::Mutex;
 
 use crate::config::GithubConfig;
 use crate::db::github_read_cache::{
-    invalidate_github_read_cache_resource, lookup_github_read_cache_entry,
-    upsert_github_read_cache_entry, GithubReadCacheEntry, GithubReadCacheKey,
+    ensure_github_read_cache_schema, invalidate_github_read_cache_resource_after_schema,
+    lookup_github_read_cache_entry_after_schema, prepare_github_read_cache_lookup,
+    upsert_github_read_cache_entry_after_schema, GithubReadCacheEntry, GithubReadCacheKey,
     GithubReadResourceKind,
 };
 
 use super::attachments::{
-    download_github_image_attachments, GithubImageAttachment, GithubImageDownloader,
+    download_github_image_attachments, FlightImageDownloads, GithubImageAttachment,
+    GithubImageDownloader,
 };
 use super::fetch::{GithubFetchRequest, GithubFetcher, GithubReadError};
+use super::model::GithubDocument;
 use super::render::{render_document_for_resource, render_outline_for_resource};
 use super::resource::{parse_resource, GithubResource, GithubResourceKind, InvalidGithubResource};
 
@@ -48,6 +51,7 @@ pub trait GithubReadCacheStore: Send + Sync {
         key: &GithubReadCacheKey,
         canonical_text: &str,
         fetched_at_ms: i64,
+        document_gap: bool,
     ) -> Result<(), String>;
     fn invalidate(
         &self,
@@ -56,18 +60,38 @@ pub trait GithubReadCacheStore: Send + Sync {
         number: u64,
         authentication_identity: Option<&str>,
     ) -> Result<usize, String>;
+
+    /// Point the store at the caller's resident `aft.db` connection, if it
+    /// keeps one. Stores without a database ignore this.
+    fn attach_resident_connection(&self, _connection: Option<&SharedConnection>) {}
 }
 
+/// The context's long-lived `aft.db` connection.
+pub type SharedConnection = Arc<std::sync::Mutex<crate::db::TrackedConnection>>;
+
 /// `aft.db` implementation of the GitHub read cache seam.
-#[derive(Clone, Debug)]
+///
+/// It works through the context's resident connection when one is attached
+/// and still alive, creating the cache table once per connection. Opening the
+/// database per operation (a schema peek, PRAGMAs and the migration check on
+/// the request thread) is only the fallback for a caller with no resident
+/// connection.
 pub struct SqliteGithubReadCacheStore {
     database_path: PathBuf,
+    /// Weak, so the store never keeps a connection open after the context
+    /// has let it go.
+    resident: Mutex<std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>>,
+    /// Resident connection address and whether its cache has gap metadata.
+    /// Cleared if a cache statement fails so the next operation checks again.
+    schema_ready_on: Mutex<Option<(usize, bool)>>,
 }
 
 impl SqliteGithubReadCacheStore {
     pub fn new(database_path: impl Into<PathBuf>) -> Self {
         Self {
             database_path: database_path.into(),
+            resident: Mutex::new(std::sync::Weak::new()),
+            schema_ready_on: Mutex::new(None),
         }
     }
 
@@ -76,13 +100,59 @@ impl SqliteGithubReadCacheStore {
             .inspect(|connection| connection.close_in_background())
             .map_err(|error| format!("failed to open GitHub read cache: {error}"))
     }
+
+    /// Run `operation` on the resident connection, or on a fresh one when
+    /// there is none. `what` names the operation in the error.
+    fn run<T>(
+        &self,
+        what: &str,
+        needs_gap_column: bool,
+        operation: impl FnOnce(&rusqlite::Connection, bool) -> rusqlite::Result<T>,
+    ) -> Result<T, String> {
+        let failed =
+            |error: rusqlite::Error| format!("failed to {what} GitHub read cache: {error}");
+        let prepare = |connection: &rusqlite::Connection| {
+            if needs_gap_column {
+                ensure_github_read_cache_schema(connection).map(|()| true)
+            } else {
+                prepare_github_read_cache_lookup(connection)
+            }
+        };
+        let resident = self.resident.lock().upgrade();
+        let Some(shared) = resident else {
+            let connection = self.connection()?;
+            let has_gap_column = prepare(&connection).map_err(failed)?;
+            return operation(&connection, has_gap_column).map_err(failed);
+        };
+        let connection = shared
+            .lock()
+            .map_err(|_| format!("failed to {what} GitHub read cache: connection lock poisoned"))?;
+        let address = Arc::as_ptr(&shared) as usize;
+        let mut ready = self.schema_ready_on.lock();
+        let has_gap_column = match *ready {
+            Some((prepared_on, has_gap_column))
+                if prepared_on == address && (has_gap_column || !needs_gap_column) =>
+            {
+                has_gap_column
+            }
+            _ => {
+                let has_gap_column = prepare(&connection).map_err(failed)?;
+                *ready = Some((address, has_gap_column));
+                has_gap_column
+            }
+        };
+        operation(&connection, has_gap_column).map_err(|error| {
+            *ready = None;
+            failed(error)
+        })
+    }
 }
 
 impl GithubReadCacheStore for SqliteGithubReadCacheStore {
     fn lookup(&self, key: &GithubReadCacheKey) -> Result<Option<GithubReadCacheEntry>, String> {
-        let connection = self.connection()?;
-        lookup_github_read_cache_entry(&connection, key)
-            .map_err(|error| format!("failed to look up GitHub read cache: {error}"))
+        self.run("look up", false, |connection, has_gap_column| {
+            lookup_github_read_cache_entry_after_schema(connection, key, has_gap_column)
+        })
     }
 
     fn upsert(
@@ -90,10 +160,17 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
         key: &GithubReadCacheKey,
         canonical_text: &str,
         fetched_at_ms: i64,
+        document_gap: bool,
     ) -> Result<(), String> {
-        let connection = self.connection()?;
-        upsert_github_read_cache_entry(&connection, key, canonical_text, fetched_at_ms)
-            .map_err(|error| format!("failed to update GitHub read cache: {error}"))
+        self.run("update", true, |connection, _| {
+            upsert_github_read_cache_entry_after_schema(
+                connection,
+                key,
+                canonical_text,
+                fetched_at_ms,
+                document_gap,
+            )
+        })
     }
 
     fn invalidate(
@@ -105,15 +182,19 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
     ) -> Result<usize, String> {
         let number = i64::try_from(number)
             .map_err(|_| "GitHub resource number exceeds cache storage range".to_string())?;
-        let connection = self.connection()?;
-        invalidate_github_read_cache_resource(
-            &connection,
-            database_kind(kind),
-            repository,
-            number,
-            authentication_identity,
-        )
-        .map_err(|error| format!("failed to invalidate GitHub read cache: {error}"))
+        self.run("invalidate", true, |connection, _| {
+            invalidate_github_read_cache_resource_after_schema(
+                connection,
+                database_kind(kind),
+                repository,
+                number,
+                authentication_identity,
+            )
+        })
+    }
+
+    fn attach_resident_connection(&self, connection: Option<&SharedConnection>) {
+        *self.resident.lock() = connection.map(Arc::downgrade).unwrap_or_default();
     }
 }
 
@@ -196,8 +277,14 @@ pub struct GithubReadCompletion {
     pub freshness: GithubReadFreshness,
     pub attachments: Vec<GithubImageAttachment>,
     /// Live structured data retained for mutation flows that must reuse read ordinals.
-    pub document: Option<super::model::GithubDocument>,
+    pub document: Option<GithubDocument>,
     pub diff_page: Option<super::diff::GithubDiffPage>,
+    /// The page stopped at [`MAX_PAGE_BYTES`]; its last line is the
+    /// truncation notice, not document text.
+    pub page_cut_by_size: bool,
+    /// The fetch left part of the resource out, or the cache cannot establish
+    /// that the fetch was complete.
+    pub document_gap: bool,
 }
 
 /// Handle for a fetch or attachment task that is running away from the request
@@ -232,9 +319,8 @@ impl GithubReadLateAnswer {
             Some((entry, selector, kind)) => Ok(complete(
                 cached_fallback_text(entry, &GithubReadError::FetchFailed(still_running), *kind),
                 selector.clone(),
-                GithubReadFreshness::CachedFallback,
                 Vec::new(),
-                None,
+                DocumentSource::Cached(entry),
             )),
             None => Err(GithubReadError::Pending(format!(
                 "{still_running} and its result will be cached; retry this call shortly"
@@ -297,12 +383,15 @@ struct GithubReadEngineState {
     flights: BTreeMap<GithubReadFlightSlot, Vec<GithubReadFlightWaiter>>,
 }
 
+/// Which repository a shorthand (`issue://42`) read in one checkout resolved
+/// to last. Repository resolution depends on the checkout, not on who reads,
+/// so the key carries no identity and the map grows only with distinct
+/// resources read, not with sessions.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ShortResourceAlias {
     kind: GithubResourceKind,
     number: u64,
     working_directory: PathBuf,
-    authentication_identity_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -314,11 +403,13 @@ struct CacheSlot {
 }
 
 /// A resolved resource can share a flight across equivalent explicit forms.
-/// An unresolved short form stays scoped to its worktree until GitHub resolves it.
+/// A shorthand read stays in its own flight, keyed by checkout and reader,
+/// because the repository it names is only known once `gh` answers: the
+/// last-seen alias may be stale (the checkout's default repository changed).
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum GithubReadFlightSlot {
     Resolved(CacheSlot),
-    Unresolved(ShortResourceAlias),
+    Unresolved(ShortResourceAlias, [u8; 32]),
 }
 
 struct GithubReadFlightWaiter {
@@ -468,6 +559,12 @@ impl GithubReadEngine {
             .map_err(cache_failure)
     }
 
+    /// Let the cache use the caller's resident `aft.db` connection instead of
+    /// opening the database for each operation.
+    pub fn attach_resident_connection(&self, connection: Option<&SharedConnection>) {
+        self.cache.attach_resident_connection(connection);
+    }
+
     fn require_enabled(&self, github: &GithubConfig) -> Result<(), GithubReadError> {
         if github.read {
             Ok(())
@@ -518,9 +615,16 @@ impl GithubReadEngine {
     }
 
     fn flight_slot_for_request(&self, request: &GithubReadRequest) -> GithubReadFlightSlot {
-        self.resolved_cache_slot(request)
-            .map(GithubReadFlightSlot::Resolved)
-            .unwrap_or_else(|| GithubReadFlightSlot::Unresolved(short_alias(request)))
+        let identity = &request.effective_authentication_identity;
+        match &request.resource.repository {
+            Some(repository) => {
+                GithubReadFlightSlot::Resolved(cache_slot(&request.resource, repository, identity))
+            }
+            None => GithubReadFlightSlot::Unresolved(
+                short_alias(request),
+                authentication_identity_hash(identity),
+            ),
+        }
     }
 
     fn defer_fetch(
@@ -575,6 +679,8 @@ impl GithubReadEngine {
                     ))
                 });
                 let waiters = state.lock().flights.remove(&slot).unwrap_or_default();
+                // Coalesced readers share one download of each image.
+                let downloads = FlightImageDownloads::new(downloader.as_ref());
                 for waiter in waiters {
                     let result = match &fetched {
                         Ok(document) => {
@@ -584,10 +690,9 @@ impl GithubReadEngine {
                                         &waiter.request,
                                         waiter.selector,
                                         canonical_text,
-                                        GithubReadFreshness::Fetched,
-                                        downloader.as_ref(),
+                                        &downloads,
                                         waiter.view,
-                                        Some(document.clone()),
+                                        DocumentSource::Fetched(document),
                                     )
                                 })
                         }
@@ -596,10 +701,9 @@ impl GithubReadEngine {
                                 &waiter.request,
                                 waiter.selector,
                                 cached_fallback_text(&entry, error, waiter.request.resource.kind),
-                                GithubReadFreshness::CachedFallback,
-                                downloader.as_ref(),
+                                &downloads,
                                 waiter.view,
-                                None,
+                                DocumentSource::Cached(&entry),
                             ),
                             None => Err(error.clone()),
                         },
@@ -623,7 +727,7 @@ fn fetch_store(
     fetcher: &dyn GithubFetcher,
     clock: &dyn GithubReadClock,
     state: &Mutex<GithubReadEngineState>,
-) -> Result<super::model::GithubDocument, GithubReadError> {
+) -> Result<GithubDocument, GithubReadError> {
     let document = fetcher.fetch(&GithubFetchRequest {
         resource: request.resource.clone(),
         working_directory: request.working_directory.clone(),
@@ -646,7 +750,12 @@ fn fetch_store(
     // A cache outage or an unrepresentable cache key must not convert a live
     // GitHub document into a failed read. The next request will fetch live again.
     if let Some(key) = github_cache_key(&slot, &request.effective_authentication_identity) {
-        if let Err(error) = cache.upsert(&key, &canonical_text, clock.now_ms()) {
+        if let Err(error) = cache.upsert(
+            &key,
+            &canonical_text,
+            clock.now_ms(),
+            document.has_fetch_gap(),
+        ) {
             log::warn!("GitHub read cache write failed: {error}");
         }
     }
@@ -660,7 +769,7 @@ fn fetch_store(
 }
 
 fn render_for_view(
-    document: &super::model::GithubDocument,
+    document: &GithubDocument,
     resource: &GithubResource,
     view: GithubReadView,
 ) -> Result<String, GithubReadError> {
@@ -670,14 +779,18 @@ fn render_for_view(
     }
 }
 
+enum DocumentSource<'a> {
+    Fetched(&'a GithubDocument),
+    Cached(&'a GithubReadCacheEntry),
+}
+
 fn complete_with_optional_attachments(
     request: &GithubReadRequest,
     selector: GithubReadSelector,
     canonical_text: String,
-    freshness: GithubReadFreshness,
     downloader: &dyn GithubImageDownloader,
     view: GithubReadView,
-    document: Option<super::model::GithubDocument>,
+    source: DocumentSource<'_>,
 ) -> Result<GithubReadCompletion, GithubReadError> {
     let attachments = if view == GithubReadView::Document && request.vision_capability == Some(true)
     {
@@ -685,51 +798,86 @@ fn complete_with_optional_attachments(
     } else {
         Vec::new()
     };
-    Ok(complete(
-        canonical_text,
-        selector,
-        freshness,
-        attachments,
-        document,
-    ))
+    Ok(complete(canonical_text, selector, attachments, source))
 }
 
 fn complete(
     canonical_text: String,
     selector: GithubReadSelector,
-    freshness: GithubReadFreshness,
     attachments: Vec<GithubImageAttachment>,
-    document: Option<super::model::GithubDocument>,
+    source: DocumentSource<'_>,
 ) -> GithubReadCompletion {
     let total_lines = canonical_text.lines().count();
+    let (content, page_cut_by_size) = select(&canonical_text, selector);
+    let (freshness, document, document_gap) = match source {
+        DocumentSource::Fetched(document) => (
+            GithubReadFreshness::Fetched,
+            Some(document.clone()),
+            document.has_fetch_gap(),
+        ),
+        DocumentSource::Cached(entry) => (
+            GithubReadFreshness::CachedFallback,
+            None,
+            entry.document_gap.unwrap_or(true),
+        ),
+    };
     GithubReadCompletion {
-        content: apply_selector(&canonical_text, selector),
+        content,
         total_lines,
         freshness,
         attachments,
         document,
         diff_page: None,
+        page_cut_by_size,
+        document_gap,
     }
 }
 
+/// Longest line a page shows whole, and most bytes one page holds: the same
+/// bounds file reads apply (`commands/read.rs`).
+const MAX_LINE_LENGTH: usize = 2000;
+const MAX_PAGE_BYTES: usize = 50 * 1024;
+
 /// Apply selection to the completed canonical render, never to raw GitHub data.
 pub fn apply_selector(canonical_text: &str, selector: GithubReadSelector) -> String {
+    select(canonical_text, selector).0
+}
+
+/// [`apply_selector`], also returning whether a line page stopped at
+/// [`MAX_PAGE_BYTES`].
+fn select(canonical_text: &str, selector: GithubReadSelector) -> (String, bool) {
     match selector {
-        GithubReadSelector::WholeDocument => canonical_text.to_string(),
+        GithubReadSelector::WholeDocument => (canonical_text.to_string(), false),
         GithubReadSelector::LineRange {
             start_line,
             end_line,
             limit,
         } => {
-            let lines: Vec<_> = canonical_text.lines().collect();
-            let start_index = start_line.saturating_sub(1).min(lines.len());
+            let start_index = start_line.saturating_sub(1);
             let requested_end =
                 end_line.unwrap_or_else(|| start_line.saturating_add(limit).saturating_sub(1));
-            let end_index = requested_end.min(lines.len()).max(start_index);
-            let selected = lines[start_index..end_index].join("\n");
-            (!selected.is_empty())
-                .then(|| format!("{selected}\n"))
-                .unwrap_or_default()
+            let mut page = String::new();
+            for line in canonical_text
+                .lines()
+                .skip(start_index)
+                .take(requested_end.saturating_sub(start_index))
+            {
+                let shown = if line.len() > MAX_LINE_LENGTH {
+                    let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
+                    format!("{}... (truncated)\n", &line[..safe_end])
+                } else {
+                    format!("{line}\n")
+                };
+                if page.len().saturating_add(shown.len()) > MAX_PAGE_BYTES {
+                    page.push_str(&format!(
+                        "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
+                        MAX_PAGE_BYTES / 1024
+                    ));
+                    return (page, true);
+                }
+                page.push_str(&shown);
+            }
+            (page, false)
         }
         GithubReadSelector::ByteOffset { offset, limit } => {
             let start = canonical_text.floor_char_boundary(offset.min(canonical_text.len()));
@@ -737,7 +885,7 @@ pub fn apply_selector(canonical_text: &str, selector: GithubReadSelector) -> Str
                 .map(|limit| start.saturating_add(limit).min(canonical_text.len()))
                 .unwrap_or(canonical_text.len());
             let end = canonical_text.floor_char_boundary(requested_end);
-            canonical_text[start..end].to_string()
+            (canonical_text[start..end].to_string(), false)
         }
     }
 }
@@ -747,9 +895,6 @@ fn short_alias(request: &GithubReadRequest) -> ShortResourceAlias {
         kind: request.resource.kind,
         number: request.resource.number,
         working_directory: request.working_directory.clone(),
-        authentication_identity_hash: authentication_identity_hash(
-            &request.effective_authentication_identity,
-        ),
     }
 }
 
@@ -880,7 +1025,146 @@ mod tests {
 
     use super::*;
     use crate::github_read::attachments::{DownloadedGithubImage, GithubImageDownloader};
-    use crate::github_read::model::{GithubDocument, GithubDocumentKind};
+    use crate::github_read::model::GithubDocumentKind;
+
+    #[test]
+    fn a_line_page_stops_at_the_file_read_byte_and_line_bounds() {
+        // 100 lines of 1 KB: twice the page ceiling, well under the line limit.
+        let line = "x".repeat(1023);
+        let canonical = format!("{line}\n").repeat(100);
+        let page = GithubReadSelector::LineRange {
+            start_line: 1,
+            end_line: None,
+            limit: 2000,
+        };
+        let (content, cut) = select(&canonical, page.clone());
+        assert!(cut);
+        assert!(content.len() <= MAX_PAGE_BYTES + 100, "{}", content.len());
+        assert!(content.ends_with(
+            "... (output truncated at 50KB, use start_line/end_line to read sections)\n"
+        ));
+        let completion = complete(
+            canonical,
+            page.clone(),
+            Vec::new(),
+            DocumentSource::Fetched(&GithubDocument::default()),
+        );
+        assert!(completion.page_cut_by_size);
+        assert_eq!(completion.total_lines, 100);
+
+        // One 200 KB line (a pasted log) is cut like a long file line.
+        let (content, cut) = select(&format!("{}\n", "y".repeat(200 * 1024)), page);
+        assert!(!cut);
+        assert_eq!(content, format!("{}... (truncated)\n", "y".repeat(2000)));
+    }
+
+    #[test]
+    fn a_line_page_under_the_bounds_is_unchanged() {
+        let canonical = "one\ntwo\nthree\n";
+        let page = |start_line, end_line| GithubReadSelector::LineRange {
+            start_line,
+            end_line,
+            limit: 2000,
+        };
+        assert_eq!(
+            select(canonical, page(1, None)),
+            (canonical.to_string(), false)
+        );
+        assert_eq!(select(canonical, page(2, Some(2))).0, "two\n");
+        assert_eq!(select(canonical, page(4, None)).0, "");
+    }
+
+    #[test]
+    fn sqlite_store_reuses_the_resident_connection_and_creates_its_table_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("aft.db");
+        let resident: SharedConnection =
+            Arc::new(std::sync::Mutex::new(crate::db::open(&database).unwrap()));
+        let store = SqliteGithubReadCacheStore::new(&database);
+        store.attach_resident_connection(Some(&resident));
+        let key = GithubReadCacheKey::new(GithubReadResourceKind::Issue, "owner/repo", 7, "id");
+
+        // Every operation used to open the database again: a read-only schema
+        // peek, PRAGMAs and the migration check, on the request thread.
+        let peeks = crate::db::schema_peek_count_for_test();
+        assert_eq!(store.lookup(&key).unwrap(), None);
+        store.upsert(&key, "# Issue\n", 1_000, false).unwrap();
+        assert_eq!(
+            store.lookup(&key).unwrap().unwrap().canonical_text,
+            "# Issue\n"
+        );
+        assert_eq!(
+            store
+                .invalidate(GithubResourceKind::Issue, "owner/repo", 7, Some("id"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(crate::db::schema_peek_count_for_test(), peeks);
+
+        // The table is created once per connection, not before every
+        // statement: dropped behind the store's back, the next statement
+        // fails, and the one after creates it again.
+        resident
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE github_read_cache")
+            .unwrap();
+        assert!(store.lookup(&key).is_err());
+        assert_eq!(store.lookup(&key).unwrap(), None);
+
+        // Once the context lets its connection go, the store opens its own.
+        drop(resident);
+        assert_eq!(store.lookup(&key).unwrap(), None);
+        assert!(crate::db::schema_peek_count_for_test() > peeks);
+    }
+
+    #[test]
+    fn sqlite_store_reuses_legacy_lookup_schema_after_a_failed_migration() {
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("aft.db");
+        let connection = crate::db::open(&database).unwrap();
+        let key = GithubReadCacheKey::new(GithubReadResourceKind::Issue, "owner/repo", 7, "id");
+        crate::db::github_read_cache::upsert_github_read_cache_entry(
+            &connection,
+            &key,
+            "# Legacy",
+            1_000,
+            false,
+        )
+        .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE github_read_cache DROP COLUMN document_gap_with_text_hash;
+                 PRAGMA query_only = ON;",
+            )
+            .unwrap();
+        let resident = Arc::new(std::sync::Mutex::new(connection));
+        let store = SqliteGithubReadCacheStore::new(&database);
+        store.attach_resident_connection(Some(&resident));
+
+        let entry = store.lookup(&key).unwrap().unwrap();
+        assert_eq!(entry.canonical_text, "# Legacy");
+        assert_eq!(entry.document_gap, None);
+        assert!(store.upsert(&key, "# Updated", 2_000, true).is_err());
+
+        resident
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only = OFF")
+            .unwrap();
+        assert_eq!(store.lookup(&key).unwrap(), Some(entry));
+        // A warm lookup uses the saved legacy schema instead of retrying migration.
+        assert!(resident
+            .lock()
+            .unwrap()
+            .prepare("SELECT document_gap_with_text_hash FROM github_read_cache")
+            .is_err());
+
+        store.upsert(&key, "# Updated", 2_000, true).unwrap();
+        let entry = store.lookup(&key).unwrap().unwrap();
+        assert_eq!(entry.canonical_text, "# Updated");
+        assert_eq!(entry.document_gap, Some(true));
+    }
 
     #[derive(Default)]
     struct MemoryCache(Mutex<Option<GithubReadCacheEntry>>);
@@ -889,6 +1173,7 @@ mod tests {
         fn with_entry(canonical_text: &str, fetched_at_ms: i64) -> Self {
             Self(Mutex::new(Some(GithubReadCacheEntry {
                 canonical_text: canonical_text.to_string(),
+                document_gap: Some(false),
                 fetched_at_ms,
                 updated_at_ms: fetched_at_ms,
             })))
@@ -908,9 +1193,11 @@ mod tests {
             _key: &GithubReadCacheKey,
             canonical_text: &str,
             fetched_at_ms: i64,
+            document_gap: bool,
         ) -> Result<(), String> {
             *self.0.lock() = Some(GithubReadCacheEntry {
                 canonical_text: canonical_text.to_string(),
+                document_gap: Some(document_gap),
                 fetched_at_ms,
                 updated_at_ms: fetched_at_ms,
             });
@@ -1534,6 +1821,174 @@ mod tests {
             }
         }
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Holds its first fetch until released. A shorthand read resolves to
+    /// `team/new`, the checkout's current default repository.
+    struct RepositoryFetcher {
+        calls: AtomicUsize,
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl GithubFetcher for RepositoryFetcher {
+        fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.started.send(());
+            if let Some(release) = self.release.lock().take() {
+                release.recv().expect("release live fetch");
+            }
+            Ok(GithubDocument {
+                repository: request
+                    .resource
+                    .repository
+                    .clone()
+                    .unwrap_or_else(|| "team/new".to_string()),
+                kind: GithubDocumentKind::Issue,
+                number: request.resource.number,
+                title: "fixture".to_string(),
+                state: "OPEN".to_string(),
+                ..GithubDocument::default()
+            })
+        }
+    }
+
+    fn fetched_text(start: GithubReadStart) -> String {
+        match start {
+            GithubReadStart::Deferred(deferred) => wait_for(deferred).unwrap().content,
+            GithubReadStart::Immediate(_) => panic!("live reads must be deferred"),
+        }
+    }
+
+    #[test]
+    fn a_stale_shorthand_alias_does_not_join_another_repositorys_live_fetch() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(8);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let fetcher = Arc::new(RepositoryFetcher {
+            calls: AtomicUsize::new(0),
+            started: started_tx,
+            release: Mutex::new(Some(release_rx)),
+        });
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        // An earlier shorthand read here resolved to team/old; the checkout's
+        // default repository has since changed to team/new.
+        let shorthand =
+            GithubReadRequest::parse("issue://42", "/fixture", "identity", None).unwrap();
+        engine
+            .state
+            .lock()
+            .aliases
+            .insert(short_alias(&shorthand), "team/old".to_string());
+
+        let explicit = engine
+            .start(
+                &enabled_gh_read(),
+                GithubReadRequest::parse("issue://team/old/42", "/fixture", "identity", None)
+                    .unwrap(),
+                GithubReadSelector::default(),
+            )
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("explicit live fetch started");
+        let shorthand = engine
+            .start(&enabled_gh_read(), shorthand, GithubReadSelector::default())
+            .unwrap();
+        release_tx.send(()).expect("release the explicit fetch");
+
+        assert!(fetched_text(explicit).contains("Repository: team/old\n"));
+        assert!(fetched_text(shorthand).contains("Repository: team/new\n"));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Holds its first fetch until released; the body links two images.
+    struct ImageFetcher {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl GithubFetcher for ImageFetcher {
+        fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+            let _ = self.started.send(());
+            if let Some(release) = self.release.lock().take() {
+                release.recv().expect("release live fetch");
+            }
+            Ok(GithubDocument {
+                repository: "owner/repo".to_string(),
+                kind: GithubDocumentKind::Issue,
+                number: request.resource.number,
+                title: "fixture".to_string(),
+                state: "OPEN".to_string(),
+                body: "https://user-images.githubusercontent.com/1/a.png https://user-images.githubusercontent.com/2/b.png".to_string(),
+                ..GithubDocument::default()
+            })
+        }
+    }
+
+    #[test]
+    fn coalesced_vision_readers_download_each_image_once() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(8);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let downloader = Arc::new(CountingDownloader::default());
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            Arc::new(ImageFetcher {
+                started: started_tx,
+                release: Mutex::new(Some(release_rx)),
+            }),
+            downloader.clone(),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        let start = || {
+            engine
+                .start(
+                    &enabled_gh_read(),
+                    request(Some(true)),
+                    GithubReadSelector::default(),
+                )
+                .unwrap()
+        };
+        let first = start();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("live fetch started");
+        let followers = [start(), start()];
+        release_tx.send(()).expect("release the shared fetch");
+        fetched_text(first);
+        for follower in followers {
+            fetched_text(follower);
+        }
+        // Two images, three readers of one fetch: two requests, not six.
+        assert_eq!(downloader.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn shorthand_aliases_do_not_grow_with_sessions() {
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            Arc::new(FixtureFetcher::default()),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        for session in 0..100 {
+            let request = GithubReadRequest::parse(
+                "issue://1",
+                "/fixture",
+                format!("session:{session}"),
+                None,
+            )
+            .unwrap();
+            let start = engine
+                .start(&enabled_gh_read(), request, GithubReadSelector::default())
+                .unwrap();
+            fetched_text(start);
+        }
+        assert_eq!(engine.state.lock().aliases.len(), 1);
     }
 
     /// A gated fetcher whose live fetch stays running until the test lets it

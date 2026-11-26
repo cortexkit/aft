@@ -297,6 +297,10 @@ fn closing_project_during_startup_reaps_child_and_never_installs_it() {
         let f = fixture();
         let (spawned_tx, spawned_rx) = unbounded();
         let (resume_tx, resume_rx) = unbounded();
+        let (finished_tx, finished_rx) = unbounded();
+        f.manager.lock().startup_finished_hook = Some(Arc::new(move || {
+            finished_tx.send(()).unwrap();
+        }));
         f.manager.lock().spawned_hook = Some(Arc::new(move |pid| {
             spawned_tx.send(pid).unwrap();
             resume_rx.recv_timeout(WAIT).unwrap();
@@ -313,15 +317,9 @@ fn closing_project_during_startup_reaps_child_and_never_installs_it() {
         }
         resume_tx.send(()).unwrap();
         assert!(signal.cancelled.load(Ordering::SeqCst));
-        assert!(signal.wait_until(Instant::now() + WAIT));
-        // waitpid blocks in the kernel, not a timing loop; the client's reaper
-        // may already have consumed the exit status, which also proves exit.
-        let waited = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
-        assert!(
-            waited == pid as i32
-                || (waited == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-        );
+        // Cancellation wakes callers before the worker has finished. Let the
+        // child owner reap the leader after it has signalled the group.
+        finished_rx.recv_timeout(WAIT).unwrap();
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
@@ -474,7 +472,7 @@ fn file_change_during_startup_replays_latest_did_open() {
         });
         pause.entered.recv_timeout(WAIT).unwrap();
         let mut expected = Vec::new();
-        for version in 0..changes {
+        for version in 1..=changes {
             let content = format!("content version {version}");
             std::fs::write(&f.file, &content).unwrap();
             expected = locked(&f, |manager| {
@@ -495,13 +493,10 @@ fn file_change_during_startup_replays_latest_did_open() {
         assert_eq!(messages[0]["method"], "textDocument/didOpen");
         assert_eq!(
             messages[0]["params"]["textDocument"]["text"],
-            format!("content version {}", changes - 1)
+            format!("content version {changes}")
         );
-        assert_eq!(
-            messages[0]["params"]["textDocument"]["version"],
-            changes - 1
-        );
-        assert_eq!(expected, vec![(f.key.clone(), changes - 1)]);
+        assert_eq!(messages[0]["params"]["textDocument"]["version"], changes);
+        assert_eq!(expected, vec![(f.key.clone(), changes)]);
     }
 }
 
@@ -521,7 +516,7 @@ fn file_change_during_cancelled_startup_is_not_replayed() {
         manager.notify_file_changed_versioned(&f.file, "never replay", &f.config)
     })
     .unwrap();
-    assert_eq!(queued, vec![(f.key.clone(), 0)]);
+    assert_eq!(queued, vec![(f.key.clone(), 1)]);
     assert!(f.manager.lock().starting[&f.key]
         .pending_notifications
         .contains(&canonicalize_for_lsp(&f.file).unwrap()));
@@ -646,15 +641,15 @@ fn startup_notification_path_bound_rejects_instead_of_dropping() {
     {
         let mut manager = f.manager.lock();
         let reservation = manager.starting.get_mut(&f.key).unwrap();
-        reservation.notification_versions.insert(f.file.clone(), 0);
+        reservation.notification_versions.insert(f.file.clone(), 1);
         for index in 1..STARTUP_NOTIFICATION_PATH_CAP {
             reservation
                 .notification_versions
-                .insert(f.file.with_file_name(format!("{index}.reserved")), 0);
+                .insert(f.file.with_file_name(format!("{index}.reserved")), 1);
         }
         assert_eq!(
             manager.queue_startup_notification(&f.key, &f.file).unwrap(),
-            1
+            2
         );
         let extra = f.file.with_file_name("over-cap.reserved");
         let error = manager

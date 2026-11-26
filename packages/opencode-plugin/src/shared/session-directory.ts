@@ -460,17 +460,23 @@ export function clearSessionDirectory(sessionId: string): void {
   verifyCache.delete(sessionId);
 }
 
-/** Release transport routes on deletion without querying a session the host has already removed. */
+/**
+ * Release transport routes on deletion without querying a session the host has already removed.
+ * `forgetDirectory: false` keeps the process-wide directory record: under
+ * OpenCode 2 several Locations see the same deletion, and the Location that
+ * owns the session still needs that record to find its background tasks.
+ */
 export async function closeDeletedSessionRoutes(
   pool: AftTransportPool,
   sessionId: string,
   fallbackDirectory: string,
+  forgetDirectory = true,
 ): Promise<void> {
   // A timeout may have bound a fallback before the stored root was known. Close both routes.
   const roots = new Set(pool.activeBridges().map((bridge) => bridge.getCwd()));
   roots.add(getSessionDirectoryCached(sessionId) ?? fallbackDirectory);
   await Promise.allSettled([...roots].map((root) => pool.closeSession(root, sessionId)));
-  clearSessionDirectory(sessionId);
+  if (forgetDirectory) clearSessionDirectory(sessionId);
 }
 
 /** Test-only: clear the cache between unit tests. */

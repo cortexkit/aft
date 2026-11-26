@@ -5,6 +5,7 @@
 pub(crate) mod frames;
 
 pub mod buffer;
+pub(crate) mod counted_mutex;
 mod exit_observer;
 mod gc_cursor;
 mod gc_memo;
@@ -12,6 +13,7 @@ mod memory_limit;
 pub mod output;
 pub mod persistence;
 pub mod process;
+pub(crate) mod pty_input;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;

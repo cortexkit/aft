@@ -28,6 +28,32 @@ pub(crate) fn set_watch_scan_budget_for_test(budget: Option<Duration>) {
     WATCH_SCAN_BUDGET_FOR_TEST.with(|cell| cell.set(budget));
 }
 
+#[cfg(test)]
+thread_local! {
+    static MATCH_WRITES_BEFORE_STOP: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Make watch scans on this thread stop right after saving `writes` matches,
+/// leaving the rest of the scan undone as a restart at that point would.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn set_match_writes_before_stop_for_test(writes: Option<usize>) {
+    MATCH_WRITES_BEFORE_STOP.with(|cell| cell.set(writes));
+}
+
+#[cfg(test)]
+fn stop_after_match_write_for_test() -> bool {
+    MATCH_WRITES_BEFORE_STOP.with(|cell| match cell.get() {
+        Some(left) if left <= 1 => true,
+        Some(left) => {
+            cell.set(Some(left - 1));
+            false
+        }
+        None => false,
+    })
+}
+
 /// Each watched stream's saved cursor from a task's watch `row`, with the
 /// capture bytes just before it (the overlap a scan keeps), so restored
 /// watches resume scanning as if the restart had not happened. `files` are
@@ -60,6 +86,53 @@ pub(super) fn resumed_cursors(
             (format!("{}:{stream}", task.task_id), offset, before)
         })
         .collect()
+}
+
+/// Each scanned task's streams that its latest watch scan could not open,
+/// for the watch's exit notice. Bounded: a full map forgets its entries
+/// rather than grow, which can only drop a note, never invent one.
+static UNREADABLE_STREAMS: std::sync::LazyLock<
+    Mutex<HashMap<String, std::collections::BTreeSet<&'static str>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+const MAX_TASKS_WITH_UNREADABLE_STREAMS: usize = 256;
+
+fn record_stream_readable(task_id: &str, stream: &'static str, readable: bool) {
+    let mut tasks = UNREADABLE_STREAMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if readable {
+        if let Some(streams) = tasks.get_mut(task_id) {
+            streams.remove(stream);
+            if streams.is_empty() {
+                tasks.remove(task_id);
+            }
+        }
+        return;
+    }
+    if !tasks.contains_key(task_id) && tasks.len() >= MAX_TASKS_WITH_UNREADABLE_STREAMS {
+        tasks.clear();
+    }
+    tasks.entry(task_id.to_string()).or_default().insert(stream);
+}
+
+/// The lines a watch's exit notice adds for `task_id`'s streams that its
+/// latest scan could not read, so the notice does not suggest the whole
+/// output was checked.
+pub(super) fn unreadable_streams_note(task_id: &str) -> Option<String> {
+    let tasks = UNREADABLE_STREAMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let streams = tasks.get(task_id)?;
+    Some(
+        streams
+            .iter()
+            .map(|stream| {
+                format!("watch: {stream} could not be read, so it was not checked for the pattern")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 impl BgTaskRegistry {
@@ -116,15 +189,32 @@ impl BgTaskRegistry {
             Ok(state) => state.metadata.mode.clone(),
             Err(_) => return true,
         };
-        let open = |artifact| open_task_artifact(&task.paths, artifact).ok();
-        let mut files = match mode {
-            BgMode::Pipes => vec![
-                ("stdout", open(TaskArtifact::Stdout)),
-                ("stderr", open(TaskArtifact::Stderr)),
-            ],
-            BgMode::Pty => vec![("pty", open(TaskArtifact::Pty))],
+        let open = |stream: &'static str, artifact| {
+            let file = open_task_artifact(&task.paths, artifact)
+                .inspect_err(|error| {
+                    crate::slog_debug!(
+                        "watch scan for {} could not open its {stream} capture: {error}",
+                        task.task_id
+                    );
+                })
+                .ok();
+            record_stream_readable(&task.task_id, stream, file.is_some());
+            file
         };
-        if files.iter().any(|(_, file)| file.is_none()) {
+        // A stream that cannot be opened is left out of this scan; the other
+        // stream is still scanned, so its matches are not lost with it. The
+        // watch's exit notice names a stream the last scan could not read.
+        let mut files: Vec<_> = match mode {
+            BgMode::Pipes => vec![
+                ("stdout", open("stdout", TaskArtifact::Stdout)),
+                ("stderr", open("stderr", TaskArtifact::Stderr)),
+            ],
+            BgMode::Pty => vec![("pty", open("pty", TaskArtifact::Pty))],
+        }
+        .into_iter()
+        .filter_map(|(stream, file)| Some((stream, file?)))
+        .collect();
+        if files.is_empty() {
             // Nothing can be scanned; waiting would not change that.
             return true;
         }
@@ -147,7 +237,7 @@ impl BgTaskRegistry {
                 let (found, reached_end) = self.scan_watch_file_until(
                     &task.task_id,
                     &format!("{}:{stream}", task.task_id),
-                    file.as_mut().expect("every stream opened"),
+                    file,
                     drain,
                     Some(deadline),
                 );
@@ -182,26 +272,31 @@ impl BgTaskRegistry {
             }
             return at_end;
         }
+        // Each match is saved without moving the watch's saved cursors, which
+        // move past these bytes only once every match in them is saved: a
+        // restart in between rescans from the old cursors instead of skipping
+        // a match that was never saved.
+        let mut saved = true;
         for mut pattern_match in matches {
             let mut fresh = pattern_match.clone();
-            self.persist_watch_match(
+            saved &=
+                self.persist_watch_match(&task.session_id, &task.task_id, &mut pattern_match, None);
+            fresh.copy_delivery_identity(&pattern_match);
+            self.emit_bash_pattern_match(&task.session_id, fresh);
+            #[cfg(test)]
+            if stop_after_match_write_for_test() {
+                return at_end;
+            }
+        }
+        if saved {
+            self.persist_task_watch_cursors(
                 &task.session_id,
                 &task.task_id,
-                &mut pattern_match,
                 stdout_offset,
                 stderr_offset,
                 pty_offset,
             );
-            fresh.copy_delivery_identity(&pattern_match);
-            self.emit_bash_pattern_match(&task.session_id, fresh);
         }
-        self.persist_task_watch_cursors(
-            &task.session_id,
-            &task.task_id,
-            stdout_offset,
-            stderr_offset,
-            pty_offset,
-        );
         at_end
     }
 

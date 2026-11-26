@@ -22,6 +22,97 @@ fn config_settings_editor_output_is_unchanged() {
 }
 
 #[test]
+fn config_settings_all_declared_properties_have_titles() {
+    fn walk(node: &Value, path: &str) {
+        if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+            for (key, child) in properties {
+                let child_path = format!("{path}/{key}");
+                // The cache choice discriminator is internal to a single JSON setting.
+                if !(path.starts_with("/storage/cache_dir/choice") && key == "kind") {
+                    assert!(
+                        child
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty()),
+                        "missing title: {child_path}"
+                    );
+                }
+                walk(child, &child_path);
+            }
+        }
+        if let Some(child) = node.get("items") {
+            walk(child, &format!("{path}/*"));
+        }
+        if let Some(child) = node.pointer("/patternProperties/^.+$") {
+            walk(child, &format!("{path}/*"));
+        }
+        if let Some(branches) = node.get("oneOf").and_then(Value::as_array) {
+            for branch in branches {
+                walk(branch, &format!("{path}/choice"));
+            }
+        }
+    }
+    walk(&settings_declaration(), "");
+}
+
+#[test]
+fn config_settings_approved_titles_and_harness_copies() {
+    let declaration = settings_declaration();
+    for (pointer, title) in [
+        ("/properties/$schema/title", "Editor schema address"),
+        ("/properties/github/title", "GitHub"),
+        (
+            "/properties/bash/properties/worker_wait_max_ms/title",
+            "Maximum subagent wait (milliseconds)",
+        ),
+        (
+            "/properties/index/properties/roots/items/properties/path/title",
+            "Folder",
+        ),
+        (
+            "/properties/lsp/properties/servers/patternProperties/^.+$/properties/binary/title",
+            "Command",
+        ),
+        (
+            "/properties/storage/properties/cache_dir/oneOf/2/title",
+            "Separate folder",
+        ),
+    ] {
+        assert_eq!(
+            declaration.pointer(pointer),
+            Some(&json!(title)),
+            "{pointer}"
+        );
+    }
+    fn compare(base: &Value, harness: &Value, path: &str) {
+        if let Some(properties) = harness.get("properties").and_then(Value::as_object) {
+            for (key, child) in properties {
+                let original = &base["properties"][key];
+                assert_eq!(child.get("title"), original.get("title"), "{path}/{key}");
+                compare(original, child, &format!("{path}/{key}"));
+            }
+        }
+        for key in ["items", "patternProperties"] {
+            if let Some(child) = harness.get(key) {
+                compare(&base[key], child, &format!("{path}/{key}"));
+            }
+        }
+        if let Some(child) = harness.pointer("/patternProperties/^.+$") {
+            compare(
+                &base["patternProperties"][MAP_KEY],
+                child,
+                &format!("{path}/*"),
+            );
+        }
+    }
+    compare(
+        &declaration,
+        &declaration["properties"]["harnesses"]["patternProperties"][MAP_KEY],
+        "harnesses/*",
+    );
+}
+
+#[test]
 fn config_settings_cache_dir_is_json_with_one_full_description() {
     const CACHE_DIR: &str = "/properties/storage/properties/cache_dir";
     let editor = editor_schema();
