@@ -40,6 +40,24 @@ impl Store {
             .await
     }
 
+    pub(super) async fn persist_awaited_notice(
+        &self,
+        id: String,
+        bytes: Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        self.run(move |conn| {
+            display_records::persist_awaited_notice(conn, &id, &bytes, display_records::now_ms())
+        })
+        .await
+    }
+
+    pub(super) async fn pending_awaited_notice(&self) -> Result<Option<String>, &'static str> {
+        self.run(move |conn| {
+            display_records::pending_awaited_notice(conn, display_records::now_ms())
+        })
+        .await
+    }
+
     pub(super) async fn read(
         &self,
         id: String,

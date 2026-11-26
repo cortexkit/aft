@@ -29,6 +29,27 @@ impl BgTaskRegistry {
         self.attach_awaited_work(service);
     }
 
+    pub(crate) fn save_awaited_finish_card_for_test(&self, key: &str, id: &str) {
+        let task = self.task(key).unwrap();
+        {
+            let mut db = DeferredDbWrites::new(self, &task);
+            let mut state = task.lock_state().unwrap();
+            state.metadata.awaited_work = Some(State::Finish {
+                outcome: Outcome::Done,
+                summary: "saved summary".into(),
+                notice: None,
+            });
+            self.persist_task_locked(&task, &state.metadata, &mut db)
+                .unwrap();
+        }
+        assert_eq!(
+            self.freeze_awaited_finish_notice(key, Some(id.into()))
+                .unwrap()
+                .as_deref(),
+            Some(id)
+        );
+    }
+
     pub(crate) fn publish_awaited_for_test(&self, key: &str) {
         let task = self.task(key).unwrap();
         let metadata = task.lock_state().unwrap().metadata.clone();

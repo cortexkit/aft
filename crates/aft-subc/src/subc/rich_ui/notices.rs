@@ -210,7 +210,12 @@ fn pull_inner(
     );
     write.check(&writer).ok()?;
     let key = cortexkit_role_tool_display::notice_idempotency_key(&writer, &write).ok()?;
-    let id = format!("{RECORD_ID_PREFIX}{:x}", Sha256::digest(key));
+    let prefix = if awaited {
+        crate::db::display_records::AWAITED_NOTICE_PREFIX
+    } else {
+        RECORD_ID_PREFIX
+    };
+    let id = format!("{prefix}{:x}", Sha256::digest(key));
     if awaited {
         // The shell event names the record; no runner send names the notice.
         write.send_id.clone_from(&id);

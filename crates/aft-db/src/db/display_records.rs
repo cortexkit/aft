@@ -27,6 +27,7 @@ CREATE INDEX IF NOT EXISTS idx_display_records_expiry ON display_records (
 "#;
 
 const EXPIRY: &str = "CASE WHEN wake_acked_at_ms IS NULL THEN announced_at_ms + 86400000 ELSE wake_acked_at_ms + 600000 END";
+pub const AWAITED_NOTICE_PREFIX: &str = "notice:awaited:";
 
 pub(super) fn install(conn: &Connection) -> rusqlite::Result<()> {
     // This optional delivery cache is outside the numbered schema: no older
@@ -173,6 +174,37 @@ pub fn read(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<Option
     conn.query_row(
         &format!("SELECT pull_bytes FROM display_records WHERE record_id=?1 AND {EXPIRY} >= ?2"),
         params![id, now_ms],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Keep the original record and its publication receipt on a replay of the
+/// same shell result. The record key is already fixed for that event.
+pub fn persist_awaited_notice(
+    conn: &Connection,
+    id: &str,
+    bytes: &[u8],
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    if read(conn, id, now_ms)?.is_some() {
+        return Ok(true);
+    }
+    persist(conn, id, bytes, now_ms)
+}
+
+/// Only linked notices use the persistent queue. Selecting one row by its key
+/// prefix avoids loading display bodies or replaying legacy announcements.
+pub fn pending_awaited_notice(conn: &Connection, now_ms: i64) -> rusqlite::Result<Option<String>> {
+    if !available(conn)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT record_id FROM display_records
+         WHERE record_id >= ?1 AND record_id < 'notice:awaited;'
+           AND wake_acked_at_ms IS NULL AND announced_at_ms + 86400000 >= ?2
+         ORDER BY record_id LIMIT 1",
+        params![AWAITED_NOTICE_PREFIX, now_ms],
         |row| row.get(0),
     )
     .optional()

@@ -15,7 +15,12 @@ pub(crate) enum State {
     Opening,
     OpeningConsumed,
     Open,
-    Finish { outcome: Outcome, summary: String },
+    Finish {
+        outcome: Outcome,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<FinishNotice>,
+    },
     Cancel,
     Settled,
 }
@@ -27,12 +32,30 @@ impl State {
 
     fn decision(&self) -> Option<Event> {
         match self {
-            Self::Finish { outcome, summary } => Some(Event::Finish {
+            Self::Finish {
+                outcome, summary, ..
+            } => Some(Event::Finish {
                 outcome: *outcome,
                 summary: summary.clone(),
             }),
             Self::Cancel => Some(Event::Cancel),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FinishNotice {
+    WithoutCard,
+    Card(String),
+}
+
+impl FinishNotice {
+    fn id(&self) -> Option<String> {
+        match self {
+            Self::WithoutCard => None,
+            Self::Card(id) => Some(id.clone()),
         }
     }
 }
@@ -60,6 +83,47 @@ pub(crate) fn state_for_spawn() -> Option<State> {
 }
 
 impl BgTaskRegistry {
+    pub(crate) fn awaited_finish_notice(&self, key: &str) -> Option<Option<String>> {
+        let task = self.task(key)?;
+        let state = task.lock_state().ok()?;
+        match &state.metadata.awaited_work {
+            Some(State::Finish {
+                notice: Some(notice),
+                ..
+            }) => Some(notice.id()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn freeze_awaited_finish_notice(
+        &self,
+        key: &str,
+        id: Option<String>,
+    ) -> std::io::Result<Option<String>> {
+        let task = self
+            .task(key)
+            .ok_or_else(|| std::io::Error::other("unknown awaited task"))?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        let Some(State::Finish { notice, .. }) = &state.metadata.awaited_work else {
+            return Err(std::io::Error::other("awaited task has no finish decision"));
+        };
+        if let Some(notice) = notice {
+            return Ok(notice.id());
+        }
+        let saved = id
+            .clone()
+            .map_or(FinishNotice::WithoutCard, FinishNotice::Card);
+        state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            if let Some(State::Finish { notice, .. }) = &mut metadata.awaited_work {
+                *notice = Some(saved);
+            }
+        })?;
+        Ok(id)
+    }
+
     pub(crate) fn prepare_awaited_spawn(&self, service: &Arc<Service>) -> AwaitedSpawn {
         self.attach_awaited_work(service);
         AwaitedSpawn(CANDIDATE.replace(true))
@@ -233,6 +297,7 @@ impl BgTaskRegistry {
                 state.metadata.awaited_work = Some(State::Finish {
                     outcome,
                     summary: summary.clone(),
+                    notice: None,
                 });
                 if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
                     log::warn!(
@@ -242,7 +307,9 @@ impl BgTaskRegistry {
                 }
                 Event::Finish { outcome, summary }
             }
-            Some(State::Finish { outcome, summary }) => Event::Finish {
+            Some(State::Finish {
+                outcome, summary, ..
+            }) => Event::Finish {
                 outcome: *outcome,
                 summary: summary.clone(),
             },

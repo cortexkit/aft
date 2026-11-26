@@ -4,6 +4,46 @@ thread_local! {
     pub(super) static TEST_SERVICE: std::cell::RefCell<Option<Arc<Service>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[tokio::test]
+async fn published_card_link_request_samples_match_afts_finish_and_progress() {
+    use serde_json::json;
+    let vectors: Value = serde_json::from_str(
+        cortexkit_role_agent_orchestrator::vectors::file("requests.json").unwrap(),
+    )
+    .unwrap();
+    let service = Service::new("demo_1-A");
+    let key = "work!42~";
+    for (sample, event, id) in [
+        (
+            "finish_notice_record",
+            Event::Finish {
+                outcome: Outcome::Done,
+                summary: "Complete.\nTwo files checked.".into(),
+            },
+            "command!42~",
+        ),
+        (
+            "progress_notice_record",
+            Event::Progress("First file checked.\nOne remaining.".into()),
+            "watch!42~",
+        ),
+    ] {
+        let mut expected = vectors[sample].clone();
+        assert_eq!(
+            expected["params"]["notice_record"],
+            json!({"writer":"demo-writer", "id":id})
+        );
+        expected["params"]["notice_record"]["writer"] = json!("aft");
+        if sample == "finish_notice_record" {
+            expected["params"]["more"] =
+                json!("full output: bash_status({ taskId: \"work!42~\" })");
+        }
+        let request = service.request_body(key, event, Some(id.into()));
+        request.validate().unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), expected);
+    }
+}
+
 #[cfg(unix)]
 mod bash_background {
     use super::*;
@@ -145,7 +185,7 @@ mod bash_background {
             crate::bash_background::HardKill::from_timeout_ms(Some(12_000)),
             ctx,
             false,
-            false,
+            true,
             false,
             false,
             24,
@@ -241,6 +281,13 @@ mod bash_background {
     #[tokio::test]
     async fn subc_bash_worker_opens_on_its_epoch_before_launch_reply_and_finishes() {
         let f = Fixture::new();
+        let (legacy, mut legacy_rx) = mpsc::unbounded_channel();
+        f.ctx
+            .set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+                if matches!(frame, PushFrame::BashCompleted(_)) {
+                    let _ = legacy.send(frame);
+                }
+            }))));
         let (service, fake, mut calls) = fake(Answer::Open, Vec::new());
         let mut rx = f.start(Some(service.clone()), true);
         let (Request::Open(open), Some(scope)) = call(&mut calls).await else {
@@ -281,6 +328,10 @@ mod bash_background {
             tokio::time::timeout(Duration::from_millis(150), calls.recv())
                 .await
                 .is_err()
+        );
+        assert!(
+            legacy_rx.try_recv().is_err(),
+            "AFT sent a separate completion notice"
         );
     }
 
@@ -420,7 +471,7 @@ mod bash_background {
         no_more(&mut calls).await;
     }
 
-    async fn restart(cancel: bool) {
+    async fn restart(cancel: bool, notice: Option<&str>) {
         let f = Fixture::new();
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
@@ -428,6 +479,8 @@ mod bash_background {
             // There is no transport yet; the reply wins and saves its
             // decision, but only the next instance can send it.
             read_watch(&f, &key);
+        } else if let Some(id) = notice {
+            registry.save_awaited_finish_card_for_test(&key, id);
         }
         let restarted = Arc::new(AppContext::from_app(
             App::default_shared(),
@@ -437,6 +490,12 @@ mod bash_background {
                 ..Default::default()
             },
         ));
+        let (legacy, mut legacy_rx) = mpsc::unbounded_channel();
+        restarted.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            if matches!(frame, PushFrame::BashCompleted(_)) {
+                let _ = legacy.send(frame);
+            }
+        }))));
         restarted
             .bash_background()
             .replay_session_for_project(f.dir.path(), "shell-session", f.root.as_path())
@@ -455,18 +514,37 @@ mod bash_background {
         if cancel {
             assert!(matches!(result, (Request::Cancel(cancel), None) if cancel.key == key));
         } else {
-            assert!(matches!(result, (Request::Finish(finish), None) if finish.key == key));
+            let (Request::Finish(finish), None) = result else {
+                panic!("missing replayed finish")
+            };
+            assert_eq!(finish.key, key);
+            assert_eq!(
+                finish.notice_record,
+                notice.map(|id| NoticeRecord {
+                    writer: "aft".into(),
+                    id: id.into()
+                })
+            );
         }
         no_more(&mut calls).await;
+        assert!(
+            legacy_rx.try_recv().is_err(),
+            "replay sent a separate completion notice"
+        );
     }
 
     #[tokio::test]
     async fn tool_provider_restart_sync_excludes_unknown_and_finishes_reattached_task() {
-        restart(false).await;
+        restart(false, None).await;
     }
 
     #[tokio::test]
     async fn tool_provider_restart_replays_the_persisted_cancel_decision() {
-        restart(true).await;
+        restart(true, None).await;
+    }
+
+    #[tokio::test]
+    async fn tool_provider_restart_replays_the_same_finish_notice_pointer() {
+        restart(false, Some("notice:awaited:saved")).await;
     }
 }

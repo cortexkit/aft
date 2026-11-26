@@ -29,6 +29,7 @@ pub(crate) fn register() {
     crate::late_result_bus::register(crate::late_result_bus::Hooks {
         take_due_read: super::rich_ui::display::take_due_read,
         mark_read_published: super::rich_ui::display::mark_read_published,
+        publish_awaited: |publish| Box::pin(super::rich_ui::display::publish_awaited_notice(publish)),
         announce: |id, bytes, publish| {
             Box::pin(async move {
                 use super::rich_ui::notices;

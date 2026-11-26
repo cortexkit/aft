@@ -187,7 +187,6 @@ impl Service {
             }
             let mut delay = Duration::from_millis(100);
             let mut persisted = !terminal;
-            let mut event = Some((event, notice));
             let mut request = None;
             loop {
                 let guard = registry.clone();
@@ -206,11 +205,20 @@ impl Service {
                     break;
                 }
                 persisted = saved;
-                if let Some(wire) = service.wire().filter(|_| persisted) {
-                    if let Some((event, notice)) = event.take() {
-                        request = Some(service.request_for(&registry, &key, event, notice).await);
+                let wire = service.wire().filter(|_| persisted);
+                if wire.is_some() && request.is_none() {
+                    match service
+                        .request_for(&registry, &key, event.clone(), notice.clone())
+                        .await
+                    {
+                        Ok(prepared) => request = Some(prepared),
+                        Err(error) if delay == Duration::from_millis(100) => {
+                            log::warn!("could not freeze awaited-work result for {key}: {error}");
+                        }
+                        Err(_) => {}
                     }
-                    let req = request.as_ref().expect("prepared awaited-work request");
+                }
+                if let (Some(wire), Some(req)) = (wire, request.as_ref()) {
                     let result = tokio::select! {
                         _ = token.cancelled() => break,
                         result = Service::call::<ItemReply>(wire.as_ref(), req, None) => result,
@@ -254,14 +262,43 @@ impl Service {
         key: &str,
         event: Event,
         notice: Option<PushFrame>,
-    ) -> Request {
-        // The agent-orchestrator 0.1.0 contract has no field for the notice id.
-        // Store the record without a wake for use by a contract that can link it.
-        let _notice_record_id = if let Some(frame) = notice {
-            stage_notice_record(registry.clone(), key.into(), frame).await
+    ) -> std::io::Result<Request> {
+        let is_finish = matches!(event, Event::Finish { .. });
+        let saved = if is_finish {
+            let (registry, key) = (registry.clone(), key.to_owned());
+            tokio::task::spawn_blocking(move || registry.awaited_finish_notice(&key))
+                .await
+                .map_err(std::io::Error::other)?
         } else {
             None
         };
+        let id = if let Some(id) = saved {
+            id
+        } else {
+            let id = if let Some(frame) = notice {
+                stage_notice_record(registry.clone(), key.into(), frame).await
+            } else {
+                None
+            };
+            if is_finish {
+                // A restart must replay the same pointer, even when there was
+                // no room for a card on the original attempt.
+                let (registry, key) = (registry.clone(), key.to_owned());
+                tokio::task::spawn_blocking(move || registry.freeze_awaited_finish_notice(&key, id))
+                    .await
+                    .map_err(std::io::Error::other)??
+            } else {
+                id
+            }
+        };
+        Ok(self.request_body(key, event, id))
+    }
+
+    fn request_body(&self, key: &str, event: Event, id: Option<String>) -> Request {
+        let notice_record = id.map(|id| NoticeRecord {
+            writer: "aft".into(),
+            id,
+        });
         match event {
             Event::Finish { outcome, summary } => Request::Finish(FinishParams {
                 instance: self.instance.clone(),
@@ -269,6 +306,7 @@ impl Service {
                 outcome,
                 summary,
                 more: Some(format!("full output: bash_status({{ taskId: \"{key}\" }})")),
+                notice_record,
             }),
             Event::Cancel => Request::Cancel(CancelParams {
                 instance: self.instance.clone(),
@@ -278,6 +316,7 @@ impl Service {
                 instance: self.instance.clone(),
                 key: key.into(),
                 text,
+                notice_record,
             }),
         }
     }
@@ -306,6 +345,7 @@ async fn stage_notice_record(
     super::rich_ui::display::stage_awaited_notice(record).await
 }
 
+#[derive(Clone)]
 pub(crate) enum Event {
     Finish { outcome: Outcome, summary: String },
     Cancel,

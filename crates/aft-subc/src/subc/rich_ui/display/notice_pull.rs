@@ -24,28 +24,54 @@ pub(in crate::subc) async fn stage_notice(record: PullRecord) {
 }
 
 pub(in crate::subc) async fn stage_awaited_notice(record: PullRecord) -> Option<String> {
-    persist_without_wake(SENDER.get()?, record, WRITE_BUDGET).await
+    let id = stage_for_display(SENDER.get()?, record, WRITE_BUDGET).await?;
+    crate::late_result_bus::display_committed();
+    Some(id)
 }
 
-async fn persist_without_wake(
+async fn stage_for_display(
     writer: &Writer,
     record: PullRecord,
     budget: Duration,
 ) -> Option<String> {
-    // The orchestrator's awaited-work notice owns the card. Enqueuing an AFT
-    // display wake would publish a second card for the same bash event.
+    // The durable queue only announces that the card's data is ready to pull.
+    // The orchestrator owns delivery of the notice that links to it.
     let PullRecord { id, bytes } = record;
-    let available = tokio::time::timeout(budget, async {
-        writer.store.persist(id.clone(), bytes).await == Ok(true)
-            || writer
-                .store
-                .read(id.clone(), crate::db::display_records::now_ms())
-                .await
-                .is_ok()
-    })
+    let stored = tokio::time::timeout(
+        budget,
+        writer.store.persist_awaited_notice(id.clone(), bytes),
+    )
     .await
-    .unwrap_or(false);
-    available.then_some(id)
+    .ok()?
+    .ok()?;
+    stored.then_some(id)
+}
+
+pub(crate) async fn publish_awaited_notice<F>(
+    publish: impl FnOnce(String) -> F,
+) -> Result<Option<String>, &'static str>
+where
+    F: std::future::Future<Output = Result<(), &'static str>>,
+{
+    let Some(writer) = SENDER.get() else {
+        return Ok(None);
+    };
+    publish_awaited_with(writer, publish).await
+}
+
+async fn publish_awaited_with<F>(
+    writer: &Writer,
+    publish: impl FnOnce(String) -> F,
+) -> Result<Option<String>, &'static str>
+where
+    F: std::future::Future<Output = Result<(), &'static str>>,
+{
+    let Some(id) = writer.store.pending_awaited_notice().await? else {
+        return Ok(None);
+    };
+    publish(id.clone()).await?;
+    writer.store.acknowledged(id.clone()).await?;
+    Ok(Some(id))
 }
 
 async fn stage_after_views(

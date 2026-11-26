@@ -11,7 +11,7 @@ use subc_protocol::Principal;
 use super::super::{announce_retained, read_for_reader, tests::test_writer};
 
 #[tokio::test]
-async fn tool_provider_awaited_finish_writes_its_own_send_id_without_a_notice_wake() {
+async fn tool_provider_awaited_finish_announces_its_record_once_across_restart() {
     use crate::bash_background::{
         persistence::PersistedTask, BgTaskRegistry, BgTaskStatus, TaskIdentity,
     };
@@ -19,7 +19,8 @@ async fn tool_provider_awaited_finish_writes_its_own_send_id_without_a_notice_wa
     use crate::subc::rich_ui::notices::for_awaited_work;
 
     let dir = tempfile::tempdir().unwrap();
-    let writer = test_writer(dir.path().join("aft.db"));
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
     let key = "bash-0000000000000001";
     let mut task = PersistedTask::starting(
         key.into(),
@@ -50,10 +51,10 @@ async fn tool_provider_awaited_finish_writes_its_own_send_id_without_a_notice_wa
         false,
     ));
     let registry = BgTaskRegistry::new(Default::default());
-    let record = for_awaited_work(&registry, &frame, &task, task.started_at).unwrap();
-    let id = record.id.clone();
+    let record = || for_awaited_work(&registry, &frame, &task, task.started_at).unwrap();
+    let id = record().id;
     assert_eq!(
-        persist_without_wake(&writer, record, Duration::from_secs(5))
+        stage_for_display(&writer, record(), Duration::from_secs(5))
             .await
             .as_deref(),
         Some(id.as_str())
@@ -68,6 +69,32 @@ async fn tool_provider_awaited_finish_writes_its_own_send_id_without_a_notice_wa
     assert_eq!(notice.session, "worker");
     assert_eq!(notice.kind, "notice");
     assert_eq!(notice.body.view, "bash_finished:1");
+    // The pending announcement survives losing AFT's in-memory queues.
+    drop(writer);
+    let writer = test_writer(path.clone());
+    let first = publish_awaited_with(&writer, |published| {
+        assert_eq!(published, id);
+        std::future::ready(Ok(()))
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.as_deref(), Some(id.as_str()));
+
+    // Rebuilding the record for a replay must not clear the published receipt.
+    drop(writer);
+    let writer = test_writer(path);
+    assert_eq!(
+        stage_for_display(&writer, record(), Duration::from_secs(5)).await,
+        Some(id)
+    );
+    assert_eq!(
+        publish_awaited_with(&writer, |_| async {
+            panic!("duplicate display_record_ready.v1")
+        })
+        .await
+        .unwrap(),
+        None
+    );
     assert!(writer
         .outbox
         .lock()

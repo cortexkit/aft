@@ -41,11 +41,16 @@ pub use views::{NoticeViewsReady, PullRecord, NOTICE_VIEWS_READY};
 
 pub(crate) type DisplayPublish<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), &'static str>> + Send + 'a>>;
+type AwaitedDisplayWake<'a> = Box<dyn FnOnce(String) -> DisplayPublish<'a> + Send + 'a>;
+type AwaitedDisplayPublish<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<String>, &'static str>> + Send + 'a>,
+>;
 
 #[doc(hidden)]
 pub struct Hooks {
     pub take_due_read: fn() -> Option<(String, Vec<u8>)>,
     pub mark_read_published: fn(&str, bool),
+    pub publish_awaited: for<'a> fn(AwaitedDisplayWake<'a>) -> AwaitedDisplayPublish<'a>,
     pub announce: for<'a> fn(String, Vec<u8>, DisplayPublish<'a>) -> DisplayPublish<'a>,
     pub bus_snapshot: fn() -> &'static [(String, Vec<u8>)],
 }
