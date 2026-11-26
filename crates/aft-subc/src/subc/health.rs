@@ -21,6 +21,12 @@ use crate::executor::BindBlockerSnapshot;
 #[path = "health/allocator.rs"]
 mod allocator;
 use allocator::CachedAllocatorObservation;
+#[path = "health/contention.rs"]
+mod contention;
+use contention::{
+    root_health_rollup_state, scheduler_contention_degraded, RootContention,
+    EXECUTOR_SCHEDULER_CONTENTION_DETAIL, SNAPSHOT_CONTENTION_DEGRADED_AFTER,
+};
 #[path = "health/demand.rs"]
 mod demand;
 #[path = "health/legacy_root.rs"]
@@ -31,10 +37,6 @@ mod root_evidence;
 pub(super) use reply_tracking::bash_watch_warning_wait_ms;
 use reply_tracking::UnansweredTool;
 use root_evidence::{health_failure_evidence, health_failure_field, health_nondefault};
-
-const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
-    "executor scheduler state could not be snapshotted without contention";
-const SNAPSHOT_CONTENTION_DEGRADED_AFTER: Duration = demand::BACKGROUND_INTERVAL.saturating_mul(3);
 
 /// Why the idle reaper kept an existing, unbound root that is past its idle
 /// TTL. Deleted roots are counted separately in the census's `blockers`.
@@ -2880,6 +2882,7 @@ pub(super) struct HealthRollupCache {
     // dropping its payload outside the lock makes blocking readers cheap.
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
+    root_contention: std::sync::Mutex<RootContention>,
     allocator: std::sync::Mutex<Option<CachedAllocatorObservation>>,
     allocator_requested: AtomicBool,
     health_requested: AtomicBool,
@@ -2948,6 +2951,7 @@ impl HealthRollupCache {
             root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
+            root_contention: std::sync::Mutex::new(RootContention::default()),
             allocator: std::sync::Mutex::new(None),
             allocator_requested: AtomicBool::new(false),
             health_requested: AtomicBool::new(false),
@@ -4333,7 +4337,16 @@ fn build_health_diagnostic_rollup_from_actors(
         });
     }
 
-    let busy_roots = candidates.iter().filter(|candidate| candidate.busy).count();
+    let root_snapshots = candidates
+        .iter()
+        .map(|candidate| (candidate.root_label.as_str(), candidate.busy))
+        .collect::<Vec<_>>();
+    let busy_roots = root_snapshots.iter().filter(|(_, busy)| *busy).count();
+    let degraded_busy_roots = cache
+        .root_contention
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .observe(&root_snapshots, cache.now_ms());
     let disk_reserve_detail = candidates
         .iter()
         .flat_map(|candidate| candidate.health.view_storage_reserve.values())
@@ -4584,6 +4597,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let (status, detail) = with_data_store_failures(
         root_health_rollup_state(
             busy_roots,
+            degraded_busy_roots,
             standing_refusals,
             warming_roots,
             disk_reserve_detail,
@@ -4834,37 +4848,6 @@ fn with_data_store_failures(
     )
 }
 
-fn root_health_rollup_state(
-    busy_roots: usize,
-    standing_refusals: usize,
-    warming_roots: usize,
-    disk_reserve_detail: Option<String>,
-) -> (HealthStatus, Option<String>) {
-    let status = if busy_roots > 0 || standing_refusals > 0 || disk_reserve_detail.is_some() {
-        HealthStatus::Degraded
-    } else {
-        HealthStatus::Ok
-    };
-    let detail = if busy_roots > 0 {
-        Some(format!(
-            "{busy_roots} root actor(s) could not be snapshotted without contention"
-        ))
-    } else if standing_refusals > 0 {
-        Some(format!(
-            "{standing_refusals} standing root(s) refused current resolved-path identity"
-        ))
-    } else if disk_reserve_detail.is_some() {
-        disk_reserve_detail
-    } else if warming_roots > 0 {
-        Some(format!(
-            "{warming_roots} root(s) warming background indexes (serving normally)"
-        ))
-    } else {
-        None
-    };
-    (status, detail)
-}
-
 fn render_cold_build_limiter_census(
     limiter: crate::cold_build_limiter::ColdBuildLimiterCensus,
 ) -> Value {
@@ -4973,6 +4956,7 @@ fn assemble_health_report(
     // A contended refresh, now or at the last rollup, leaves the retained
     // census in place and reports it as stale.
     let scheduler_busy = executor.try_actor_count().is_none() || cache.census_contended(&rollup);
+    let scheduler_degraded = scheduler_busy && scheduler_contention_degraded(snapshot_age_ms);
     let stale_reason = if scheduler_busy {
         Some("executor_contended")
     } else {
@@ -5179,7 +5163,7 @@ fn assemble_health_report(
         (None, warning) => warning,
     };
     HealthReport {
-        status: if scheduler_busy || watch_gap_unresolved {
+        status: if scheduler_degraded || watch_gap_unresolved {
             HealthStatus::Degraded
         } else {
             rollup.status.clone()
@@ -6827,7 +6811,7 @@ mod tests {
         };
         // Warming alone is ok; a root whose data store failed is not warming.
         let (status, detail) =
-            with_data_store_failures(root_health_rollup_state(0, 0, 1, None), &one);
+            with_data_store_failures(root_health_rollup_state(0, 0, 0, 1, None), &one);
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
@@ -6838,7 +6822,7 @@ mod tests {
         );
         // A fleet already degraded for another reason keeps that reason.
         let (status, detail) =
-            with_data_store_failures(root_health_rollup_state(2, 0, 0, None), &one);
+            with_data_store_failures(root_health_rollup_state(2, 2, 0, 0, None), &one);
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
@@ -6847,7 +6831,7 @@ mod tests {
         // No failure: unchanged.
         assert_eq!(
             with_data_store_failures(
-                root_health_rollup_state(0, 0, 0, None),
+                root_health_rollup_state(0, 0, 0, 0, None),
                 &DataStoreFailedRoots::default()
             ),
             (HealthStatus::Ok, None)
@@ -6904,7 +6888,7 @@ mod tests {
         ));
         assert_eq!(data_store_failure_reason(&store), None);
         let failed = DataStoreFailedRoots::collect([(root_path.as_str(), &store)]);
-        let state = root_health_rollup_state(0, 0, 1, None);
+        let state = root_health_rollup_state(0, 0, 0, 1, None);
         assert_eq!(with_data_store_failures(state.clone(), &failed), state);
         let mut root = json!({"project_root": root_path, "data_store": store});
         assert!(abbreviate_health_root(&mut root));
@@ -6974,7 +6958,7 @@ mod tests {
             })
         );
         let (status, detail) =
-            with_data_store_failures(root_health_rollup_state(0, 0, 0, None), &failed);
+            with_data_store_failures(root_health_rollup_state(0, 0, 0, 0, None), &failed);
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
@@ -7019,7 +7003,7 @@ mod tests {
                 DataStoreFailedRoots::collect(paths.iter().map(|path| (path.as_str(), &bind)));
             assert_eq!(failed.named.len(), 5);
             let (_, detail) =
-                with_data_store_failures(root_health_rollup_state(0, 0, 0, None), &failed);
+                with_data_store_failures(root_health_rollup_state(0, 0, 0, 0, None), &failed);
             let detail = detail.expect("a degraded detail");
             let added = detail.len() - base(paths.len()).len();
             assert!(
