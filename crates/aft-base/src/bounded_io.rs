@@ -1659,6 +1659,8 @@ fn run_with_timeout<T: Send + 'static>(
     };
     let owned = path.to_path_buf();
     let budget = current();
+    // A guarded temp read's open checks must follow the read onto the helper.
+    let general_temp = crate::task_temp_reads::current_general_temp();
     let alloc_label = crate::alloc_trace::carry();
     let carry = capture_carry(path)?;
     #[cfg(any(test, feature = "test-support"))]
@@ -1672,6 +1674,7 @@ fn run_with_timeout<T: Send + 'static>(
     }
     permit.send(Box::new(move || {
             let _alloc_label = alloc_label.enter();
+            let _general_temp = crate::task_temp_reads::admit_general_temp(general_temp);
             #[cfg(any(test, feature = "test-support"))]
             regression_tests::before_helper(&owned);
             let result = (|| {
@@ -2285,12 +2288,25 @@ pub fn read_content_to_string(path: impl AsRef<Path>) -> io::Result<String> {
     std::io::read_to_string(open_content_file(path.as_ref())?)
 }
 
-/// The same handle check without following a final symlink, for scratch reads.
+/// The same handle check without following a final symlink, for scratch and
+/// guarded temp reads. On Windows it opens a final reparse point itself, so
+/// the caller's opened-handle check sees and refuses it.
 pub(crate) fn open_content_file_no_follow(path: &Path) -> io::Result<std::fs::File> {
-    open_content_file_sized(path, true).map(|(file, _)| file)
+    open_content_file_opened(path, true, true).map(|(file, _)| file)
 }
 
-fn open_content_file_sized(path: &Path, _no_follow: bool) -> io::Result<(std::fs::File, u64)> {
+fn open_content_file_sized(path: &Path, no_follow: bool) -> io::Result<(std::fs::File, u64)> {
+    open_content_file_opened(path, no_follow, false)
+}
+
+/// `reparse_point` is Windows-only: open a final reparse point itself rather
+/// than its target. Only checked reads ask for it; an ordinary read must keep
+/// opening reparse points such as cloud placeholders through their filter.
+fn open_content_file_opened(
+    path: &Path,
+    _no_follow: bool,
+    _reparse_point: bool,
+) -> io::Result<(std::fs::File, u64)> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2298,14 +2314,28 @@ fn open_content_file_sized(path: &Path, _no_follow: bool) -> io::Result<(std::fs
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK | if _no_follow { libc::O_NOFOLLOW } else { 0 });
     }
+    #[cfg(windows)]
+    if _reparse_point {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
+    // A checked read refuses a final link with its usual refusal, the same
+    // answer it gave before the link itself was opened instead of followed.
+    #[cfg(windows)]
+    if _reparse_point && metadata.file_type().is_symlink() {
+        return Err(crate::task_temp_reads::refused());
+    }
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
+    // Path floors judged the name; a hard link can give a protected file this
+    // name too. Judge the opened file before the caller reads any byte.
+    crate::opened_floor::check(path, &file, &metadata)?;
     Ok((file, metadata.len()))
 }
 
@@ -2323,7 +2353,7 @@ fn regular_open_sized(path: &Path, _no_follow: bool) -> io::Result<(std::fs::Fil
     crate::io_accounting::WORK
         .content_reads
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (file, size) = open_content_file_sized(path, _no_follow)?;
+    let (file, size) = open_content_file_opened(path, _no_follow, scratch_check.is_some())?;
     crate::task_temp_reads::check_opened(path, scratch_check.as_ref(), &file)?;
     Ok((file, size))
 }

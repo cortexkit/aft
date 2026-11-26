@@ -27,6 +27,9 @@ use crate::github_read::{
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
+mod opened_checks;
+#[cfg(test)]
+pub(crate) use opened_checks::after_authorization_for_test;
 mod unranged;
 
 const DEFAULT_LIMIT: u32 = 2000;
@@ -195,12 +198,21 @@ enum PreparedPathRead {
         raw_bytes: Vec<u8>,
         media: SniffedMedia,
     },
+    /// The opened file is also a protected file. The caller renders the
+    /// policy's floor refusal; `fallback` is the opener's own refusal text.
+    Floor {
+        protected: Option<PathBuf>,
+        fallback: String,
+    },
 }
 
 impl PreparedPathRead {
     fn into_response(self, id: &str) -> Response {
         let (raw_bytes, media) = match self {
             Self::Response(response) => return response,
+            Self::Floor { fallback, .. } => {
+                return Response::error(id, "denied_floor", fallback);
+            }
             Self::Media { raw_bytes, media } => (raw_bytes, media),
         };
         match media {
@@ -2102,6 +2114,8 @@ fn handle_read_local(
         }
         Err(resp) => return resp,
     };
+    #[cfg(test)]
+    opened_checks::authorized();
 
     if let Some(result) = ctx.output_files().read(req.session(), &path) {
         return match result {
@@ -2132,6 +2146,10 @@ fn handle_read_local(
     // reader hold. Include stat, directory iteration, open, and streaming reads:
     // any of those can wait in the kernel on a protected or remote volume.
     let owned_req = req.clone();
+    // Hold the general temp allowance's open checks for every open below,
+    // including those the filesystem helpers make.
+    let _general_temp =
+        crate::task_temp_reads::admit_general_temp(opened_checks::general_temp_root(ctx, &path));
     #[cfg(test)]
     let legacy = LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
     #[cfg(test)]
@@ -2155,6 +2173,13 @@ fn handle_read_local(
         Ok((response, captured, observations, size))
     });
     match result {
+        Ok((
+            PreparedPathRead::Floor {
+                protected,
+                fallback,
+            },
+            ..,
+        )) => opened_checks::floor_refusal(ctx, req, requested, protected.as_deref(), fallback),
         Ok((response, captured, _observations, size)) => {
             #[cfg(test)]
             {
@@ -2223,6 +2248,12 @@ fn handle_read_path(
     let magic = match read_magic(path) {
         Ok(magic) => magic,
         Err(e) => {
+            if let Some(alias) = aft_base::opened_floor::protected_alias(&e) {
+                return PreparedPathRead::Floor {
+                    protected: alias.protected().map(Path::to_path_buf),
+                    fallback: alias.to_string(),
+                };
+            }
             return PreparedPathRead::Response(Response::error(
                 &req.id,
                 "io_error",

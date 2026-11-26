@@ -713,6 +713,26 @@ impl AccessPolicy {
             deny.push(floor.path.clone());
             floor_rules.push(floor);
         }
+        // Path floors cannot see a hard link to a protected file from an
+        // allowed folder; the content openers compare opened files with the
+        // small credential floors registered here.
+        aft_base::opened_floor::register(
+            floor_rules
+                .iter()
+                .filter(|floor| {
+                    matches!(
+                        floor.rule,
+                        FloorRule::CredentialPath
+                            | FloorRule::ConfiguredReadDeny
+                            | FloorRule::SubcConnection
+                    )
+                })
+                .map(|floor| floor.path.clone()),
+            floor_rules
+                .iter()
+                .filter(|floor| matches!(floor.rule, FloorRule::CortexkitModuleData))
+                .map(|floor| floor.path.clone()),
+        );
         let mut private_store_carveouts = vec![home
             .join(cortexkit_data::HOME_DATA_DIR)
             .join(cortexkit_data::WORKTREES)];
