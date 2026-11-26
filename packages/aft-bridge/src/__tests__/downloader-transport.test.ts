@@ -15,7 +15,9 @@ import {
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { getActiveLogger } from "../active-logger.js";
 import { isTrustedCachedBinary, readBinaryIdentity } from "../binary-identity.js";
+import { formatFetchError } from "../fetch-proxy.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "../platform.js";
 import { __setOffThreadVersionProbeForTests } from "../version-probe.js";
 import { linkCachedExecutable } from "./test-utils/cached-executable.js";
@@ -28,6 +30,33 @@ function shellFixtureAvailable(): boolean {
   if (!shellFixtureSkipReason) return true;
   if (process.env.CI === "true") throw new Error(shellFixtureSkipReason);
   return false;
+}
+
+async function captureBridgeErrors(run: () => Promise<unknown>): Promise<string[]> {
+  const lines: string[] = [];
+  const active = getActiveLogger();
+  if (active) {
+    const original = active.error;
+    active.error = (message) => {
+      lines.push(message);
+    };
+    try {
+      await run();
+      return lines;
+    } finally {
+      active.error = original;
+    }
+  }
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    lines.push(args.map((value) => String(value)).join(" "));
+  };
+  try {
+    await run();
+    return lines;
+  } finally {
+    console.error = original;
+  }
 }
 
 describe("downloadBinary hardened transport", () => {
@@ -349,5 +378,102 @@ describe("downloadBinary hardened transport", () => {
 
     await expect(downloadBinary("v1.2.4")).resolves.toBeNull();
     expect(existsSync(join(tmpDir, "aft", "bin", "v1.2.4", getBinaryName()))).toBe(false);
+  });
+
+  test("logs the inner cause of a fetch failure", async () => {
+    const { downloadBinary } = await import(`../downloader.js?cause-${Date.now()}`);
+    globalThis.fetch = (async () => {
+      throw new TypeError("fetch failed", {
+        cause: Object.assign(new Error("Connect Timeout Error"), {
+          code: "UND_ERR_CONNECT_TIMEOUT",
+        }),
+      });
+    }) as typeof fetch;
+
+    const lines = await captureBridgeErrors(() => downloadBinary("v1.2.3"));
+    expect(lines.join("\n")).toContain(
+      "Failed to download AFT binary: fetch failed (UND_ERR_CONNECT_TIMEOUT: Connect Timeout Error)",
+    );
+  });
+
+  test("keeps the HTTP status log line unchanged", async () => {
+    const { downloadBinary } = await import(`../downloader.js?http-${Date.now()}`);
+    const assetName = currentAssetName();
+    globalThis.fetch = (async () =>
+      new Response("bad", { status: 502, statusText: "Bad Gateway" })) as typeof fetch;
+
+    const lines = await captureBridgeErrors(() => downloadBinary("v9.9.9"));
+    expect(lines.join("\n")).toContain(
+      `Failed to download AFT binary: HTTP 502: Bad Gateway (https://github.com/cortexkit/aft/releases/download/v9.9.9/${assetName})`,
+    );
+  });
+});
+
+describe("formatFetchError", () => {
+  test("appends an inner cause code and message", () => {
+    const error = new TypeError("fetch failed", {
+      cause: Object.assign(new Error("Connect Timeout Error"), {
+        code: "UND_ERR_CONNECT_TIMEOUT",
+      }),
+    });
+    expect(formatFetchError(error, { env: {} })).toBe(
+      "fetch failed (UND_ERR_CONNECT_TIMEOUT: Connect Timeout Error)",
+    );
+  });
+
+  test("collects AggregateError causes", () => {
+    const error = new AggregateError(
+      [
+        Object.assign(new Error("getaddrinfo ENOTFOUND github.com"), { code: "ENOTFOUND" }),
+        Object.assign(new Error("Connect Timeout Error"), { code: "UND_ERR_CONNECT_TIMEOUT" }),
+      ],
+      "fetch failed",
+    );
+    const message = formatFetchError(error, { env: {} });
+    expect(message).toContain("getaddrinfo ENOTFOUND github.com");
+    expect(message).toContain("UND_ERR_CONNECT_TIMEOUT: Connect Timeout Error");
+  });
+
+  test("names a download timeout", () => {
+    const error = new TypeError("fetch failed", {
+      cause: Object.assign(new Error("Connect Timeout Error"), {
+        code: "UND_ERR_CONNECT_TIMEOUT",
+      }),
+    });
+    expect(formatFetchError(error, { timedOut: true, timeoutMs: 300_000, env: {} })).toBe(
+      "timed out after 300s (UND_ERR_CONNECT_TIMEOUT: Connect Timeout Error)",
+    );
+  });
+
+  test("hints NODE_USE_ENV_PROXY=1 when proxy env is set on Node without env-proxy flag", () => {
+    const error = new TypeError("fetch failed", {
+      cause: Object.assign(new Error("Connect Timeout Error"), {
+        code: "UND_ERR_CONNECT_TIMEOUT",
+      }),
+    });
+    const env = { https_proxy: "http://127.0.0.1:7890" };
+    expect(formatFetchError(error, { env, isBun: false, execArgv: [] })).toContain(
+      "(HTTP(S)_PROXY is set, but Node.js fetch ignores it unless NODE_USE_ENV_PROXY=1 is set)",
+    );
+    expect(
+      formatFetchError(error, {
+        env: { ...env, NODE_USE_ENV_PROXY: "1" },
+        isBun: false,
+        execArgv: [],
+      }),
+    ).not.toContain("NODE_USE_ENV_PROXY=1");
+    expect(
+      formatFetchError(error, { env, isBun: false, execArgv: ["--use-env-proxy"] }),
+    ).not.toContain("NODE_USE_ENV_PROXY=1");
+    expect(formatFetchError(error, { env, isBun: true, execArgv: [] })).not.toContain(
+      "NODE_USE_ENV_PROXY=1",
+    );
+    expect(
+      formatFetchError(new Error("onnx runtime library hash mismatch"), {
+        env,
+        isBun: false,
+        execArgv: [],
+      }),
+    ).toBe("onnx runtime library hash mismatch");
   });
 });

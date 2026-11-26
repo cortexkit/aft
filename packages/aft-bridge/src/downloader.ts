@@ -41,6 +41,7 @@ import {
 } from "./binary-identity.js";
 import { getAftBinaryCacheDir } from "./cache-paths.js";
 import { spawnSync } from "./child-process.js";
+import { formatFetchError } from "./fetch-proxy.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 import { parseAftVersionOutput, readBinaryVersionOffThread } from "./version-probe.js";
 
@@ -183,6 +184,7 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   let checksumController: AbortController | null = null;
   let binaryTimeout: ReturnType<typeof setTimeout> | null = null;
   let checksumTimeout: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
   const tmpPath = `${binaryPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
   const cleanUpPartialDownload = () => {
     try {
@@ -237,17 +239,24 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     checksumController = new AbortController();
     const activeBinaryController = binaryController;
     const activeChecksumController = checksumController;
-    binaryTimeout = setTimeout(() => activeBinaryController.abort(), DOWNLOAD_TIMEOUT_MS);
-    checksumTimeout = setTimeout(() => activeChecksumController.abort(), DOWNLOAD_TIMEOUT_MS);
+    binaryTimeout = setTimeout(() => {
+      timedOut = true;
+      activeBinaryController.abort();
+    }, DOWNLOAD_TIMEOUT_MS);
+    checksumTimeout = setTimeout(() => {
+      timedOut = true;
+      activeChecksumController.abort();
+    }, DOWNLOAD_TIMEOUT_MS);
     const [binaryResponse, checksumResponse] = await Promise.all([
       fetch(downloadUrl, { redirect: "follow", signal: activeBinaryController.signal }),
       fetch(checksumUrl, { redirect: "follow", signal: activeChecksumController.signal }),
     ]);
 
     if (!binaryResponse.ok) {
-      throw new Error(
-        `HTTP ${binaryResponse.status}: ${binaryResponse.statusText} (${downloadUrl})`,
+      error(
+        `Failed to download AFT binary: HTTP ${binaryResponse.status}: ${binaryResponse.statusText} (${downloadUrl})`,
       );
+      return null;
     }
     if (!binaryResponse.body) {
       throw new Error(`Download response for ${assetName} had no body`);
@@ -347,7 +356,7 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     log(`AFT binary ready at ${binaryPath}`);
     return binaryPath;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = formatFetchError(err, { timedOut, timeoutMs: DOWNLOAD_TIMEOUT_MS });
     error(`Failed to download AFT binary: ${msg}`);
 
     cleanUpPartialDownload();
