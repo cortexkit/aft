@@ -4957,7 +4957,7 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(return_paths_root(&main, outside.path()), main);
+    assert!(return_paths_workdir(outside.path()).1.is_none());
     let error = build_remote_request(
         &main,
         outside.path(),

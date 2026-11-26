@@ -2,18 +2,25 @@ use super::*;
 
 #[test]
 fn requested_paths_are_relative_files_listed_once_and_at_most_64() {
+    use std::path::Path;
+
+    let root = Path::new("checkout");
     let paths = |list: &[&str]| list.iter().map(|path| path.to_string()).collect::<Vec<_>>();
+    let check = |list: &[&str]| check_requested_paths(&paths(list), root, root);
     assert_eq!(
-        check_requested_paths(&paths(&["out.json", "dist/app.bin"])),
-        Ok(())
+        check(&["out.json", "dist/app.bin"]),
+        Ok(paths(&["out.json", "dist/app.bin"]))
     );
     let too_many: Vec<String> = (0..=MAX_RETURN_PATHS).map(|n| format!("f{n}")).collect();
     assert_eq!(
-        check_requested_paths(&too_many),
+        check_requested_paths(&too_many, root, root),
         Err("return_paths lists 65 paths; at most 64 are allowed".into())
     );
+    assert_eq!(
+        check(&["/etc/passwd"]),
+        Err("return_paths path /etc/passwd must be relative to workdir".into())
+    );
     let refused = [
-        ("/etc/passwd", "must be relative to workdir"),
         ("../outside.txt", "must not use .."),
         ("dist/../../outside.txt", "must not use .."),
         ("dist/", "names a directory"),
@@ -21,12 +28,38 @@ fn requested_paths_are_relative_files_listed_once_and_at_most_64() {
         ("", "empty path"),
     ];
     for (path, reason) in refused {
-        let error = check_requested_paths(&paths(&[path])).unwrap_err();
+        let error = check(&[path]).unwrap_err();
         assert!(error.contains(reason), "{path:?}: {error}");
     }
     assert_eq!(
-        check_requested_paths(&paths(&["a.txt", "a.txt"])),
+        check(&["a.txt", "a.txt"]),
         Err("return_paths lists a.txt twice".into())
+    );
+}
+
+#[test]
+fn requested_paths_normalize_parent_steps_without_reading_the_filesystem() {
+    use std::path::Path;
+
+    let root = Path::new("checkout");
+    let workdir = root.join("rune");
+    let check = |paths: &[&str]| {
+        let paths = paths
+            .iter()
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>();
+        check_requested_paths(&paths, &workdir, root)
+    };
+    let checked = check(&["../capture.png", "nonexistent/../out.txt"]).unwrap();
+    assert_eq!(Path::new(&checked[0]), Path::new("../capture.png"));
+    assert_eq!(checked[1], "out.txt");
+    assert_eq!(
+        check(&["../../outside.txt"]),
+        Err("return_paths path ../../outside.txt must not use ..".into())
+    );
+    assert_eq!(
+        check(&["unused/../out.txt", "out.txt"]),
+        Err("return_paths lists out.txt twice".into())
     );
 }
 

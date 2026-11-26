@@ -934,28 +934,33 @@ fn attach_return_paths(
                 .into(),
         ));
     }
-    check_requested_paths(&params.return_paths).map_err(|message| {
-        refused(format!(
-            "return_paths refused: {message}; the command did not run"
-        ))
-    })?;
     // The runner copies the checkout containing workdir, which may be a linked
     // worktree outside the session's project. Containment still applies even
     // when the session permits other tools to write outside its project.
-    let root = ctx
-        .config()
-        .project_root
-        .clone()
-        .unwrap_or_else(|| workdir.to_path_buf());
     #[cfg(unix)]
-    let root = crate::bash_background::registry::remote::return_paths_root(&root, workdir);
-    let root = std::fs::canonicalize(&root).map_err(|error| {
+    let (resolved_workdir, checkout) =
+        crate::bash_background::registry::remote::return_paths_workdir(workdir);
+    #[cfg(not(unix))]
+    let (resolved_workdir, checkout) = (workdir.to_path_buf(), None::<PathBuf>);
+    let config = ctx.config();
+    let root = checkout
+        .as_deref()
+        .or(config.project_root.as_deref())
+        .unwrap_or(workdir);
+    let root = std::fs::canonicalize(root).map_err(|error| {
         refused(format!(
             "return_paths refused: cannot resolve the project root {}: {error}",
             root.display()
         ))
     })?;
-    for path in &params.return_paths {
+    let checked = check_requested_paths(&params.return_paths, &resolved_workdir, &root).map_err(
+        |message| {
+            refused(format!(
+                "return_paths refused: {message}; the command did not run"
+            ))
+        },
+    )?;
+    for path in &checked {
         let shown = path.escape_default();
         if let Err(response) = ctx.validate_path(req_id, &workdir.join(path)) {
             let reason = response.data["message"]
@@ -980,7 +985,7 @@ fn attach_return_paths(
             }
         }
     }
-    launch.return_paths = params.return_paths.clone();
+    launch.return_paths = checked;
     Ok(())
 }
 

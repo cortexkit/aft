@@ -131,12 +131,16 @@ pub(crate) fn render_report_with_cap(paths: &[ReturnedPath], cap: u64) -> String
 pub(crate) const LOCAL_RUN_NOTE: &str =
     "return_paths: the command ran on this machine, so its files are already where it wrote them; nothing was copied back";
 
-/// Check the shape of the requested paths before anything else happens.
-/// Each is a file path relative to the command's workdir, without `..`,
-/// listed once, and there are at most [`MAX_RETURN_PATHS`]. Whether each
-/// resolves inside the project is checked separately against the filesystem.
+/// Validate workdir-relative file paths before submission. Cancel dot components
+/// in paths with `..` so that they name the same file on the runner and locally.
+/// Check these paths against the checkout lexically; symlinks are checked separately.
 #[doc(hidden)]
-pub fn check_requested_paths(paths: &[String]) -> Result<(), String> {
+pub fn check_requested_paths(
+    paths: &[String],
+    workdir: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    use crate::path_identity::lexical_normalize;
     use std::path::{Component, Path};
     if paths.len() > MAX_RETURN_PATHS {
         return Err(format!(
@@ -144,7 +148,7 @@ pub fn check_requested_paths(paths: &[String]) -> Result<(), String> {
             paths.len()
         ));
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut checked = Vec::with_capacity(paths.len());
     for path in paths {
         let shown = path.escape_default();
         if path.trim().is_empty() {
@@ -161,24 +165,30 @@ pub fn check_requested_paths(paths: &[String]) -> Result<(), String> {
         }
         if parsed
             .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+            .any(|component| matches!(component, Component::Prefix(_)))
         {
             return Err(format!("return_paths path {shown} must not use .."));
         }
-        if path.ends_with(['/', '\\'])
-            || !parsed
-                .components()
-                .any(|component| matches!(component, Component::Normal(_)))
-        {
+        let has_parent = parsed.components().any(|part| part == Component::ParentDir);
+        if has_parent && !lexical_normalize(&workdir.join(parsed)).starts_with(root) {
+            return Err(format!("return_paths path {shown} must not use .."));
+        }
+        if path.ends_with(['/', '\\']) || parsed.file_name().is_none() {
             return Err(format!(
                 "return_paths path {shown} names a directory; list the files to copy back"
             ));
         }
-        if !seen.insert(path.as_str()) {
+        let path = if has_parent {
+            lexical_normalize(parsed).to_string_lossy().into_owned()
+        } else {
+            path.clone()
+        };
+        if checked.contains(&path) {
             return Err(format!("return_paths lists {shown} twice"));
         }
+        checked.push(path);
     }
-    Ok(())
+    Ok(checked)
 }
 
 /// Where a returned path's file goes, as resolved before any of it is written.
@@ -714,10 +724,11 @@ mod receiver {
         fn checkout_path(&self, index: usize) -> Option<String> {
             let checkout = self.checkout_root.as_deref()?;
             let cwd = fs::canonicalize(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
-            let relative = cwd.strip_prefix(checkout).ok()?;
+            let destination =
+                crate::path_identity::lexical_normalize(&cwd.join(&self.paths[index]));
+            let relative = destination.strip_prefix(checkout).ok()?;
             let parts: Vec<String> = relative
                 .components()
-                .chain(Path::new(&self.paths[index]).components())
                 .filter_map(|component| match component {
                     Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
                     _ => None,
