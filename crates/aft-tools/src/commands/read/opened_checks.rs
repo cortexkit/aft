@@ -30,7 +30,7 @@ thread_local! {
 
 /// Run `hook` once, after the next read on this thread is authorized and
 /// before it opens anything, so a test can replace the file in that gap.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn after_authorization_for_test(hook: impl FnOnce() + 'static) {
     AFTER_AUTHORIZATION.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }

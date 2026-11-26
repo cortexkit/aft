@@ -28,7 +28,7 @@ use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 mod opened_checks;
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use opened_checks::after_authorization_for_test;
 mod unranged;
 
