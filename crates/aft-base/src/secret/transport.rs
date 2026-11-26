@@ -255,7 +255,8 @@ impl SubcSecretUseTransport {
         consumer: &subc_client_rs::SubcConsumer,
         params: Value,
         test_principal: Option<ConsumerIdentity>,
-    ) -> Result<Zeroizing<Vec<u8>>, Failure> {
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, Failure> {
         let target = &params["target"];
         if target["scheme"] != "https"
             || target
@@ -271,6 +272,9 @@ impl SubcSecretUseTransport {
         let scope = ScopeSelector::new(stamp.owner, stamp.scope_ref, Some(stamp.scope_epoch));
         let body = serde_json::to_vec(&json!({"method": "secret.use", "params": params}))
             .map_err(|_| Failure::local(Stage::Encode))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
         let route = open_vault_route(
             consumer,
             config.identity.clone(),
@@ -280,6 +284,9 @@ impl SubcSecretUseTransport {
         )
         .await
         .map_err(|error| Failure::call(Stage::RouteOpen, &error).under_scope(kind, &scope))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
         let reply = consumer
             .request(
                 &route,
@@ -290,7 +297,7 @@ impl SubcSecretUseTransport {
                 },
             )
             .await;
-        match reply {
+        let result = match reply {
             Ok(bytes) => {
                 let bytes = Zeroizing::new(bytes);
                 Ok(bytes)
@@ -316,7 +323,8 @@ impl SubcSecretUseTransport {
                 }
             }
             Err(error) => Err(Failure::call(Stage::Request, &error)),
-        }
+        };
+        result.map(Some)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -414,9 +422,9 @@ impl SubcSecretUseTransport {
                     consumer.as_ref().expect("connected consumer"),
                     work.params,
                     work.test_principal,
+                    work.deadline,
                 )
                 .await
-                .map(Some)
             })
             .await
             .unwrap_or_else(|_| Err(Failure::local(Stage::Deadline)));

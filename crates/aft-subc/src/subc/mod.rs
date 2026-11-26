@@ -1759,7 +1759,7 @@ struct BgSub {
     session: String,
 }
 
-use push::{BgSubsBySession, BgWakePending, BgWakeState};
+use push::{BgSubsBySession, BgWakePending};
 
 struct MaintenanceCompletion {
     root_id: ProjectRootId,
@@ -15710,7 +15710,7 @@ mod tests {
             HashSet::from([route]),
         )]);
         let mut bg_wake_pending =
-            BgWakePending::from([(route, BgWakeState::armed(Instant::now()))]);
+            BgWakePending::from([(route, push::BgWakeState::armed(Instant::now()))]);
         let mut bg_wake_epoch = HashMap::new();
         let mut pending_bash_asks = HashMap::new();
         let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));

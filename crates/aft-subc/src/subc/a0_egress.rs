@@ -1373,7 +1373,7 @@ mod ordering_tests {
         .unwrap();
         let subscription = candidates.next_ready().unwrap();
         assert_eq!(subscription.frame.header.corr, 2);
-        let mut wakes = BgWakePending::from([(route, BgWakeState::armed(Instant::now()))]);
+        let mut wakes = BgWakePending::from([(route, push::BgWakeState::armed(Instant::now()))]);
         let subscriptions = HashMap::from([(
             route,
             BgSub {
