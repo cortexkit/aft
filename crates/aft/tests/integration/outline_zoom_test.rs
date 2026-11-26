@@ -951,7 +951,7 @@ fn typescript_outline_and_zoom_find_exported_pattern_bindings() {
   options: { shorthand, fallback = fallbackValue }, ...remaining
 } = makeCommands();
 export const [first, , [nested], ...tail] = makeItems();
-const { key: viaClause } = makeOther();
+const { key: viaClause, hidden } = makeOther();
 export { viaClause as publicOther };
 "#;
     for extension in ["ts", "tsx"] {
@@ -961,6 +961,14 @@ export { viaClause as publicOther };
             json!({"id":"export-patterns", "command":"outline", "file":file}),
         );
         assert_eq!(reply["success"], true, "{reply}");
+        let text = reply["text"].as_str().unwrap();
+        for alias in ["useCommand", "executeCommand"] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("E const {alias} "))),
+                "{extension}: missing outline entry for {alias}: {text}"
+            );
+        }
         let symbols = aft::parser::FileParser::new()
             .extract_symbols(&file)
             .unwrap();
@@ -1001,6 +1009,59 @@ export { viaClause as publicOther };
             "{reply}"
         );
     }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn typescript_outline_bindings_are_search_definitions() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        dir.path(),
+        "module.ts",
+        "export const { value: exportedAlias } = makeValue();\nconsole.log(exportedAlias);\n",
+    );
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let search = send(
+        &mut aft,
+        json!({"id":"search-export-alias", "command":"semantic_search", "query":"exportedAlias"}),
+    );
+    assert_eq!(search["success"], true, "{search}");
+    assert!(
+        search["results"].as_array().unwrap().iter().any(|hit| {
+            hit["name"] == "exportedAlias" && hit["kind"] == "variable" && hit["start_line"] == 1
+        }),
+        "expected a definition rather than just a text match: {search}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn typescript_outline_preserves_call_target_resolution() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "module.ts",
+        "export const { value: exportedAlias } = makeValue();\nexport function target() { return exportedAlias; }\n",
+    );
+    let caller = write_file(
+        dir.path(),
+        "caller.tsx",
+        "import { target } from './module';\nexport function caller() { return <div>{target()}</div>; }\n",
+    );
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let calls = send(
+        &mut aft,
+        json!({"id":"exported-call-target", "command":"call_tree", "file":caller, "symbol":"caller", "depth":1}),
+    );
+    assert_eq!(calls["success"], true, "{calls}");
+    assert!(
+        calls["children"].as_array().unwrap().iter().any(|child| {
+            child["name"] == "target" && child["resolved"] == true && child["file"] == json!(file)
+        }),
+        "expected the imported function to resolve to module.ts: {calls}"
+    );
     assert!(aft.shutdown().success());
 }
 

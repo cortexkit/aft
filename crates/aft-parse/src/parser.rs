@@ -36,6 +36,7 @@ pub use reusable::reusable_parser_pools_memory;
 #[cfg(any(test, feature = "test-support"))]
 pub use reusable::{parse_source_with_parser_deadline, REUSABLE_PARSERS};
 pub mod todo_markers;
+mod typescript;
 
 const MAX_REEXPORT_DEPTH: usize = 10;
 
@@ -48,118 +49,6 @@ const MAX_REEXPORT_DEPTH: usize = 10;
 pub const MAX_SIGNATURE_BYTES: usize = 1024;
 
 // --- Query patterns embedded at compile time ---
-
-const TS_QUERY: &str = r#"
-;; function declarations
-(function_declaration
-  name: (identifier) @fn.name) @fn.def
-
-;; function-like values assigned to const/let/var
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @arrow.name
-    value: (arrow_function) @arrow.body) @arrow.decl) @arrow.def
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @arrow.name
-    value: (function_expression) @arrow.body) @arrow.decl) @arrow.def
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @arrow.name
-    value: (generator_function) @arrow.body) @arrow.decl) @arrow.def
-
-;; anonymous default exports
-(export_statement
-  value: (function_expression) @default.body) @default.def
-(export_statement
-  value: (generator_function) @default.body) @default.def
-(export_statement
-  value: (class) @default.body) @default.def
-
-;; class declarations
-(class_declaration
-  name: (type_identifier) @class.name) @class.def
-
-;; method definitions inside classes
-(class_declaration
-  name: (type_identifier) @method.class_name
-  body: (class_body
-    (method_definition
-      name: (property_identifier) @method.name) @method.def))
-
-;; callable fields inside classes
-(class_declaration
-  name: (type_identifier) @class_property.class_name
-  body: (class_body
-    (public_field_definition
-      name: (_) @class_property.name
-      value: (arrow_function) @class_property.value) @class_property.def))
-(class_declaration
-  name: (type_identifier) @class_property.class_name
-  body: (class_body
-    (public_field_definition
-      name: (_) @class_property.name
-      value: (function_expression) @class_property.value) @class_property.def))
-
-;; interface declarations and callable members
-(interface_declaration
-  name: (type_identifier) @interface.name) @interface.def
-(interface_declaration
-  name: (type_identifier) @interface_member.interface_name
-  body: (interface_body
-    (method_signature
-      name: (_) @interface_member.name) @interface_member.def))
-(interface_declaration
-  name: (type_identifier) @interface_property.interface_name
-  body: (interface_body
-    (property_signature
-      name: (_) @interface_property.name) @interface_property.def))
-
-;; callable object-literal properties
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (arrow_function) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (function_expression) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (generator_function) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (method_definition
-        name: (_) @object_property.name) @object_property.def)))
-
-;; enum declarations
-(enum_declaration
-  name: (identifier) @enum.name) @enum.def
-
-;; type alias declarations
-(type_alias_declaration
-  name: (type_identifier) @type_alias.name) @type_alias.def
-
-;; top-level const/let variable declarations
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @var.name) @var.decl) @var.def
-
-;; export statement wrappers (top-level only)
-(export_statement) @export.stmt
-"#;
 
 const JS_QUERY: &str = r#"
 ;; function declarations
@@ -859,7 +748,7 @@ fn markdown_line_block_bound(line: &[u8]) -> usize {
 /// Returns the query pattern string for a given LangId, if implemented.
 fn query_for(lang: LangId) -> Option<&'static str> {
     match lang {
-        LangId::TypeScript | LangId::Tsx => Some(TS_QUERY),
+        LangId::TypeScript | LangId::Tsx => Some(typescript::QUERY),
         LangId::JavaScript => Some(JS_QUERY),
         LangId::Python => Some(PY_QUERY),
         LangId::Rust => None,
@@ -3033,10 +2922,9 @@ fn extract_ts_symbols<'tree>(
     let lang = LangId::TypeScript;
     let capture_names = query.capture_names();
 
-    let ExportIndex {
-        ranges: export_ranges,
-        names: exported_names,
-    } = collect_exports(source, root, nav);
+    let exported_names = typescript::named_exports(source, *root);
+    let is_exported =
+        |declaration, name| typescript::is_exported(declaration, name, &exported_names, nav);
 
     let mut symbols = Vec::new();
     let mut variable_names = VariableNameIndex::default();
@@ -3132,13 +3020,14 @@ fn extract_ts_symbols<'tree>(
 
         // Function declaration
         if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Function,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
@@ -3146,13 +3035,14 @@ fn extract_ts_symbols<'tree>(
         // Arrow/function expression declarator
         if let (Some(name_node), Some(def_node)) = (arrow_name_node, arrow_def_node) {
             let range_node = arrow_decl_node.unwrap_or(def_node);
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Function,
                 range: node_range_with_decorators_with(&range_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
@@ -3164,13 +3054,14 @@ fn extract_ts_symbols<'tree>(
 
         // Class declaration
         if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Class,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
@@ -3211,13 +3102,14 @@ fn extract_ts_symbols<'tree>(
 
         // Interface declaration
         if let (Some(name_node), Some(def_node)) = (interface_name_node, interface_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Interface,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
@@ -3298,38 +3190,52 @@ fn extract_ts_symbols<'tree>(
 
         // Enum declaration
         if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Enum,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
 
         // Type alias
         if let (Some(name_node), Some(def_node)) = (type_alias_name_node, type_alias_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::TypeAlias,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
 
         // Top-level const/let variable declaration (not arrow functions — those are handled above)
         if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            let range_node = var_decl_node.unwrap_or(def_node);
+            if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
+                typescript::push_pattern_symbols(
+                    &mut symbols,
+                    source,
+                    name_node,
+                    range_node,
+                    def_node,
+                    &exported_names,
+                    nav,
+                );
+                continue;
+            }
             // Only include module-scope variables (parent is program/export_statement, not inside a function)
             let is_top_level = nav
                 .parent(def_node)
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
-            let range_node = var_decl_node.unwrap_or(def_node);
             let is_function_like = if range_node.kind() == "variable_declarator" {
                 variable_declarator_has_function_value(&range_node)
             } else {
@@ -3343,14 +3249,12 @@ fn extract_ts_symbols<'tree>(
                     range: node_range_with_decorators_with(&range_node, source, lang, nav),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
-                    exported: is_exported(&def_node, &export_ranges),
+                    exported: is_exported(def_node, name),
                     parent: None,
                 });
             }
         }
     }
-
-    mark_named_exports(&mut symbols, &exported_names);
 
     // Deduplicate: methods can appear as both class and method captures
     dedup_symbols(&mut symbols);

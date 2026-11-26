@@ -58,7 +58,9 @@ use crate::parser::LangId;
 /// contained type of proven standard-library smart-pointer fields (for example,
 /// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods;
 /// 15 stores each distinct method-call answer once per fragment;
-/// 25 adds Rust constants, statics, and type aliases to the symbol table.
+/// 25 adds Rust constants, statics, and type aliases to the symbol table. The
+/// TypeScript extractor marks only exported declarations and records each
+/// exported destructuring binding as a symbol.
 pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-25";
 
 /// The language of a resolver configuration file the call graph reads raw,
