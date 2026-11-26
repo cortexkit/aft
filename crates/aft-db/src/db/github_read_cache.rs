@@ -392,11 +392,7 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn github_read_cache_legacy_rows_remain_readable_with_unknown_gap() {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
-        let version = crate::db::current_schema_version(&conn).unwrap();
+    fn insert_legacy_row(conn: &Connection) -> GithubReadCacheKey {
         conn.execute_batch(
             "CREATE TABLE github_read_cache (
                 resource_kind TEXT NOT NULL CHECK (resource_kind IN ('issue', 'pr')),
@@ -407,7 +403,8 @@ mod tests {
                 fetched_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (resource_kind, repository, resource_number, authentication_identity_hash)
-            );",
+            );
+            CREATE INDEX idx_github_read_cache_hard_ttl ON github_read_cache (fetched_at_ms);",
         )
         .unwrap();
         let key = GithubReadCacheKey::new(GithubReadResourceKind::Issue, "owner/repo", 7, "id");
@@ -416,12 +413,47 @@ mod tests {
             [key.authentication_identity_hash.as_slice()],
         )
         .unwrap();
+        key
+    }
+
+    #[test]
+    fn github_read_cache_read_only_legacy_row_remains_readable_with_unknown_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = crate::db::open(&path).unwrap();
+        let key = insert_legacy_row(&conn);
+        drop(conn);
+        let conn =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
 
         let entry = lookup_github_read_cache_entry(&conn, &key)
             .unwrap()
             .unwrap();
         assert_eq!(entry.canonical_text, "# Legacy");
         assert_eq!(entry.document_gap, None);
+        assert!(!has_document_gap_column(&conn).unwrap());
+        assert!(upsert_github_read_cache_entry(&conn, &key, "# Updated", 2, true).is_err());
+    }
+
+    #[test]
+    fn github_read_cache_legacy_rows_remain_readable_with_unknown_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let version = crate::db::current_schema_version(&conn).unwrap();
+        let key = insert_legacy_row(&conn);
+
+        let entry = lookup_github_read_cache_entry(&conn, &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.canonical_text, "# Legacy");
+        assert_eq!(entry.document_gap, None);
+        assert!(has_document_gap_column(&conn).unwrap());
+        upsert_github_read_cache_entry(&conn, &key, "# Updated", 2, true).unwrap();
+        let entry = lookup_github_read_cache_entry(&conn, &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.canonical_text, "# Updated");
+        assert_eq!(entry.document_gap, Some(true));
         assert_eq!(crate::db::current_schema_version(&conn).unwrap(), version);
     }
 
