@@ -12,10 +12,11 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "THIRD-PARTY-NOTICES.txt"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external @earendil-works/pi-tui --external @oh-my-pi/pi-coding-agent/internal-urls --external typebox --external diff && tsc --emitDeclarationOnly",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external @oh-my-pi/pi-coding-agent/internal-urls --external typebox --external diff && bun scripts/check-bundle.mjs && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "bun test src/__tests__/",
     "lint": "biome check src",
@@ -40,7 +41,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.2",
     "@earendil-works/pi-ai": "^0.80.2",
-    "@earendil-works/pi-tui": "^0.80.2",
+    "@earendil-works/pi-tui": "0.80.2",
     "@types/node": "^22.0.0",
     "typebox": "1.1.38",
     "typescript": "^5.8.0"
@@ -48,7 +49,6 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "exports": {

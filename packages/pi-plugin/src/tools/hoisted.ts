@@ -33,14 +33,15 @@ import {
   shortenHomePath as shortenPath,
   toolErrorFromResponse,
 } from "@cortexkit/aft-bridge";
-import {
-  type AgentToolResult,
-  type ExtensionAPI,
-  type ExtensionContext,
-  renderDiff,
-  type Theme,
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Spacer } from "@earendil-works/pi-tui/dist/components/spacer.js";
+import { Text } from "@earendil-works/pi-tui/dist/components/text.js";
+import { type Component, Container } from "@earendil-works/pi-tui/dist/tui.js";
 import { type Static, type TObject, Type } from "typebox";
 import { resolveBashConfig, resolveGithubConfig, toolEnabled } from "../config.js";
 import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";
@@ -66,8 +67,8 @@ import {
   asString,
   collapsibleResult,
   formatUnifiedDiffForPi,
-  normalizeTerminalText,
   type RenderResultOptionsLike,
+  renderNumberedDiff,
 } from "./render-helpers.js";
 
 function isGithubResourcePath(value: string): boolean {
@@ -1413,8 +1414,7 @@ export function renderMutationResult(
     });
   }
 
-  // Diff: render using Pi's built-in renderer for colored lines + intra-line
-  // highlighting, wrapped in a Container with a top spacer for breathing room.
+  // Separate numbered diff rows from the call with a blank line.
   const container = reuseContainer(context.lastComponent);
   container.clear();
   container.addChild(new Spacer(1));
@@ -1426,11 +1426,11 @@ export function renderMutationResult(
       const counts = theme.fg("muted", ` (+${file.additions}/-${file.deletions})`);
       container.addChild(new Text(`${theme.fg("accent", mutationFileName(file))}${counts}`, 1, 0));
       if (file.diff !== undefined) {
-        container.addChild(new Text(renderTerminalDiff(file.diff), 1, 0));
+        container.addChild(new Text(renderNumberedDiff(file.diff, theme), 1, 0));
       }
     }
   } else {
-    container.addChild(new Text(renderTerminalDiff(diff), 1, 0));
+    container.addChild(new Text(renderNumberedDiff(diff, theme), 1, 0));
   }
   const rawPath =
     context.args &&
@@ -1448,20 +1448,6 @@ export function renderMutationResult(
     expanded: options.expanded,
     context,
   });
-}
-
-/** A Pi line-numbered diff colored by Pi's diff renderer, safe for the terminal. */
-function renderTerminalDiff(diff: string): string {
-  let renderedDiff: string;
-  try {
-    renderedDiff = renderDiff(diff);
-  } catch {
-    // Renderer tests and non-interactive hosts may not have initialized Pi's theme proxy.
-    renderedDiff = diff;
-  }
-  // Normalize before Text wraps the lines, then collapsibleResult applies the
-  // same safeguard to every renderer's final terminal-bound output.
-  return normalizeTerminalText(renderedDiff);
 }
 
 /** Resolve a path argument to an absolute path if it exists, decoding file:
