@@ -164,7 +164,7 @@ impl Drop for Env {
 }
 
 #[test]
-fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient() {
+fn protected_manifest_and_operator_arms_delegate_only_on_operator_disable() {
     let _lock = crate::test_env::process_env_lock();
     let manifest = super::tests::fixture_manifest();
     let dir = tempfile::tempdir().unwrap();
@@ -289,11 +289,16 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
             },
             |_, _, _, _| Ok(None),
         );
-        assert_ne!(exit, 0, "{mode}");
-        assert!(
-            !delegated.get(),
-            "protected {mode} must not reach native gh"
-        );
+        if mode == "operator-disable" {
+            assert_eq!(exit, 0, "explicit operator disable must pass through");
+            assert!(delegated.get());
+        } else {
+            assert_ne!(exit, 0, "{mode}");
+            assert!(
+                !delegated.get(),
+                "protected {mode} must not reach native gh"
+            );
+        }
     }
     for invalid_view in ["missing", "corrupt", "wrong-ticket"] {
         match invalid_view {
@@ -575,7 +580,7 @@ fn captured_rung_refusals_distinguish_discovery_failures_from_policy() {
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn protected_restart_and_disabled_writes_refuse_without_native_delegation() {
+fn protected_writes_refuse_during_restart_but_operator_disable_passes_through() {
     let _lock = crate::test_env::process_env_lock();
     for disabled in [false, true] {
         let manifest = super::tests::fixture_manifest();
@@ -646,13 +651,15 @@ fn protected_restart_and_disabled_writes_refuse_without_native_delegation() {
             },
             |_, _, _, _| panic!("protected refusal must not reach the native probe"),
         );
-        assert_eq!(exit, REFUSAL_EXIT_STATUS);
-        assert!(!delegated.get(), "disabled={disabled}");
-        assert_eq!(
-            *lines.lock().unwrap(),
-            vec![expected],
-            "disabled={disabled}"
-        );
+        if disabled {
+            assert_eq!(exit, 0);
+            assert!(delegated.get());
+            assert!(lines.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(exit, REFUSAL_EXIT_STATUS);
+            assert!(!delegated.get());
+            assert_eq!(*lines.lock().unwrap(), vec![expected]);
+        }
     }
 }
 
