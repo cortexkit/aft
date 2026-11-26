@@ -100,8 +100,11 @@ mod provider_pulls;
 mod rust_compiler_retry;
 mod shutdown;
 mod watched_overflow;
+mod worker_analyzer;
 mod workspace_pulls;
 use memory::DiagnosticMergeCache;
+pub use worker_analyzer::start_applicable_server_unlocked;
+pub(crate) use worker_analyzer::{DiagnosticsActivity, DiagnosticsActivityGuard};
 
 use background_document_pulls::{run_background_document_pulls, ClosedDocumentPulls};
 
@@ -1017,6 +1020,7 @@ type ShutdownResult = (Option<ServerKey>, u32, Result<(), LspError>);
 
 pub struct LspManager {
     capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
+    pub(crate) diagnostics_activity: Arc<parking_lot::Mutex<DiagnosticsActivity>>,
     capacity_slots: HashMap<ServerKey, Arc<()>>,
     #[cfg(any(test, feature = "test-support"))]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1307,6 +1311,7 @@ struct StartFailure {
 pub(crate) struct ServerCapacity {
     slots: Vec<std::sync::Weak<()>>,
     managers: Vec<std::sync::Weak<parking_lot::Mutex<LspManager>>>,
+    worker_reap: Weak<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1374,6 +1379,7 @@ impl LspManager {
             super::pending_changes::PendingLspChangeQueue::new(event_tx.clone());
         Self {
             capacity: Arc::default(),
+            diagnostics_activity: Arc::default(),
             capacity_slots: HashMap::new(),
             #[cfg(any(test, feature = "test-support"))]
             spawn_hook: None,
@@ -2137,7 +2143,16 @@ impl LspManager {
         file: &Path,
         config: &Config,
     ) -> ServerAttemptResult {
-        match self.begin_file_server_start(def, key, file, config) {
+        let start = self.begin_file_server_start(def, key, file, config);
+        self.launch_file_server_start(key, start)
+    }
+
+    fn launch_file_server_start(
+        &self,
+        key: &ServerKey,
+        start: FileServerStart,
+    ) -> ServerAttemptResult {
+        match start {
             FileServerStart::Running => ServerAttemptResult::Ok {
                 server_key: key.clone(),
             },
@@ -6909,6 +6924,7 @@ impl LspManager {
 
         Ok(PreparedSpawn {
             start_signal: None,
+            worker_permit: None,
             #[cfg(any(test, feature = "test-support"))]
             spawn_hook: self.spawn_hook.clone(),
             #[cfg(test)]
@@ -7841,6 +7857,7 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
 /// Everything needed to spawn and initialize one language server, gathered
 /// from `LspManager` state so the slow part can run without the manager lock.
 struct PreparedSpawn {
+    worker_permit: Option<super::client::RustAnalyzerPermit>,
     start_signal: Option<Arc<StartSignal>>,
     #[cfg(any(test, feature = "test-support"))]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -7973,20 +7990,27 @@ impl PreparedSpawn {
                     error: LspError::Io(error),
                 },
             )?;
-        let mut client = match LspClient::spawn_with_reclaim_root(
-            self.kind.clone(),
-            self.root.clone(),
-            &self.binary,
-            &self.args,
-            &self.env,
-            LspEventSender::Managed {
-                sender: self.event_tx,
-                instance: self.instance,
-            },
-            self.child_registry,
-            Some(&self.reclaim_root),
-            worker,
-        ) {
+        let permit = match self.worker_permit.take() {
+            Some(permit) => Ok(Some(permit)),
+            None if worker => super::client::rust_analyzer_capacity().acquire().map(Some),
+            None => Ok(None),
+        };
+        let mut client = match permit.and_then(|permit| {
+            LspClient::spawn_with_worker_permit(
+                self.kind.clone(),
+                self.root.clone(),
+                &self.binary,
+                &self.args,
+                &self.env,
+                LspEventSender::Managed {
+                    sender: self.event_tx,
+                    instance: self.instance,
+                },
+                self.child_registry,
+                Some(&self.reclaim_root),
+                permit,
+            )
+        }) {
             Ok(client) => client,
             Err(err) => {
                 let exit_log_line = format!(
@@ -8484,97 +8508,6 @@ where
     signals
         .iter()
         .all(|signal| wait_for_startup_outcome(&lock, signal, deadline).is_some())
-}
-
-/// Start or join one producer's reserved startup without holding the manager
-/// mutex across process creation, initialization, or waiting for completion.
-/// The request deadline limits waiting, not the worker's initialize handshake.
-pub fn start_applicable_server_unlocked(
-    manager: &Arc<parking_lot::Mutex<LspManager>>,
-    snapshot: &ApplicableServerSnapshot,
-    server: &ServerKey,
-    config: &Config,
-    deadline: Instant,
-) -> ApplicableServerStartOutcomes {
-    let mut outcomes = ApplicableServerStartOutcomes {
-        failures: snapshot
-            .producer_failures
-            .iter()
-            .filter(|f| f.server_key == *server)
-            .cloned()
-            .collect(),
-        ..ApplicableServerStartOutcomes::default()
-    };
-    let Some(candidate) = snapshot.candidates.iter().find(|c| c.key == *server) else {
-        return outcomes;
-    };
-    let mut retried_abandoned = false;
-    let result = loop {
-        if Instant::now() >= deadline {
-            outcomes.deadline_exceeded = Some(server.clone());
-            return outcomes;
-        }
-        let (initial, signal) = {
-            let mut lsp = manager.lock();
-            lsp.startup_owner = Arc::downgrade(manager);
-            let result = lsp.start_server(
-                &candidate.definition,
-                server,
-                &candidate.source_file,
-                config,
-            );
-            let signal = lsp.starting.get(server).map(|r| Arc::clone(&r.signal));
-            (result, signal)
-        };
-        let abandoned_before_join = signal.as_ref().is_some_and(|signal| {
-            signal
-                .request_deadline_exceeded
-                .load(std::sync::atomic::Ordering::Acquire)
-        });
-        let result = if let (ServerAttemptResult::InProgress { .. }, Some(signal)) =
-            (&initial, signal)
-        {
-            wait_for_startup_outcome(|| manager.lock(), &signal, deadline).unwrap_or_else(|| {
-                signal
-                    .request_deadline_exceeded
-                    .store(true, std::sync::atomic::Ordering::Release);
-                initial
-            })
-        } else {
-            initial
-        };
-        // A new request can overlap cleanup of an earlier timed-out request.
-        // Observe its result, then retry once with the new request's budget and
-        // configuration instead of returning that abandoned attempt's failure.
-        if abandoned_before_join
-            && !retried_abandoned
-            && matches!(
-                result,
-                ServerAttemptResult::SpawnFailed { .. }
-                    | ServerAttemptResult::BinaryNotInstalled { .. }
-            )
-            && Instant::now() < deadline
-        {
-            let lsp = manager.lock();
-            if !lsp.is_quiesced() && lsp.failure_to_replay(server).is_none() {
-                retried_abandoned = true;
-                continue;
-            }
-        }
-        break result;
-    };
-    match result {
-        ServerAttemptResult::Ok { server_key } => outcomes.successful.push(server_key),
-        ServerAttemptResult::InProgress { server_key } => {
-            outcomes.in_progress.push(server_key.clone());
-            outcomes.deadline_exceeded = Some(server_key);
-        }
-        result => outcomes.failures.push(ApplicableServerFailure {
-            server_key: server.clone(),
-            result,
-        }),
-    }
-    outcomes
 }
 
 /// Wake waiters if a startup worker unwinds before publishing a result.

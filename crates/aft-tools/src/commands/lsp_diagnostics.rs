@@ -62,6 +62,7 @@ struct LspDiagnosticsParams {
 /// }
 /// ```
 pub fn handle_lsp_diagnostics(req: &RawRequest, ctx: &AppContext) -> Response {
+    let _activity = ctx.lsp_diagnostics_activity();
     let params = match serde_json::from_value::<LspDiagnosticsParams>(req.params.clone()) {
         Ok(params) => params,
         Err(err) => {

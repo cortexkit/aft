@@ -2876,6 +2876,7 @@ pub struct AppContext {
     /// The LSP manager's "a worker used this root" flag, readable without the
     /// manager lock (see [`AppContext::disable_rust_cargo_for_worker`]).
     lsp_rust_worker_policy: Arc<std::sync::atomic::AtomicBool>,
+    lsp_diagnostics_activity: Arc<parking_lot::Mutex<crate::lsp::manager::DiagnosticsActivity>>,
     /// Advances with every configuration publication; a background
     /// language-server applicability walk stores its result only while it
     /// still matches (see `refresh_project_applicability`).
@@ -3399,6 +3400,7 @@ impl AppContext {
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
             lsp_rust_worker_policy: lsp_manager.rust_worker_policy(),
+            lsp_diagnostics_activity: Arc::clone(&lsp_manager.diagnostics_activity),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
             project_applicability_progress: Arc::default(),
@@ -8743,26 +8745,6 @@ impl AppContext {
         self.lsp_manager.lock().shutdown_all();
     }
 
-    /// Start one inspect producer, holding the LSP manager lock only to
-    /// reserve the server and to publish it; the spawn and `initialize`
-    /// handshake run unlocked (see
-    /// [`crate::lsp::manager::start_applicable_server_unlocked`]).
-    pub fn lsp_start_applicable_server_until(
-        &self,
-        snapshot: &crate::lsp::manager::ApplicableServerSnapshot,
-        server: &crate::lsp::roots::ServerKey,
-        config: &Config,
-        deadline: Instant,
-    ) -> crate::lsp::manager::ApplicableServerStartOutcomes {
-        crate::lsp::manager::start_applicable_server_unlocked(
-            &self.lsp_manager,
-            snapshot,
-            server,
-            config,
-            deadline,
-        )
-    }
-
     /// Make a running rust-analyzer reload its workspace when its Cargo
     /// manifests, lockfile, toolchain file, or Cargo config changed since it
     /// last loaded them (see
@@ -9100,6 +9082,7 @@ impl AppContext {
         content: &str,
         timeout: std::time::Duration,
     ) -> crate::lsp::manager::PostEditWaitOutcome {
+        let activity = self.lsp_diagnostics_activity();
         let config = self.config();
         let timeout = timeout.min(Duration::from_secs(10));
         let pending = crate::lsp::manager::PostEditWaitOutcome {
@@ -9143,6 +9126,7 @@ impl AppContext {
         if let Err(err) = std::thread::Builder::new()
             .name("aft-lsp-post-edit".into())
             .spawn(move || {
+                let _activity = activity;
                 let outcome = Self::lsp_collect_post_edit_diagnostics(
                     &manager, &slot, config, &file_path, &content, deadline,
                 );

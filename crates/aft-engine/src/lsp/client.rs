@@ -60,43 +60,66 @@ impl std::fmt::Display for RustAnalyzerCapacityExhausted {
 
 impl std::error::Error for RustAnalyzerCapacityExhausted {}
 
-struct RustAnalyzerCapacity {
+pub(super) struct RustAnalyzerCapacity {
     active: Mutex<usize>,
+    slot_released: std::sync::Condvar,
     cap: usize,
     refusals: AtomicU64,
 }
 
-struct RustAnalyzerPermit(Arc<RustAnalyzerCapacity>);
+pub(super) struct RustAnalyzerPermit(Arc<RustAnalyzerCapacity>);
 
 impl RustAnalyzerCapacity {
-    fn acquire(self: &Arc<Self>) -> io::Result<RustAnalyzerPermit> {
+    pub(super) fn acquire(self: &Arc<Self>) -> io::Result<RustAnalyzerPermit> {
+        self.try_acquire().map_err(|error| self.refuse(error))
+    }
+
+    pub(super) fn try_acquire(
+        self: &Arc<Self>,
+    ) -> Result<RustAnalyzerPermit, RustAnalyzerCapacityExhausted> {
         let mut active = self.active.lock().unwrap();
         if *active >= self.cap {
-            self.refusals.fetch_add(1, Ordering::Relaxed);
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                RustAnalyzerCapacityExhausted {
-                    cap: self.cap,
-                    current: *active,
-                },
-            ));
+            return Err(RustAnalyzerCapacityExhausted {
+                cap: self.cap,
+                current: *active,
+            });
         }
         *active += 1;
         Ok(RustAnalyzerPermit(self.clone()))
+    }
+
+    pub(super) fn refuse(&self, error: RustAnalyzerCapacityExhausted) -> io::Error {
+        self.refusals.fetch_add(1, Ordering::Relaxed);
+        io::Error::new(io::ErrorKind::WouldBlock, error)
+    }
+
+    pub(super) fn is_full(&self) -> bool {
+        *self.active.lock().unwrap() >= self.cap
+    }
+
+    pub(super) fn wait_for_release(&self, timeout: Duration) {
+        let active = self.active.lock().unwrap();
+        drop(
+            self.slot_released
+                .wait_timeout_while(active, timeout, |active| *active >= self.cap)
+                .unwrap(),
+        );
     }
 }
 
 impl Drop for RustAnalyzerPermit {
     fn drop(&mut self) {
         *self.0.active.lock().unwrap() -= 1;
+        self.0.slot_released.notify_all();
     }
 }
 
-fn rust_analyzer_capacity() -> &'static Arc<RustAnalyzerCapacity> {
+pub(super) fn rust_analyzer_capacity() -> &'static Arc<RustAnalyzerCapacity> {
     static CAPACITY: OnceLock<Arc<RustAnalyzerCapacity>> = OnceLock::new();
     CAPACITY.get_or_init(|| {
         Arc::new(RustAnalyzerCapacity {
             active: Mutex::new(0),
+            slot_released: std::sync::Condvar::new(),
             cap: RUST_ANALYZER_WORKER_PROCESS_CAP,
             refusals: AtomicU64::new(0),
         })
@@ -1200,7 +1223,10 @@ impl LspClient {
         reclaim_root: Option<&Path>,
         worker_policy: bool,
     ) -> io::Result<Self> {
-        Self::spawn_with_capacity(
+        let permit = (kind == ServerKind::Rust && worker_policy)
+            .then(|| rust_analyzer_capacity().acquire())
+            .transpose()?;
+        Self::spawn_with_worker_permit(
             kind,
             root,
             binary,
@@ -1209,12 +1235,11 @@ impl LspClient {
             event_tx,
             child_registry,
             reclaim_root,
-            worker_policy,
-            rust_analyzer_capacity(),
+            permit,
         )
     }
 
-    fn spawn_with_capacity(
+    pub(super) fn spawn_with_worker_permit(
         kind: ServerKind,
         root: PathBuf,
         binary: &Path,
@@ -1223,15 +1248,13 @@ impl LspClient {
         event_tx: LspEventSender,
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
-        worker_policy: bool,
-        capacity: &Arc<RustAnalyzerCapacity>,
+        rust_analyzer_permit: Option<RustAnalyzerPermit>,
     ) -> io::Result<Self> {
         let instance = match &event_tx {
             LspEventSender::Standalone(_) => ServerInstanceId::next(),
             LspEventSender::Managed { instance, .. } => *instance,
         };
-        let worker_policy = kind == ServerKind::Rust && worker_policy;
-        let rust_analyzer_permit = worker_policy.then(|| capacity.acquire()).transpose()?;
+        let worker_policy = rust_analyzer_permit.is_some();
         #[cfg(windows)]
         let is_batch_file = crate::windows_command::is_batch_file(binary);
         #[cfg(windows)]
@@ -2673,6 +2696,16 @@ impl LspClient {
             .map_or(true, |pending| !pending.is_empty())
     }
 
+    pub(super) fn can_reclaim_worker_analyzer(&self) -> bool {
+        self._rust_analyzer_permit.is_some()
+            && self.state == ServerState::Ready
+            && !self.has_pending_requests()
+            && self.rust_flycheck_running.is_empty()
+            && !self.rust_flycheck_lost
+            // A flycheck start notification can reach the reader before the manager records it.
+            && self.rust_check_begin_receipts.lock().is_ok_and(|receipts| receipts.is_empty())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_last_used_at_for_test(&mut self, at: Instant) {
         self.last_used_at = at;
@@ -3538,6 +3571,7 @@ mod tests {
         let capacity = Arc::new(RustAnalyzerCapacity {
             cap: 1,
             active: Mutex::new(0),
+            slot_released: std::sync::Condvar::new(),
             refusals: AtomicU64::new(0),
         });
         let permit = capacity.acquire().unwrap();

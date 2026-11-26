@@ -532,7 +532,9 @@ fn verify_final_root_stats(
 }
 
 mod entry;
+mod lsp_start;
 pub use entry::handle_inspect;
+use lsp_start::start_applicable_servers_concurrently;
 
 /// Configure records which language servers apply to the project on a
 /// background walk, and until it finishes the status bar reports project
@@ -683,6 +685,7 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     if let Some(reason) = ctx.cache_unavailable_reason() {
         return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
     }
+    let _activity = ctx.lsp_diagnostics_activity();
     if req.worker_session() {
         ctx.disable_rust_cargo_for_worker();
     }
@@ -1464,6 +1467,7 @@ pub(crate) fn handle_inspect_deferred_with_clock(
             let _config_pin = ctx.pin_config_to(admitted_config);
             let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
             let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+            let _activity = ctx.lsp_diagnostics_activity();
             // The first worker-policy transition can wait for the LSP manager.
             // Keep it inside the deferred request's independently bounded body.
             if request.worker_session() {
@@ -2329,72 +2333,6 @@ fn inspect_failure_reason(response: &Response) -> &'static str {
         "lsp_quiescence_timeout"
     } else {
         "inspect_not_fresh"
-    }
-}
-
-/// Start every applicable producer at once, each bounded by the same startup
-/// deadline, and return one outcome per server in `server_keys` order.
-///
-/// Starting them one after another made the startup budget a sum: on a busy
-/// machine a project with a dozen servers spent it on the first few
-/// handshakes, and every later server was reported as "startup wait budget
-/// exhausted" without ever having been tried. Each start already runs its
-/// spawn and `initialize` handshake without the manager lock, so starts of
-/// different servers do not wait on each other.
-fn start_applicable_servers_concurrently(
-    ctx: &AppContext,
-    applicability: &ApplicableServerSnapshot,
-    startup_deadline: Instant,
-) -> Vec<ApplicableServerStartOutcomes> {
-    let config = ctx.config();
-    let cancellation = crate::executor::current_job_cancellation();
-    let start = |server: &crate::lsp::roots::ServerKey| {
-        let outcome =
-            ctx.lsp_start_applicable_server_until(applicability, server, &config, startup_deadline);
-        if let Some(token) = &cancellation {
-            token.report_progress();
-        }
-        outcome
-    };
-    std::thread::scope(|scope| {
-        let handles = applicability
-            .server_keys
-            .iter()
-            .map(|server| {
-                let spawned = std::thread::Builder::new()
-                    .name("aft-inspect-lsp-start".into())
-                    .spawn_scoped(scope, move || start(server));
-                (server, spawned)
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|(server, spawned)| match spawned {
-                Ok(handle) => handle
-                    .join()
-                    .unwrap_or_else(|_| start_panicked_outcome(server, "server start panicked")),
-                // If the thread cannot be spawned, start the server on this
-                // thread instead: slower, because it no longer overlaps the
-                // other starts, but the server is still started.
-                Err(_) => start(server),
-            })
-            .collect()
-    })
-}
-
-fn start_panicked_outcome(
-    server: &crate::lsp::roots::ServerKey,
-    reason: &str,
-) -> ApplicableServerStartOutcomes {
-    ApplicableServerStartOutcomes {
-        failures: vec![ApplicableServerFailure {
-            server_key: server.clone(),
-            result: crate::lsp::manager::ServerAttemptResult::SpawnFailed {
-                binary: String::new(),
-                reason: reason.to_string(),
-            },
-        }],
-        ..ApplicableServerStartOutcomes::default()
     }
 }
 
