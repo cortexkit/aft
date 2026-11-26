@@ -995,6 +995,12 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         output = (
             "     Running unittests src\\lib.rs (target\\debug\\deps\\agent_file_tools-0123abcd.exe)\n"
             "         LINK : warning LNK4217: symbol 'wasm_engine_delete' defined in 'libwasmtime_c_api.rlib' is imported\n"
+            # Cargo's unused-dependency manifest lint ends with a bare `help:` line.
+            "warning: unused dependency `rustc-demangle`\n"
+            "  --> crates\\aft-base\\Cargo.toml:39:1\n"
+            "   |\n"
+            "   = note: `cargo::unused_dependencies` is set to `warn` by default\n"
+            "help: consider removing the dependency on `rustc-demangle`\n"
             "parser::tests::parses: test\n"
             "\n"
             "1 test, 0 benchmarks\n"
@@ -2301,21 +2307,24 @@ while [[ "$1" != --output ]]; do shift; done
                     self.assertIn("System python3:", result.stdout)
 
     def test_cleanup_includes_the_injected_e2e_executable_cache(self) -> None:
+        # cleanup_processes protects its own process, so the fake leaked PID must
+        # never equal this test's PID (fresh job sandboxes hand out small PIDs).
+        leaked = os.getpid() + 1
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             local = home / "localappdata"
             binary = (local / "aft/bin/v1/aft.exe" if os.name == "nt"
                       else home / ".cache/aft/bin/v1/aft")
             with unittest.mock.patch.object(self.state.Path, "home", return_value=home), \
-                 unittest.mock.patch.object(self.state, "process_table", return_value={10: (0, str(binary))}), \
+                 unittest.mock.patch.object(self.state, "process_table", return_value={leaked: (0, str(binary))}), \
                  unittest.mock.patch.object(self.state.os, "kill") as kill, \
                  unittest.mock.patch.object(self.state.subprocess, "run") as run, \
                  unittest.mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": str(home / "workspace"), "LOCALAPPDATA": str(local)}):
                 self.state.cleanup_processes(home / "aft-ci")
             if os.name == "nt":
-                self.assertEqual(run.call_args.args[0], ["taskkill", "/T", "/F", "/PID", "10"])
+                self.assertEqual(run.call_args.args[0], ["taskkill", "/T", "/F", "/PID", str(leaked)])
             else:
-                kill.assert_called_once_with(10, self.state.signal.SIGKILL)
+                kill.assert_called_once_with(leaked, self.state.signal.SIGKILL)
 
 
 class CortexkitTrackingGateTests(unittest.TestCase):

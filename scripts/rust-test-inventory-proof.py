@@ -144,9 +144,10 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
         # `sccache: warning:` lines when its server restarts mid-build. None of
         # them carry test entries. The MSVC linker also prints `LINK : warning
         # LNK4217` lines for the Wasm runtime's C API when the wasm-grammars
-        # feature is on.
+        # feature is on. Cargo's own manifest lints (such as an unused
+        # dependency) end with a bare `help:` line instead of `= help:`.
         if (
-            stripped.startswith(("warning:", "= note:", "= help:", "sccache: ", "--> ", "...", "LINK : warning "))
+            stripped.startswith(("warning:", "= note:", "= help:", "help:", "sccache: ", "--> ", "...", "LINK : warning "))
             or stripped == "|"
             or WARNING_EXCERPT_RE.match(stripped)
         ):
