@@ -22,7 +22,7 @@ class GateResult(subprocess.CompletedProcess[str]):
 
 class RustGateCollectionTests(unittest.TestCase):
     def run_gate(self, phases, ci=True, fail=False, archives=False, cargo_only=False, leak=False,
-                 log_dir_mode=None, macos=False, native_target=False):
+                 log_dir_mode=None, macos=False, native_target=False, unit_runner="nextest"):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             tools = home / "bin"
@@ -33,6 +33,7 @@ class RustGateCollectionTests(unittest.TestCase):
                 "cargo-nextest": "#!/bin/sh\nexit 0\n",
                 "cargo": '''#!/usr/bin/env python3
 import json, os, sys
+from pathlib import Path
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALL_LOG"], "a") as out:
     out.write(json.dumps(args) + "\\n")
@@ -41,8 +42,21 @@ if os.environ.get("AFT_CI_TARGET_DIR") and any(
 ):
     print("ambient Cargo target leaked into the test runner", file=sys.stderr)
     sys.exit(90)
+target = Path(args[args.index("--target-dir") + 1] if "--target-dir" in args
+              else os.environ["FAKE_CARGO_TARGET"])
+launcher = target / "debug" / "aft"
+if args[0] == "metadata":
+    print(json.dumps({"target_directory": str(target)}))
+if args[0] == "build" and "--bin" in args and args[args.index("--bin") + 1] == "aft":
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.touch()
+    launcher.chmod(0o755)
+if args[0] == "test" and all(flag in args for flag in ("--workspace", "--lib", "--bins")):
+    configured = Path(os.environ.get("AFT_TEST_AFT_BINARY", ""))
+    if not configured.is_absolute() or not os.access(configured, os.X_OK) or not configured.samefile(launcher):
+        print("lib tests did not receive the built native launcher", file=sys.stderr)
+        sys.exit(91)
 if args[:2] == ["nextest", "list"] and "--extract-to" in args:
-    from pathlib import Path
     metadata = Path(args[args.index("--extract-to") + 1]) / "target/nextest"
     metadata.mkdir(parents=True)
     (metadata / "cargo-metadata.json").write_text("{}")
@@ -81,14 +95,15 @@ sys.exit(0)
             env.update({
                 "PATH": str(tools) + os.pathsep + env["PATH"],
                 "FAKE_REPO_ROOT": str(ROOT), "FAKE_CALL_LOG": str(calls),
+                "FAKE_CARGO_TARGET": str(home / "configured Cargo target"),
                 "FAKE_FAIL": "1" if fail else "0", "AFT_GATE_DEMOTED": "1",
                 "AFT_SKIP_BOX_GATE": "1", "AFT_GATE_PHASES": phases,
                 "AFT_GATE_HOME_ROOT": str(home / "homes"), "AFT_GATE_LOG": str(home / "logs" / "gate.log"),
-                "AFT_RUST_TEST_RUNNER": "cargo" if cargo_only else "nextest", "AFT_UNIT_TEST_RUNNER": "nextest",
+                "AFT_RUST_TEST_RUNNER": "cargo" if cargo_only else "nextest", "AFT_UNIT_TEST_RUNNER": unit_runner,
             })
             for name in ("CI", "AFT_NEXTEST_ARCHIVE_FILE", "AFT_NEXTEST_ARCHIVE_BIN_FILE",
                          "AFT_NEXTEST_EXTRACT_TO", "AFT_NEXTEST_PARTITION", "AFT_GATE_SKIP_RELEASE_STORM",
-                         "AFT_CI_TARGET_DIR"):
+                         "AFT_CI_TARGET_DIR", "AFT_TEST_AFT_BINARY"):
                 env.pop(name, None)
             if native_target:
                 env.update({"AFT_CI_TARGET_DIR": str(home / "native target"),
@@ -159,6 +174,21 @@ sys.exit(0)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any("--cargo-metadata" in call for call in calls), calls)
         self.assertTrue(all("--target-dir" not in call for call in calls), calls)
+
+    def test_cargo_lib_gate_builds_and_exports_its_native_launcher(self):
+        for native_target in (False, True):
+            with self.subTest(native_target=native_target):
+                result, calls = self.run_gate("lib", ci=False, native_target=native_target,
+                                              unit_runner="cargo")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                target_args = ["--target-dir", result.native_target] if native_target else []
+                build = ["build", *target_args, "--features", "wasm-grammars", "-p",
+                         "agent-file-tools", "--bin", "aft"]
+                self.assertIn(build, calls)
+                self.assertLess(calls.index(build), len(calls) - 1)
+                self.assertEqual(calls[-1][:1 + len(target_args)], ["test", *target_args])
+                self.assertIn("--bins", calls[-1])
+                self.assertIn("GATE PASSED", result.stdout)
 
     def test_local_gate_keeps_fail_fast_phase_behavior(self):
         result, calls = self.run_gate("conformance", ci=False, fail=True)

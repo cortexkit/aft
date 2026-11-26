@@ -2573,17 +2573,23 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blocked");
         fifo(&path);
+        // A private, already-running helper: with the shared pool, a parallel
+        // test or a loaded machine can make the read time out before it ever
+        // reaches open(), which is a different refusal than the one under test.
+        let limiter = Limiter::new(1);
+        run_with_limiter(dir.path(), None, limiter.clone(), |_| Ok(())).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let input = path.clone();
         let thread = std::thread::spawn(move || {
-            tx.send(run(
+            tx.send(run_with_limiter(
                 &input,
-                Some(Instant::now() + Duration::from_millis(80)),
+                Some(Instant::now() + Duration::from_millis(300)),
+                limiter,
                 std::fs::read,
             ))
             .unwrap()
         });
-        let before_writer = rx.recv_timeout(Duration::from_millis(800));
+        let before_writer = rx.recv_timeout(Duration::from_secs(5));
         release_fifo(&path);
         thread.join().unwrap();
         let error = before_writer

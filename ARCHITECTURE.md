@@ -191,8 +191,8 @@ gets a copy of the checkout; only output, the exit code and the files named in
 `return_paths` come back, and AFT refuses a command that would edit tracked
 files before submitting it. Commands may name secret placeholders; the vault
 seam (`crates/aft-base/src/secret/`, `crates/aft-base/src/secret_proxy/`,
-`subc/secret_consent.rs`) resolves them per call, but the production vault is
-not wired yet, so none resolve today.
+`subc/secret_consent.rs`) resolves them per call, but the production vault
+is not wired yet, so none resolve today.
 
 **Inspect.** `aft_inspect` (`commands/inspect.rs`, `inspect/`) reports
 diagnostics, metrics, and TODOs (tier 1) and cross-file categories such as dead
@@ -215,16 +215,18 @@ features include diagnostics for inspect and edits, and navigation.
 
 **Config and trust.** Config is JSONC at two tiers: user
 `~/.config/cortexkit/aft.jsonc` and project `<root>/.cortexkit/aft.jsonc`,
-each with optional `harnesses.<name>` overrides. In subc mode AFT reads both
-files itself and ignores config sent over the wire.
-`crates/aft-base/src/config_resolve.rs` parses both strictly and merges them,
-and it drops project values for security-relevant keys: path restriction,
-semantic backend endpoints and credentials, LSP executables, subc transport,
-remote execution, GitHub capabilities, and anything that weakens the sandbox.
-For these keys a project can only tighten: raise a sandbox mode or add read
-denies, switch an index or remote execution off, or disable tools other than
-`aft_safety` and the host tool slots. Retired key names are translated with a
-notice, and AFT rewrites the user file to current keys when it loads it.
+each with optional `harnesses.<name>` overrides. In subc mode AFT ignores config
+from callers, reads the project file itself, and either receives approved user
+settings from the daemon via `config.gate` (`subc/settings.rs`,
+`config_live/schema.rs`) or reads the user file itself when `config.gate` is
+unavailable. `crates/aft-base/src/config_resolve.rs` parses both strictly and
+merges them, and it drops project values for security-relevant keys: path
+restriction, semantic backend endpoints and credentials, LSP executables, subc
+transport, remote execution, GitHub capabilities, and anything that weakens the
+sandbox. For these keys a project can only tighten: raise a sandbox mode or add
+read denies, switch an index or remote execution off, or disable tools other
+than `aft_safety` and the host tool slots. Retired key names are translated
+with a notice, and AFT rewrites the user file to current keys when it loads it.
 Separately, the subc edge assigns each route bind a `BindTrust` (`subc/mod.rs`):
 first-party principals get full replies; a reserved module is first-party only
 for the exact (module, harness) pairs it has been checked for; untrusted binds
