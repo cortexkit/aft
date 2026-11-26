@@ -358,6 +358,8 @@ enum KillSignalPlan {
     Pty {
         pid: Option<u32>,
         master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+        /// What proves the group, gathered before the leader was hung up.
+        evidence: Option<verified_kill::GroupEvidence>,
     },
 }
 
@@ -396,12 +398,6 @@ pub fn stop_tasks_in_parallel<T: Send, R: Send>(
     #[cfg(not(unix))]
     tasks.into_iter().map(stop).collect()
 }
-
-// Sending a group signal and reaping its leader do not mean descendants have
-// exited yet. Settle the signalled group before sampling the kill completion,
-// but keep reporting real survivors when this bounded grace expires.
-#[cfg(unix)]
-const KILL_GROUP_SETTLEMENT_GRACE: Duration = Duration::from_secs(2);
 
 /// Longest a completion notice waits for a process-group check another caller
 /// has started. The check is one listing of the group, normally milliseconds.
@@ -459,65 +455,6 @@ impl KillSettlementTestSamples {
         )
     }
 }
-
-#[cfg(unix)]
-fn kill_settlement_now() -> Instant {
-    #[cfg(test)]
-    if let Some(now) = KILL_SETTLEMENT_TEST_NOW.with(std::cell::Cell::get) {
-        return now;
-    }
-    Instant::now()
-}
-
-#[cfg(unix)]
-fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
-    let Some(pgid) = pgid else {
-        return;
-    };
-    let started = kill_settlement_now();
-    #[cfg(test)]
-    let diagnostic_started = Instant::now();
-    loop {
-        let exists = unsafe { libc::killpg(pgid, 0) } == 0;
-        if !exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return;
-        }
-        // Zombies cannot run or retain output pipes. An unreaped orphan may
-        // still make killpg(0) succeed, but is not a live descendant to report.
-        let listing = live_process_group_members(pgid);
-        #[cfg(test)]
-        KILL_SETTLEMENT_TEST_SAMPLES.with(|samples| {
-            if let Some(samples) = samples.borrow().as_ref() {
-                samples.lock().unwrap().record(
-                    pgid,
-                    format!(
-                        "real={:?}, settlement={:?}, exists={exists}, listing={listing:?}",
-                        diagnostic_started.elapsed(),
-                        kill_settlement_now().saturating_duration_since(started)
-                    ),
-                );
-            }
-        });
-        if listing.is_ok_and(|listing| listing.is_clean()) {
-            return;
-        }
-        #[cfg(test)]
-        if let Some(notice) = KILL_SETTLEMENT_NOTICES
-            .get()
-            .and_then(|notices| notices.lock().unwrap().remove(task_id))
-        {
-            let _ = notice.send(());
-        }
-        let _ = task_id;
-        if kill_settlement_now().saturating_duration_since(started) >= KILL_GROUP_SETTLEMENT_GRACE {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[cfg(not(unix))]
-fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
 
 /// Whether a finished task's process group, answering under its saved
 /// number, is still that task's group and may be signalled. The number is the
@@ -12024,6 +11961,11 @@ impl BgTaskRegistry {
             return Ok(());
         }
         if let Ok(state) = task.lock_state() {
+            // A PTY kill in flight decides the outcome (it may not be
+            // confirmed); finalization waits for it.
+            if cfg!(unix) && state.kill_in_flight && matches!(state.runtime, TaskRuntime::Pty(_)) {
+                return Ok(());
+            }
             if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
                 // The Windows wrapper can write the marker before the child
                 // actually exits. Only the waiter makes it safe to close the
@@ -14075,6 +14017,12 @@ impl BgTaskRegistry {
                 }
 
                 let (pgid, child_pid) = adopted_identity::signal_targets(&state);
+                #[cfg(unix)]
+                let evidence = matches!(state.runtime, TaskRuntime::Pty(Some(_)))
+                    .then(|| verified_kill::pty_evidence_before_hangup(&state.metadata))
+                    .flatten();
+                #[cfg(not(unix))]
+                let evidence = None;
                 let plan = match &mut state.runtime {
                     // The child handle leaves the slot for the unlocked wait.
                     // With the slot empty and the task not yet detached, the
@@ -14098,6 +14046,7 @@ impl BgTaskRegistry {
                         KillSignalPlan::Pty {
                             pid: pty.child_pid,
                             master: pty.master.take(),
+                            evidence,
                         }
                     }
                     TaskRuntime::Pty(None) => KillSignalPlan::Nothing,
@@ -14111,6 +14060,7 @@ impl BgTaskRegistry {
 
         let mut scope_kill_attempted = false;
         let mut coverage_note = None;
+        let mut deferred_error = None;
         match plan {
             KillSignalPlan::Nothing => {}
             #[cfg(any(windows, test, feature = "test-support"))]
@@ -14124,8 +14074,10 @@ impl BgTaskRegistry {
             KillSignalPlan::TerminalSurvivors { pgid, live_count } => {
                 kill_reached = live_count;
                 log_bash_kill(task_id, None, Some(pgid), kill_reason);
-                (kill_signaled, coverage_note) =
-                    self.terminate_terminal_survivors(&task, pgid, kill_reason)?;
+                match self.terminate_terminal_survivors(&task, pgid, kill_reason) {
+                    Ok(outcome) => (kill_signaled, coverage_note) = outcome,
+                    Err(error) => deferred_error = Some(error),
+                }
             }
             KillSignalPlan::Piped {
                 pgid,
@@ -14206,12 +14158,17 @@ impl BgTaskRegistry {
                         terminal_status
                     };
 
-                    if let Err(error) = scope_result {
-                        // An unconfirmed scope stop must not schedule the same kill on each poll.
+                    let unconfirmed = verified_kill::unconfirmed_kill_reason(
+                        &scope_result,
+                        coverage_note.as_deref(),
+                    )
+                    .filter(|_| scope_result.is_err() || natural_exit_before_signal.is_none());
+                    if let Some(unconfirmed) = unconfirmed {
+                        // An unconfirmed stop must not schedule the same kill on each poll.
                         state.metadata.mark_terminal(
                             BgTaskStatus::FateUnknown,
                             None,
-                            Some(format!("Task outcome is unknown: {error}.")),
+                            Some(unconfirmed),
                         );
                     } else if let Some(marker) =
                         natural_exit_before_signal.filter(|_| !resource_kill)
@@ -14275,11 +14232,15 @@ impl BgTaskRegistry {
                     terminalized = true;
                 }
             }
-            KillSignalPlan::Pty { pid, master } => {
+            KillSignalPlan::Pty {
+                pid,
+                master,
+                evidence,
+            } => {
                 #[cfg(windows)]
                 log_bash_kill(task_id, pid, None, kill_reason);
                 if let Some(pid) = pid {
-                    coverage_note = self.signal_live_pty_kill(&task, pid);
+                    coverage_note = self.signal_live_pty_kill(&task, pid, evidence);
                 }
                 #[cfg(windows)]
                 {
@@ -14295,18 +14256,27 @@ impl BgTaskRegistry {
                 }
                 settle_killed_process_group(&task.task_id, pid.map(|pid| pid as i32));
                 close_pty_master(master);
+                let scope_result = self.kill_task_scope_with_reason(&task.task_id, kill_reason);
+                scope_kill_attempted = true;
                 terminalized = self.finish_pty_kill(
                     &task,
                     terminal_status,
                     reason,
                     resource_kill,
+                    verified_kill::unconfirmed_kill_reason(&scope_result, coverage_note.as_deref()),
                     &mut saves,
                 )?;
+                // Finalization waited for this kill's outcome; publish it now if
+                // the command has already exited.
+                #[cfg(unix)]
+                let _ = self.poll_task(&task);
             }
         }
 
         if !scope_kill_attempted {
-            self.kill_task_scope_with_reason(&task.task_id, kill_reason)?;
+            if let Err(error) = self.kill_task_scope_with_reason(&task.task_id, kill_reason) {
+                deferred_error.get_or_insert(error);
+            }
         }
         if terminalized {
             #[cfg(any(test, feature = "test-support"))]
@@ -14343,7 +14313,11 @@ impl BgTaskRegistry {
                 diagnostic_start.elapsed().as_millis()
             );
         }
-        Ok(snapshot)
+        // The completion is posted above even when a scope could not be ended.
+        match deferred_error {
+            Some(error) => Err(error.into()),
+            None => Ok(snapshot),
+        }
     }
 
     /// Check the process group of a task whose terminal state was published by
@@ -17976,6 +17950,7 @@ mod watch_scan;
 
 #[path = "verified_kill.rs"]
 mod verified_kill;
+use verified_kill::settle_killed_process_group;
 
 #[path = "pty_input_write.rs"]
 mod pty_input_write;

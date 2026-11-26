@@ -2029,3 +2029,202 @@ fn pty_task_runs_in_its_task_scope() {
         "PTY command was not launched in its scope: {launched}"
     );
 }
+
+/// Kernels before 5.14 have no `cgroup.kill`. A scoped kill then ends the
+/// scope's processes with SIGKILL through their pidfds, so a command that
+/// ignores SIGTERM is still stopped and the kill is confirmed.
+#[test]
+fn task_scope_kill_without_cgroup_kill_sigkills_each_process() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    r.inner.shutdown.store(true, Ordering::SeqCst);
+    let id = r
+        .spawn(
+            SpawnPlan::Unsandboxed,
+            "trap '' TERM; echo ready; exec sleep 300",
+            "no-cgroup-kill".into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.path().into(),
+            8,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    let task = r.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.stdout)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+    let members = super::super::process::live_process_group_members(pgid).unwrap();
+    let procs: String = members
+        .identities
+        .iter()
+        .map(|identity| format!("{}\n", identity.pid))
+        .collect();
+    // A scope with processes listed but no `cgroup.kill` file.
+    let cgroup = root.path().join("old-kernel-scope");
+    std::fs::create_dir(&cgroup).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(&id, cgroup));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let killed = super::super::task_scope::with_kill_events_for_test(events.clone(), || {
+        r.kill(&id, "no-cgroup-kill").unwrap()
+    });
+    let stopped = super::super::process::group_exited(pgid);
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    assert!(
+        stopped,
+        "the TERM-ignoring command survived the scoped kill"
+    );
+    assert_eq!(killed.info.status, BgTaskStatus::Killed);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["scope-term", "scope-kill", "scope-member-kill"]
+    );
+}
+
+/// When a PTY's scope cannot be ended, the kill still publishes the task's
+/// outcome (fate unknown) and posts its completion once, instead of
+/// returning an error before the completion. Without pidfds, the PTY's group
+/// is signalled instead of the scope's processes.
+#[test]
+fn pty_scope_kill_failure_still_posts_one_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    r.inner.shutdown.store(true, Ordering::SeqCst);
+    let id = r
+        .spawn_pty(
+            SpawnPlan::Unsandboxed,
+            "echo ready; sleep 60",
+            "pty-scope-failure".into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.path().into(),
+            8,
+            true,
+            false,
+            Some(root.path().into()),
+            24,
+            80,
+        )
+        .unwrap();
+    let task = r.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.pty)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+    // `cgroup.kill` cannot be written: it is a directory.
+    let cgroup = root.path().join("broken-scope");
+    std::fs::create_dir_all(cgroup.join("cgroup.kill")).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), format!("{pgid}\n")).unwrap();
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(&id, cgroup));
+    let killed = super::super::task_scope::with_pidfds_unavailable_for_test(|| {
+        r.kill(&id, "pty-scope-failure")
+    });
+    let stopped = super::super::process::group_exited(pgid);
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    assert!(killed.is_ok(), "{killed:?}");
+    assert!(stopped, "without pidfds the PTY's group was not signalled");
+    let mut status = None;
+    until(|| {
+        let snapshot = r.status(&id, "pty-scope-failure", None, None, 0).unwrap();
+        let terminal = snapshot.info.status.is_terminal();
+        status = Some(snapshot);
+        terminal
+    });
+    let status = status.unwrap();
+    assert_eq!(status.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(
+        status.info.status_reason.as_deref(),
+        Some(
+            format!("Task outcome is unknown: task scope aft-task-{id}.scope could not be killed.")
+                .as_str()
+        )
+    );
+    let completions = r
+        .pending_completions_for_session("pty-scope-failure")
+        .into_iter()
+        .filter(|completion| completion.task_id == id)
+        .count();
+    assert_eq!(completions, 1);
+}
+
+/// When `systemd-run` cannot create a PTY's scope, the command has not run;
+/// it starts again without a scope, exactly once, and the failed launcher's
+/// reaped pid is never signalled.
+#[test]
+fn pty_scope_launch_failure_retries_without_a_scope() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let launcher = root.path().join("systemd-run");
+    std::fs::write(
+        &launcher,
+        "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = -- ] && exit 1; done\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = BgTaskRegistry::default();
+    r.inner.task_scopes.set_launcher_for_test(launcher);
+    r.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    let (id, lines) = crate::logging::capture_log_lines(|| {
+        r.spawn_pty_with_shell_typed(
+            SpawnPlan::Unsandboxed,
+            "echo ran >> runs; sleep 60",
+            super::super::BashShell::Bash,
+            PathBuf::from("/bin/bash"),
+            "pty-scope-retry".into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.path().into(),
+            8,
+            false,
+            false,
+            Some(root.path().into()),
+            24,
+            80,
+            true,
+        )
+        .unwrap()
+    });
+    let task = r.task(&id).unwrap();
+    until(|| root.path().join("runs").exists());
+    let (runtime, pgid) = {
+        let state = task.lock_state().unwrap();
+        (
+            state.metadata.task_scope_runtime_ms,
+            state.metadata.pgid.unwrap(),
+        )
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let runs = std::fs::read_to_string(root.path().join("runs")).unwrap();
+    let _ = r.kill(&id, "pty-scope-retry");
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    assert_eq!(runtime, None, "the retried PTY still names a scope");
+    assert_eq!(runs, "ran\n");
+    assert!(
+        !lines.iter().any(|line| line.contains("pty_setup_failed")),
+        "the reaped launcher was signalled: {lines:?}"
+    );
+}

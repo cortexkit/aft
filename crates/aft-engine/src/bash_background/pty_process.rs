@@ -471,6 +471,42 @@ fn try_spawn_pty(
     };
     let child_pid = child.child.as_ref().unwrap().process_id();
     child.root = child_pid.and_then(crate::agent_commands::started);
+    // Placement comes first: a launcher that could not create the scope never
+    // ran the command, so nothing after it (the secret proxy included) has
+    // started when the caller retries without a scope.
+    #[cfg(target_os = "linux")]
+    if let Some((scope, memory_mib)) = scope {
+        let pid = child_pid.ok_or("task scope launch PID missing")?;
+        let root = child.root;
+        let reaped = std::cell::Cell::new(false);
+        let launcher = child
+            .child
+            .as_deref_mut()
+            .ok_or("task scope launch child missing")?;
+        let exited = || {
+            let exited = matches!(
+                crate::agent_commands::try_wait_pty(launcher, root),
+                Ok(Some(_))
+            );
+            reaped.set(exited);
+            exited
+        };
+        match registry.place_pty_task_scope(scope, pid, exited, memory_mib) {
+            Ok(monitor) => *memory_monitor = monitor,
+            Err(error) => {
+                if reaped.get() {
+                    // Its pid is free now: the cleanup guard must not signal it.
+                    child.child = None;
+                }
+                return Err(error);
+            }
+        }
+        if let Some(monitor) = memory_monitor.as_ref() {
+            publish_memory_policy(&monitor.policy)?;
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let _ = scope;
     #[cfg(unix)]
     if spawn_plan
         .prepared_task()
@@ -509,27 +545,6 @@ fn try_spawn_pty(
         monitor.attach(child_pid.ok_or("memory cap launch PID missing")?)?;
         publish_memory_policy(&monitor.policy)?;
     }
-    #[cfg(target_os = "linux")]
-    if let Some((scope, memory_mib)) = scope {
-        let pid = child_pid.ok_or("task scope launch PID missing")?;
-        let root = child.root;
-        let launcher = child
-            .child
-            .as_deref_mut()
-            .ok_or("task scope launch child missing")?;
-        let exited = || {
-            matches!(
-                crate::agent_commands::try_wait_pty(launcher, root),
-                Ok(Some(_))
-            )
-        };
-        *memory_monitor = registry.place_pty_task_scope(scope, pid, exited, memory_mib)?;
-        if let Some(monitor) = memory_monitor.as_ref() {
-            publish_memory_policy(&monitor.policy)?;
-        }
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    let _ = scope;
     let killer = child.child.as_ref().unwrap().clone_killer();
     #[cfg(test)]
     fail_pty_setup_for_test(child_pid)?;

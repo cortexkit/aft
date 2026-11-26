@@ -9,16 +9,21 @@ pub(super) fn kill(cgroup: &Path) -> io::Result<()> {
 }
 
 /// The processes in a cgroup and every cgroup below it, sorted. A cgroup that
-/// is gone, or cannot be read, lists none.
-fn member_pids(cgroup: &Path) -> Vec<u32> {
+/// is gone lists none; one whose listing cannot be read is an error.
+fn member_pids(cgroup: &Path) -> io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     let mut pending = vec![cgroup.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        if let Ok(text) = std::fs::read_to_string(directory.join("cgroup.procs")) {
-            pids.extend(
+        match std::fs::read_to_string(directory.join("cgroup.procs")) {
+            Ok(text) => pids.extend(
                 text.split_whitespace()
                     .filter_map(|pid| pid.parse::<u32>().ok()),
-            );
+            ),
+            // A cgroup removed while it was being listed has no processes.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && matches!(directory.try_exists(), Ok(false)) => {}
+            Err(error) => return Err(error),
         }
         for entry in std::fs::read_dir(&directory)
             .into_iter()
@@ -32,7 +37,7 @@ fn member_pids(cgroup: &Path) -> Vec<u32> {
     }
     pids.sort_unstable();
     pids.dedup();
-    pids
+    Ok(pids)
 }
 
 fn pidfd_open(pid: u32) -> Option<OwnedFd> {
@@ -41,42 +46,135 @@ fn pidfd_open(pid: u32) -> Option<OwnedFd> {
     (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
-/// SIGTERM every process in `cgroup`, then wait the termination grace period,
-/// ending early once the cgroup is empty. A listed pid can exit and be given
-/// to an unrelated process before it is signalled, so each is signalled
-/// through a pidfd, which names one process for good. A pid still listed after
-/// its pidfd was opened belongs to that pidfd's process, if that process is
-/// still alive when signalled; a dead one makes the signal fail harmlessly.
-pub(super) fn terminate_members(cgroup: &Path, mut reap: impl FnMut()) {
-    let opened: Vec<(u32, OwnedFd)> = member_pids(cgroup)
+#[cfg(test)]
+thread_local! {
+    static PIDFDS_UNAVAILABLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make this thread behave as if the kernel had no pidfds (before Linux 5.3).
+#[cfg(test)]
+pub(crate) fn with_pidfds_unavailable_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PIDFDS_UNAVAILABLE_FOR_TEST.with(|slot| slot.set(false));
+        }
+    }
+    PIDFDS_UNAVAILABLE_FOR_TEST.with(|slot| slot.set(true));
+    let _restore = Restore;
+    run()
+}
+
+/// Whether this kernel can open pidfds (Linux 5.3 and later).
+fn pidfds_supported() -> bool {
+    #[cfg(test)]
+    if PIDFDS_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| pidfd_open(std::process::id()).is_some())
+}
+
+/// Whether the process behind a pidfd has exited (zombies included).
+fn pidfd_exited(fd: &OwnedFd) -> bool {
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    (unsafe { libc::poll(&mut poll, 1, 0) }) > 0
+}
+
+/// Signal every listed process in `cgroup` that has not exited, and return
+/// the pidfds signalled; signal 0 only finds them. A listed pid can exit and
+/// be given to an unrelated process before it is signalled, so each is
+/// signalled through a pidfd, which names one process for good. A pid still
+/// listed after its pidfd was opened belongs to that pidfd's process, if that
+/// process is still alive when signalled; a dead one makes the signal fail
+/// harmlessly. An unreadable listing is an error.
+fn signal_members(cgroup: &Path, signal: i32) -> io::Result<Vec<OwnedFd>> {
+    let opened: Vec<(u32, OwnedFd)> = member_pids(cgroup)?
         .into_iter()
         .filter_map(|pid| pidfd_open(pid).map(|fd| (pid, fd)))
         .collect();
-    let still_listed = member_pids(cgroup);
-    for (pid, fd) in &opened {
-        if still_listed.binary_search(pid).is_ok() {
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    fd.as_raw_fd(),
-                    libc::SIGTERM,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0_u32,
-                );
+    let still_listed = member_pids(cgroup)?;
+    let mut signalled = Vec::new();
+    for (pid, fd) in opened {
+        if still_listed.binary_search(&pid).is_ok() && !pidfd_exited(&fd) {
+            if signal != 0 {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd.as_raw_fd(),
+                        signal,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0_u32,
+                    );
+                }
             }
+            signalled.push(fd);
         }
     }
-    drop(opened);
+    Ok(signalled)
+}
+
+/// SIGTERM every process in `cgroup`, then wait the termination grace period,
+/// ending early once none is left running. Returns false, having sent
+/// nothing, when this kernel has no pidfds; the caller then signals the
+/// process group instead.
+pub(super) fn terminate_members(cgroup: &Path, mut reap: impl FnMut()) -> bool {
+    if !pidfds_supported() {
+        return false;
+    }
+    if signal_members(cgroup, libc::SIGTERM).is_err() {
+        return true;
+    }
     let started = Instant::now();
     while started.elapsed() < super::super::process::TERMINATE_GRACE {
         reap();
-        if member_pids(cgroup).is_empty() {
-            return;
+        if signal_members(cgroup, 0).map_or(true, |live| live.is_empty()) {
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    true
 }
 
+/// SIGKILL every process in `cgroup` through pidfds, for a kernel without
+/// `cgroup.kill` (before Linux 5.14) or a `cgroup.kill` write that failed.
+/// Returns whether every process found has exited; false when the listing
+/// cannot be read or there are no pidfds. A process started after a listing
+/// is caught by the next round; a few rounds are tried.
+pub(super) fn kill_members(cgroup: &Path) -> bool {
+    if !pidfds_supported() {
+        return false;
+    }
+    for _ in 0..3 {
+        let Ok(signalled) = signal_members(cgroup, libc::SIGKILL) else {
+            return false;
+        };
+        if signalled.is_empty() {
+            return true;
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !signalled.iter().all(pidfd_exited) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    signal_members(cgroup, 0).is_ok_and(|live| live.is_empty())
+}
+
+/// Whether a process may still be running in `cgroup` or below it. An
+/// unreadable listing counts as possibly running.
+pub(super) fn has_members(cgroup: &Path) -> bool {
+    if pidfds_supported() {
+        return signal_members(cgroup, 0).map_or(true, |live| !live.is_empty());
+    }
+    member_pids(cgroup).map_or(true, |pids| !pids.is_empty())
+}
 fn open_kill_file(path: &Path) -> io::Result<File> {
     #[cfg(test)]
     if let Some(error) = OPEN_ERROR_FOR_TEST.with(|slot| slot.borrow_mut().take()) {

@@ -97,29 +97,38 @@ impl GroupEvidence {
         (count > 0).then(|| outside_group_note(count))
     }
 
+    /// Record who is in the group now, if the group is proven both before and
+    /// after the listing (only then does the listing describe the task's
+    /// group). A recorded member still in the group proves it later, even
+    /// after the leader is gone: a group number cannot be reused while the
+    /// group has members. Returns whether the group was proven.
+    #[cfg(unix)]
+    pub(super) fn remember_members(&mut self) -> bool {
+        if !self.proven() {
+            return false;
+        }
+        if let Ok(listing) = live_process_group_members(self.pgid) {
+            if !self.proven() {
+                return false;
+            }
+            self.identities.extend(listing.identities);
+        }
+        true
+    }
+
     /// TERM the group, wait the grace period, then KILL it, proving the group
     /// is the task's before each signal. Before TERM it also records who is in
     /// the group, so the KILL can still be proven after TERM ends the leader.
     /// Returns the note a kill reply should carry, if any.
     #[cfg(unix)]
     pub(super) fn terminate(&mut self) -> Option<String> {
-        let pgid = self.pgid;
         let mut first = true;
-        let outcome = super::super::process::terminate_proven_pgid(pgid, || {
-            if !self.proven() {
-                return false;
-            }
+        let outcome = super::super::process::terminate_proven_pgid(self.pgid, || {
             if std::mem::take(&mut first) {
-                if let Ok(listing) = live_process_group_members(pgid) {
-                    // The listing describes the task's group only if the group
-                    // is still proven after it was taken.
-                    if !self.proven() {
-                        return false;
-                    }
-                    self.identities.extend(listing.identities);
-                }
+                self.remember_members()
+            } else {
+                self.proven()
             }
-            true
         });
         self.coverage_note(outcome)
     }
@@ -187,12 +196,20 @@ pub(super) fn terminate_piped_task(
 }
 
 /// Signal a PTY task's process group, whose number is its session leader's
-/// pid. Returns the note a kill reply should carry, if any.
-pub(super) fn terminate_pty_task(metadata: &PersistedTask, pid: u32) -> Option<String> {
+/// pid. `evidence` is what was gathered before the leader was hung up, while
+/// it was known to be alive; without it the evidence is gathered now. Returns
+/// the note a kill reply should carry, if any.
+pub(super) fn terminate_pty_task(
+    metadata: &PersistedTask,
+    pid: u32,
+    #[cfg_attr(windows, allow(unused_variables))] evidence: Option<GroupEvidence>,
+) -> Option<String> {
     #[cfg(unix)]
     {
         let pgid = i32::try_from(pid).ok()?;
-        GroupEvidence::for_task(metadata, pgid, None).terminate()
+        evidence
+            .unwrap_or_else(|| GroupEvidence::for_task(metadata, pgid, None))
+            .terminate()
     }
     #[cfg(windows)]
     {
@@ -200,6 +217,70 @@ pub(super) fn terminate_pty_task(metadata: &PersistedTask, pid: u32) -> Option<S
         terminate_pid(pid);
         None
     }
+}
+
+/// SIGTERM the processes in a task's scope and wait the grace period; the
+/// caller then ends the scope with its kill switch. On a kernel without pidfds
+/// the scope's processes cannot be signalled one by one, so the task's process
+/// group is terminated instead, re-proven before each signal. Returns the note
+/// a kill reply should carry, if any.
+#[cfg(target_os = "linux")]
+fn terminate_scope_or_group(
+    scope: &super::super::task_scope::ScopeHandle,
+    group: impl FnOnce() -> Option<GroupEvidence>,
+    reap: impl FnMut(),
+) -> Option<String> {
+    if scope.terminate_members(reap) {
+        return None;
+    }
+    group()?.terminate()
+}
+
+/// Why a live kill's outcome is unknown, when it is: its scope could not be
+/// ended, or nothing could be sent while the command still had processes.
+pub(super) fn unconfirmed_kill_reason(
+    scope_result: &Result<(), String>,
+    note: Option<&str>,
+) -> Option<String> {
+    match scope_result {
+        Err(error) => Some(format!("Task outcome is unknown: {error}.")),
+        Ok(()) => note
+            .filter(|note| *note == NOTHING_SENT_NOTE)
+            .map(str::to_string),
+    }
+}
+
+/// Whether something still answers under the command's saved pid or process
+/// group, so that a kill AFT could not deliver may have left it running.
+fn command_may_still_run(metadata: &PersistedTask) -> bool {
+    let leader = metadata
+        .child_pid
+        .or_else(|| metadata.pgid.and_then(|pgid| u32::try_from(pgid).ok()));
+    if leader.is_some_and(is_process_alive) {
+        return true;
+    }
+    #[cfg(unix)]
+    if metadata
+        .pgid
+        .is_some_and(|pgid| !super::super::process::group_exited(pgid))
+    {
+        return true;
+    }
+    false
+}
+
+/// A restarted AFT's reason for a command it could not stop: nothing could
+/// be tied to it, so no signal was sent.
+fn undelivered_kill_reason(metadata: &PersistedTask, paths: &TaskPaths) -> String {
+    let output = match metadata.mode {
+        BgMode::Pipes => &paths.stdout,
+        BgMode::Pty => &paths.pty,
+    };
+    format!(
+        "task {}: daemon restarted and AFT could not deliver the kill; the command's processes may still be running, last output at {}",
+        metadata.task_id,
+        output.display()
+    )
 }
 
 /// What a restart may signal for a command whose kill or terminal was
@@ -295,8 +376,24 @@ impl BgTaskRegistry {
         let note = match self.replay_kill(metadata) {
             #[cfg(target_os = "linux")]
             ReplayKill::Scope(scope) => {
+                if !scope.has_members() {
+                    // The scope outlived its processes: the command had
+                    // already ended, with an outcome nobody observed.
+                    let reason = restart_fate_unknown_reason(metadata, paths);
+                    metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(reason));
+                    super::super::persistence::persist_terminal_exit(paths, metadata);
+                    return;
+                }
                 log_bash_kill(&metadata.task_id, metadata.child_pid, metadata.pgid, reason);
-                scope.terminate_members(|| {});
+                let note = terminate_scope_or_group(
+                    &scope,
+                    || {
+                        metadata
+                            .pgid
+                            .map(|pgid| GroupEvidence::for_task(metadata, pgid, None))
+                    },
+                    || {},
+                );
                 if let Err(error) = self.inner.task_scopes.kill_with_audit(
                     &metadata.task_id,
                     Some(scope.cgroup()),
@@ -309,7 +406,7 @@ impl BgTaskRegistry {
                     super::super::persistence::persist_terminal_exit(paths, metadata);
                     return;
                 }
-                None
+                note
             }
             #[cfg(target_os = "linux")]
             ReplayKill::ScopeUnconfirmed(error) => {
@@ -323,12 +420,12 @@ impl BgTaskRegistry {
                     BgMode::Pipes => {
                         terminate_piped_task(metadata, metadata.pgid, Some(pid), reason, None)
                     }
-                    BgMode::Pty => terminate_pty_task(metadata, pid),
+                    BgMode::Pty => terminate_pty_task(metadata, pid, None),
                 };
                 if note.as_deref() == Some(NOTHING_SENT_NOTE) {
                     // The process stopped matching between the check and the
                     // signal: nothing was sent.
-                    let reason = restart_fate_unknown_reason(metadata, paths);
+                    let reason = undelivered_kill_reason(metadata, paths);
                     metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(reason));
                     super::super::persistence::persist_terminal_exit(paths, metadata);
                     return;
@@ -337,7 +434,11 @@ impl BgTaskRegistry {
                 note
             }
             ReplayKill::Unverified => {
-                let reason = restart_fate_unknown_reason(metadata, paths);
+                let reason = if command_may_still_run(metadata) {
+                    undelivered_kill_reason(metadata, paths)
+                } else {
+                    restart_fate_unknown_reason(metadata, paths)
+                };
                 metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(reason));
                 super::super::persistence::persist_terminal_exit(paths, metadata);
                 return;
@@ -376,21 +477,20 @@ impl BgTaskRegistry {
             .clone();
         #[cfg(target_os = "linux")]
         let scoped = match self.kill_scope_handle(&metadata) {
-            Ok(Some(scope)) => {
-                scope.terminate_members(|| {});
-                true
-            }
-            _ => false,
+            Ok(Some(scope)) => Some(terminate_scope_or_group(
+                &scope,
+                || Some(GroupEvidence::for_task(&metadata, pgid, None)),
+                || {},
+            )),
+            _ => None,
         };
         #[cfg(not(target_os = "linux"))]
-        let scoped = false;
-        let note = if scoped {
-            None
-        } else {
-            GroupEvidence::for_task(&metadata, pgid, None).terminate()
-        };
+        let scoped: Option<Option<String>> = None;
+        let note =
+            scoped.unwrap_or_else(|| GroupEvidence::for_task(&metadata, pgid, None).terminate());
         let signalled = note.as_deref() != Some(NOTHING_SENT_NOTE);
-        self.kill_task_scope_with_reason(&task.task_id, reason)?;
+        // The scope's result is reported after the post-kill check is saved.
+        let scope_result = self.kill_task_scope_with_reason(&task.task_id, reason);
         settle_killed_process_group(&task.task_id, Some(pgid));
         let sample = live_process_group_members(pgid);
         let mut db = DeferredDbWrites::new(self, task);
@@ -401,6 +501,7 @@ impl BgTaskRegistry {
         record_group_check(&mut state.metadata, &sample);
         self.persist_task_locked(task, &state.metadata, &mut db)
             .map_err(|error| format!("failed to persist post-kill descendant sample: {error}"))?;
+        scope_result?;
         Ok((signalled, note))
     }
 
@@ -436,14 +537,19 @@ impl BgTaskRegistry {
         #[cfg(target_os = "linux")]
         if let Ok(Some(scope)) = self.kill_scope_handle(&metadata) {
             log_bash_kill(&task.task_id, child_pid, pgid, reason);
-            scope.terminate_members(|| {
-                if let Some(child) = child.as_deref_mut() {
-                    let _ = child.try_wait();
-                }
-            });
+            let owned_leader = child.as_ref().map(|child| child.id());
+            let note = terminate_scope_or_group(
+                &scope,
+                || pgid.map(|pgid| GroupEvidence::for_task(&metadata, pgid, owned_leader)),
+                || {
+                    if let Some(child) = child.as_deref_mut() {
+                        let _ = child.try_wait();
+                    }
+                },
+            );
             return (
                 self.kill_task_scope_with_reason(&task.task_id, reason),
-                None,
+                note,
             );
         }
         let note = terminate_piped_task(&metadata, pgid, child_pid, reason, child);
@@ -454,17 +560,32 @@ impl BgTaskRegistry {
     }
 
     /// Signal a live PTY task: through its Linux task scope when it has one,
-    /// otherwise its process group. Returns the note a kill reply should
-    /// carry, if any.
-    pub(super) fn signal_live_pty_kill(&self, task: &Arc<BgTask>, pid: u32) -> Option<String> {
+    /// otherwise its process group, using `evidence` gathered before the
+    /// leader was hung up. Returns the note a kill reply should carry, if any.
+    pub(super) fn signal_live_pty_kill(
+        &self,
+        task: &Arc<BgTask>,
+        pid: u32,
+        evidence: Option<GroupEvidence>,
+    ) -> Option<String> {
         let metadata = task.lock_state().ok()?.metadata.clone();
         #[cfg(target_os = "linux")]
         if let Ok(Some(scope)) = self.kill_scope_handle(&metadata) {
-            scope.terminate_members(|| {});
-            return None;
+            return terminate_scope_or_group(&scope, || evidence, || {});
         }
-        terminate_pty_task(&metadata, pid)
+        terminate_pty_task(&metadata, pid, evidence)
     }
+}
+
+/// The evidence a PTY kill needs, gathered under the task's state lock before
+/// its leader is hung up: the leader is then still running, so it proves the
+/// group, and the members listed then prove it after the leader is gone.
+#[cfg(unix)]
+pub(super) fn pty_evidence_before_hangup(metadata: &PersistedTask) -> Option<GroupEvidence> {
+    let pgid = metadata.pgid?;
+    let mut evidence = GroupEvidence::for_task(metadata, pgid, None);
+    evidence.remember_members();
+    Some(evidence)
 }
 
 /// Settle a PTY task that was running when AFT stopped and left no exit
@@ -478,6 +599,71 @@ pub(super) fn settle_unattached_pty(
 ) {
     registry.resume_replay_kill(metadata, paths, "pty_lost_on_bridge_restart");
 }
+
+// Sending a group signal and reaping its leader do not mean descendants have
+// exited yet. Settle the signalled group before sampling the kill completion,
+// but keep reporting real survivors when this bounded grace expires.
+#[cfg(unix)]
+const KILL_GROUP_SETTLEMENT_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+fn kill_settlement_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = KILL_SETTLEMENT_TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(unix)]
+pub(super) fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
+    let Some(pgid) = pgid else {
+        return;
+    };
+    let started = kill_settlement_now();
+    #[cfg(test)]
+    let diagnostic_started = Instant::now();
+    loop {
+        let exists = unsafe { libc::killpg(pgid, 0) } == 0;
+        if !exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
+        // Zombies cannot run or retain output pipes. An unreaped orphan may
+        // still make killpg(0) succeed, but is not a live descendant to report.
+        let listing = live_process_group_members(pgid);
+        #[cfg(test)]
+        KILL_SETTLEMENT_TEST_SAMPLES.with(|samples| {
+            if let Some(samples) = samples.borrow().as_ref() {
+                samples.lock().unwrap().record(
+                    pgid,
+                    format!(
+                        "real={:?}, settlement={:?}, exists={exists}, listing={listing:?}",
+                        diagnostic_started.elapsed(),
+                        kill_settlement_now().saturating_duration_since(started)
+                    ),
+                );
+            }
+        });
+        if listing.is_ok_and(|listing| listing.is_clean()) {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(notice) = KILL_SETTLEMENT_NOTICES
+            .get()
+            .and_then(|notices| notices.lock().unwrap().remove(task_id))
+        {
+            let _ = notice.send(());
+        }
+        let _ = task_id;
+        if kill_settlement_now().saturating_duration_since(started) >= KILL_GROUP_SETTLEMENT_GRACE {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(unix))]
+pub(super) fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
 
 #[cfg(test)]
 mod tests {
@@ -615,7 +801,9 @@ mod tests {
             assert!(persisted
                 .status_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("daemon restarted, process fate unknown")));
+                .is_some_and(|reason| reason.contains(
+                    "AFT could not deliver the kill; the command's processes may still be running"
+                )));
         }
     }
 
@@ -663,6 +851,52 @@ mod tests {
         assert!(stopped, "the scope's SIGTERM did not reach its process");
         let persisted = crate::bash_background::persistence::read_task(&paths.json).unwrap();
         assert_eq!(persisted.status, BgTaskStatus::Killed);
+    }
+
+    /// A scope whose folder still exists after its processes ended says the
+    /// command had already finished: nothing is killed and the outcome is
+    /// recorded the way an exited command's is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replay_into_an_empty_scope_records_the_command_as_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let (metadata, paths) =
+            replay_record(dir.path(), u32::MAX, BgMode::Pipes, BgTaskStatus::Killing);
+        crate::bash_background::persistence::write_task(&paths.json, &metadata).unwrap();
+        let cgroup = dir.path().join("scope");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), "").unwrap();
+        std::fs::write(cgroup.join("cgroup.kill"), "0").unwrap();
+        let registry = BgTaskRegistry::default();
+        registry
+            .inner
+            .task_scopes
+            .register(super::super::super::task_scope::handle_for_test(
+                &paths.task_id,
+                cgroup.clone(),
+            ));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        super::super::super::task_scope::with_kill_events_for_test(events.clone(), || {
+            registry
+                .rehydrate_resolved_task_with_process_probe(
+                    metadata,
+                    paths.clone(),
+                    "session",
+                    |_| false,
+                )
+                .unwrap()
+        });
+        let persisted = crate::bash_background::persistence::read_task(&paths.json).unwrap();
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "{:?}",
+            events.lock().unwrap()
+        );
+        assert_eq!(persisted.status, BgTaskStatus::FateUnknown);
+        assert_eq!(
+            persisted.status_reason,
+            Some(restart_fate_unknown_reason(&persisted, &paths))
+        );
     }
 
     /// A group number is checked again right before SIGKILL; a group no longer

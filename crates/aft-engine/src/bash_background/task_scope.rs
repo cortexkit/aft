@@ -8,7 +8,9 @@ pub(crate) use unsupported::*;
 mod scope_kill;
 
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use scope_kill::with_scope_kill_open_error_for_test;
+pub(crate) use scope_kill::{
+    with_pidfds_unavailable_for_test, with_scope_kill_open_error_for_test,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -169,9 +171,19 @@ mod linux {
         ) -> Result<(), String> {
             if let Some(handle) = self.resolve_handle(task_id, recorded)? {
                 super::super::registry::log_bash_kill(task_id, pid, pgid, reason);
-                handle
-                    .kill()
-                    .map_err(|_| format!("task scope {} could not be killed", handle.unit))?;
+                if handle.kill().is_err() {
+                    // Without `cgroup.kill` (before Linux 5.14), or when its
+                    // write fails, SIGKILL the scope's processes one by one.
+                    if !super::scope_kill::kill_members(&handle.cgroup) {
+                        return Err(format!("task scope {} could not be killed", handle.unit));
+                    }
+                    #[cfg(test)]
+                    KILL_EVENTS.with(|slot| {
+                        if let Some(events) = slot.borrow().as_ref() {
+                            events.lock().unwrap().push("scope-member-kill");
+                        }
+                    });
+                }
             }
             Ok(())
         }
@@ -1169,14 +1181,20 @@ mod linux {
         /// grace period, ending early once the scope is empty. `reap` runs on
         /// each check so a direct child that exits does not linger as a zombie.
         /// The caller ends the scope with [`Self::kill`] afterwards.
-        pub(crate) fn terminate_members(&self, reap: impl FnMut()) {
+        /// Returns false, having sent nothing, when this kernel has no pidfds.
+        pub(crate) fn terminate_members(&self, reap: impl FnMut()) -> bool {
+            let sent = super::scope_kill::terminate_members(&self.cgroup, reap);
             #[cfg(test)]
             KILL_EVENTS.with(|slot| {
-                if let Some(events) = slot.borrow().as_ref() {
+                if let (true, Some(events)) = (sent, slot.borrow().as_ref()) {
                     events.lock().unwrap().push("scope-term");
                 }
             });
-            super::scope_kill::terminate_members(&self.cgroup, reap);
+            sent
+        }
+        /// Whether any process is still in the scope.
+        pub(crate) fn has_members(&self) -> bool {
+            super::scope_kill::has_members(&self.cgroup)
         }
         pub(crate) fn stop(&self) -> Result<(), String> {
             stop_unit_with(&self.manager, &self.unit)

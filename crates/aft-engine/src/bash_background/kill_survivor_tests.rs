@@ -1394,3 +1394,86 @@ fn timeout_kill_reports_a_root_owned_survivor_through_sudo() {
         Some(summary.as_str())
     );
 }
+
+/// A PTY kill hangs up the leader first. The leader exits and its waiter
+/// reaps it right away, so the group must be proven before the hangup: a
+/// child that ignores SIGHUP is still stopped by the group kill.
+#[test]
+fn pty_kill_stops_a_child_that_ignores_the_hangup() {
+    for round in 0..3 {
+        let registry = registry();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn_pty(
+                SpawnPlan::Unsandboxed,
+                "/bin/sh -c \"(trap '' HUP; touch ready; exec sleep 300) & wait\"",
+                SESSION.to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+                24,
+                80,
+            )
+            .unwrap();
+        wait_for_file(&dir.path().join("ready"), "the command did not start");
+        let pgid = task_pgid(&registry, &task_id);
+        let _reap = ReapGroup(pgid);
+
+        let killed = registry.kill(&task_id, SESSION).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !crate::bash_background::process::group_exited(pgid) {
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: the hangup-ignoring child survived the kill: {:?}",
+                killed.kill_state_warning
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(killed.kill_state_warning, None, "round {round}");
+    }
+}
+
+/// A live kill that could send nothing while the command still had processes
+/// does not report a normal kill: the task ends fate unknown, and the reason
+/// reaches its status and its completion as well as the kill reply.
+#[test]
+fn live_kill_that_sent_nothing_records_fate_unknown() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(&registry, dir.path(), "touch ready; sleep 30");
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    let (kill_reached, release_kill) = install_kill_signal_gate_for_test(&task_id);
+    let killer = {
+        let registry = registry.clone();
+        let task_id = task_id.clone();
+        std::thread::spawn(move || registry.kill(&task_id, SESSION))
+    };
+    kill_reached.recv_timeout(Duration::from_secs(10)).unwrap();
+    // The wrapper dies and is reaped before any signal. Its shell and sleep
+    // remain in the group, but nothing recorded for the task proves it.
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+        libc::waitpid(pgid, std::ptr::null_mut(), 0);
+    }
+    release_kill.send(()).unwrap();
+    let killed = killer.join().unwrap().unwrap();
+    let survived = !crate::bash_background::process::group_exited(pgid);
+
+    let note = super::verified_kill::NOTHING_SENT_NOTE;
+    assert!(survived, "the kill was expected to send nothing");
+    assert_eq!(killed.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(killed.kill_state_warning.as_deref(), Some(note));
+    let status = registry.status(&task_id, SESSION, None, None, 0).unwrap();
+    assert_eq!(status.info.status_reason.as_deref(), Some(note));
+    let completion = completion_for(&registry, &task_id);
+    assert_eq!(completion.status, BgTaskStatus::FateUnknown);
+    assert_eq!(completion.status_reason.as_deref(), Some(note));
+}

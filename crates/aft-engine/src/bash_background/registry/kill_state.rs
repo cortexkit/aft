@@ -71,13 +71,16 @@ impl BgTaskRegistry {
     }
 
     /// Re-take the state lock after a PTY kill's signal and close the master.
-    /// Returns whether this call published the terminal state.
+    /// `unconfirmed` is why the kill's outcome is unknown, when it is; the
+    /// task then ends fate unknown with that reason. Returns whether this call
+    /// published the terminal state.
     pub(super) fn finish_pty_kill(
         &self,
         task: &Arc<BgTask>,
         terminal_status: BgTaskStatus,
         reason: Option<String>,
         resource_kill: bool,
+        unconfirmed: Option<String>,
         #[cfg_attr(not(windows), allow(unused_variables))] saves: &mut KillStateSave,
     ) -> Result<bool, String> {
         #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
@@ -87,6 +90,14 @@ impl BgTaskRegistry {
             .map_err(|_| "background task lock poisoned".to_string())?;
         state.kill_in_flight = false;
         task.kill_settled.notify_all();
+        // The waiter's exit marker is published after this, with this outcome.
+        #[cfg(not(windows))]
+        if let Some(unconfirmed) = unconfirmed.clone() {
+            if !state.metadata.status.is_terminal() {
+                state.pending_terminal_override = Some(BgTaskStatus::FateUnknown);
+                state.metadata.status_reason = Some(unconfirmed);
+            }
+        }
 
         // On Unix the PTY waiter writes the exit marker and the watchdog
         // publishes the terminal state from it. Windows ConPTY gives no such
@@ -105,6 +116,10 @@ impl BgTaskRegistry {
                 .pending_terminal_override
                 .take()
                 .unwrap_or(default_status);
+            let (target_status, reason) = match unconfirmed {
+                Some(unconfirmed) => (BgTaskStatus::FateUnknown, Some(unconfirmed)),
+                None => (target_status, reason),
+            };
             if !task.paths.exit.exists() {
                 saves.record(task, write_kill_marker_if_absent(&task.paths), false);
             }
