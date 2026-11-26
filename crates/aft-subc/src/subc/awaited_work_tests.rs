@@ -55,7 +55,7 @@ mod bash_background {
         PersistentCancelSignal, RouteChannel,
     };
     use serde_json::json;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
     use subc_protocol::{Flags, Principal, Priority, PROTOCOL_VERSION};
     use tokio::sync::{mpsc, Notify};
@@ -74,8 +74,8 @@ mod bash_background {
         allow_open: Notify,
         listed: parking_lot::Mutex<Vec<String>>,
         cancel_offline: AtomicBool,
-        cancel_refusals: AtomicUsize,
-        finish_failures: AtomicUsize,
+        cancel_refusal: AtomicBool,
+        finish_failure: AtomicBool,
     }
 
     fn vector(name: &str) -> Value {
@@ -147,12 +147,7 @@ mod bash_background {
                         }
                     }
                 }
-                Request::Finish(_)
-                    if self
-                        .finish_failures
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                        .is_ok() =>
-                {
+                Request::Finish(_) if self.finish_failure.swap(false, Ordering::SeqCst) => {
                     return Err(Failure::Unknown("finish reply lost".into()));
                 }
                 Request::Finish(finish) => (
@@ -167,12 +162,7 @@ mod bash_background {
                 Request::Cancel(_) if self.cancel_offline.load(Ordering::SeqCst) => {
                     return Err(Failure::Transport("cancel route down".into()))
                 }
-                Request::Cancel(_)
-                    if self
-                        .cancel_refusals
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                        .is_ok() =>
-                {
+                Request::Cancel(_) if self.cancel_refusal.swap(false, Ordering::SeqCst) => {
                     return Err(Failure::Refused("unknown_key".into()));
                 }
                 Request::Cancel(cancel) => {
@@ -200,8 +190,8 @@ mod bash_background {
             allow_open: Notify::new(),
             listed: listed.into(),
             cancel_offline: false.into(),
-            cancel_refusals: 0.into(),
-            finish_failures: 0.into(),
+            cancel_refusal: false.into(),
+            finish_failure: false.into(),
         });
         let service = Arc::new(Service::new("worker-provider-test"));
         *service.wire.write() = Some(fake.clone());
@@ -598,7 +588,7 @@ mod bash_background {
     async fn lost_awaited_open_reply_cancels_the_item_but_holds_the_shell_reply() {
         let f = Fixture::new();
         let (service, fake, mut calls) = fake(Answer::LostReply, Vec::new());
-        fake.cancel_refusals.store(1, Ordering::SeqCst);
+        fake.cancel_refusal.store(true, Ordering::SeqCst);
         let mut rx = f.start(Some(service.clone()), true);
         let (Request::Open(open), _) = call(&mut calls).await else {
             panic!("missing open")
@@ -808,7 +798,7 @@ mod bash_background {
     async fn awaited_finish_retries_after_its_registry_entry_is_dropped() {
         let f = Fixture::new();
         let (service, fake, mut calls) = fake(Answer::Open, Vec::new());
-        fake.finish_failures.store(1, Ordering::SeqCst);
+        fake.finish_failure.store(true, Ordering::SeqCst);
         let mut rx = f.start(Some(service.clone()), true);
         let (Request::Open(open), _) = call(&mut calls).await else {
             panic!("missing open")

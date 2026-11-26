@@ -733,7 +733,7 @@ async fn reconcile(
             .keys()
             .filter(|key| !unknown.contains(*key))
             .cloned()
-            .collect(),
+            .collect::<HashSet<_>>(),
     );
     for registry in registries {
         registry
