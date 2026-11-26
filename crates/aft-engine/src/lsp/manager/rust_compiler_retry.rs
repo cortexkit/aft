@@ -1,7 +1,8 @@
 use super::*;
 
 impl LspManager {
-    pub(crate) fn recheck_unproven_rust_file(&mut self, key: &ServerKey, file: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn recheck_unproven_rust_file(&mut self, key: &ServerKey, file: &Path) -> bool {
         let lookup = (key.clone(), normalize_lookup_path(file));
         let Some(hash) = self
             .documents

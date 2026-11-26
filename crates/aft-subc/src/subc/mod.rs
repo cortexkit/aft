@@ -14589,7 +14589,7 @@ pub(crate) mod test_support {
                 });
                 #[cfg(unix)]
                 let group_samples = ctx.as_ref().and_then(|ctx| {
-                    crate::bash_background::registry::root_reclaim_tests::reclaim_group_samples(
+                    aft_engine::test_bridge::bash_remote::bash_background::registry::root_reclaim_tests::reclaim_group_samples(
                         ctx.bash_background(),
                         root,
                     )

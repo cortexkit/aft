@@ -836,11 +836,8 @@ impl MeaningSnapshot {
     }
 
     /// Score only this file's members without disturbing the filtered-search cache.
-    pub(crate) fn best_file_score(
-        &self,
-        query: &[f32],
-        path: &Path,
-    ) -> Result<Option<f32>, DataError> {
+    #[doc(hidden)]
+    pub fn best_file_score(&self, query: &[f32], path: &Path) -> Result<Option<f32>, DataError> {
         let (Some(shared), Ok(relative)) = (&self.loaded.shared, path.strip_prefix(&self.root))
         else {
             return Ok(None);
