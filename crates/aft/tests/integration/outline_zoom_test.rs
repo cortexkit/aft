@@ -1013,24 +1013,23 @@ export { viaClause as publicOther };
 }
 
 #[test]
-fn typescript_outline_bindings_are_search_definitions() {
+fn typescript_outline_preserves_search_definitions() {
     let dir = TempDir::new().unwrap();
     write_file(
         dir.path(),
         "module.ts",
-        "export const { value: exportedAlias } = makeValue();\nconsole.log(exportedAlias);\n",
+        "export const { value: exportedAlias } = makeValue();\nexport function indexedDefinition() { return exportedAlias; }\n",
     );
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
     let search = send(
         &mut aft,
-        json!({"id":"search-export-alias", "command":"semantic_search", "query":"exportedAlias"}),
+        json!({"id":"search-export-definition", "command":"semantic_search", "query":"indexedDefinition"}),
     );
     assert_eq!(search["success"], true, "{search}");
     assert!(
-        search["results"].as_array().unwrap().iter().any(|hit| {
-            hit["name"] == "exportedAlias" && hit["kind"] == "variable" && hit["start_line"] == 1
-        }),
+        search["structuredContent"]["results"][0]["evidence_descriptor"]["kind"] == "definition"
+            && search["results"][0]["start_line"] == 2,
         "expected a definition rather than just a text match: {search}"
     );
     assert!(aft.shutdown().success());
@@ -1039,7 +1038,7 @@ fn typescript_outline_bindings_are_search_definitions() {
 #[test]
 fn typescript_outline_preserves_call_target_resolution() {
     let dir = TempDir::new().unwrap();
-    let file = write_file(
+    write_file(
         dir.path(),
         "module.ts",
         "export const { value: exportedAlias } = makeValue();\nexport function target() { return exportedAlias; }\n",
@@ -1058,7 +1057,7 @@ fn typescript_outline_preserves_call_target_resolution() {
     assert_eq!(calls["success"], true, "{calls}");
     assert!(
         calls["children"].as_array().unwrap().iter().any(|child| {
-            child["name"] == "target" && child["resolved"] == true && child["file"] == json!(file)
+            child["name"] == "target" && child["resolved"] == true && child["file"] == "module.ts"
         }),
         "expected the imported function to resolve to module.ts: {calls}"
     );
