@@ -286,6 +286,7 @@ async fn next_bash_reply(
         trust: BindTrust::FirstParty,
         tool_result_body: false,
         model_only: false,
+        codemode: false,
         output_scope: None,
     });
     reply.project_tool_result().unwrap();

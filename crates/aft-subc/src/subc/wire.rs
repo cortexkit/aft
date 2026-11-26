@@ -302,7 +302,7 @@ impl WriterFrame {
                         frame.header.corr,
                         frame.header.flags,
                         &result,
-                        policy.trust,
+                        policy.trust.into(),
                         MAX_FRAME_BODY_LEN as usize,
                     ) {
                         frame = rebuilt;
@@ -957,6 +957,23 @@ const TOOL_RESPONSE_ENVELOPE_MARGIN_DIVISOR: usize = 8;
 const RESPONSE_TOO_LARGE_CODE: &str = "response_too_large";
 const TRANSPORT_TRUNCATION_REASON: &str = "transport_frame_limit";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StructuredContent {
+    Omit,
+    Full,
+    // Programs can read matching data fields, such as `content` or `output`.
+    OmitDuplicateText,
+}
+
+impl From<BindTrust> for StructuredContent {
+    fn from(trust: BindTrust) -> Self {
+        match trust {
+            BindTrust::Untrusted => Self::Omit,
+            _ => Self::Full,
+        }
+    }
+}
+
 fn transport_limit_mib(bytes: usize) -> usize {
     bytes.div_ceil(TRANSPORT_MIB).max(1)
 }
@@ -996,18 +1013,19 @@ fn truncate_rendered_text(text: &str, limit: usize) -> Cow<'_, str> {
 #[cfg(test)]
 fn serialize_tool_response_body(
     result: &ToolCallResult,
-    include_structured: bool,
+    structured: StructuredContent,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    serialize_tool_response_body_with_text(result, include_structured, &result.text, false, false)
+    serialize_tool_response_body_with_text(result, structured, &result.text, false, false)
 }
 
 fn serialize_tool_response_body_with_text(
     result: &ToolCallResult,
-    include_structured: bool,
+    structured: StructuredContent,
     rendered_text: &str,
     transport_truncated: bool,
     tool_result_body: bool,
 ) -> Result<Vec<u8>, serde_json::Error> {
+    let include_structured = structured != StructuredContent::Omit;
     let data_capacity = result
         .response
         .data
@@ -1101,7 +1119,9 @@ fn serialize_tool_response_body_with_text(
             }),
         }
 
-        let mut has_text = false;
+        let omit_duplicate_text =
+            structured == StructuredContent::OmitDuplicateText && result.response.success;
+        let mut has_rendered_text = false;
         let mut has_complete = false;
         let mut has_truncated = false;
         let mut has_truncation_reason = false;
@@ -1109,7 +1129,7 @@ fn serialize_tool_response_body_with_text(
             for (key, value) in data {
                 match key.as_str() {
                     "id" | "success" => continue,
-                    "text" => has_text = true,
+                    "text" => has_rendered_text = true,
                     "complete" => has_complete = true,
                     "truncated" => has_truncated = true,
                     "truncation_reason" => has_truncation_reason = true,
@@ -1127,12 +1147,13 @@ fn serialize_tool_response_body_with_text(
                     }
                     _ if value.as_str() == Some(result.text.as_str()) => {
                         body.extend_from_within(encoded_text_start..encoded_text_end);
+                        has_rendered_text |= omit_duplicate_text;
                     }
                     _ => serde_json::to_writer(&mut body, value)?,
                 }
             }
         }
-        if !has_text {
+        if !has_rendered_text {
             body.extend_from_slice(b",\"text\":");
             body.extend_from_within(encoded_text_start..encoded_text_end);
         }
@@ -1212,7 +1233,7 @@ fn response_too_large_frame(
     flags: Flags,
     body_len: usize,
     max_body_len: usize,
-    include_structured: bool,
+    structured: StructuredContent,
     tool_result_body: bool,
     source: &Value,
 ) -> Frame {
@@ -1229,7 +1250,7 @@ fn response_too_large_frame(
     };
     let mut body = serialize_tool_response_body_with_text(
         &result,
-        include_structured,
+        structured,
         &result.text,
         false,
         tool_result_body,
@@ -1247,7 +1268,7 @@ fn response_too_large_frame(
         .data;
         body = serialize_tool_response_body_with_text(
             &minimal,
-            include_structured,
+            structured,
             &minimal.text,
             false,
             tool_result_body,
@@ -1304,7 +1325,11 @@ fn oversized_client_reply(
     let header = &frame.header;
     if header.ty == FrameType::Response {
         if let Ok(envelope) = serde_json::from_slice::<ToolEnvelope>(body) {
-            let include_structured = envelope.structured_content.is_some();
+            let structured = if envelope.structured_content.is_some() {
+                StructuredContent::Full
+            } else {
+                StructuredContent::Omit
+            };
             let source = envelope
                 .structured_content
                 .map(|data| {
@@ -1335,7 +1360,7 @@ fn oversized_client_reply(
                 header.flags,
                 body.len(),
                 CLIENT_REPLY_BODY_LIMIT,
-                include_structured,
+                structured,
                 tool_result_body || envelope.error_code.is_some(),
                 &source,
             ));
@@ -1368,6 +1393,7 @@ pub(super) struct ToolResponsePolicy {
     pub(super) trust: BindTrust,
     pub(super) tool_result_body: bool,
     pub(super) model_only: bool,
+    pub(super) codemode: bool,
     pub(super) output_scope: Option<Arc<crate::output_store::OutputScope>>,
 }
 
@@ -1387,12 +1413,23 @@ impl ToolResponsePolicy {
             trust: BindTrust::FirstParty,
             tool_result_body: true,
             model_only: false,
+            codemode: false,
             output_scope: None,
         }
     }
 
     fn include_structured(&self) -> bool {
         !matches!(self.trust, BindTrust::Untrusted) && !self.model_only
+    }
+
+    fn structured_content(&self) -> StructuredContent {
+        if !self.include_structured() {
+            StructuredContent::Omit
+        } else if self.codemode {
+            StructuredContent::OmitDuplicateText
+        } else {
+            StructuredContent::Full
+        }
     }
 
     /// Custody replies embed recorded results, not freshly serialized tool
@@ -1425,6 +1462,7 @@ impl From<BindTrust> for ToolResponsePolicy {
             trust,
             tool_result_body: false,
             model_only: false,
+            codemode: false,
             output_scope: None,
         }
     }
@@ -1444,6 +1482,7 @@ impl From<&super::RouteIdentity> for ToolResponsePolicy {
             // Programs read arbitrary fields. Only positively identified
             // ordinary calls lose structured data; flow and unknown modes keep it.
             model_only: Self::model_only_for_bind(principal, &identity.call_mode),
+            codemode: identity.call_mode == subc_protocol::call_mode::CallMode::Codemode,
             output_scope: identity.output_scope.get().cloned(),
         }
     }
@@ -1536,7 +1575,7 @@ pub(super) fn build_tool_response_frame_with_limit(
                     notices: Default::default(),
                 },
             };
-            crate::tool_output::cap_with_scope(scope, "tool", &capped.response, &mut capped.text);
+            aft_tools::tool_output::cap_with_scope(scope, "tool", &capped.response, &mut capped.text);
             &capped
         } else {
             result
@@ -1544,7 +1583,7 @@ pub(super) fn build_tool_response_frame_with_limit(
     } else {
         result
     };
-    let trust = policy.trust;
+    let legacy_structured = policy.trust.into();
     if !policy.tool_result_body {
         let legacy_limit = if policy.model_only {
             MAX_FRAME_BODY_LEN as usize
@@ -1552,14 +1591,29 @@ pub(super) fn build_tool_response_frame_with_limit(
             max_body_len
         };
         let frame =
-            build_legacy_tool_response_frame(ver, route, corr, flags, result, trust, legacy_limit)?;
+            build_legacy_tool_response_frame(ver, route, corr, flags, result, legacy_structured, legacy_limit)?;
         // The ledger retains the full legacy frame. Only the final writer sees
-        // the runner's projection, just as it does for tool-result/v1 replies.
-        let projection = policy
-            .model_only
-            .then(|| model_only_body(&frame.body))
-            .transpose()
-            .map_err(SubcError::Json)?;
+        // the receiving route's projection, just as for tool-result/v1 replies.
+        let projection = if policy.model_only {
+            Some(model_only_body(&frame.body).map_err(SubcError::Json)?)
+        } else if policy.structured_content() == StructuredContent::OmitDuplicateText
+            && result.response.success
+        {
+            Some(
+                build_legacy_tool_response_frame(
+                    ver,
+                    route,
+                    corr,
+                    flags,
+                    result,
+                    StructuredContent::OmitDuplicateText,
+                    max_body_len,
+                )?
+                .body,
+            )
+        } else {
+            None
+        };
         let mut outgoing = WriterFrame::plain(frame);
         outgoing.response_policy = Some(policy);
         outgoing.prepared_projection = projection.map(Arc::new);
@@ -1597,7 +1651,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         corr,
         flags,
         &source,
-        trust,
+        legacy_structured,
         MAX_FRAME_BODY_LEN as usize,
     )?;
     if let Some(parts) = source
@@ -1625,7 +1679,7 @@ fn build_legacy_tool_response_frame(
     corr: u64,
     flags: Flags,
     result: &ToolCallResult,
-    trust: BindTrust,
+    structured: StructuredContent,
     max_body_len: usize,
 ) -> Result<Frame, SubcError> {
     // `content`/`isError` is the MCP-native surface a GENERIC host reads. The
@@ -1643,14 +1697,14 @@ fn build_legacy_tool_response_frame(
     // MCP-spec-clean), and hosts like Claude Code prefer `structuredContent`
     // for model input when present — feeding the model a raw JSON dump with
     // the rendered text buried inside it, at a multiple of the token cost.
-    let include_structured = !matches!(trust, BindTrust::Untrusted);
+    let include_structured = structured != StructuredContent::Omit;
     let effective_max_body_len = max_body_len.min(MAX_FRAME_BODY_LEN as usize);
     let text_limit = tool_response_text_limit(effective_max_body_len, include_structured);
     let rendered_text = truncate_rendered_text(&result.text, text_limit);
     let transport_truncated = matches!(rendered_text, Cow::Owned(_));
     let body = serialize_tool_response_body_with_text(
         result,
-        include_structured,
+        structured,
         &rendered_text,
         transport_truncated,
         false,
@@ -1665,7 +1719,7 @@ fn build_legacy_tool_response_frame(
             flags,
             body.len(),
             effective_max_body_len,
-            include_structured,
+            structured,
             false,
             &result.response.data,
         ));
@@ -1783,15 +1837,10 @@ fn build_result_body_frame(
     policy: ToolResponsePolicy,
     max_body_len: usize,
 ) -> Result<(Frame, ToolCallResult), SubcError> {
-    let include_structured = policy.include_structured();
-    let mut body = serialize_tool_response_body_with_text(
-        &result,
-        include_structured,
-        &result.text,
-        false,
-        true,
-    )
-    .map_err(SubcError::Json)?;
+    let structured = policy.structured_content();
+    let mut body =
+        serialize_tool_response_body_with_text(&result, structured, &result.text, false, true)
+            .map_err(SubcError::Json)?;
     // The result contract is strictly below 3 MiB, independently of the transport cap.
     if body.len() >= super::result_body::MAX_RESULT_BYTES || body.len() > max_body_len {
         let mut response = super::result_body::too_large(
@@ -1811,14 +1860,9 @@ fn build_result_body_frame(
             text: response.data["message"].as_str().unwrap().into(),
             response,
         };
-        body = serialize_tool_response_body_with_text(
-            &result,
-            include_structured,
-            &result.text,
-            false,
-            true,
-        )
-        .map_err(SubcError::Json)?;
+        body =
+            serialize_tool_response_body_with_text(&result, structured, &result.text, false, true)
+                .map_err(SubcError::Json)?;
     }
     Frame::build_with_version(
         ver,
@@ -2386,6 +2430,84 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn codemode_read_and_shell_omit_only_the_appended_duplicate_text() {
+        use subc_protocol::call_mode::CallMode;
+        let codemode = result_route(Some("reserved:basal"), "opencode", CallMode::Codemode);
+        let mut legacy = result_route(Some("reserved:basal"), "opencode", CallMode::Codemode);
+        Arc::get_mut(&mut legacy.0).unwrap().tool_result_body = false;
+        let plugin = result_route(Some("reserved:aft"), "opencode", CallMode::Classic);
+        let runner = result_route(Some("reserved:broca"), "opencode", CallMode::Classic);
+        let mut untrusted = result_route(Some("reserved:basal"), "opencode", CallMode::Codemode);
+        Arc::get_mut(&mut untrusted.0).unwrap().trust = BindTrust::Untrusted;
+
+        let text = "line \"one\"\nline two\n";
+        for field in ["content", "output"] {
+            let result = ToolCallResult {
+                text: text.into(),
+                response: Response::success("plain-id", json!({ (field): text })),
+            };
+            let full_body = legacy_tool_response_body(&result, true);
+            for identity in [&codemode, &legacy] {
+                let mut outgoing = build_tool_response_frame(
+                    PROTOCOL_VERSION,
+                    route_key(7, 3),
+                    42,
+                    control_flags(),
+                    &result,
+                    identity,
+                )
+                .unwrap();
+                assert_eq!(
+                    outgoing.frame.body, full_body,
+                    "keep the body stored by the ledger"
+                );
+                outgoing.project_tool_result().unwrap();
+                let body: Value = serde_json::from_slice(&outgoing.frame.body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({
+                        "content": [{"type": "text", "text": text}],
+                        "isError": false,
+                        "structuredContent": {"id": "plain-id", "success": true, (field): text},
+                    })
+                );
+            }
+            assert_eq!(projected_result_body(&result, &plugin), full_body);
+            let model_only = legacy_tool_response_body(&result, false);
+            assert_eq!(projected_result_body(&result, &runner), model_only);
+            assert_eq!(projected_result_body(&result, &untrusted), model_only);
+        }
+    }
+
+    #[test]
+    fn codemode_read_with_a_footer_keeps_rendered_text() {
+        use subc_protocol::call_mode::CallMode;
+        let codemode = result_route(Some("reserved:basal"), "opencode", CallMode::Codemode);
+        let result = ToolCallResult {
+            text: "first line\n\n[more lines available]".into(),
+            response: Response::success("read-id", json!({ "content": "first line\n" })),
+        };
+        assert_eq!(
+            projected_result_body(&result, &codemode),
+            legacy_tool_response_body(&result, true),
+        );
+    }
+
+    #[test]
+    fn codemode_error_keeps_rendered_text_even_when_it_matches_the_message() {
+        use subc_protocol::call_mode::CallMode;
+        let codemode = result_route(Some("reserved:basal"), "opencode", CallMode::Codemode);
+        let result = ToolCallResult {
+            text: "file not found".into(),
+            response: Response::error("read-id", "not_found", "file not found"),
+        };
+        assert_eq!(
+            projected_result_body(&result, &codemode),
+            br#"{"content":[{"type":"text","text":"file not found"}],"isError":true,"errorCode":"not_found","structuredContent":{"id":"read-id","success":false,"code":"not_found","message":"file not found","text":"file not found"}}"#,
+        );
+    }
+
+    #[test]
     fn tool_output_cap_codemode_keeps_full_structured_content() {
         use subc_protocol::call_mode::CallMode;
         let storage = tempfile::tempdir().unwrap();
@@ -2577,6 +2699,7 @@ pub(super) mod tests {
                 trust: BindTrust::FirstParty,
                 tool_result_body: true,
                 model_only: false,
+                codemode: false,
                 output_scope: None,
             },
         ))
@@ -2594,6 +2717,7 @@ pub(super) mod tests {
                     trust: BindTrust::Untrusted,
                     tool_result_body: true,
                     model_only: false,
+                    codemode: false,
                     output_scope: None,
                 }
             ),
@@ -2713,8 +2837,11 @@ pub(super) mod tests {
                     let body = if legacy {
                         legacy_tool_response_body(std::hint::black_box(result), true)
                     } else {
-                        serialize_tool_response_body(std::hint::black_box(result), true)
-                            .expect("serialize optimized tool response envelope")
+                        serialize_tool_response_body(
+                            std::hint::black_box(result),
+                            StructuredContent::Full,
+                        )
+                        .expect("serialize optimized tool response envelope")
                     };
                     std::hint::black_box(body);
                 }
@@ -2746,7 +2873,7 @@ pub(super) mod tests {
             .collect();
         for result in &results {
             assert_eq!(
-                serialize_tool_response_body(result, true).unwrap(),
+                serialize_tool_response_body(result, StructuredContent::Full).unwrap(),
                 legacy_tool_response_body(result, true)
             );
         }
