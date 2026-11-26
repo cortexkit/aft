@@ -264,6 +264,55 @@ impl LspManager {
         }
     }
 
+    pub(super) fn handle_rust_progress(
+        &mut self,
+        root: PathBuf,
+        params: &serde_json::Value,
+        order: Option<u64>,
+    ) {
+        let token = match params.get("token") {
+            Some(serde_json::Value::String(token)) => token.clone(),
+            Some(serde_json::Value::Number(token)) => token.to_string(),
+            _ => return,
+        };
+        let Some(value) = params.get("value") else {
+            return;
+        };
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let title = value.get("title").and_then(serde_json::Value::as_str);
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root,
+        };
+        if let Some(client) = self.clients.get_mut(&key) {
+            if matches!(kind, "begin" | "end") {
+                slog_info!(
+                    "lsp_protocol server=rust root={} method=$/progress event={} token={} title={}",
+                    key.root.display(),
+                    kind,
+                    token,
+                    title.unwrap_or("-")
+                );
+            }
+            if client.record_rust_progress(&token, kind, title, order)
+                && value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| {
+                        let message = message.to_lowercase();
+                        message.contains("cancel") || message.contains("fail")
+                    })
+            {
+                if let Some(cache) = client.completed_rust_check.as_mut() {
+                    cache.abort();
+                }
+            }
+        }
+    }
+
     pub(super) fn apply_ingress_overflows(&mut self) -> Vec<ServerKey> {
         let overflows = self
             .event_tx
@@ -272,12 +321,13 @@ impl LspManager {
         let mut retired = Vec::new();
         for (key, overflow) in overflows {
             match overflow {
-                IngressOverflow::Dropped(progress) => {
+                IngressOverflow::Dropped { through, progress } => {
+                    let client = self.clients.get_mut(&key).unwrap();
                     if let Some(progress) = progress {
-                        self.clients
-                            .get_mut(&key)
-                            .unwrap()
+                        client
                             .recover_analysis_progress(progress, self.diagnostics.current_epoch());
+                    } else if key.kind == ServerKind::Rust {
+                        client.lose_flycheck_progress(through);
                     }
                     slog_warn!(
                         "discarded language server events for {key:?}: event queue overflow"

@@ -1353,9 +1353,13 @@ fn flycheck_overflow_leaves_no_running_or_completed_check_and_rearms() {
     assert!(!manager.rust_check_completed_current(&key));
 
     manager.event_tx.send(progress("end")).unwrap();
+    let file = key.root.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+    publish_for_progress(&manager, &key, 1, &file);
     manager.drain_events();
     assert_eq!(manager.rust_check_state(&key), RustCheckState::Unreported);
     assert!(!manager.rust_check_completed_current(&key));
+    assert!(!manager.has_authoritative_report_for_server(&key));
 
     manager.rearm_unreported_rust_check(&key);
     manager.rearm_unreported_rust_check(&key);

@@ -6262,7 +6262,7 @@ impl LspManager {
                 method,
                 params: Some(params),
             } if method == "$/progress" && *server_kind == ServerKind::Rust => {
-                self.handle_rust_progress(root.clone(), params);
+                self.handle_rust_progress(root.clone(), params, receipt.receive_order);
                 None
             }
             LspEvent::ServerExited {
@@ -6386,6 +6386,13 @@ impl LspManager {
         );
         let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
+        if self
+            .clients
+            .get(&key)
+            .is_some_and(LspClient::has_lost_flycheck)
+        {
+            return None;
+        }
         if self.discard_duplicate_closed_push(&key, &file, &stored, Instant::now()) {
             return None;
         }
@@ -6512,51 +6519,6 @@ impl LspManager {
             );
         }
         Some(file)
-    }
-
-    fn handle_rust_progress(&mut self, root: PathBuf, params: &serde_json::Value) {
-        let token = match params.get("token") {
-            Some(serde_json::Value::String(token)) => token.clone(),
-            Some(serde_json::Value::Number(token)) => token.to_string(),
-            _ => return,
-        };
-        let Some(value) = params.get("value") else {
-            return;
-        };
-        let kind = value
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let title = value.get("title").and_then(serde_json::Value::as_str);
-        let key = ServerKey {
-            kind: ServerKind::Rust,
-            root,
-        };
-        if let Some(client) = self.clients.get_mut(&key) {
-            if matches!(kind, "begin" | "end") {
-                slog_info!(
-                    "lsp_protocol server=rust root={} method=$/progress event={} token={} title={}",
-                    key.root.display(),
-                    kind,
-                    token,
-                    title.unwrap_or("-")
-                );
-            }
-            client.record_rust_progress(&token, kind, title);
-            if kind == "end"
-                && value
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|message| {
-                        message.to_lowercase().contains("cancel")
-                            || message.to_lowercase().contains("fail")
-                    })
-            {
-                if let Some(cache) = client.completed_rust_check.as_mut() {
-                    cache.abort();
-                }
-            }
-        }
     }
 
     /// Remember a document a scoped inspect closed (see

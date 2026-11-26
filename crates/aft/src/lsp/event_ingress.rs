@@ -28,7 +28,10 @@ struct Control {
 }
 
 pub(super) enum IngressOverflow {
-    Dropped(Option<AnalysisProgressShadow>),
+    Dropped {
+        through: u64,
+        progress: Option<AnalysisProgressShadow>,
+    },
     ProgressLimit,
 }
 
@@ -172,7 +175,10 @@ impl EventIngress {
                     if let Some(progress) = &control.progress {
                         control.last_dropped = control.last_dropped.max(progress.last_transition);
                     }
-                    IngressOverflow::Dropped(control.progress.clone())
+                    IngressOverflow::Dropped {
+                        through: control.last_dropped,
+                        progress: control.progress.clone(),
+                    }
                 };
                 Some((control.key.clone(), overflow))
             })

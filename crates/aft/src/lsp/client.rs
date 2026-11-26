@@ -1089,6 +1089,9 @@ pub struct LspClient {
     /// the diagnostics store only when such a run finishes, so while one is
     /// running the published Rust diagnostics are missing those errors.
     rust_flycheck_running: HashMap<String, u64>,
+    /// The server event queue overflowed, so the last check cannot prove its
+    /// results. Only a new BEGIN can associate later pushes with another run.
+    rust_flycheck_lost: bool,
     /// Begin ordinal of the latest completed check. A matching begin/end is
     /// evidence even when a clean compiler run publishes no diagnostic rows.
     rust_completed_check_begin: Option<u64>,
@@ -1109,14 +1112,11 @@ pub struct LspClient {
     /// drained. Events wait in the channel until a caller drains them, so a
     /// begin drained after a save was sent may have been sent by the server
     /// before the save, for a run of the files before the edit; comparing
-    /// this count, taken when the save is sent, with
-    /// `rust_check_begins_drained` tells the two apart.
+    /// this count, taken when the save is sent, with the received BEGIN's
+    /// ordinal tells the two apart.
     rust_check_begins_read: Arc<AtomicU64>,
-    rust_check_begin_times: Arc<Mutex<HashMap<u64, SystemTime>>>,
+    rust_check_begin_receipts: Arc<Mutex<HashMap<u64, (u64, SystemTime)>>>,
     pub(crate) completed_rust_check: Option<super::completed_rust_check::CompletedRustCheck>,
-    /// How many check-run begin notifications have been drained (see
-    /// [`LspClient::record_rust_progress`]).
-    rust_check_begins_drained: u64,
     /// How the server asked to hear about saves (`textDocumentSync.save` in
     /// its initialize response). `None` until `initialize` succeeds, and when
     /// the server did not ask.
@@ -1361,8 +1361,8 @@ impl LspClient {
         let reader_root = root.clone();
         let rust_check_begins_read = Arc::new(AtomicU64::new(0));
         let reader_check_begins = Arc::clone(&rust_check_begins_read);
-        let rust_check_begin_times = Arc::new(Mutex::new(HashMap::new()));
-        let reader_check_begin_times = Arc::clone(&rust_check_begin_times);
+        let rust_check_begin_receipts = Arc::new(Mutex::new(HashMap::new()));
+        let reader_check_begin_receipts = Arc::clone(&rust_check_begin_receipts);
 
         let event_ingress = match &event_tx {
             LspEventSender::Managed { sender, instance } => Some(sender.register(
@@ -1400,8 +1400,8 @@ impl LspClient {
                         let receive_order = reader_writer.note_received();
                         if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
                             let ordinal = reader_check_begins.fetch_add(1, Ordering::SeqCst) + 1;
-                            if let Ok(mut times) = reader_check_begin_times.lock() {
-                                times.insert(ordinal, SystemTime::now());
+                            if let Ok(mut receipts) = reader_check_begin_receipts.lock() {
+                                receipts.insert(receive_order, (ordinal, SystemTime::now()));
                             }
                         }
                         let _ = event_tx.send_ordered(
@@ -1520,15 +1520,15 @@ impl LspClient {
             rust_analyzer_warning: None,
             rust_workspace_check_owed_since: None,
             rust_flycheck_running: HashMap::new(),
+            rust_flycheck_lost: false,
             rust_completed_check_begin: None,
             rust_check_begins_at_load: 0,
             rust_flycheck_finished_at: None,
             rust_flycheck_started_at: None,
             rust_save: None,
             rust_check_begins_read,
-            rust_check_begin_times,
+            rust_check_begin_receipts,
             completed_rust_check: None,
-            rust_check_begins_drained: 0,
             save_notification: None,
             rust_checks_on_save: false,
             rust_checks_on_load: false,
@@ -2069,25 +2069,37 @@ impl LspClient {
     /// Record one rust-analyzer `$/progress` notification. Only check runs
     /// are tracked: rust-analyzer names their token `rust-analyzer/flycheck/N`
     /// and titles them with the check command (`cargo check`, `cargo clippy`).
-    pub(crate) fn record_rust_progress(&mut self, token: &str, kind: &str, title: Option<&str>) {
+    /// Returns true only when an END matches a tracked run.
+    pub(super) fn record_rust_progress(
+        &mut self,
+        token: &str,
+        kind: &str,
+        title: Option<&str>,
+        order: Option<u64>,
+    ) -> bool {
         if !matches!(&self.kind, ServerKind::Rust) {
-            return;
+            return false;
         }
         match kind {
             "begin" => {
                 if is_rust_check_progress(token, title) {
-                    self.rust_check_begins_drained += 1;
-                    let ordinal = self.rust_check_begins_drained;
-                    let began = self
-                        .rust_check_begin_times
-                        .lock()
-                        .ok()
-                        .and_then(|mut times| times.remove(&ordinal));
-                    if let Some(cache) = self.completed_rust_check.as_mut() {
-                        if let Some(began) = began {
+                    let ordinal = if let Some(order) = order {
+                        let Some((ordinal, began)) = self
+                            .rust_check_begin_receipts
+                            .lock()
+                            .ok()
+                            .and_then(|mut receipts| receipts.remove(&order))
+                        else {
+                            return false;
+                        };
+                        if let Some(cache) = self.completed_rust_check.as_mut() {
                             cache.begin(began);
                         }
-                    }
+                        ordinal
+                    } else {
+                        self.rust_check_begins_read.load(Ordering::Acquire)
+                    };
+                    self.rust_flycheck_lost = false;
                     self.rust_flycheck_running
                         .insert(token.to_string(), ordinal);
                     self.rust_flycheck_started_at = Some(Instant::now());
@@ -2126,10 +2138,38 @@ impl LspClient {
                         self.rust_completed_check_begin
                             .map_or(begin, |previous| previous.max(begin)),
                     );
+                    return true;
                 }
             }
             _ => {}
         }
+        false
+    }
+
+    pub(super) fn lose_flycheck_progress(&mut self, through: u64) {
+        // Keep BEGIN receipts newer than the overflow's last discarded event.
+        // Their ordinals still have to match the notifications in the queue.
+        let mut lost =
+            !self.rust_flycheck_running.is_empty() || self.rust_completed_check_begin.is_some();
+        if let Ok(mut receipts) = self.rust_check_begin_receipts.lock() {
+            receipts.retain(|&order, _| {
+                lost |= order <= through;
+                order > through
+            });
+        }
+        if lost {
+            self.rust_flycheck_running.clear();
+            self.rust_completed_check_begin = None;
+            self.rust_flycheck_started_at = None;
+            self.rust_flycheck_finished_at = None;
+            self.rust_save = None;
+            self.rust_workspace_check_owed_since = None;
+            self.rust_flycheck_lost = true;
+        }
+    }
+
+    pub(super) fn has_lost_flycheck(&self) -> bool {
+        self.rust_flycheck_lost
     }
 
     /// How this server wants to be told that a document was saved, or `None`
@@ -2287,6 +2327,7 @@ impl LspClient {
             Some(finished) if now.saturating_duration_since(finished) < publish_settle => {
                 RustCheckState::Running
             }
+            _ if self.rust_flycheck_lost => RustCheckState::Unreported,
             _ => RustCheckState::Current,
         }
     }
@@ -3941,12 +3982,17 @@ with open(sys.argv[1], 'w') as output:
             RustCheckState::Current
         );
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
-        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None);
+        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None, None);
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         client.rust_check_begins_read.store(1, Ordering::SeqCst);
-        client.record_rust_progress("rust-analyzer/flycheck/0", "begin", Some("cargo check"));
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/0",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
-        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None);
+        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None, None);
         assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::from_secs(1)));
 
@@ -3955,12 +4001,22 @@ with open(sys.argv[1], 'w') as output:
         let uri = "file:///test/lib.rs".parse().unwrap();
         client.rust_check_begins_read.store(2, Ordering::SeqCst);
         client.record_save_sent(&uri);
-        client.record_rust_progress("rust-analyzer/flycheck/1", "begin", Some("cargo check"));
-        client.record_rust_progress("rust-analyzer/flycheck/1", "end", None);
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/1",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
+        client.record_rust_progress("rust-analyzer/flycheck/1", "end", None, None);
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         client.rust_check_begins_read.store(3, Ordering::SeqCst);
-        client.record_rust_progress("rust-analyzer/flycheck/2", "begin", Some("cargo check"));
-        client.record_rust_progress("rust-analyzer/flycheck/2", "end", None);
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/2",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
+        client.record_rust_progress("rust-analyzer/flycheck/2", "end", None, None);
         assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
 
         // Reloading the workspace requires a check begun after the reload;
@@ -3968,16 +4024,26 @@ with open(sys.argv[1], 'w') as output:
         client.rust_check_begins_read.store(4, Ordering::SeqCst);
         let previous = client.begin_rust_workspace_reload(SystemTime::now());
         client.set_rust_analyzer_quiescent(true);
-        client.record_rust_progress("rust-analyzer/flycheck/3", "begin", Some("cargo check"));
-        client.record_rust_progress("rust-analyzer/flycheck/3", "end", None);
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/3",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
+        client.record_rust_progress("rust-analyzer/flycheck/3", "end", None, None);
         assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         client.restore_rust_workspace_state(previous);
         assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
         client.begin_rust_workspace_reload(SystemTime::now());
         client.set_rust_analyzer_quiescent(true);
         client.rust_check_begins_read.store(5, Ordering::SeqCst);
-        client.record_rust_progress("rust-analyzer/flycheck/4", "begin", Some("cargo check"));
-        client.record_rust_progress("rust-analyzer/flycheck/4", "end", None);
+        client.record_rust_progress(
+            "rust-analyzer/flycheck/4",
+            "begin",
+            Some("cargo check"),
+            None,
+        );
+        client.record_rust_progress("rust-analyzer/flycheck/4", "end", None, None);
         assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
     }
 
