@@ -420,11 +420,15 @@ mod bash_background {
         no_more(&mut calls).await;
     }
 
-    #[tokio::test]
-    async fn tool_provider_restart_sync_excludes_unknown_and_finishes_reattached_task() {
+    async fn restart(cancel: bool) {
         let f = Fixture::new();
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        if cancel {
+            // There is no transport yet; the reply wins and saves its
+            // decision, but only the next instance can send it.
+            read_watch(&f, &key);
+        }
         let restarted = Arc::new(AppContext::from_app(
             App::default_shared(),
             Config {
@@ -447,9 +451,22 @@ mod bash_background {
         assert!(
             matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [key.clone()])
         );
-        assert!(
-            matches!(call(&mut calls).await, (Request::Finish(finish), None) if finish.key == key)
-        );
+        let result = call(&mut calls).await;
+        if cancel {
+            assert!(matches!(result, (Request::Cancel(cancel), None) if cancel.key == key));
+        } else {
+            assert!(matches!(result, (Request::Finish(finish), None) if finish.key == key));
+        }
         no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn tool_provider_restart_sync_excludes_unknown_and_finishes_reattached_task() {
+        restart(false).await;
+    }
+
+    #[tokio::test]
+    async fn tool_provider_restart_replays_the_persisted_cancel_decision() {
+        restart(true).await;
     }
 }

@@ -20,7 +20,7 @@ impl BgTaskRegistry {
         metadata.started_at = unix_millis().saturating_sub(1000);
         metadata.awaited_work = Some(State::Open);
         metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
-        self.persist_task(&paths, &metadata).unwrap();
+        super::super::super::persistence::write_task_at(&layout, &metadata).unwrap();
         self.insert_rehydrated_task(metadata, paths, true).unwrap();
         key.into()
     }
