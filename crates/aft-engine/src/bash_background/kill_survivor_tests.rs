@@ -895,6 +895,43 @@ fn bash_kill_signals_a_finished_group_whose_recorded_leader_still_runs() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// A process the task recorded has left the group it was killed through. The
+/// group kill cannot reach it, so the kill reply says how many such processes
+/// AFT still sees.
+#[test]
+fn bash_kill_names_recorded_processes_running_outside_the_killed_group() {
+    let registry = registry();
+    let storage = tempfile::tempdir().unwrap();
+    let mut leader = spawn_group_leader("exec sleep 30");
+    let pgid = leader.id() as i32;
+    let _reap = ReapGroup(pgid);
+    let mut escaped = spawn_group_leader("exec sleep 30");
+    let _reap_escaped = ReapGroup(escaped.id() as i32);
+    let started = ProcessIdentity::of(leader.id()).unwrap().started_at_ms;
+    let recorded = ProcessIdentity::of(escaped.id()).unwrap();
+    let task_id = finished_task_on_group(
+        &registry,
+        storage.path(),
+        pgid,
+        Some(started),
+        vec![recorded],
+    );
+
+    let killed = registry.kill(&task_id, SESSION).unwrap();
+    let escaped_running = escaped.try_wait().unwrap().is_none();
+    let _ = escaped.kill();
+    let _ = escaped.wait();
+    let _ = leader.wait();
+
+    assert!(killed.kill_signaled);
+    assert!(escaped_running, "the group kill reached another group");
+    assert_eq!(
+        killed.kill_state_warning.as_deref(),
+        Some("The kill reached only the command's original process group; AFT still sees 1 process it recorded for this command running outside that group.")
+    );
+}
+
 /// More survivors than the 16 the task shows. Once the shown ones have
 /// exited, a member that was only counted ("+N more") is the one still
 /// running in the group, and `bash_kill` must still recognise the group as the
