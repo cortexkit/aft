@@ -1,5 +1,5 @@
 use std::io::{self, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{path_error_response, AppContext, WorkerSearchTool};
 use crate::access_policy::{self, AccessGrant, AccessOperation, AskRoute, GrantKind};
