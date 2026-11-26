@@ -268,10 +268,13 @@ pub enum Script {
     /// past seq 0, so empty output stands in for the seqs before it. An
     /// attach replays the vector's records from the requested seq.
     ReturnVector(&'static str),
-    /// Like `ReturnVector`, but the terminal record reports these
-    /// checkout-relative paths as changed, as ck-motor's Linux runner does
-    /// (its list includes untracked files; it sends no separate list).
-    ReturnVectorReporting(&'static str, &'static [&'static str]),
+    /// Like `ReturnVector`, but the manifest echoes different workdir-relative
+    /// paths and the terminal record lists changes relative to the checkout.
+    ReturnVectorReporting {
+        vector: &'static str,
+        paths: &'static [&'static str],
+        changed: &'static [&'static str],
+    },
     /// Refuse the run with ck-motor's pinned final refusal for return_paths
     /// on a runner that does not copy files back.
     ReturnPathsUnsupported,
@@ -498,9 +501,9 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                             }
                             replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
                         }
-                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..) | Script::GatedReturnVector(_) | Script::MotorExpiredReplay) => {
+                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting { .. } | Script::GatedReturnVector(_) | Script::MotorExpiredReplay) => {
                             let records = match script {
-                                Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _) | Script::GatedReturnVector(name) => super::return_vector_fixture::return_vector_records(name),
+                                Script::ReturnVector(name) | Script::ReturnVectorReporting { vector: name, .. } | Script::GatedReturnVector(name) => super::return_vector_fixture::return_vector_records(name),
                                 _ => super::return_vector_fixture::motor_expired_replay(4, None),
                             };
                             if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
@@ -524,8 +527,19 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(Vec::new())))).unwrap()));
                             }
                             for mut record in records {
-                                if let (Script::ReturnVectorReporting(_, reported), StreamRecord::Terminal(terminal)) = (script, &mut record) {
-                                    terminal.workspace_changes = Some(reported.iter().map(|path| path.to_string()).collect());
+                                if let Script::ReturnVectorReporting { paths, changed, .. } = script {
+                                    match &mut record {
+                                        StreamRecord::ReturnManifest(manifest) => {
+                                            assert_eq!(manifest.files.len(), paths.len());
+                                            for (file, path) in manifest.files.iter_mut().zip(paths) {
+                                                file.path = (*path).into();
+                                            }
+                                        }
+                                        StreamRecord::Terminal(terminal) => {
+                                            terminal.workspace_changes = Some(changed.iter().map(|path| path.to_string()).collect());
+                                        }
+                                        _ => {}
+                                    }
                                 }
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
                             }
