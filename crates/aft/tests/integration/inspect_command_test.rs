@@ -7191,14 +7191,13 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     };
     let ctx = new_context();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    let warm = loop {
+    loop {
         let warm = scoped_diagnostics_inspect(&ctx, "saved-warm", "src");
         if warm["summary"]["diagnostics"]["errors"] == 0 {
-            break warm;
+            break;
         }
         assert!(std::time::Instant::now() < deadline, "{warm:#}");
-    };
-    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+    }
     // Inspect certifies the live result before its detached cache writer finishes.
     // A restart can restore only the record whose atomic write has completed.
     let record = wait_for_completed_rust_check(&storage, 0, || {}).unwrap();
@@ -7273,16 +7272,17 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         }
         assert!(std::time::Instant::now() < deadline, "{response:#}");
     };
-    let error_record = wait_for_completed_rust_check(
-        &storage,
-        errors["summary"]["diagnostics"]["errors"].as_u64().unwrap(),
-        || {},
-    )
-    .unwrap();
-    println!(
-        "real restart: saved errors {}",
-        fs::read_to_string(error_record).unwrap()
-    );
+    let expected_errors = errors["summary"]["diagnostics"]["errors"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // This context has no daemon maintenance loop to drain the remaining Rust check events.
+    while completed_rust_check_record(&storage, expected_errors).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "no completed Rust check with {expected_errors} errors was persisted: {errors:#}"
+        );
+        aft::runtime_drain::drain_lsp_events(&ctx);
+        thread::sleep(Duration::from_millis(50));
+    }
     drop(ctx);
     let ctx = new_context();
     let started = std::time::Instant::now();
@@ -7300,8 +7300,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         "{restored_errors:#}"
     );
     assert_eq!(
-        restored_errors["summary"]["diagnostics"]["errors"],
-        errors["summary"]["diagnostics"]["errors"],
+        restored_errors["summary"]["diagnostics"]["errors"], expected_errors,
         "{restored_errors:#}"
     );
     assert!(restored_elapsed < std::time::Duration::from_secs(5));
