@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   aftLiveConfigKeys,
+  aftLiveSecurityKeys,
   applyLiveConfigKeys,
   CONFIG_LIVE_KEEP_NOTE,
   type LiveConfigLoad,
@@ -30,7 +31,7 @@ import {
 type TestConfig = {
   remote_exec?: { enabled?: boolean; project_off?: boolean; default_demand?: string };
   durability?: { macos_full_sync?: boolean };
-  lsp?: { idle_minutes?: number | "never"; max_servers?: number };
+  lsp?: { idle_minutes?: number | "never"; max_servers?: number; worker_rust_analyzers?: number };
   restrict_to_project_root?: boolean;
   disabled_tools?: string[];
   bash?: boolean | Record<string, unknown>;
@@ -114,6 +115,20 @@ describe("applyLiveConfigKeys", () => {
     expect(result.deferred).toEqual([]);
     expect(result.config).toEqual(next);
     expect(current.lsp?.idle_minutes).toBe(60);
+  });
+  test("worker rust-analyzer limit applies live and project reload can only tighten", () => {
+    const current: TestConfig = { lsp: { worker_rust_analyzers: 2 } };
+    const next: TestConfig = { lsp: { worker_rust_analyzers: 0 } };
+    const result = applyLiveConfigKeys(current, next, KEYS);
+    expect(result.applied).toEqual(["lsp.worker_rust_analyzers"]);
+    expect(result.config.lsp?.worker_rust_analyzers).toBe(0);
+
+    const rule = aftLiveSecurityKeys(KEYS).find(
+      (entry) => entry.key.name === "lsp.worker_rust_analyzers",
+    );
+    expect(rule?.loosens(0, undefined)).toBe(true);
+    expect(rule?.loosens(undefined, 3)).toBe(true);
+    expect(rule?.loosens(undefined, 0)).toBe(false);
   });
   test("applies a live key and defers the rest", () => {
     const current: TestConfig = { restrict_to_project_root: false, disabled_tools: [] };
