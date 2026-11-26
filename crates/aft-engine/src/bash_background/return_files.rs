@@ -170,19 +170,32 @@ pub fn check_requested_paths(
             return Err(format!("return_paths path {shown} must not use .."));
         }
         let has_parent = parsed.components().any(|part| part == Component::ParentDir);
-        if has_parent && !lexical_normalize(&workdir.join(parsed)).starts_with(root) {
-            return Err(format!("return_paths path {shown} must not use .."));
-        }
+        let normalized = if has_parent {
+            let relative = lexical_normalize(parsed);
+            let mut base = workdir.to_path_buf();
+            // Pop leading parents explicitly: normalizing an absolute join
+            // would silently discard steps above the filesystem root.
+            let mut suffix = relative.as_path();
+            while let Ok(rest) = suffix.strip_prefix("..") {
+                if !base.pop() {
+                    return Err(format!("return_paths path {shown} must not use .."));
+                }
+                suffix = rest;
+            }
+            if !base.join(suffix).starts_with(root) {
+                return Err(format!("return_paths path {shown} must not use .."));
+            }
+            Some(relative)
+        } else {
+            None
+        };
         if path.ends_with(['/', '\\']) || parsed.file_name().is_none() {
             return Err(format!(
                 "return_paths path {shown} names a directory; list the files to copy back"
             ));
         }
-        let path = if has_parent {
-            lexical_normalize(parsed).to_string_lossy().into_owned()
-        } else {
-            path.clone()
-        };
+        let path =
+            normalized.map_or_else(|| path.clone(), |path| path.to_string_lossy().into_owned());
         if checked.contains(&path) {
             return Err(format!("return_paths lists {shown} twice"));
         }

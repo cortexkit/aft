@@ -41,14 +41,14 @@ fn requested_paths_are_relative_files_listed_once_and_at_most_64() {
 fn requested_paths_normalize_parent_steps_without_reading_the_filesystem() {
     use std::path::Path;
 
-    let root = Path::new("checkout");
+    let root = Path::new(std::path::MAIN_SEPARATOR_STR).join("checkout");
     let workdir = root.join("rune");
     let check = |paths: &[&str]| {
         let paths = paths
             .iter()
             .map(|path| path.to_string())
             .collect::<Vec<_>>();
-        check_requested_paths(&paths, &workdir, root)
+        check_requested_paths(&paths, &workdir, &root)
     };
     let checked = check(&["../capture.png", "nonexistent/../out.txt"]).unwrap();
     assert_eq!(Path::new(&checked[0]), Path::new("../capture.png"));
@@ -56,6 +56,10 @@ fn requested_paths_normalize_parent_steps_without_reading_the_filesystem() {
     assert_eq!(
         check(&["../../outside.txt"]),
         Err("return_paths path ../../outside.txt must not use ..".into())
+    );
+    assert_eq!(
+        check(&["../../../checkout/out.txt"]),
+        Err("return_paths path ../../../checkout/out.txt must not use ..".into())
     );
     assert_eq!(
         check(&["unused/../out.txt", "out.txt"]),
