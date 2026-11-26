@@ -74,6 +74,10 @@ runs:
         fi
         printf '%s\n' "$directory" >> "$GITHUB_PATH"
         printf 'AFT_CI_PYTHON=%s\n' "$executable" >> "$GITHUB_ENV"
+    - name: Prefer Git for Windows tools on hosted runners
+      if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+      shell: pwsh
+      run: python scripts/ci-native-state.py windows-git-path
     - if: inputs.phase != 'python'
       shell: bash
       env:

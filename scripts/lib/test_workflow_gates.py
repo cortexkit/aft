@@ -838,6 +838,44 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
                 self.assertEqual(job["name"], name)
                 self.assertEqual(job["runs-on"], ["self-hosted", "narli"])
 
+    def test_hosted_windows_git_path_precedes_every_command(self) -> None:
+        action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
+        steps = action["runs"]["steps"]
+        path_setup = next(
+            i for i, step in enumerate(steps)
+            if step.get("name") == "Prefer Git for Windows tools on hosted runners"
+        )
+        step = steps[path_setup]
+        self.assertEqual(step["shell"], "pwsh")
+        self.assertEqual(
+            step["if"],
+            "runner.os == 'Windows' && runner.environment == 'github-hosted'",
+        )
+        self.assertEqual(step["run"], "python scripts/ci-native-state.py windows-git-path")
+        for i, command in enumerate(steps):
+            if command.get("shell") == "bash" and "runner.environment == 'self-hosted'" not in command.get("if", ""):
+                self.assertLess(path_setup, i)
+
+        for filename in ("_unit-suite.yml", "_e2e-suite.yml"):
+            workflow = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows" / filename))
+            for name, job in workflow["jobs"].items():
+                if job.get("runs-on") != "windows-2025":
+                    continue
+                with self.subTest(job=name):
+                    steps = job["steps"]
+                    setup = next(
+                        i for i, step in enumerate(steps)
+                        if step.get("uses") == "./.github/actions/native-ci-state"
+                    )
+                    python = next(
+                        i for i, step in enumerate(steps)
+                        if step.get("uses") == "actions/setup-python@v6"
+                    )
+                    self.assertLess(python, setup)
+                    for i, step in enumerate(steps):
+                        if "run" in step:
+                            self.assertLess(setup, i, f"{name}: command runs before Git for Windows PATH setup")
+
 
 class UnitShardPartitionCountTests(unittest.TestCase):
     """Each inventory proof must partition lib/bin tests the way its shards do.
@@ -1804,6 +1842,31 @@ while [[ "$1" != --output ]]; do shift; done
             self.assertTrue(job.is_dir())
             self.assertNotIn("AFT_CI_TARGET_DIR", values, "hosted builds use their workspace cache")
 
+    def test_hosted_windows_path_setup_uses_git_for_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git = root / "Git"
+            expected = [git / part for part in ("bin", "cmd", "ucrt64/bin", "usr/bin")]
+            for path in expected:
+                path.mkdir(parents=True, exist_ok=True)
+            (git / "cmd/git.exe").touch()
+            (git / "bin/bash.exe").touch()
+            path_file = root / "github-path"
+            with unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "windows-git-path"]), \
+                 unittest.mock.patch.object(
+                     self.state.subprocess, "check_output", return_value=str(git / "ucrt64/libexec/git-core")
+                 ), \
+                 unittest.mock.patch.dict(os.environ, {"RUNNER_OS": "Windows", "GITHUB_PATH": str(path_file)}):
+                self.state.main()
+            self.assertEqual(
+                path_file.read_text().splitlines(), [path.as_posix() for path in reversed(expected)]
+            )
+
+            with unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "windows-git-path"]), \
+                 unittest.mock.patch.dict(os.environ, {"RUNNER_OS": "Linux", "GITHUB_PATH": str(path_file)}):
+                with self.assertRaisesRegex(ValueError, "requires a Windows runner"):
+                    self.state.main()
+
     def test_shared_target_is_cleaned_whole_only_above_the_runner_cap_on_self_hosted(self) -> None:
         for environment, cap, size, expected in (("github-hosted", 30, 78, False),
                                                   ("self-hosted", 30, 30, False), ("self-hosted", 30, 31, True),
@@ -1850,7 +1913,7 @@ while [[ "$1" != --output ]]; do shift; done
     def test_native_state_action_passes_the_target_cap_to_setup(self) -> None:
         action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
         self.assertEqual(action["inputs"]["target-max-gib"]["default"], "50")
-        step = next(step for step in action["runs"]["steps"] if "scripts/ci-native-state.py" in step.get("run", ""))
+        step = next(step for step in action["runs"]["steps"] if "AFT_CI_PHASE" in step.get("env", {}))
         self.assertEqual(step["env"]["AFT_CI_TARGET_MAX_GIB"], "${{ inputs.target-max-gib }}")
         self.assertIn('scripts/ci-native-state.py "$AFT_CI_PHASE" "$AFT_CI_TARGET_MAX_GIB"', step["run"])
         for args, cap in (([], 50), (["30"], 30), (["50"], 50)):
@@ -2120,8 +2183,9 @@ while [[ "$1" != --output ]]; do shift; done
         steps = action["runs"]["steps"]
         self.assertEqual(steps[0]["name"], "Validate system Python on the native runner")
         self.assertEqual(steps[0]["if"], "runner.environment == 'self-hosted'")
-        self.assertIn('python="$AFT_CI_PYTHON"', steps[1]["run"])
-        self.assertEqual(steps[1]["if"], "inputs.phase != 'python'")
+        setup = next(step for step in steps if "AFT_CI_PHASE" in step.get("env", {}))
+        self.assertIn('python="$AFT_CI_PYTHON"', setup["run"])
+        self.assertEqual(setup["if"], "inputs.phase != 'python'")
 
     def test_system_python_probe_rejects_313_and_accepts_314_or_newer(self) -> None:
         match = re.search(r"probe='(.*?)'\n", self.system_python_preflight(), re.DOTALL)
