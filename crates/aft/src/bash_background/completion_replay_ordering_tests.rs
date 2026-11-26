@@ -140,9 +140,11 @@ fn replay_during_terminal_publication_does_not_steal_live_completion() {
     // Replay in this process must keep the registered task instead of queuing
     // a drain-only replacement that would deduplicate away the later push.
     owner.replay_session(storage.path(), SESSION).unwrap();
-    assert!(owner
-        .drain_completions_for_session(Some(SESSION))
-        .is_empty());
+    assert!(task.is_terminal());
+    let snapshot = owner.completion_snapshot_for_task(&task).unwrap();
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert_eq!(snapshot.output_preview, format!("finished {MASKED}\n"));
+    assert!(owner.pending_completions_for_session(SESSION).is_empty());
     release_tx.send(()).unwrap();
     publisher.join().unwrap().unwrap();
     let live = completion_frames(&frames, &task.task_id);

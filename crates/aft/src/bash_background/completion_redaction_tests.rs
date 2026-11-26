@@ -508,8 +508,8 @@ fn bash_background_completion_masks_before_every_preview_cut() {
 }
 
 #[cfg(unix)]
-#[test]
-fn bash_background_completion_masks_per_call_env_values() {
+#[tokio::test]
+async fn bash_background_completion_masks_per_call_env_values() {
     let fixture = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
     let value = "opaque deployment credential";
@@ -532,17 +532,25 @@ fn bash_background_completion_masks_per_call_env_values() {
         )
         .unwrap();
     let task = registry.task(&id).unwrap();
-    let start = Instant::now();
-    while !task.is_terminal() {
-        registry.poll_task(&task).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(10));
-        std::thread::yield_now();
-    }
+    let queued = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // A terminal task can still be publishing its notice. Subscribe
+            // before checking the queue so a concurrent wake isn't lost.
+            let transitioned = registry.inner.terminal_transition.notified();
+            let queued = registry.pending_completions_for_session("env-redaction");
+            if !queued.is_empty() {
+                break queued;
+            }
+            transitioned.await;
+        }
+    })
+    .await
+    .expect("watchdog did not queue the background completion");
     let completion = registry.completion_snapshot_for_task(&task).unwrap();
     assert_eq!(completion.output_preview.trim(), SECRET_PLACEHOLDER);
     assert_eq!(completion.exit_code, Some(0));
-    let queued = registry.pending_completions_for_session("env-redaction");
     assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].task_id, id);
     assert_eq!(queued[0].output_preview.trim(), SECRET_PLACEHOLDER);
     let status = registry
         .status(&id, "env-redaction", None, None, 8192)
