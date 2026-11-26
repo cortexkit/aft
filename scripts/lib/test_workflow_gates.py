@@ -1002,6 +1002,39 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         entries = namespace["parse_cargo_list"](output)
         self.assertEqual([(entry.kind, entry.name) for entry in entries], [("lib", "parser::tests::parses")])
 
+    def test_inventory_proof_resolves_bash_before_starting_it(self) -> None:
+        import ast
+        import types
+
+        wanted = {"resolve_shell_command", "run_command"}
+        nodes: list[ast.stmt] = [
+            node for node in ast.parse(PROOF_TEXT).body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        self.assertEqual(len(nodes), 2)
+        run = unittest.mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+        which = unittest.mock.Mock(return_value="C:/Program Files/Git/bin/bash.exe")
+        namespace = {
+            "ROOT": Path("D:/a/aft/aft"),
+            "os": os,
+            "sys": sys,
+            "shutil": types.SimpleNamespace(which=which),
+            "subprocess": types.SimpleNamespace(run=run, PIPE="pipe", STDOUT="stdout"),
+        }
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), namespace)
+
+        namespace["run_command"](["bash", "D:/a/aft/aft/scripts/check-cmake.sh"])
+        which.assert_called_once_with("bash")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["C:/Program Files/Git/bin/bash.exe", "D:/a/aft/aft/scripts/check-cmake.sh"],
+        )
+
+        which.return_value = None
+        with self.assertRaisesRegex(FileNotFoundError, "bash.*PATH"):
+            namespace["run_command"](["bash", "scripts/check-cmake.sh"])
+        run.assert_called_once()
+
     def test_proof_remaps_every_archive_list_and_partition_to_the_consumer(self) -> None:
         import ast
 

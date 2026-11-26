@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -64,7 +65,20 @@ class NextestEntry:
         return f"{self.kind}|{self.suite}|{self.name}"
 
 
+def resolve_shell_command(command: list[str]) -> list[str]:
+    if not command or command[0] not in {"bash", "sh"}:
+        return command
+    executable = shutil.which(command[0])
+    if executable is None:
+        raise FileNotFoundError(f"Required {command[0]} executable was not found on PATH")
+    # On Windows, CreateProcess can find System32's Windows Subsystem for Linux
+    # bash.exe before PATH. Passing shutil.which's result keeps Python on Git
+    # for Windows.
+    return [executable, *command[1:]]
+
+
 def run_command(command: list[str], merge_stderr: bool = True) -> str:
+    command = resolve_shell_command(command)
     completed = subprocess.run(
         command,
         cwd=ROOT,
