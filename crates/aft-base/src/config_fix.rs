@@ -22,14 +22,16 @@
 //! names) are dropped from what it materializes and reported, matching what
 //! the resolver would ignore anyway.
 
-use std::fs::{self, Permissions};
+use std::fs::{self, Permissions, TryLockError};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::feature_config::{self, INDEX_INPUTS, RETIRED_PATHS};
+use crate::fs_lock::AdvisoryLockGuard;
 use crate::jsonc_edit;
 
 /// Which trust tier a config file belongs to.
@@ -619,12 +621,10 @@ impl UserConfigMigration {
     }
 }
 
-/// How long another process's migration lock is honoured before it is
-/// treated as left behind by a crash and removed.
-const MIGRATION_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a loader waits for another process that is migrating the same
 /// file before it gives up and reads the file as it is.
-const MIGRATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const MIGRATION_LOCK_WAIT: Duration = Duration::from_secs(2);
+const MIGRATION_LOCK_RETRY: Duration = Duration::from_millis(25);
 
 /// The retired-key translation of a config text, when it parses as an object
 /// and uses at least one retired key.
@@ -662,73 +662,8 @@ fn names_refused_key(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Exclusive, cross-process right to rewrite one config file, held as a lock
-/// file next to it and removed on drop. The file holds a value unique to this
-/// holder, so neither a stale-lock removal nor this holder's drop can delete a
-/// lock that another process took in the meantime.
-struct MigrationLock {
-    path: PathBuf,
-    nonce: String,
-}
-
-impl Drop for MigrationLock {
-    fn drop(&mut self) {
-        if std::fs::read(&self.path).is_ok_and(|held| held == self.nonce.as_bytes()) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn migration_lock_nonce() -> String {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Only digits and dashes: the nonce becomes part of a file name, and
-    // Windows refuses names containing ':'.
-    format!("{}-{now}-{sequence}", std::process::id())
-}
-
-/// The lock's contents and age when it is older than the stale limit.
-fn stale_lock(path: &Path) -> Option<Vec<u8>> {
-    let age = std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()?
-        .elapsed()
-        .ok()?;
-    (age > MIGRATION_LOCK_STALE).then(|| std::fs::read(path).ok())?
-}
-
-/// Remove the stale lock this loader inspected, and only that one. Another
-/// loader may have replaced it with a fresh lock since the inspection, so move
-/// whatever is there aside first (an atomic step), then delete it only if it is
-/// still the stale lock; otherwise put the fresh lock back. Returns false when
-/// the lock could not be moved, so the caller waits instead of retrying at once.
-fn remove_stale_lock(path: &Path, seen: &[u8], nonce: &str) -> bool {
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(format!(".{nonce}.stale"));
-    let aside = PathBuf::from(aside);
-    if std::fs::rename(path, &aside).is_err() {
-        return false;
-    }
-    if stale_lock(&aside).is_some_and(|held| held == seen) {
-        let _ = std::fs::remove_file(&aside);
-        return true;
-    }
-    #[cfg(test)]
-    tests::migration_lock_hook(tests::LockStep::Contended);
-    // A link never replaces a lock taken after the move; that holder keeps it.
-    if let Err(error) = std::fs::hard_link(&aside, path) {
-        log::warn!("config migration lock could not be restored: {error}");
-    }
-    let _ = std::fs::remove_file(&aside);
-    true
-}
-
 enum LockAttempt {
-    Acquired(MigrationLock),
+    Acquired(AdvisoryLockGuard),
     /// Another process holds the lock and did not release it in time.
     Busy,
     Failed(std::io::Error),
@@ -740,53 +675,45 @@ fn acquire_migration_lock(target: &Path) -> LockAttempt {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "aft.jsonc".to_string());
     let path = target.with_file_name(format!(".{name}.migrate.lock"));
-    let deadline = std::time::Instant::now() + MIGRATION_LOCK_WAIT;
-    let nonce = migration_lock_nonce();
-    loop {
-        match std::fs::OpenOptions::new()
+    let deadline = Instant::now() + MIGRATION_LOCK_WAIT;
+    // Never unlink the lock file: waiters may already have it open, and a new
+    // file at the same path would let two holders lock different files. The
+    // OS releases the lock on exit; the file's age and contents don't matter.
+    let file = loop {
+        match fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&path)
         {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(nonce.as_bytes()) {
-                    drop(file);
-                    let _ = std::fs::remove_file(&path);
-                    return LockAttempt::Failed(error);
-                }
-                return LockAttempt::Acquired(MigrationLock { path, nonce });
+            Ok(file) => break file,
+            // Windows can deny access while a lock file's deletion is pending.
+            // Retry within the deadline; a persistent denial still fails.
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == io::ErrorKind::PermissionDenied
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(MIGRATION_LOCK_RETRY);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Some(seen) = stale_lock(&path) {
-                    #[cfg(test)]
-                    tests::migration_lock_hook(tests::LockStep::BeforeAttempt);
-                    // A lock that cannot be moved aside falls through to the
-                    // deadline check, so it cannot become a busy loop.
-                    if remove_stale_lock(&path, &seen, &nonce) {
-                        continue;
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
+            Err(error) => return LockAttempt::Failed(error),
+        }
+    };
+    #[cfg(test)]
+    tests::migration_lock_hook(tests::LockStep::BeforeAttempt);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return LockAttempt::Acquired(AdvisoryLockGuard::from_locked_file(file)),
+            Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                tests::migration_lock_hook(tests::LockStep::Contended);
+                if Instant::now() >= deadline {
                     return LockAttempt::Busy;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(25));
+                std::thread::sleep(MIGRATION_LOCK_RETRY);
             }
-            Err(error) => {
-                // Windows refuses to create a file whose previous holder is
-                // still deleting it (a delete-pending name) with
-                // ERROR_ACCESS_DENIED rather than AlreadyExists, so a
-                // concurrent migration releasing the lock looks like a
-                // permission error. Retry it like a held lock until the wait
-                // ends; a real permission problem still fails after that.
-                if cfg!(windows)
-                    && error.kind() == std::io::ErrorKind::PermissionDenied
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                return LockAttempt::Failed(error);
-            }
+            Err(TryLockError::Error(error)) => return LockAttempt::Failed(error),
         }
     }
 }
