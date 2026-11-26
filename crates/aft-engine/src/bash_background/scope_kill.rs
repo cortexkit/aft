@@ -219,7 +219,8 @@ pub(super) fn terminate_members(
         return false;
     }
     before();
-    // A failed listing is settled by the kill switch and its confirmation.
+    // A failed listing is settled by the caller writing to `cgroup.kill` and
+    // checking that the scope is empty.
     if signal_members(cgroup, libc::SIGTERM).is_err() {
         return true;
     }
