@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const CHECK_BUDGET: Duration = Duration::from_secs(15);
+pub(super) const CHECK_BUDGET: Duration = Duration::from_secs(15);
 const MAX_WORKFLOWS: usize = 128;
 const MAX_TREE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_WORKFLOW_BYTES: u64 = 1024 * 1024;
+pub(super) const MAX_WORKFLOW_BYTES: u64 = 1024 * 1024;
 const MAX_DISPLAY_PATHS: usize = 5;
 const PUBLISHED_MESSAGE: &str = "{repo} publishes {count} item(s) other repositories can reference by name ({paths}). GitHub does not redirect those references after a rename, so workflows that use them would break. To rename anyway, re-run with GH_SHIM_RENAME_PUBLISHED=allow.";
 const UNVERIFIED_MESSAGE: &str = "could not check whether {repo} publishes reusable workflows or actions ({reason}). A rename would silently break any workflow that references them. To rename anyway, re-run with GH_SHIM_RENAME_PUBLISHED=allow.";
@@ -220,7 +220,7 @@ fn rename_repo_argument(args: &[OsString]) -> Result<Option<String>, String> {
     Ok(found)
 }
 
-fn segment(value: &str) -> String {
+pub(super) fn segment(value: &str) -> String {
     value
         .bytes()
         .map(|b| {
@@ -288,7 +288,7 @@ pub(super) fn resolve_preflight_gh() -> Option<PathBuf> {
     resolve_real_gh(&executing_image())
 }
 
-fn read_preflight_gh(
+pub(super) fn read_preflight_gh(
     real_gh: &Path,
     args: &[String],
     deadline: Instant,
@@ -391,7 +391,9 @@ fn read_gh_after_spawn(
     result
 }
 
-fn yaml_payload(mut node: tree_sitter::Node<'_>) -> Result<tree_sitter::Node<'_>, String> {
+pub(super) fn yaml_payload(
+    mut node: tree_sitter::Node<'_>,
+) -> Result<tree_sitter::Node<'_>, String> {
     while matches!(
         node.kind(),
         "document" | "block_node" | "flow_node" | "block_sequence_item"
@@ -409,7 +411,7 @@ fn yaml_payload(mut node: tree_sitter::Node<'_>) -> Result<tree_sitter::Node<'_>
     Ok(node)
 }
 
-fn yaml_scalar(node: tree_sitter::Node<'_>, source: &str) -> Result<String, String> {
+pub(super) fn yaml_scalar(node: tree_sitter::Node<'_>, source: &str) -> Result<String, String> {
     let node = yaml_payload(node)?;
     let text = node
         .utf8_text(source.as_bytes())
@@ -427,7 +429,7 @@ fn yaml_scalar(node: tree_sitter::Node<'_>, source: &str) -> Result<String, Stri
     }
 }
 
-fn yaml_pairs<'a>(
+pub(super) fn yaml_pairs<'a>(
     node: tree_sitter::Node<'a>,
     source: &str,
 ) -> Result<Vec<(String, Option<tree_sitter::Node<'a>>)>, String> {

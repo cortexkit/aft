@@ -32,6 +32,7 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod api_rules;
 mod enable_gate;
 mod manifest_guard;
 pub mod manifest_sync;
@@ -45,6 +46,9 @@ mod ticket_repository;
 mod v22_rows;
 mod v23_queue;
 mod worker_reads;
+mod workflow_approval;
+
+use api_rules::{api_rule_matches_path, api_tuple, is_api_tuple};
 
 use prefrontal_route::select_route_holder;
 
@@ -593,10 +597,11 @@ pub enum RefusalCode {
     OperatorCredentials,
     RenamePublished,
     RenameUnverified,
+    WorkflowApprovalRefused,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::WorkerNativeGh,
         Self::WorkerWriteRefused,
         Self::Unclassified,
@@ -620,6 +625,7 @@ impl RefusalCode {
         Self::OperatorCredentials,
         Self::RenamePublished,
         Self::RenameUnverified,
+        Self::WorkflowApprovalRefused,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -647,6 +653,7 @@ impl RefusalCode {
             Self::OperatorCredentials => "gh_shim_operator_credentials",
             Self::RenamePublished => "gh_shim_rename_published",
             Self::RenameUnverified => "gh_shim_rename_unverified",
+            Self::WorkflowApprovalRefused => "gh_shim_workflow_approval_refused",
         }
     }
 }
@@ -858,6 +865,9 @@ fn run_with(
         && !is_unbound_safe(args)
     {
         return refuse(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT);
+    }
+    if workflow_approval::targets_approval(args) {
+        return workflow_approval::dispatch(args, &paths, now, delegate);
     }
     // Explicit operator administration keeps its audited path; worker writes
     // have already been refused above, regardless of the bypass request.
@@ -5000,6 +5010,9 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     let Some(shape) = api_request_shape(args) else {
         return Classification::Unclassified;
     };
+    if workflow_approval::is_approval_path(&shape.path) {
+        return workflow_approval::classify(&shape, manifest, platform);
+    }
     // The method upstream `gh` sends: a field or `--input` payload without a
     // named method is a POST, which is how a review reply is usually written.
     // Before v22 no POST rule exists, so an implicit POST stays undeclared
@@ -5079,54 +5092,6 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
         Tier::Governed => Classification::Unclassified,
         Tier::Admin => unreachable!("admin API rules return before field protection"),
     }
-}
-
-fn api_rule_matches_path(rule: &ApiRule, path: &str) -> bool {
-    if rule.path_glob == PRIVATE_REPORTING_PATH_GLOB {
-        // glob's `*` can span slashes. This setting is a single repository
-        // endpoint, not a subtree or a similarly named neighbouring setting.
-        let segments = path.split('/').collect::<Vec<_>>();
-        return matches!(segments.as_slice(), ["", "repos", owner, repo, "private-vulnerability-reporting"]
-            if !owner.is_empty() && !repo.is_empty());
-    }
-    if matches!(
-        rule.path_glob.as_str(),
-        REVIEW_REPLY_PATH_GLOB
-            | PULL_EDIT_PATH_GLOB
-            | STACK_CREATE_PATH_GLOB
-            | STACK_ADD_PATH_GLOB
-            | STACK_UNSTACK_PATH_GLOB
-            | MERGE_ASYNC_PATH_GLOB
-    ) {
-        // The same reason: `/repos/*/*/pulls/*` must name one pull request,
-        // not every endpoint below it, so each `*` matches one non-empty
-        // path segment.
-        let pattern = rule.path_glob.split('/').collect::<Vec<_>>();
-        let segments = path.split('/').collect::<Vec<_>>();
-        return pattern.len() == segments.len()
-            && pattern.iter().zip(&segments).all(|(expected, actual)| {
-                if *expected == "*" {
-                    !actual.is_empty()
-                } else {
-                    expected == actual
-                }
-            });
-    }
-    glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(path))
-}
-
-/// Stable name for an API rule, shared by admin bypass audit records and the
-/// governed own-comment row: `api:<METHOD>:<path glob>`.
-fn api_tuple(rule: &ApiRule) -> String {
-    format!(
-        "api:{}:{}",
-        rule.method.to_ascii_uppercase(),
-        rule.path_glob
-    )
-}
-
-fn is_api_tuple(tuple: &str) -> bool {
-    tuple.starts_with("api:")
 }
 
 fn api_method_and_path(args: &[OsString]) -> Option<(String, String, bool)> {
@@ -11575,7 +11540,7 @@ pub(crate) mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 23);
+        assert_eq!(RefusalCode::ALL.len(), 24);
         assert_eq!(
             RefusalCode::WorkerWriteRefused.as_str(),
             crate::gh_shim_speech::WORKER_WRITE_CODE

@@ -266,3 +266,57 @@ fn older_or_undeclared_manifest_refuses_before_reads() {
         );
     }
 }
+
+#[test]
+fn approval_cannot_override_the_checked_endpoint_or_host() {
+    let fixture = Fixture::new(30, true);
+    for raw in [
+        vec![
+            "api",
+            "-XPOST",
+            ENDPOINT,
+            "--hostname",
+            "enterprise.example",
+        ],
+        vec!["api", "-XPOST", ENDPOINT, "--input", "body.json"],
+        vec![
+            "api",
+            "-XPOST",
+            "repos/test-org/unbound/actions/runs/42/%61pprove?query=yes",
+        ],
+        vec![
+            "api",
+            "-XPOST",
+            "repos/{owner}/{repo}/actions/runs/42/approve",
+        ],
+    ] {
+        fixture.refuses(
+            &raw,
+            replies("pull_request", "action_required", Ok(HOSTED)),
+            0,
+            "with an explicit repository and no other flags",
+        );
+    }
+}
+
+#[test]
+fn approval_requires_the_operator_bypass_and_no_bot_credentials() {
+    let fixture = Fixture::new(30, true);
+    let raw = ["api", "-XPOST", ENDPOINT];
+    {
+        let _bypass = Env::set("GH_SHIM_BYPASS", None);
+        fixture.refuses(
+            &raw,
+            replies("pull_request", "action_required", Ok(HOSTED)),
+            0,
+            "gh_shim_admin_tier",
+        );
+    }
+    let _bot = Env::set("GH_TOKEN", Some("fake-bot-token"));
+    fixture.refuses(
+        &raw,
+        replies("pull_request", "action_required", Ok(HOSTED)),
+        0,
+        "gh_shim_bypass_bot_credentials",
+    );
+}

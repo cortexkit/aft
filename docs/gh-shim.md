@@ -188,6 +188,7 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 | `pr merge`, `release create` | ADMINISTRATION | v1 |
 | `repo edit`, `run delete` | ADMINISTRATION | v9 |
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
+| `api` POST `/repos/*/*/actions/runs/*/approve` | ADMINISTRATION (fork-run safety check) | v30 |
 | `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
 | `repo rename`, `repo create` | ADMINISTRATION-AS-OPERATOR | v19 |
 | `workflow disable`, `workflow enable` | ADMINISTRATION-AS-OPERATOR | v19 |
@@ -218,6 +219,22 @@ envelope with `python3 scripts/prepare-gh-shim-v15.py /path/to/v13-envelope.json
 the script prints its SHA-256 and defaults to that private ceremony directory.
 An optional second argument selects another output path. Verify the printed hash
 before signing, and do not re-serialize the payload after signing.
+
+Fork-run approval takes an explicit `repos/OWNER/REPO/actions/runs/ID/approve`
+endpoint and `--method POST` (or `-X POST`), with no other flags. It requires
+`GH_SHIM_BYPASS=operator` and a signed v30 or newer manifest declaring the row,
+even for repositories without a bot binding. All requests target `github.com`.
+Before auditing or sending the POST, the shim reads the run and checks the
+workflow file in the head repository at the run's exact head commit. The run
+must be awaiting approval (`action_required`) for `pull_request`,
+`pull_request_review`, or `pull_request_review_comment`.
+
+Each job must name only listed GitHub-hosted runner labels: `ubuntu-latest`,
+`ubuntu-24.04`, `ubuntu-22.04`, `windows-latest`, `windows-2025`, `windows-2022`,
+`macos-latest`, `macos-26`, `macos-15`, or `macos-14`. Self-hosted and unknown
+labels, expressions, runner groups, reusable workflow calls, and unreadable or
+uninspectable workflows refuse before the POST. Use the operator's normal diff
+review in addition to this runner check.
 
 Every row is declared for `macos` and `linux`: the schema requires a non-empty
 `platform` list on tuples and API rules alike, so no row is OS-neutral.
