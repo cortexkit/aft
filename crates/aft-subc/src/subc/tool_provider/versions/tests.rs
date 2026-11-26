@@ -23,7 +23,10 @@ fn catalog_publication_switch_controls_the_wire_version_and_digest() {
     assert!(!published.is_empty());
     for tool in published {
         if PUBLISH_TOOL_VERSIONS {
-            assert_eq!(tool["version"], "1.0.0");
+            assert_eq!(
+                tool["version"],
+                version(tool["name"].as_str().unwrap()).to_string()
+            );
         } else {
             assert!(tool.get("version").is_none());
         }
@@ -32,6 +35,27 @@ fn catalog_publication_switch_controls_the_wire_version_and_digest() {
         default["catalog_digest"] != legacy["catalog_digest"],
         PUBLISH_TOOL_VERSIONS
     );
+}
+
+#[test]
+fn outline_minor_bump_keeps_major_one_pins_live() {
+    let tool = &served_tools(CatalogPreset::Worker)
+        .iter()
+        .find(|tool| tool.catalog.name == "outline")
+        .unwrap()
+        .catalog;
+    assert_eq!(tool.version, Some(ToolVersion::new(1, 1, 0)));
+    let current = tool.schema_pin().encode().unwrap();
+    assert!(current.ends_with(":1"), "{current}");
+
+    // A live session can carry the schema digest it received before the minor
+    // bump. Same-major admission uses the current schema without remapping the pin.
+    let previous = ToolMajorPin::new("outline", "0".repeat(64), 1)
+        .encode()
+        .unwrap();
+    let mut call = ToolCallRequest::new("outline", json!({"target":"src/main.rs"}));
+    call.schema_pin = Some(previous);
+    assert_eq!(admit(&call).unwrap(), CallerRole::Head);
 }
 
 #[test]

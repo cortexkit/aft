@@ -34,7 +34,7 @@ const VERSIONS: &[(&str, ToolVersion)] = &[
     ("import", INITIAL),
     ("inspect", INITIAL),
     ("move", INITIAL),
-    ("outline", INITIAL),
+    ("outline", ToolVersion::new(1, 1, 0)),
     ("powershell", INITIAL),
     ("read", INITIAL),
     ("safety", INITIAL),
