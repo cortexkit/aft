@@ -1,1 +1,1 @@
-Read image attachment (image/png, 1024×768, 240 KB).
+Read image attachment (image/png, 1024×768, scaled from 2048×1536, 240 KB).

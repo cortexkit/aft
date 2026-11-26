@@ -99,6 +99,8 @@ struct ProcessedImage {
     mime: &'static str,
     width: u32,
     height: u32,
+    source_width: u32,
+    source_height: u32,
     resized: bool,
     source_mime: Option<&'static str>,
     animation: &'static str,
@@ -338,6 +340,10 @@ fn image_attachment_response_with_budget(
     if budget.is_some() {
         attachment["encoding"] = serde_json::json!(image.mime.trim_start_matches("image/"));
     }
+    if image.resized {
+        attachment["source_width"] = serde_json::json!(image.source_width);
+        attachment["source_height"] = serde_json::json!(image.source_height);
+    }
     if let Some(source_mime) = image.source_mime {
         attachment
             .as_object_mut()
@@ -345,13 +351,25 @@ fn image_attachment_response_with_budget(
             .insert("source_mime".to_string(), serde_json::json!(source_mime));
     }
 
-    let mut content = format!(
-        "Read image attachment ({}, {}×{}, {}).",
-        image.mime,
-        image.width,
-        image.height,
-        attachment_size_note(byte_size)
-    );
+    let mut content = if image.resized {
+        format!(
+            "Read image attachment ({}, {}×{}, scaled from {}×{}, {}).",
+            image.mime,
+            image.width,
+            image.height,
+            image.source_width,
+            image.source_height,
+            attachment_size_note(byte_size)
+        )
+    } else {
+        format!(
+            "Read image attachment ({}, {}×{}, {}).",
+            image.mime,
+            image.width,
+            image.height,
+            attachment_size_note(byte_size)
+        )
+    };
     if image.animation == "first_frame" {
         content.push_str(" Animated image was resized from its first frame.");
     }
@@ -502,6 +520,8 @@ fn process_image_fitting(
             mime: kind.mime(),
             width,
             height,
+            source_width: width,
+            source_height: height,
             resized: false,
             source_mime: None,
             animation: if animated { "preserved" } else { "none" },
@@ -513,20 +533,22 @@ fn process_image_fitting(
     if orientation_applied {
         decoded.apply_orientation(orientation);
     }
-    let (width, height) = decoded.dimensions();
-    let (target_width, target_height) = resized_dimensions(width, height);
-    let mut current = if width.max(height) > MAX_INLINE_IMAGE_DIMENSION {
+    let (source_width, source_height) = decoded.dimensions();
+    let (target_width, target_height) = resized_dimensions(source_width, source_height);
+    let mut current = if source_width.max(source_height) > MAX_INLINE_IMAGE_DIMENSION {
         decoded.resize_exact(target_width, target_height, FilterType::Lanczos3)
     } else {
         decoded
     };
-    let mut result = if width.max(height) > MAX_INLINE_IMAGE_DIMENSION {
+    let mut result = if source_width.max(source_height) > MAX_INLINE_IMAGE_DIMENSION {
         let (bytes, mime) = encode_fitted_image(&current, kind, allow_lossy)?;
         ProcessedImage {
             bytes,
             mime,
             width: target_width,
             height: target_height,
+            source_width,
+            source_height,
             resized: true,
             source_mime: Some(kind.mime()),
             animation: if animated { "first_frame" } else { "none" },
@@ -536,8 +558,10 @@ fn process_image_fitting(
         ProcessedImage {
             bytes: raw_bytes,
             mime: kind.mime(),
-            width,
-            height,
+            width: source_width,
+            height: source_height,
+            source_width,
+            source_height,
             resized: false,
             source_mime: None,
             animation: if animated { "preserved" } else { "none" },
@@ -590,6 +614,8 @@ fn process_image_fitting(
             mime,
             width,
             height,
+            source_width,
+            source_height,
             resized: true,
             source_mime: Some(kind.mime()),
             animation: if animated { "first_frame" } else { "none" },
@@ -631,6 +657,8 @@ fn process_image(raw_bytes: Vec<u8>, kind: ImageKind) -> Result<ProcessedImage, 
             mime: source_mime,
             width: decoded_width,
             height: decoded_height,
+            source_width: decoded_width,
+            source_height: decoded_height,
             resized: false,
             source_mime: None,
             animation: if animated { "preserved" } else { "none" },
@@ -652,6 +680,8 @@ fn process_image(raw_bytes: Vec<u8>, kind: ImageKind) -> Result<ProcessedImage, 
         mime,
         width: target_width,
         height: target_height,
+        source_width: oriented_width,
+        source_height: oriented_height,
         resized: true,
         source_mime: Some(source_mime),
         animation: if animated { "first_frame" } else { "none" },
@@ -3438,6 +3468,33 @@ mod tests {
         DynamicImage::ImageRgba8(image)
     }
 
+    fn jpeg_with_orientation(image: &DynamicImage, orientation: u16) -> Vec<u8> {
+        let jpeg = encode_jpeg(image).unwrap();
+        // One TIFF orientation entry in an APP1 segment exercises the decoder's
+        // real EXIF handling without depending on an external fixture file.
+        let mut exif = Vec::new();
+        exif.extend_from_slice(b"Exif\0\0");
+        exif.extend_from_slice(b"II");
+        exif.extend_from_slice(&42u16.to_le_bytes());
+        exif.extend_from_slice(&8u32.to_le_bytes());
+        exif.extend_from_slice(&1u16.to_le_bytes());
+        exif.extend_from_slice(&0x0112u16.to_le_bytes());
+        exif.extend_from_slice(&3u16.to_le_bytes());
+        exif.extend_from_slice(&1u32.to_le_bytes());
+        exif.extend_from_slice(&orientation.to_le_bytes());
+        exif.extend_from_slice(&0u16.to_le_bytes());
+        exif.extend_from_slice(&0u32.to_le_bytes());
+
+        let app1_len = u16::try_from(exif.len() + 2).unwrap();
+        let mut bytes = Vec::with_capacity(jpeg.len() + exif.len() + 4);
+        bytes.extend_from_slice(&jpeg[..2]);
+        bytes.extend_from_slice(&[0xff, 0xe1]);
+        bytes.extend_from_slice(&app1_len.to_be_bytes());
+        bytes.extend_from_slice(&exif);
+        bytes.extend_from_slice(&jpeg[2..]);
+        bytes
+    }
+
     fn write_fixture(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let path = root.join(name);
         fs::write(&path, bytes).expect("write fixture");
@@ -3485,7 +3542,14 @@ mod tests {
             assert_eq!(attachment["animation"], "none");
             assert_eq!(attachment["orientation_applied"], false);
             assert_eq!(attachment["bytes"], bytes.len());
+            assert!(attachment.get("source_width").is_none());
+            assert!(attachment.get("source_height").is_none());
             assert_eq!(decoded_attachment_bytes(attachment), bytes);
+            let expected = format!(
+                "Read image attachment ({mime}, 32×16, {}).",
+                attachment_size_note(bytes.len())
+            );
+            assert_eq!(response.data["content"].as_str(), Some(expected.as_str()));
         }
     }
 
@@ -3506,8 +3570,41 @@ mod tests {
         assert_eq!(attachment["width"], 1024);
         assert_eq!(attachment["height"], 256);
         assert_eq!(attachment["resized"], true);
+        assert_eq!(attachment["source_width"], 2048);
+        assert_eq!(attachment["source_height"], 512);
         assert_eq!(attachment["source_mime"], ImageKind::Png.mime());
+        let expected = format!(
+            "Read image attachment (image/png, 1024×256, scaled from 2048×512, {}).",
+            attachment_size_note(attachment["bytes"].as_u64().unwrap() as usize)
+        );
+        assert_eq!(response.data["content"].as_str(), Some(expected.as_str()));
         assert!(response.data.get("binary").is_none());
+    }
+
+    #[test]
+    fn resized_jpeg_reports_oriented_source_dimensions() {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let large = rgba_image(2048, 512, false);
+        let bytes = jpeg_with_orientation(&large, 6);
+        let path = write_fixture(temp.path(), "rotated.jpg", &bytes);
+
+        let response = read_response(temp.path(), &path, json!({}));
+
+        assert!(response.success);
+        let attachment = first_attachment(&response.data);
+        assert_eq!(attachment["mime"], ImageKind::Jpeg.mime());
+        assert_eq!(attachment["width"], 256);
+        assert_eq!(attachment["height"], 1024);
+        assert_eq!(attachment["resized"], true);
+        assert_eq!(attachment["source_width"], 512);
+        assert_eq!(attachment["source_height"], 2048);
+        assert_eq!(attachment["orientation_applied"], true);
+        let expected = format!(
+            "Read image attachment (image/jpeg, 256×1024, scaled from 512×2048, {}).",
+            attachment_size_note(attachment["bytes"].as_u64().unwrap() as usize)
+        );
+        assert_eq!(response.data["content"].as_str(), Some(expected.as_str()));
     }
 
     #[test]
