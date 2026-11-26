@@ -277,9 +277,9 @@ jobs:
     with:
       cargo_profile: stage
 
-  # Archives stay on their producing machine until every consumer succeeds;
-  # failed-job retries still need the successful producers from the same run.
-  # Cargo's target directory is deliberately not part of this cleanup.
+  # Windows archives stay on narli until every consumer succeeds; failed-job
+  # retries still need the successful producers from the same run. Cargo's
+  # target directory is deliberately not part of this cleanup.
   native-ci-cleanup:
     name: Clean native CI state (${{ matrix.machine }})
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -287,19 +287,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        machine: [mac-mini, narli]
+        machine: [narli]
     runs-on: [self-hosted, "${{ matrix.machine }}"]
-    # The Mac branch reserves 50 minutes to drain the fleet VMs.
-    timeout-minutes: ${{ matrix.machine == 'mac-mini' && 55 || 5 }}
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
         id: checkout
-
-      - name: Acquire MOTOR macOS hold
-        if: matrix.machine == 'mac-mini'
-        uses: ./.github/actions/macos-hold
-        with:
-          phase: acquire
 
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
@@ -308,12 +301,6 @@ jobs:
       - uses: ./.github/actions/native-ci-state
         with:
           phase: ${{ needs.unit.result == 'success' && needs.e2e.result == 'success' && 'finalize' || 'cleanup' }}
-
-      - name: Release MOTOR macOS hold
-        if: always() && matrix.machine == 'mac-mini' && steps.checkout.outcome == 'success'
-        uses: ./.github/actions/macos-hold
-        with:
-          phase: release
 
   search-quality-binary:
     name: Search quality binary (Linux x64)

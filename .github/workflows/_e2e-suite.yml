@@ -593,32 +593,24 @@ jobs:
   e2e-macos:
     name: E2E (macOS native)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: [self-hosted, mac-mini]
+    runs-on: macos-26
     # Landing E2E tests exercise behavior, not release-calibrated latency.
     # Publication still tests the shipped release binary in release.yml.
-    # The timeout includes 50 minutes to acquire the MOTOR grant.
     timeout-minutes: 95
     env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE: ${{ inputs.cargo_profile == 'stage' && 'dev' || 'release' }}
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v5
-        id: checkout
-
-      - name: Acquire MOTOR macOS hold
-        id: macos-hold
-        uses: ./.github/actions/macos-hold
-        with:
-          phase: acquire
 
       - uses: actions/setup-python@v6
-        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
-        with:
-          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -648,7 +640,7 @@ jobs:
       # cache-bin: false makes rust-cache safe on macOS: the old failure was
       # the cached ~/.cargo/bin shim overwriting the fresh cargo shim (which
       # then misread argv as rustup-init). Excluding bin keeps the dependency
-      # artifacts without touching shims. See _unit-suite.yml unit-macos.
+      # artifacts without touching shims.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
         with:
@@ -661,7 +653,7 @@ jobs:
         run: python3 scripts/ci-stage-aft.py cargo rustc --profile "$CARGO_PROFILE" --bin aft -p agent-file-tools --timings --features wasm-grammars
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target
-          CARGO_BUILD_BUILD_DIR: ${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}
+          CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/target
 
       # Ad-hoc sign + verify + exec once: an unsigned fresh binary gets
       # SIGKILLed on newer macOS, and the first exec pays a syspolicyd
@@ -697,15 +689,3 @@ jobs:
           name: e2e-macos-plugin-log-${{ github.run_attempt }}
           path: ${{ runner.temp }}/aft-e2e-data/cortexkit/aft/logs/aft-plugin.log
           if-no-files-found: warn
-
-      - name: Clean native test processes
-        if: always() && steps.macos-hold.outcome == 'success'
-        uses: ./.github/actions/native-ci-state
-        with:
-          phase: cleanup
-
-      - name: Release MOTOR macOS hold
-        if: always() && steps.checkout.outcome == 'success'
-        uses: ./.github/actions/macos-hold
-        with:
-          phase: release
