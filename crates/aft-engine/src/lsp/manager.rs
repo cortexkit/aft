@@ -9953,7 +9953,11 @@ mod transient_retry_tests {
             .unwrap();
         let error = LspError::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
-            super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 2 },
+            super::super::client::RustAnalyzerCapacityExhausted {
+                cap: 2,
+                current: 2,
+                project_limited: false,
+            },
         ));
         let failure = manager.absorb_spawn_failure(SpawnFailure::NotStarted {
             error,
@@ -10375,7 +10379,11 @@ mod transient_retry_tests {
         let failure = || {
             let error = LspError::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 3 },
+                super::super::client::RustAnalyzerCapacityExhausted {
+                    cap: 2,
+                    current: 3,
+                    project_limited: false,
+                },
             ));
             let durability = process_start_durability(&error);
             assert_eq!(durability, FailureDurability::Capacity);
