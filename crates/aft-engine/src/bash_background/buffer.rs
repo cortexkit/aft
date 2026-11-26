@@ -514,8 +514,9 @@ impl<R: io::Read> io::Read for ScanReader<R> {
 }
 
 #[cfg(all(unix, any(test, feature = "test-support")))]
-static STDERR_SCANS: OnceLock<Mutex<std::collections::HashMap<PathBuf, (usize, u64)>>> =
-    OnceLock::new();
+static STDERR_SCANS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (usize, u64)>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(all(unix, any(test, feature = "test-support")))]
 fn record_stderr_scan(path: &Path, bytes: u64, opened: bool) {

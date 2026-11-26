@@ -50,7 +50,7 @@ impl IndexedGlobMatcher {
     }
 }
 
-/// The ordinary index walk, with coverage accounting for the unpublished corpus.
+/// Walk files before an index snapshot is available and record any gaps in coverage.
 pub fn checked_project_walk_builder(
     root: &Path,
     coverage: crate::grep_executor::WalkCoverage,
