@@ -45,6 +45,67 @@ impl BgTaskRegistry {
         pty.coordinator.observed_exit.get().cloned()
     }
 
+    /// A PTY kill whose outcome is unknown may leave its leader running, and
+    /// then no exit is ever observed. After the termination grace period, if
+    /// the leader has still not exited, publish the unknown outcome here so
+    /// the task never stays `killing`. Returns whether this call published it.
+    #[cfg(unix)]
+    pub(super) fn settle_unconfirmed_pty_kill(
+        &self,
+        task: &Arc<BgTask>,
+        saves: &mut KillStateSave,
+    ) -> Result<bool, String> {
+        let exited = |state: &BgTaskState| {
+            state.metadata.status.is_terminal()
+                || match &state.runtime {
+                    TaskRuntime::Pty(Some(pty)) => pty.exit_observed.load(Ordering::SeqCst),
+                    _ => true,
+                }
+        };
+        let deadline = Instant::now() + super::super::process::TERMINATE_GRACE;
+        loop {
+            let state = task
+                .lock_state()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if exited(&state) {
+                return Ok(false);
+            }
+            drop(state);
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| "background task lock poisoned".to_string())?;
+        if exited(&state) {
+            return Ok(false);
+        }
+        let status = state
+            .pending_terminal_override
+            .take()
+            .unwrap_or(BgTaskStatus::FateUnknown);
+        let reason = state.metadata.status_reason.clone();
+        state.metadata.mark_terminal(status, None, reason);
+        task.mark_terminal_now();
+        // The runtime is dropped after the lock is released.
+        let retired = match &mut state.runtime {
+            TaskRuntime::Pty(runtime) => runtime.take(),
+            TaskRuntime::Piped(_) => None,
+        };
+        state.detached = true;
+        saves.record(
+            task,
+            self.persist_task_locked(task, &state.metadata, &mut db),
+            true,
+        );
+        drop(state);
+        drop(retired);
+        Ok(true)
+    }
+
     pub(in crate::bash_background) fn output_limit_exceeded(&self, task: &BgTask) -> bool {
         let Ok(mut state) = task.lock_state() else {
             return false;

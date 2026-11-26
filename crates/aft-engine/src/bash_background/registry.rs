@@ -456,50 +456,6 @@ impl KillSettlementTestSamples {
     }
 }
 
-/// Whether a finished task's process group, answering under its saved
-/// number, is still that task's group and may be signalled. The number is the
-/// group leader's pid, and once the original group has exited the system can
-/// hand it to an unrelated process. So the group is the task's only while its
-/// leader, or a member a check of this task found, is still running in it
-/// with the start time AFT recorded. Without such evidence it is left alone,
-/// even when a check could not see every member.
-fn finished_group_is_still_the_tasks(metadata: &PersistedTask, pgid: i32) -> bool {
-    verified_kill::GroupEvidence::for_task(metadata, pgid, None).proven()
-}
-
-/// Store the outcome of one check of a task's process group: the surviving
-/// members, why they could not be listed, or both when the listing was
-/// incomplete. An empty list is stored only for a clean check, so `[]` always
-/// means the group was seen to be empty.
-fn record_group_check(
-    metadata: &mut PersistedTask,
-    check: &Result<GroupListing, LiveDescendantsUnavailable>,
-) {
-    match check {
-        Ok(listing) => {
-            let found_any = !listing.members.is_empty() || listing.omitted > 0;
-            metadata.live_descendants =
-                (found_any || !listing.incomplete).then(|| listing.members.clone());
-            metadata.live_descendants_omitted = listing.omitted;
-            metadata.live_descendants_unavailable = listing
-                .incomplete
-                .then_some(LiveDescendantsUnavailable::ListingIncomplete);
-            if found_any {
-                metadata.group_member_identities = listing.identities.clone();
-                metadata.group_member_identities_truncated = listing.identities_truncated;
-            } else if !listing.incomplete {
-                metadata.group_member_identities.clear();
-                metadata.group_member_identities_truncated = false;
-            }
-        }
-        Err(reason) => {
-            metadata.live_descendants = None;
-            metadata.live_descendants_omitted = 0;
-            metadata.live_descendants_unavailable = Some(*reason);
-        }
-    }
-}
-
 /// Close a PTY's pseudoterminal so its reader reaches end-of-file and
 /// the task can finalize. On Windows, ConPTY's reader sees end-of-file only
 /// once the pseudoconsole is closed, and closing it can wait for conhost to
@@ -13868,6 +13824,17 @@ impl BgTaskRegistry {
         // mirror must not flush until after signaling. An unrelated aft.db
         // holder must not consume the command's entire timeout budget.
         let mut killing_db = DeferredDbWrites::new(self, &task);
+        // A PTY kill's evidence is gathered before the plan's lock is taken:
+        // listing a process group can be slow, and status must not wait on it.
+        #[cfg(unix)]
+        let pty_evidence = task
+            .lock_state()
+            .ok()
+            .filter(|state| matches!(state.runtime, TaskRuntime::Pty(Some(_))))
+            .map(|state| state.metadata.clone())
+            .and_then(|metadata| verified_kill::pty_evidence_before_hangup(&metadata));
+        #[cfg(not(unix))]
+        let pty_evidence: Option<verified_kill::GroupEvidence> = None;
         let plan = {
             let mut state = task
                 .lock_state()
@@ -13890,6 +13857,10 @@ impl BgTaskRegistry {
                     }
                     _ => KillSignalPlan::Nothing,
                 }
+            } else if state.kill_in_flight {
+                // Another kill owns this command's outcome; it must not be
+                // published over, even from an exit marker.
+                KillSignalPlan::AwaitOtherKill
             } else if let Some(marker) = read_exit_marker(&task.paths)
                 .ok()
                 .flatten()
@@ -13980,8 +13951,6 @@ impl BgTaskRegistry {
                     terminalized = true;
                     KillSignalPlan::RetirePty(retired_pty)
                 }
-            } else if state.kill_in_flight {
-                KillSignalPlan::AwaitOtherKill
             } else {
                 let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
                 let mut killing = state.metadata.clone();
@@ -14017,12 +13986,6 @@ impl BgTaskRegistry {
                 }
 
                 let (pgid, child_pid) = adopted_identity::signal_targets(&state);
-                #[cfg(unix)]
-                let evidence = matches!(state.runtime, TaskRuntime::Pty(Some(_)))
-                    .then(|| verified_kill::pty_evidence_before_hangup(&state.metadata))
-                    .flatten();
-                #[cfg(not(unix))]
-                let evidence = None;
                 let plan = match &mut state.runtime {
                     // The child handle leaves the slot for the unlocked wait.
                     // With the slot empty and the task not yet detached, the
@@ -14034,8 +13997,10 @@ impl BgTaskRegistry {
                     },
                     TaskRuntime::Pty(Some(pty)) => {
                         pty.was_killed.store(true, Ordering::SeqCst);
+                        // Hang up only a leader still proven to be the task's:
+                        // its pid is otherwise free for reuse.
                         #[cfg(not(windows))]
-                        {
+                        if pty_evidence.as_ref().is_some_and(|e| e.leader_running()) {
                             log_bash_kill(task_id, pty.child_pid, pgid, kill_reason);
                             if let Err(error) = pty.killer.kill() {
                                 crate::slog_warn!(
@@ -14046,7 +14011,7 @@ impl BgTaskRegistry {
                         KillSignalPlan::Pty {
                             pid: pty.child_pid,
                             master: pty.master.take(),
-                            evidence,
+                            evidence: pty_evidence,
                         }
                     }
                     TaskRuntime::Pty(None) => KillSignalPlan::Nothing,
@@ -14089,27 +14054,34 @@ impl BgTaskRegistry {
                 // A command may have finished after Killing was published but
                 // before any signal was delivered. Its own marker wins even
                 // when no status reader has published the terminal state yet.
-                let natural_exit_before_signal = {
-                    let mut state = task
-                        .lock_state()
-                        .map_err(|_| "background task lock poisoned".to_string())?;
-                    let marker = read_exit_marker(&task.paths)
-                        .ok()
-                        .flatten()
-                        .filter(|marker| !resource_kill && matches!(marker, ExitMarker::Code(_)));
-                    if marker.is_none()
-                        && !state.metadata.status.is_terminal()
-                        && pending_resource_stop_reason(&state).is_none()
-                    {
-                        // Serialize the signal decision with marker finalization.
-                        // A later numeric marker can be the waiter's report of
-                        // this kill, not an independent natural completion.
-                        state.pending_terminal_override = Some(terminal_status.clone());
+                // The kill commits only right before its first signal; until
+                // then a numeric marker is the command's own exit.
+                let mut natural_exit_before_signal = None;
+                let mut committed = false;
+                let mut commit = || {
+                    committed = true;
+                    if let Ok(mut state) = task.lock_state() {
+                        let marker =
+                            read_exit_marker(&task.paths)
+                                .ok()
+                                .flatten()
+                                .filter(|marker| {
+                                    !resource_kill && matches!(marker, ExitMarker::Code(_))
+                                });
+                        if marker.is_none()
+                            && !state.metadata.status.is_terminal()
+                            && pending_resource_stop_reason(&state).is_none()
+                        {
+                            // Serialize the signal decision with marker finalization.
+                            // A later numeric marker can be the waiter's report of
+                            // this kill, not an independent natural completion.
+                            state.pending_terminal_override = Some(terminal_status.clone());
+                        }
+                        natural_exit_before_signal = marker;
                     }
-                    marker
+                    #[cfg(any(test, feature = "test-support"))]
+                    wait_on_kill_signal_gate_for_test(&format!("{}:committed", task.task_id));
                 };
-                #[cfg(any(test, feature = "test-support"))]
-                wait_on_kill_signal_gate_for_test(&format!("{}:committed", task.task_id));
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
                     crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
@@ -14120,9 +14092,19 @@ impl BgTaskRegistry {
                     child_pid,
                     kill_reason,
                     child.as_mut(),
+                    &mut commit,
                 );
                 coverage_note = note;
                 scope_kill_attempted = true;
+                #[cfg(test)]
+                wait_on_kill_signal_gate_for_test(&format!("{}:signalled", task.task_id));
+                // With nothing sent, any numeric marker is the command's own.
+                if !committed {
+                    natural_exit_before_signal = read_exit_marker(&task.paths)
+                        .ok()
+                        .flatten()
+                        .filter(|marker| !resource_kill && matches!(marker, ExitMarker::Code(_)));
+                }
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
                     crate::slog_info!(
@@ -14130,18 +14112,22 @@ impl BgTaskRegistry {
                         diagnostic_start.elapsed().as_millis()
                     );
                 }
-                let child_exit_observed = child.as_mut().is_some_and(|child| child.wait().is_ok());
+                let child_exit_observed = verified_kill::reap_within(&mut child);
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
                     crate::slog_info!("scope diagnostic phase=child_reaped task={task_id} observed={child_exit_observed} natural_marker={natural_exit_before_signal:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
                 }
-                drop(child);
                 settle_killed_process_group(&task.task_id, pgid);
 
                 let mut db = DeferredDbWrites::new(self, &task);
                 let mut state = task
                     .lock_state()
                     .map_err(|_| "background task lock poisoned".to_string())?;
+                // A wrapper that outlived the reap wait goes back to its slot,
+                // where the watchdog's reap pass collects it later.
+                if let (Some(child), TaskRuntime::Piped(slot)) = (child, &mut state.runtime) {
+                    *slot = Some(child);
+                }
                 state.kill_in_flight = false;
                 state.child_exit_observed |= child_exit_observed;
                 task.kill_settled.notify_all();
@@ -14258,14 +14244,21 @@ impl BgTaskRegistry {
                 close_pty_master(master);
                 let scope_result = self.kill_task_scope_with_reason(&task.task_id, kill_reason);
                 scope_kill_attempted = true;
+                let unconfirmed =
+                    verified_kill::unconfirmed_kill_reason(&scope_result, coverage_note.as_deref());
                 terminalized = self.finish_pty_kill(
                     &task,
                     terminal_status,
                     reason,
                     resource_kill,
-                    verified_kill::unconfirmed_kill_reason(&scope_result, coverage_note.as_deref()),
+                    unconfirmed.clone(),
                     &mut saves,
                 )?;
+                // A leader that outlived every signal is never seen to exit.
+                #[cfg(unix)]
+                if unconfirmed.is_some() && !terminalized {
+                    terminalized = self.settle_unconfirmed_pty_kill(&task, &mut saves)?;
+                }
                 // Finalization waited for this kill's outcome; publish it now if
                 // the command has already exited.
                 #[cfg(unix)]
@@ -17950,7 +17943,9 @@ mod watch_scan;
 
 #[path = "verified_kill.rs"]
 mod verified_kill;
-use verified_kill::settle_killed_process_group;
+use verified_kill::{
+    finished_group_is_still_the_tasks, record_group_check, settle_killed_process_group,
+};
 
 #[path = "pty_input_write.rs"]
 mod pty_input_write;
@@ -26315,12 +26310,15 @@ mod tests {
                     .unwrap()
                     .write(TaskArtifact::Exit, code.to_string().as_bytes())
                     .unwrap();
-                if code == 7 {
-                    // A repeated kill is another consumer of the waiter's marker.
-                    registry.kill(&id, "session").unwrap();
-                } else {
-                    registry.poll_task(&task).unwrap();
-                }
+                // A repeated kill is another consumer of the waiter's marker.
+                // It waits for the kill in flight, which owns the outcome,
+                // instead of publishing over it.
+                let repeated = (code == 7).then(|| {
+                    let registry = registry.clone();
+                    let id = id.clone();
+                    std::thread::spawn(move || registry.kill(&id, "session"))
+                });
+                registry.poll_task(&task).unwrap();
                 let expected_status = if after_commit {
                     BgTaskStatus::Killed
                 } else if code == 0 {
@@ -26336,6 +26334,10 @@ mod tests {
                 );
                 assert_eq!(observed.exit_code, Some(expected_code));
                 release.send(()).unwrap();
+                if let Some(repeated) = repeated {
+                    let repeated = repeated.join().unwrap().unwrap();
+                    assert_eq!(repeated.info.status, expected_status);
+                }
                 let killed = killer.join().unwrap().unwrap();
                 assert_eq!(killed.info.status, expected_status);
                 assert_eq!(killed.exit_code, Some(expected_code));

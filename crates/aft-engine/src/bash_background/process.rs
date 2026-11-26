@@ -91,14 +91,36 @@ impl GroupListing {
 /// means the group was checked and has no live member; an incomplete one keeps
 /// the members it found; an error says why the group could not be checked.
 pub fn live_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
+    list_process_group(pgid, true)
+}
+
+/// The identities of a process group's live members, without describing
+/// them: no command lines and no account lookups, which can stall on a slow
+/// directory service. Used where only proof of membership is needed.
+pub fn process_group_identities(
+    pgid: i32,
+) -> Result<Vec<ProcessIdentity>, LiveDescendantsUnavailable> {
+    list_process_group(pgid, false).map(|listing| listing.identities)
+}
+
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(unused_variables)
+)]
+fn list_process_group(
+    pgid: i32,
+    describe: bool,
+) -> Result<GroupListing, LiveDescendantsUnavailable> {
+    #[cfg(test)]
+    test_hooks::observe_listing();
     #[cfg(any(test, all(unix, feature = "test-support")))]
     if group_listing_test::listing_fails(pgid) {
         return Err(LiveDescendantsUnavailable::ListingFailed);
     }
     #[cfg(target_os = "linux")]
-    return linux_process_group_members(pgid);
+    return linux_process_group_members(pgid, describe);
     #[cfg(target_os = "macos")]
-    return macos_process_group_members(pgid);
+    return macos_process_group_members(pgid, describe);
     #[cfg(windows)]
     {
         let _ = pgid;
@@ -162,6 +184,31 @@ pub(crate) mod test_hooks {
     static OUTSIDERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     #[cfg(target_os = "linux")]
     thread_local! { static SIGNAL_EVENTS: std::cell::RefCell<Option<(i32, std::sync::Arc<Mutex<Vec<&'static str>>>)>> = const { std::cell::RefCell::new(None) }; }
+    thread_local! { static LISTING_OBSERVER: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) }; }
+
+    /// Run `observe` at every process-group listing on this thread.
+    pub(crate) fn with_listing_observer<T>(
+        observe: impl Fn() + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTING_OBSERVER.with(|slot| slot.take());
+            }
+        }
+        LISTING_OBSERVER.with(|slot| slot.replace(Some(Box::new(observe))));
+        let _restore = Restore;
+        run()
+    }
+
+    pub(super) fn observe_listing() {
+        LISTING_OBSERVER.with(|slot| {
+            if let Some(observe) = slot.borrow().as_ref() {
+                observe();
+            }
+        });
+    }
 
     #[cfg(target_os = "linux")]
     pub(crate) fn with_signal_events<T>(
@@ -364,7 +411,10 @@ fn bounded_members<C>(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
+fn linux_process_group_members(
+    pgid: i32,
+    describe: bool,
+) -> Result<GroupListing, LiveDescendantsUnavailable> {
     // An empty group needs no /proc walk. EPERM still means the group exists
     // and must be enumerated, including reparented descendants.
     if pgid > 0 && process_group_gone(pgid) {
@@ -392,9 +442,13 @@ fn linux_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendant
     // An unreadable entry may be a member of this group. With none of them,
     // a group the probe found alive must show at least one member or zombie.
     let incomplete = unreadable > 0 || (candidates.is_empty() && zombies == 0);
-    Ok(group_listing(pgid, candidates, incomplete, |pid, comm| {
-        Some(linux_describe_member(pid, comm))
-    }))
+    Ok(group_listing(
+        pgid,
+        candidates,
+        incomplete,
+        describe,
+        |pid, comm| Some(linux_describe_member(pid, comm)),
+    ))
 }
 
 /// Build a listing from the members found. An incomplete listing of a group
@@ -405,6 +459,7 @@ fn group_listing<C>(
     pgid: i32,
     candidates: Vec<(u32, C)>,
     incomplete: bool,
+    describe_members: bool,
     describe: impl FnMut(u32, C) -> Option<LiveDescendant>,
 ) -> GroupListing {
     if incomplete && process_group_gone(pgid) {
@@ -414,7 +469,11 @@ fn group_listing<C>(
     candidates.sort_by_key(|(pid, _)| *pid);
     let (identities, identities_truncated) =
         capped_identities(candidates.iter().map(|(pid, _)| *pid), ProcessIdentity::of);
-    let (members, omitted) = bounded_members(candidates, describe);
+    let (members, omitted) = if describe_members {
+        bounded_members(candidates, describe)
+    } else {
+        (Vec::new(), candidates.len())
+    };
     GroupListing {
         members,
         omitted,
@@ -591,7 +650,10 @@ fn linux_describe_member(pid: u32, comm: String) -> LiveDescendant {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
+fn macos_process_group_members(
+    pgid: i32,
+    describe: bool,
+) -> Result<GroupListing, LiveDescendantsUnavailable> {
     use std::ffi::{c_char, c_int, c_void};
 
     #[link(name = "proc")]
@@ -652,29 +714,35 @@ fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendant
     // A group the probe finds alive must show at least one member, and a
     // process that has exited counts as one it saw.
     let incomplete = candidates.is_empty() && exited == 0;
-    Ok(group_listing(pgid, candidates, incomplete, |pid, info| {
-        let mut name = [0 as c_char; 1024];
-        let name_len =
-            unsafe { proc_name(pid as c_int, name.as_mut_ptr().cast(), name.len() as u32) };
-        let comm = if name_len > 0 {
-            unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            info.as_ref()
-                .map(|info| info.comm.clone())
-                .unwrap_or_else(|| "?".to_string())
-        };
-        let args = macos_argv(pid).unwrap_or_default();
-        let argv0 = safe_argv0(args.first().filter(|value| !value.is_empty()), &comm);
-        Some(LiveDescendant {
-            pid,
-            command: shown_command(&comm, arguments_may_be_present(&args)),
-            comm: safe_name(&comm),
-            argv0,
-            user: info.map(|info| user_name(info.ruid)),
-        })
-    }))
+    Ok(group_listing(
+        pgid,
+        candidates,
+        incomplete,
+        describe,
+        |pid, info| {
+            let mut name = [0 as c_char; 1024];
+            let name_len =
+                unsafe { proc_name(pid as c_int, name.as_mut_ptr().cast(), name.len() as u32) };
+            let comm = if name_len > 0 {
+                unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                info.as_ref()
+                    .map(|info| info.comm.clone())
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            let args = macos_argv(pid).unwrap_or_default();
+            let argv0 = safe_argv0(args.first().filter(|value| !value.is_empty()), &comm);
+            Some(LiveDescendant {
+                pid,
+                command: shown_command(&comm, arguments_may_be_present(&args)),
+                comm: safe_name(&comm),
+                argv0,
+                user: info.map(|info| user_name(info.ruid)),
+            })
+        },
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -1792,7 +1860,7 @@ fn lifecycle_empty_group_avoids_proc_scan() {
     let pgid = child.id() as i32;
     child.wait().unwrap();
     PROC_SCAN_COUNT.with(|count| count.set(0));
-    assert!(linux_process_group_members(pgid).unwrap().is_clean());
+    assert!(linux_process_group_members(pgid, true).unwrap().is_clean());
     assert_eq!(
         PROC_SCAN_COUNT.with(std::cell::Cell::get),
         0,
@@ -1903,7 +1971,7 @@ fn macos_kinfo_reads_this_process() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_group_listing_includes_another_users_process() {
-    let members = macos_process_group_members(1)
+    let members = macos_process_group_members(1, true)
         .expect("group 1 can be listed")
         .members;
     let launchd = members
@@ -1922,7 +1990,7 @@ fn linux_member_records_owner_and_executable_name_only() {
     start_new_session(&mut command);
     let mut child = command.spawn().unwrap();
     let pgid = child.id() as i32;
-    let members = linux_process_group_members(pgid);
+    let members = linux_process_group_members(pgid, true);
     let _ = child.kill();
     let _ = child.wait();
     let GroupListing {

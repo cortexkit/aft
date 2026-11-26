@@ -9,7 +9,8 @@ mod scope_kill;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use scope_kill::{
-    with_pidfds_unavailable_for_test, with_scope_kill_open_error_for_test,
+    with_listing_faults_for_test, with_pidfds_unavailable_for_test,
+    with_scope_kill_open_error_for_test, ListingFaults,
 };
 
 #[cfg(target_os = "linux")]
@@ -1182,8 +1183,8 @@ mod linux {
         /// each check so a direct child that exits does not linger as a zombie.
         /// The caller ends the scope with [`Self::kill`] afterwards.
         /// Returns false, having sent nothing, when this kernel has no pidfds.
-        pub(crate) fn terminate_members(&self, reap: impl FnMut()) -> bool {
-            let sent = super::scope_kill::terminate_members(&self.cgroup, reap);
+        pub(crate) fn terminate_members(&self, before: impl FnOnce(), reap: impl FnMut()) -> bool {
+            let sent = super::scope_kill::terminate_members(&self.cgroup, before, reap);
             #[cfg(test)]
             KILL_EVENTS.with(|slot| {
                 if let (true, Some(events)) = (sent, slot.borrow().as_ref()) {

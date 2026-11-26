@@ -97,21 +97,30 @@ impl GroupEvidence {
         (count > 0).then(|| outside_group_note(count))
     }
 
-    /// Record who is in the group now, if the group is proven both before and
-    /// after the listing (only then does the listing describe the task's
-    /// group). A recorded member still in the group proves it later, even
-    /// after the leader is gone: a group number cannot be reused while the
-    /// group has members. Returns whether the group was proven.
+    /// Whether the task's recorded leader (the process whose pid is the group
+    /// number) is still running in the group with its saved start.
+    #[cfg(unix)]
+    pub(super) fn leader_running(&self) -> bool {
+        self.identities.iter().any(|identity| {
+            i32::try_from(identity.pid) == Ok(self.pgid)
+                && super::super::process::is_running_in_group(identity, self.pgid)
+        })
+    }
+
+    /// Record who is in the group now, if the group is proven before the
+    /// listing. The members are kept even if the leader exits while the group
+    /// is listed: a recorded member still running in the group proves it
+    /// later, because a group number cannot be reused while the group has
+    /// members. The listing reads only identities, never account names,
+    /// which can stall on a slow directory service. Returns whether the group
+    /// was proven.
     #[cfg(unix)]
     pub(super) fn remember_members(&mut self) -> bool {
         if !self.proven() {
             return false;
         }
-        if let Ok(listing) = live_process_group_members(self.pgid) {
-            if !self.proven() {
-                return false;
-            }
-            self.identities.extend(listing.identities);
+        if let Ok(identities) = super::super::process::process_group_identities(self.pgid) {
+            self.identities.extend(identities);
         }
         true
     }
@@ -122,17 +131,30 @@ impl GroupEvidence {
     /// Returns the note a kill reply should carry, if any.
     #[cfg(unix)]
     pub(super) fn terminate(&mut self) -> Option<String> {
+        self.terminate_with(|| {})
+    }
+
+    /// [`Self::terminate`], calling `before_first_signal` once, right before
+    /// SIGTERM is sent; it is never called when nothing is sent.
+    #[cfg(unix)]
+    pub(super) fn terminate_with(
+        &mut self,
+        mut before_first_signal: impl FnMut(),
+    ) -> Option<String> {
         let mut first = true;
         let outcome = super::super::process::terminate_proven_pgid(self.pgid, || {
             if std::mem::take(&mut first) {
-                self.remember_members()
+                let proven = self.remember_members();
+                if proven {
+                    before_first_signal();
+                }
+                proven
             } else {
                 self.proven()
             }
         });
         self.coverage_note(outcome)
     }
-
     #[cfg(unix)]
     fn coverage_note(&self, outcome: GroupTermination) -> Option<String> {
         match outcome {
@@ -157,6 +179,7 @@ pub(super) fn terminate_piped_task(
     child_pid: Option<u32>,
     reason: &str,
     #[allow(unused_mut)] mut child: Option<&mut Child>,
+    before_first_signal: &mut dyn FnMut(),
 ) -> Option<String> {
     let task_id = metadata.task_id.as_str();
     #[cfg(all(test, unix))]
@@ -165,6 +188,7 @@ pub(super) fn terminate_piped_task(
         .is_some_and(|tasks| tasks.lock().unwrap().remove(task_id))
     {
         if let Some(pgid) = pgid {
+            before_first_signal();
             unsafe {
                 libc::killpg(pgid, libc::SIGTERM);
             }
@@ -178,13 +202,14 @@ pub(super) fn terminate_piped_task(
         // The child is reaped only after the KILL, so it keeps the group
         // number pinned to this task for the whole termination.
         let owned_leader = child.as_ref().map(|child| child.id());
-        GroupEvidence::for_task(metadata, pgid, owned_leader).terminate()
+        GroupEvidence::for_task(metadata, pgid, owned_leader).terminate_with(before_first_signal)
     }
     #[cfg(windows)]
     {
         let _ = pgid;
         if let Some(pid) = child.as_ref().map(|child| child.id()).or(child_pid) {
             log_bash_kill(task_id, Some(pid), None, reason);
+            before_first_signal();
         }
         if let Some(child) = child {
             super::super::process::terminate_process(child);
@@ -228,16 +253,18 @@ pub(super) fn terminate_pty_task(
 fn terminate_scope_or_group(
     scope: &super::super::task_scope::ScopeHandle,
     group: impl FnOnce() -> Option<GroupEvidence>,
+    before_first_signal: &mut dyn FnMut(),
     reap: impl FnMut(),
 ) -> Option<String> {
-    if scope.terminate_members(reap) {
+    if scope.terminate_members(&mut *before_first_signal, reap) {
         return None;
     }
-    group()?.terminate()
+    group()?.terminate_with(before_first_signal)
 }
 
 /// Why a live kill's outcome is unknown, when it is: its scope could not be
-/// ended, or nothing could be sent while the command still had processes.
+/// ended, nothing could be sent while the command still had processes, or
+/// SIGKILL was withheld while survivors could not be confirmed.
 pub(super) fn unconfirmed_kill_reason(
     scope_result: &Result<(), String>,
     note: Option<&str>,
@@ -245,9 +272,18 @@ pub(super) fn unconfirmed_kill_reason(
     match scope_result {
         Err(error) => Some(format!("Task outcome is unknown: {error}.")),
         Ok(()) => note
-            .filter(|note| *note == NOTHING_SENT_NOTE)
+            .filter(|note| note_is_unconfirmed(note))
             .map(str::to_string),
     }
+}
+
+/// Whether a kill note says the kill was not confirmed.
+fn note_is_unconfirmed(note: &str) -> bool {
+    #[cfg(unix)]
+    if note == KILL_WITHHELD_NOTE {
+        return true;
+    }
+    note == NOTHING_SENT_NOTE
 }
 
 /// Whether something still answers under the command's saved pid or process
@@ -392,6 +428,7 @@ impl BgTaskRegistry {
                             .pgid
                             .map(|pgid| GroupEvidence::for_task(metadata, pgid, None))
                     },
+                    &mut || {},
                     || {},
                 );
                 if let Err(error) = self.inner.task_scopes.kill_with_audit(
@@ -417,9 +454,14 @@ impl BgTaskRegistry {
             }
             ReplayKill::Process(pid) => {
                 let note = match metadata.mode {
-                    BgMode::Pipes => {
-                        terminate_piped_task(metadata, metadata.pgid, Some(pid), reason, None)
-                    }
+                    BgMode::Pipes => terminate_piped_task(
+                        metadata,
+                        metadata.pgid,
+                        Some(pid),
+                        reason,
+                        None,
+                        &mut || {},
+                    ),
                     BgMode::Pty => terminate_pty_task(metadata, pid, None),
                 };
                 if note.as_deref() == Some(NOTHING_SENT_NOTE) {
@@ -444,6 +486,13 @@ impl BgTaskRegistry {
                 return;
             }
         };
+        // SIGKILL withheld while survivors could not be confirmed: the
+        // command may still be running, so its outcome is unknown.
+        if let Some(note) = note.as_deref().filter(|note| note_is_unconfirmed(note)) {
+            metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(note.to_string()));
+            super::super::persistence::persist_terminal_exit(paths, metadata);
+            return;
+        }
         let mut reason = killed_reason.to_string();
         if let Some(note) = note {
             reason = format!("{reason}; {note}");
@@ -480,6 +529,7 @@ impl BgTaskRegistry {
             Ok(Some(scope)) => Some(terminate_scope_or_group(
                 &scope,
                 || Some(GroupEvidence::for_task(&metadata, pgid, None)),
+                &mut || {},
                 || {},
             )),
             _ => None,
@@ -529,6 +579,7 @@ impl BgTaskRegistry {
         child_pid: Option<u32>,
         reason: &str,
         #[allow(unused_mut)] mut child: Option<&mut Child>,
+        before_first_signal: &mut dyn FnMut(),
     ) -> (Result<(), String>, Option<String>) {
         let metadata = match task.lock_state() {
             Ok(state) => state.metadata.clone(),
@@ -541,6 +592,7 @@ impl BgTaskRegistry {
             let note = terminate_scope_or_group(
                 &scope,
                 || pgid.map(|pgid| GroupEvidence::for_task(&metadata, pgid, owned_leader)),
+                before_first_signal,
                 || {
                     if let Some(child) = child.as_deref_mut() {
                         let _ = child.try_wait();
@@ -552,7 +604,14 @@ impl BgTaskRegistry {
                 note,
             );
         }
-        let note = terminate_piped_task(&metadata, pgid, child_pid, reason, child);
+        let note = terminate_piped_task(
+            &metadata,
+            pgid,
+            child_pid,
+            reason,
+            child,
+            before_first_signal,
+        );
         (
             self.kill_task_scope_with_reason(&task.task_id, reason),
             note,
@@ -571,21 +630,50 @@ impl BgTaskRegistry {
         let metadata = task.lock_state().ok()?.metadata.clone();
         #[cfg(target_os = "linux")]
         if let Ok(Some(scope)) = self.kill_scope_handle(&metadata) {
-            return terminate_scope_or_group(&scope, || evidence, || {});
+            return terminate_scope_or_group(&scope, || evidence, &mut || {}, || {});
         }
         terminate_pty_task(&metadata, pid, evidence)
     }
 }
 
-/// The evidence a PTY kill needs, gathered under the task's state lock before
-/// its leader is hung up: the leader is then still running, so it proves the
-/// group, and the members listed then prove it after the leader is gone.
+/// The evidence a PTY kill needs, gathered before its leader is hung up and
+/// without the task's state lock (listing a group can be slow): the leader is
+/// still running then, so it proves the group, and the members listed then
+/// prove it after the leader is gone. The caller re-checks the leader under
+/// the lock before the hangup.
 #[cfg(unix)]
 pub(super) fn pty_evidence_before_hangup(metadata: &PersistedTask) -> Option<GroupEvidence> {
     let pgid = metadata.pgid?;
     let mut evidence = GroupEvidence::for_task(metadata, pgid, None);
     evidence.remember_members();
     Some(evidence)
+}
+
+/// How long a kill waits for its own wrapper to exit before leaving it for
+/// the watchdog's reap pass. A wrapper stuck in uninterruptible I/O must not
+/// hold the kill, and the completion it publishes, indefinitely.
+const KILL_REAP_WAIT: Duration = Duration::from_secs(5);
+
+/// Reap a killed task's own wrapper, waiting at most [`KILL_REAP_WAIT`].
+/// Returns whether it was reaped. `child` is left set only when the wrapper
+/// has not exited yet, so the caller can hand it back for a later reap.
+pub(super) fn reap_within(child: &mut Option<Child>) -> bool {
+    let Some(running) = child.as_mut() else {
+        return false;
+    };
+    let deadline = Instant::now() + KILL_REAP_WAIT;
+    let reaped = loop {
+        match running.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => return false,
+            Err(_) => break false,
+        }
+    };
+    *child = None;
+    reaped
 }
 
 /// Settle a PTY task that was running when AFT stopped and left no exit
@@ -664,6 +752,50 @@ pub(super) fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
 
 #[cfg(not(unix))]
 pub(super) fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
+
+/// Whether a finished task's process group, answering under its saved
+/// number, is still that task's group and may be signalled. The number is the
+/// group leader's pid, and once the original group has exited the system can
+/// hand it to an unrelated process. So the group is the task's only while its
+/// leader, or a member a check of this task found, is still running in it
+/// with the start time AFT recorded. Without such evidence it is left alone,
+/// even when a check could not see every member.
+pub(super) fn finished_group_is_still_the_tasks(metadata: &PersistedTask, pgid: i32) -> bool {
+    GroupEvidence::for_task(metadata, pgid, None).proven()
+}
+
+/// Store the outcome of one check of a task's process group: the surviving
+/// members, why they could not be listed, or both when the listing was
+/// incomplete. An empty list is stored only for a clean check, so `[]` always
+/// means the group was seen to be empty.
+pub(super) fn record_group_check(
+    metadata: &mut PersistedTask,
+    check: &Result<GroupListing, LiveDescendantsUnavailable>,
+) {
+    match check {
+        Ok(listing) => {
+            let found_any = !listing.members.is_empty() || listing.omitted > 0;
+            metadata.live_descendants =
+                (found_any || !listing.incomplete).then(|| listing.members.clone());
+            metadata.live_descendants_omitted = listing.omitted;
+            metadata.live_descendants_unavailable = listing
+                .incomplete
+                .then_some(LiveDescendantsUnavailable::ListingIncomplete);
+            if found_any {
+                metadata.group_member_identities = listing.identities.clone();
+                metadata.group_member_identities_truncated = listing.identities_truncated;
+            } else if !listing.incomplete {
+                metadata.group_member_identities.clear();
+                metadata.group_member_identities_truncated = false;
+            }
+        }
+        Err(reason) => {
+            metadata.live_descendants = None;
+            metadata.live_descendants_omitted = 0;
+            metadata.live_descendants_unavailable = Some(*reason);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

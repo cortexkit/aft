@@ -1477,3 +1477,194 @@ fn live_kill_that_sent_nothing_records_fate_unknown() {
     assert_eq!(completion.status, BgTaskStatus::FateUnknown);
     assert_eq!(completion.status_reason.as_deref(), Some(note));
 }
+
+/// Listing a process group can be slow (on macOS it reads every member's
+/// record), and status must never wait on it: a PTY kill lists its group
+/// without holding the task's state lock.
+#[test]
+fn pty_kill_lists_its_group_without_holding_the_task_lock() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = registry
+        .spawn_pty(
+            SpawnPlan::Unsandboxed,
+            "/bin/sh -c \"touch ready; exec sleep 300\"",
+            SESSION.to_string(),
+            dir.path().to_path_buf(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(dir.path().to_path_buf()),
+            24,
+            80,
+        )
+        .unwrap();
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    let task = registry.task_for_test(&task_id).unwrap();
+    let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let under_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer = {
+        let (task, listings, under_lock) = (task.clone(), listings.clone(), under_lock.clone());
+        move || {
+            listings.fetch_add(1, Ordering::SeqCst);
+            if task.state.try_lock().is_err() {
+                under_lock.store(true, Ordering::SeqCst);
+            }
+        }
+    };
+    test_hooks::with_listing_observer(observer, || registry.kill(&task_id, SESSION).unwrap());
+    assert!(
+        listings.load(Ordering::SeqCst) > 0,
+        "the kill never listed its group"
+    );
+    assert!(
+        !under_lock.load(Ordering::SeqCst),
+        "the group was listed while the task's state lock was held"
+    );
+}
+
+/// A second kill while one is in flight must not publish its own outcome:
+/// here the first kill can send nothing, so the command's fate is unknown,
+/// and a `killed` marker seen by the second kill must not turn that into a
+/// plain kill.
+#[test]
+fn a_second_kill_waits_for_the_kill_in_flight() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(&registry, dir.path(), "touch ready; sleep 30");
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    let task = registry.task_for_test(&task_id).unwrap();
+    let (kill_reached, release_kill) = install_kill_signal_gate_for_test(&task_id);
+    let kill = |registry: &BgTaskRegistry| {
+        let registry = registry.clone();
+        let task_id = task_id.clone();
+        std::thread::spawn(move || registry.kill(&task_id, SESSION))
+    };
+    let first = kill(&registry);
+    kill_reached.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Nothing recorded for the task proves its group once the wrapper is gone.
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+        libc::waitpid(pgid, std::ptr::null_mut(), 0);
+    }
+    task.lock_state()
+        .unwrap()
+        .io_handles
+        .as_mut()
+        .unwrap()
+        .write(TaskArtifact::Exit, b"killed")
+        .unwrap();
+    let second = kill(&registry);
+    std::thread::sleep(Duration::from_millis(300));
+    release_kill.send(()).unwrap();
+    let first = first.join().unwrap().unwrap();
+    let second = second.join().unwrap().unwrap();
+
+    assert_eq!(first.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(second.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(
+        completion_for(&registry, &task_id).status,
+        BgTaskStatus::FateUnknown
+    );
+}
+
+/// SIGTERM was sent, but a process the group gained afterwards ignores it,
+/// and nothing recorded proves the group when SIGKILL is due. The kill is not
+/// confirmed: the task ends fate unknown with the withheld-kill note, in its
+/// status and completion as well as the reply.
+#[test]
+fn a_withheld_sigkill_records_fate_unknown() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("survivor.sh"),
+        "trap 'sh -c \"trap \\\"\\\" TERM; exec sleep 30\" & exit 0' TERM\ntouch ready\nwhile :; do sleep 0.2; done\n",
+    )
+    .unwrap();
+    let task_id = spawn_for_kill(&registry, dir.path(), "sh ./survivor.sh");
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    let task = registry.task_for_test(&task_id).unwrap();
+    let (kill_reached, release_kill) = install_kill_signal_gate_for_test(&task_id);
+    let killer = {
+        let registry = registry.clone();
+        let task_id = task_id.clone();
+        std::thread::spawn(move || registry.kill(&task_id, SESSION))
+    };
+    kill_reached.recv_timeout(Duration::from_secs(10)).unwrap();
+    // The members a status check recorded prove the group at SIGTERM; the
+    // wrapper, which would pin the group number, is gone.
+    let members = crate::bash_background::process::process_group_identities(pgid).unwrap();
+    task.lock_state().unwrap().metadata.group_member_identities = members;
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+        libc::waitpid(pgid, std::ptr::null_mut(), 0);
+    }
+    release_kill.send(()).unwrap();
+    let killed = killer.join().unwrap().unwrap();
+    let survived = !crate::bash_background::process::group_exited(pgid);
+
+    let note = super::verified_kill::KILL_WITHHELD_NOTE;
+    assert!(
+        survived,
+        "the late TERM-ignoring child was expected to survive"
+    );
+    assert_eq!(killed.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(killed.kill_state_warning.as_deref(), Some(note));
+    let completion = completion_for(&registry, &task_id);
+    assert_eq!(completion.status, BgTaskStatus::FateUnknown);
+    assert_eq!(completion.status_reason.as_deref(), Some(note));
+}
+
+/// A kill that sends nothing never committed to an outcome, so the
+/// command's own exit code, reported after the kill decided, wins.
+#[test]
+fn a_natural_exit_wins_over_a_kill_that_sent_nothing() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(&registry, dir.path(), "touch ready; sleep 30");
+    wait_for_file(&dir.path().join("ready"), "the command did not start");
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    let task = registry.task_for_test(&task_id).unwrap();
+    let (kill_reached, release_kill) = install_kill_signal_gate_for_test(&task_id);
+    let (signalled, release_signalled) =
+        install_kill_signal_gate_for_test(&format!("{task_id}:signalled"));
+    let killer = {
+        let registry = registry.clone();
+        let task_id = task_id.clone();
+        std::thread::spawn(move || registry.kill(&task_id, SESSION))
+    };
+    kill_reached.recv_timeout(Duration::from_secs(10)).unwrap();
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+        libc::waitpid(pgid, std::ptr::null_mut(), 0);
+    }
+    release_kill.send(()).unwrap();
+    signalled.recv_timeout(Duration::from_secs(10)).unwrap();
+    task.lock_state()
+        .unwrap()
+        .io_handles
+        .as_mut()
+        .unwrap()
+        .write(TaskArtifact::Exit, b"0")
+        .unwrap();
+    release_signalled.send(()).unwrap();
+    let killed = killer.join().unwrap().unwrap();
+
+    assert_eq!(killed.info.status, BgTaskStatus::Completed);
+    assert_eq!(killed.exit_code, Some(0));
+    assert_eq!(
+        completion_for(&registry, &task_id).status,
+        BgTaskStatus::Completed
+    );
+}

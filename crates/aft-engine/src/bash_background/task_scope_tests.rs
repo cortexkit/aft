@@ -2228,3 +2228,186 @@ fn pty_scope_launch_failure_retries_without_a_scope() {
         "the reaped launcher was signalled: {lines:?}"
     );
 }
+
+/// Start a TERM-ignoring piped command, register a fake scope listing its
+/// processes, and return the task id and process group.
+fn fake_scoped_command(
+    r: &BgTaskRegistry,
+    root: &Path,
+    session: &str,
+    cgroup_kill: bool,
+    list_members: bool,
+) -> (String, i32) {
+    r.inner.shutdown.store(true, Ordering::SeqCst);
+    let id = r
+        .spawn(
+            SpawnPlan::Unsandboxed,
+            "trap '' TERM; echo ready; exec sleep 300",
+            session.into(),
+            root.into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.into(),
+            8,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    let task = r.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.stdout)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+    let procs: String = if list_members {
+        super::super::process::process_group_identities(pgid)
+            .unwrap()
+            .iter()
+            .map(|identity| format!("{}\n", identity.pid))
+            .collect()
+    } else {
+        String::new()
+    };
+    let cgroup = root.join("scope");
+    std::fs::create_dir(&cgroup).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+    if cgroup_kill {
+        std::fs::write(cgroup.join("cgroup.kill"), "0").unwrap();
+    }
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(&id, cgroup));
+    (id, pgid)
+}
+
+/// Without `cgroup.kill`, a scope whose processes cannot be opened (no file
+/// descriptors left) or whose folder cannot be walked is not confirmed
+/// empty: the kill ends fate unknown and nothing is reported killed.
+#[test]
+fn task_scope_fallback_fails_closed_when_members_cannot_be_reached() {
+    for (case, faults) in [
+        (
+            "EMFILE",
+            super::super::task_scope::ListingFaults {
+                pidfd_errno: Some(libc::EMFILE),
+                ..Default::default()
+            },
+        ),
+        (
+            "walk error",
+            super::super::task_scope::ListingFaults {
+                walk_error: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let r = BgTaskRegistry::default();
+        let (id, pgid) = fake_scoped_command(&r, root.path(), "fail-closed", false, true);
+        let killed = super::super::task_scope::with_listing_faults_for_test(faults, || {
+            r.kill(&id, "fail-closed").unwrap()
+        });
+        let survived = !super::super::process::group_exited(pgid);
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        assert!(survived, "{case}: the group was expected to survive");
+        assert_eq!(killed.info.status, BgTaskStatus::FateUnknown, "{case}");
+        assert_eq!(
+            killed.info.status_reason.as_deref(),
+            Some(
+                format!(
+                    "Task outcome is unknown: task scope aft-task-{id}.scope could not be killed."
+                )
+                .as_str()
+            ),
+            "{case}"
+        );
+    }
+}
+
+/// Without pidfds the process group is terminated instead of the scope's
+/// processes. An empty scope folder that lingers without `cgroup.kill` then
+/// confirms the kill.
+#[test]
+fn task_scope_without_pidfds_confirms_an_emptied_scope_without_cgroup_kill() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    let (id, pgid) = fake_scoped_command(&r, root.path(), "no-pidfds", false, false);
+    let killed = super::super::task_scope::with_pidfds_unavailable_for_test(|| {
+        r.kill(&id, "no-pidfds").unwrap()
+    });
+    let stopped = super::super::process::group_exited(pgid);
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    assert!(stopped, "the process group was not terminated");
+    assert_eq!(killed.info.status, BgTaskStatus::Killed);
+}
+
+/// A scoped PTY whose leader outlives every signal never reports an exit.
+/// Its kill still ends it, fate unknown, after a bounded wait, and posts one
+/// completion instead of leaving the task `killing`.
+#[test]
+fn scoped_pty_that_outlives_its_kill_still_ends_and_posts_one_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    r.inner.shutdown.store(true, Ordering::SeqCst);
+    let id = r
+        .spawn_pty(
+            SpawnPlan::Unsandboxed,
+            "trap '' HUP TERM; echo ready; while :; do sleep 1; done",
+            "pty-survives".into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.path().into(),
+            8,
+            true,
+            false,
+            Some(root.path().into()),
+            24,
+            80,
+        )
+        .unwrap();
+    let task = r.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.pty)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+    super::super::process::test_hooks::deny_sigkill(pgid);
+    // `cgroup.kill` cannot be written: it is a directory.
+    let cgroup = root.path().join("broken-scope");
+    std::fs::create_dir_all(cgroup.join("cgroup.kill")).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), format!("{pgid}\n")).unwrap();
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(&id, cgroup));
+    let started = Instant::now();
+    let killed =
+        super::super::task_scope::with_pidfds_unavailable_for_test(|| r.kill(&id, "pty-survives"));
+    let elapsed = started.elapsed();
+    let survived = !super::super::process::group_exited(pgid);
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    let killed = killed.unwrap();
+    assert!(survived, "the leader was expected to outlive the kill");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the kill took {elapsed:?}"
+    );
+    assert_eq!(killed.info.status, BgTaskStatus::FateUnknown);
+    let completions = r
+        .pending_completions_for_session("pty-survives")
+        .into_iter()
+        .filter(|completion| completion.task_id == id)
+        .count();
+    assert_eq!(completions, 1);
+}
