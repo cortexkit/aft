@@ -673,7 +673,7 @@ fn maintain_with_probe(
 
 /// Install the managed git hooks that `git.co_author` needs, without touching
 /// the gh shim. A live config reload turning co-author attribution on calls
-/// this; the shim is only changed by a full configure.
+/// this without changing the shim.
 pub(crate) fn ensure_git_hooks(storage_root: &Path) -> Result<(), String> {
     ensure_managed_git_hooks(&managed_git_hooks_dir(storage_root))
 }
@@ -907,7 +907,13 @@ pub fn inject(
             explicit.to_string_lossy().into_owned(),
         );
     }
-    maintain(config, storage_root)?;
+    if gh_enabled {
+        maintain(config, storage_root)?;
+    } else {
+        // A live switch-off controls future children. Do not remove the shared
+        // shim entry from the PATH of a child launched while it was enabled.
+        ensure_git_hooks(storage_root)?;
+    }
 
     if gh_enabled {
         let shims_dir = crate::pinned_executable::shims_dir(storage_root);

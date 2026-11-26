@@ -377,6 +377,32 @@ fn user_file_edit_applies_live_too() {
 }
 
 #[test]
+fn gh_shim_user_edit_reloads_without_reconfigure_and_keeps_harness_precedence() {
+    for harness_override in [false, true] {
+        let doc = |enabled| {
+            let mut value = json!({"github": {"shim": enabled}});
+            if harness_override {
+                value["harnesses"] = json!({"opencode": {"github": {"shim": true}}});
+            }
+            value.to_string()
+        };
+        let fixture = Fixture::new(&doc(true), None);
+        assert!(fixture.ctx.config().github.shim);
+        let generation = fixture.ctx.configure_generation();
+
+        write(&fixture.user_path, &doc(false));
+        let outcome = fixture.reload();
+        assert_eq!(fixture.ctx.config().github.shim, harness_override);
+        assert_eq!(
+            applied(&outcome).contains(&"github.shim"),
+            !harness_override
+        );
+        assert!(!deferred(&outcome).contains(&"github.shim"));
+        assert_eq!(fixture.ctx.configure_generation(), generation);
+    }
+}
+
+#[test]
 fn deferred_keys_are_listed_and_not_applied_until_the_next_configure() {
     let fixture = Fixture::new("{}", Some("{}"));
     let generation = fixture.ctx.configure_generation();

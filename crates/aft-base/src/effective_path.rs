@@ -81,10 +81,11 @@ pub fn initialize_process_path() -> &'static OsStr {
 
     #[cfg(unix)]
     {
-        if path != OsStr::new("") && std::env::var_os("PATH").as_deref() != Some(path) {
+        let inherited = std::env::var_os("PATH");
+        if !path.is_empty() && inherited.as_deref() != Some(path) {
             std::env::set_var("PATH", path);
         }
-        spawn_cached_path_refresh();
+        spawn_cached_path_refresh(inherited.as_deref());
     }
 
     path
@@ -385,10 +386,7 @@ pub fn effective_path() -> &'static OsStr {
             let cache = EffectivePathCache {
                 schema: EFFECTIVE_PATH_CACHE_SCHEMA,
                 shell: result.shell.to_string_lossy().into_owned(),
-                path: result
-                    .path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
+                path: result.path.as_deref().and_then(cacheable_login_path),
                 probed_at_unix: unix_timestamp_secs(),
                 inputs: shell_startup_inputs(&result.shell),
             };
@@ -852,6 +850,21 @@ fn read_effective_path_cache(path: &Path) -> Option<EffectivePathCache> {
 }
 
 #[cfg(unix)]
+fn cacheable_login_path(path: &OsStr) -> Option<String> {
+    let entries = std::env::split_paths(path).filter(|entry| {
+        // A permission error does not prove the entry is gone.
+        !std::fs::metadata(entry).is_err_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            )
+        })
+    });
+    let path = std::env::join_paths(entries).ok()?;
+    (!path.is_empty()).then(|| path.to_string_lossy().into_owned())
+}
+
+#[cfg(unix)]
 fn write_effective_path_cache(path: &Path, cache: &EffectivePathCache) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         crate::private_storage::create_dir_all(parent)?;
@@ -947,10 +960,7 @@ pub fn refresh_login_shell_path_cache(cache_path: &Path) -> Result<(), String> {
     let cache = EffectivePathCache {
         schema: EFFECTIVE_PATH_CACHE_SCHEMA,
         shell: result.shell.to_string_lossy().into_owned(),
-        path: result
-            .path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
+        path: result.path.as_deref().and_then(cacheable_login_path),
         probed_at_unix: unix_timestamp_secs(),
         inputs: shell_startup_inputs(&result.shell),
     };
@@ -964,7 +974,7 @@ pub fn refresh_login_shell_path_cache(_cache_path: &std::path::Path) -> Result<(
 }
 
 #[cfg(unix)]
-fn spawn_cached_path_refresh() {
+fn spawn_cached_path_refresh(inherited_path: Option<&OsStr>) {
     // Integration tests point this seam at a deliberately sleeping shell and
     // assert the serving binary does not run it on a cache hit. Production
     // launches do not set the seam and always refresh through the helper.
@@ -990,6 +1000,11 @@ fn spawn_cached_path_refresh() {
         return;
     };
     let mut command = Command::new(executable);
+    // Start from the launch environment, not entries from the cache being refreshed.
+    match inherited_path {
+        Some(path) => command.env("PATH", path),
+        None => command.env_remove("PATH"),
+    };
     command
         .arg("--probe-login-shell-path")
         .arg(cache_path)

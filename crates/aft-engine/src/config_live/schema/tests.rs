@@ -317,6 +317,15 @@ fn config_settings_layer_policy_golden() {
 }
 
 #[test]
+fn gh_shim_settings_declaration_applies_live() {
+    let declaration = settings_declaration();
+    let github = &declaration["properties"]["github"]["properties"];
+    assert_eq!(github["shim"]["x-ck-apply"], "live");
+    assert_eq!(github["read"]["x-ck-apply"], "module_restart");
+    assert_eq!(github["write"]["x-ck-apply"], "module_restart");
+}
+
+#[test]
 fn config_settings_harness_overrides_are_closed_and_inherit() {
     let schema = validated();
     fn has_default(node: &Value) -> bool {

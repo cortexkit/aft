@@ -1,29 +1,20 @@
-use std::cell::OnceCell;
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
-use subc_client_rs::{ConsumerOptions, SubcConsumer};
-
 use super::{
-    connection_file_from_config_doc, current_platform, delegate_after_invalid_manifest_notice,
-    gh_shim_state_dir_from, is_unbound_safe, read_user_config_doc, refuse, regressed_disposition,
-    relay_client, resolve_manifest, unix_seconds, ManifestProblem, ManifestResolution, RefusalCode,
-    RegressedDisposition, StatePaths, DISCOVERY_BUDGET,
+    current_platform, delegate_after_invalid_manifest_notice, gh_shim_state_dir_from,
+    is_unbound_safe, refuse, regressed_disposition, resolve_manifest, unix_seconds,
+    ManifestProblem, ManifestResolution, RefusalCode, RegressedDisposition, StatePaths,
 };
 
 pub(super) struct ManifestGuard<'a> {
     paths: &'a StatePaths,
-    // Dispatch and the final upstream guard share one lookup for this invocation.
-    routing_may_be_offered: OnceCell<bool>,
 }
 
 impl<'a> ManifestGuard<'a> {
     pub(super) fn new(paths: &'a StatePaths) -> Self {
-        Self {
-            paths,
-            routing_may_be_offered: OnceCell::new(),
-        }
+        Self { paths }
     }
 
     pub(super) fn dispatch_without_valid_manifest(
@@ -54,9 +45,6 @@ impl<'a> ManifestGuard<'a> {
         );
         if manifest_state_was_provisioned(&self.paths.root)
             || manifest_state_was_provisioned(&default_root)
-            || *self
-                .routing_may_be_offered
-                .get_or_init(routing_may_be_offered)
         {
             return Some(refuse(
                 RefusalCode::ManifestUnavailable,
@@ -104,39 +92,4 @@ fn manifest_state_was_provisioned(root: &Path) -> bool {
         // provisioned. Only absence permits that fallback.
         Err(error) => error.kind() != io::ErrorKind::NotFound,
     })
-}
-
-fn routing_may_be_offered() -> bool {
-    // Use config only to locate the daemon, not to decide what it serves.
-    // A configured but unusable connection does not establish absence.
-    let Some(connection_file) = read_user_config_doc()
-        .as_deref()
-        .and_then(connection_file_from_config_doc)
-    else {
-        return false;
-    };
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-    else {
-        return true;
-    };
-    let offered = runtime.block_on(async {
-        tokio::time::timeout(DISCOVERY_BUDGET, async {
-            let options = ConsumerOptions {
-                call_timeout: DISCOVERY_BUDGET,
-                handshake_timeout: DISCOVERY_BUDGET,
-                ..ConsumerOptions::default()
-            };
-            let consumer = SubcConsumer::connect(&connection_file, options)
-                .await
-                .ok()?;
-            let catalog = consumer.catalog_list().await.ok()?;
-            Some(relay_client::relay_holder(&catalog.modules).is_some())
-        })
-        .await
-    });
-    // Only a successful catalog response can rule out the write relay.
-    !matches!(offered, Ok(Some(false)))
 }

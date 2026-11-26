@@ -782,10 +782,6 @@ fn run_with(
         );
     }
     let paths = StatePaths::from_process();
-    let manifest_guard = manifest_guard::ManifestGuard::new(&paths);
-    // The manifest can disappear after authority and audit checks finish.
-    // Recheck it before calling upstream gh, including audited operator writes.
-    let mut delegate = |args: &[OsString]| manifest_guard.delegate(args, &mut native_delegate);
     if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
         if let Some(line) = co_author_line(&paths) {
             println!("{line}");
@@ -796,6 +792,14 @@ fn run_with(
         print_self_report(&paths, status_audit_requested(args));
         return 0;
     }
+    // Opting out skips shim governance, not the native-gh restriction on workers.
+    if shim_disabled_by_operator() {
+        return native_delegate(args);
+    }
+    let manifest_guard = manifest_guard::ManifestGuard::new(&paths);
+    // The manifest can disappear after authority and audit checks finish.
+    // Recheck it before calling upstream gh, including audited operator writes.
+    let mut delegate = |args: &[OsString]| manifest_guard.delegate(args, &mut native_delegate);
     if crate::environment::non_empty_var(crate::gh_shim_speech::start_view::WORKER_POLICY_ENV)
         .as_deref()
         == Some("1")
@@ -904,8 +908,8 @@ fn run_with(
     // login. Decide that before the rung probe: the answer does not depend on
     // the governance daemon, and a bound target falls through to the governed
     // path below unchanged. Without a signed manifest there are no bindings to
-    // compare against; the fallback checks manifest history and daemon routing
-    // before allowing upstream execution.
+    // compare against; the fallback checks manifest history before allowing
+    // upstream execution.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
         if let Some(status) =
             worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
@@ -915,7 +919,6 @@ fn run_with(
         // Check operator bypasses before discovery can report governed routing as
         // unavailable and hide the credential-specific refusal.
         if operator_bypass_requested()
-            && !shim_disabled_by_operator()
             && match classify(args, manifest, current_platform()) {
                 Classification::Admin { .. } => true,
                 Classification::Governed { tuple, .. } => {
@@ -933,9 +936,7 @@ fn run_with(
         // The operator's token works on every repository, bound or not, and
         // an agent holding it could reach GitHub around the shim, so this
         // check comes before any target is resolved.
-        if let Some((command, credential_use)) =
-            operator_credential_use(args).filter(|_| !shim_disabled_by_operator())
-        {
+        if let Some((command, credential_use)) = operator_credential_use(args) {
             return dispatch_operator_credentials(
                 args,
                 &command,
@@ -946,9 +947,7 @@ fn run_with(
                 delegate,
             );
         }
-        if let Some(write) = unbound_write(args, manifest, current_platform(), &target, &cwd)
-            .filter(|_| !shim_disabled_by_operator())
-        {
+        if let Some(write) = unbound_write(args, manifest, current_platform(), &target, &cwd) {
             return dispatch_unbound_write(
                 args,
                 &write,

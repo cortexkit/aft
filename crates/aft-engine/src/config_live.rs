@@ -875,7 +875,6 @@ macro_rules! restart_settings {
         $field!("semantic.max_input_tokens", semantic.max_input_tokens);
         $field!("semantic.max_files", semantic.max_files);
         $field!("subc.connection_file", semantic.subc_connection_file);
-        $field!("github.shim", github.shim);
         $field!("github.read", github.read);
         $field!("github.write", github.write);
         $field!("gh_shim.binary_path", gh_shim.binary_path);
@@ -1005,6 +1004,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("search.rerank", search.rerank);
     // Integrations.
     live!("git.co_author", git.co_author);
+    live!("github.shim", github.shim);
     // The user switch and project refusal apply to the next call, even if
     // the caller still holds a catalog that offered runon. A later catalog
     // fetch reflects the new switch; the runner default waits for reconnect.

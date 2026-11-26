@@ -78,6 +78,12 @@ impl Fixture {
         write_user_config(&self.config, &connection, Some(true));
     }
 
+    fn disable_shim(&self) {
+        let directory = self.config.join("cortexkit");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("aft.jsonc"), r#"{"github":{"shim":false}}"#).unwrap();
+    }
+
     fn assert_passthrough(&self, args: &[&str], bypass: bool) {
         let output = self.run(args, bypass);
         assert_eq!(output.status.code(), Some(73), "{output:?}");
@@ -274,24 +280,22 @@ fn gh_shim_manifest_unavailable_unprovisioned_passthrough_is_unchanged() {
 }
 
 #[test]
-fn gh_shim_manifest_unavailable_fresh_with_write_relay_refuses_writes_but_passes_reads() {
+fn gh_shim_manifest_unavailable_write_relay_does_not_replace_manifest_history() {
     let fixture = Fixture::new();
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig::default());
     fixture.connect_daemon(&daemon);
 
+    let write = ["issue", "comment", "1", "--body", "offline"];
     for bypass in [false, true] {
+        fixture.assert_passthrough(&write, bypass);
+    }
+
+    fixture.high_water();
+    for bypass in [false, true] {
+        fixture.assert_refused(&write, bypass, UNAVAILABLE);
         fixture.assert_passthrough(&["issue", "view", "1"], bypass);
     }
-    assert_eq!(daemon.catalog_requests(), 0, "reads need no catalog lookup");
-
-    for bypass in [false, true] {
-        fixture.assert_refused(
-            &["issue", "comment", "1", "--body", "offline"],
-            bypass,
-            UNAVAILABLE,
-        );
-    }
-    assert_eq!(daemon.catalog_requests(), 2);
+    assert_eq!(daemon.catalog_requests(), 0);
 }
 
 #[test]
@@ -303,11 +307,11 @@ fn gh_shim_manifest_unavailable_fresh_with_read_only_relay_passes_writes() {
     for bypass in [false, true] {
         fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], bypass);
     }
-    assert_eq!(daemon.catalog_requests(), 2, "one catalog lookup per write");
+    assert_eq!(daemon.catalog_requests(), 0);
 }
 
 #[test]
-fn gh_shim_manifest_unavailable_fresh_with_catalog_timeout_refuses_writes() {
+fn gh_shim_manifest_unavailable_without_history_does_not_query_slow_catalog() {
     let fixture = Fixture::new();
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
         catalog_delay: Duration::from_secs(30),
@@ -315,16 +319,133 @@ fn gh_shim_manifest_unavailable_fresh_with_catalog_timeout_refuses_writes() {
     });
     fixture.connect_daemon(&daemon);
 
-    fixture.assert_refused(
-        &["issue", "comment", "1", "--body", "offline"],
-        true,
-        UNAVAILABLE,
-    );
-    assert_eq!(
-        daemon.catalog_requests(),
-        1,
-        "timeout must reach the catalog"
-    );
+    fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], true);
+    assert_eq!(daemon.catalog_requests(), 0);
+}
+
+#[test]
+fn gh_shim_live_off_delegates_when_a_provisioned_manifest_is_missing_or_invalid() {
+    let fixture = Fixture::new();
+    fixture.high_water();
+    let write = ["issue", "comment", "1", "--body", "offline"];
+    fixture.assert_refused(&write, false, UNAVAILABLE);
+
+    fixture.disable_shim();
+    for invalid in [false, true] {
+        if invalid {
+            fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
+        }
+        for bypass in [false, true] {
+            fixture.assert_passthrough(&write, bypass);
+            fixture.assert_passthrough(&["auth", "status"], bypass);
+        }
+    }
+}
+
+#[test]
+fn gh_shim_live_off_delegates_when_the_manifest_has_regressed() {
+    let fixture = Fixture::new();
+    fixture.activate();
+    fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
+    fixture.disable_shim();
+    for bypass in [false, true] {
+        fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], bypass);
+        fixture.assert_passthrough(&["pr", "merge", "1"], bypass);
+    }
+}
+
+#[test]
+fn gh_shim_live_off_skips_captured_and_worker_shim_policies() {
+    let fixture = Fixture::new();
+    fixture.high_water();
+    fixture.disable_shim();
+    let write = ["issue", "comment", "1", "--body", "offline"];
+    for policy in ["AFT_GH_SPEECH_PROVISIONED", "AFT_GH_WORKER_WRITE_POLICY"] {
+        let output = fixture
+            .command(&write, false)
+            .env(policy, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{policy}: {output:?}");
+        assert!(output.stderr.is_empty(), "{policy}: {output:?}");
+    }
+}
+
+#[test]
+fn gh_shim_live_off_does_not_bypass_native_worker_guard() {
+    let fixture = Fixture::new();
+    fixture.high_water();
+    fixture.disable_shim();
+    let output = fixture
+        .command(&["issue", "comment", "1", "--body", "offline"], false)
+        .env("AFT_GH_SHIM_WORKER", "1")
+        .env("AFT_GH_WORKER_WRITE_POLICY", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("gh_shim_worker_native_gh"));
+    assert!(!fixture.record.exists());
+}
+
+#[test]
+fn gh_shim_live_off_affects_new_children_but_not_an_already_launched_child() {
+    use std::io::Write;
+    use std::process::{Child, Stdio};
+
+    let fixture = Fixture::new();
+    fixture.high_water();
+    let storage = fixture._root.path().join("storage");
+    let mut enabled = Config::default();
+    enabled.github.shim = true;
+    enabled.git.co_author = "auto".into();
+    enabled.gh_shim.binary_path = Some(aft_binary());
+    let spawn = |config: &Config| {
+        let mut env = fixture
+            .command(&[], false)
+            .get_envs()
+            .map(|(key, val)| {
+                (
+                    key.to_str().unwrap().to_owned(),
+                    val.unwrap().to_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        aft::agent_child_env::inject(config, &storage, &mut env, None).unwrap();
+        Command::new("/bin/sh")
+            .env_clear()
+            .envs(env)
+            .env("AFT_STORAGE_DIR", &storage)
+            .env("AFT_GH_SHIM_STATE_DIR", &fixture.state)
+            .arg("-c")
+            .arg("read -r go || exit; printf '%s\\n' \"${AFT_GH_SHIM_ENABLED-unset}\"; exec gh issue comment 1 --body offline")
+            .current_dir(&fixture.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let finish = |mut child: Child| {
+        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let old_child = spawn(&enabled);
+    fixture.disable_shim();
+    let mut candidate = enabled.clone();
+    candidate.github.shim = false;
+    let live = aft::config_live::apply_live_config(&enabled, &candidate, &enabled);
+    let new = finish(spawn(&live.next));
+    assert_eq!(new.status.code(), Some(73), "{new:?}");
+    assert_eq!(new.stdout, b"unset\n");
+    assert!(new.stderr.is_empty(), "{new:?}");
+    fs::remove_file(&fixture.record).unwrap();
+
+    let old = finish(old_child);
+    assert_eq!(old.status.code(), Some(86), "{old:?}");
+    assert_eq!(old.stdout, b"1\n");
+    assert_eq!(old.stderr, UNAVAILABLE.as_bytes());
+    assert!(!fixture.record.exists());
 }
 
 #[test]
