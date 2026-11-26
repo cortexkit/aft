@@ -568,17 +568,14 @@ fn task_scope_kill_reaches_setsid_descendant() {
 }
 
 #[test]
-fn task_scope_kill_follows_group_signal_order() {
+fn task_scope_kill_signals_the_scope_instead_of_the_group_number() {
     let root = tempfile::tempdir().unwrap();
     let r = BgTaskRegistry::default();
     r.inner.shutdown.store(true, Ordering::SeqCst);
     let id = r
         .spawn(
             SpawnPlan::Unsandboxed,
-            // Ignoring TERM keeps the group alive through the grace period, so
-            // the group SIGKILL is due; a group that is already gone is never
-            // signalled again.
-            "trap '' TERM; echo ready; sleep 60",
+            "echo ready; sleep 60",
             "order".into(),
             root.path().into(),
             HashMap::new(),
@@ -598,9 +595,18 @@ fn task_scope_kill_follows_group_signal_order() {
             .contains("ready")
     });
     let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+    // The fake scope lists the command's processes; its kill switch is inert,
+    // so only the scope's own SIGTERM can stop them.
+    let members = super::super::process::live_process_group_members(pgid).unwrap();
+    let procs: String = members
+        .identities
+        .iter()
+        .map(|identity| format!("{}\n", identity.pid))
+        .collect();
     let cgroup = root.path().join("fake-cgroup");
     std::fs::create_dir(&cgroup).unwrap();
     std::fs::write(cgroup.join("cgroup.kill"), "0").unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
     r.inner
         .task_scopes
         .register(super::super::task_scope::handle_for_test(
@@ -613,14 +619,16 @@ fn task_scope_kill_follows_group_signal_order() {
             r.kill(&id, "order").unwrap()
         })
     });
-    assert_eq!(
-        *events.lock().unwrap(),
-        vec!["group-term", "group-kill", "scope-kill"]
-    );
+    let stopped = super::super::process::group_exited(pgid);
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["scope-term", "scope-kill"]);
     assert_eq!(
         std::fs::read_to_string(cgroup.join("cgroup.kill")).unwrap(),
         "1"
     );
+    assert!(stopped, "the scope's SIGTERM did not stop the command");
 }
 
 #[test]
@@ -1940,5 +1948,84 @@ fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
     assert!(
         super::super::task_scope::matches_membership(&id, &text),
         "new actor missed the shared daemon fact: {text}"
+    );
+}
+
+/// A terminal command gets a task scope like a piped one, so a kill can reach
+/// descendants that leave its process group. The fake launcher stands in for
+/// `systemd-run --scope`: it records its arguments and runs the command.
+#[test]
+fn pty_task_runs_in_its_task_scope() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let launcher = root.path().join("systemd-run");
+    let arguments = root.path().join("launcher-arguments");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = -- ] && found=1; done\n[ -n \"$found\" ] || exit 0\nprintf '%s\\n' \"$@\" > '{}'\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+            arguments.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        super::super::task_scope::current_cgroup(std::process::id()).is_some(),
+        "requires a visible unified cgroup hierarchy"
+    );
+    let r = BgTaskRegistry::default();
+    r.inner.task_scopes.set_launcher_for_test(launcher);
+    r.configure_task_scope_runtime(true, Duration::from_secs(86400));
+    let id = super::super::task_scope::with_placement_reader_for_test(
+        |_, id| Ok(format!("0::/user.slice/aft.slice/aft-task-{id}.scope\n")),
+        || {
+            r.spawn_pty_with_shell_typed(
+                SpawnPlan::Unsandboxed,
+                "echo scoped-pty-ran; sleep 60",
+                super::super::BashShell::Bash,
+                PathBuf::from("/bin/bash"),
+                "pty-scope".into(),
+                root.path().into(),
+                HashMap::new(),
+                super::super::HardKill::Default,
+                None,
+                root.path().into(),
+                8,
+                false,
+                false,
+                Some(root.path().into()),
+                24,
+                80,
+                true,
+            )
+        },
+    )
+    .unwrap();
+    let task = r.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.pty)
+            .unwrap_or_default()
+            .contains("scoped-pty-ran")
+    });
+    let (runtime, pgid) = {
+        let state = task.lock_state().unwrap();
+        (
+            state.metadata.task_scope_runtime_ms,
+            state.metadata.pgid.unwrap(),
+        )
+    };
+    let registered = r.inner.task_scopes.get(&id).is_some();
+    let launched = std::fs::read_to_string(&arguments).unwrap_or_default();
+    let _ = r.kill(&id, "pty-scope");
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    assert!(runtime.is_some(), "PTY task record names no scope");
+    assert!(registered, "PTY task scope was not registered");
+    assert!(
+        launched
+            .lines()
+            .any(|line| line == format!("--unit=aft-task-{id}")),
+        "PTY command was not launched in its scope: {launched}"
     );
 }

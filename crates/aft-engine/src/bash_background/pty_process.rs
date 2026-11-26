@@ -24,6 +24,12 @@ use super::pty_runtime::{CompletionCoordinator, PtyRuntime};
 /// hanging the caller forever.
 const PTY_SETUP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The error a PTY launch returns when its task scope could not be created
+/// before the command was released. The command never ran, so the caller
+/// starts it again without a scope.
+pub(crate) const PTY_SCOPE_RETRY: &str =
+    "task scope creation failed before the command was released";
+
 /// A PTY child (and, during setup, the PTY master) that setup still owns. If
 /// setup fails before handing the child to its waiter thread, dropping this
 /// attempts to kill and reap the child within a deadline, logging reap failures.
@@ -128,8 +134,9 @@ pub(crate) fn spawn_pty_for_command(
     memory_monitor: &mut Option<super::memory_limit::Monitor>,
     publish_memory_policy: &mut dyn FnMut(&super::memory_limit::MemoryPolicy) -> Result<(), String>,
     defer_bootstrap: bool,
+    scope: Option<(&super::task_scope::ScopeLaunch, Option<u64>)>,
 ) -> Result<PtyRuntime, String> {
-    let launch_gated = memory_monitor.is_some() || defer_bootstrap;
+    let launch_gated = memory_monitor.is_some() || defer_bootstrap || scope.is_some();
     #[cfg(unix)]
     {
         let _ = shell_kind;
@@ -193,6 +200,15 @@ pub(crate) fn spawn_pty_for_command(
             args = wrapped;
             std::ffi::OsStr::new("/bin/sh")
         };
+        // `systemd-run --scope` places itself in the task scope, then runs the
+        // command, which waits at the launch gate until placement is confirmed.
+        #[cfg(target_os = "linux")]
+        let scoped = scope.map(|(scope, _)| scope.argv(Path::new(program), &args));
+        #[cfg(target_os = "linux")]
+        let (program, args) = match &scoped {
+            Some((launcher, wrapped)) => (launcher.as_os_str(), wrapped.clone()),
+            None => (program, args),
+        };
         try_spawn_pty(
             registry,
             spawn_plan,
@@ -211,11 +227,12 @@ pub(crate) fn spawn_pty_for_command(
             memory_monitor,
             publish_memory_policy,
             defer_bootstrap,
+            scope,
         )
     }
     #[cfg(windows)]
     {
-        let _ = shell_path;
+        let _ = (shell_path, scope);
         use crate::windows_shell::shell_candidates;
 
         let candidates = if shell_kind.is_powershell() {
@@ -387,6 +404,7 @@ fn try_spawn_pty(
     memory_monitor: &mut Option<super::memory_limit::Monitor>,
     publish_memory_policy: &mut dyn FnMut(&super::memory_limit::MemoryPolicy) -> Result<(), String>,
     defer_bootstrap: bool,
+    #[cfg(unix)] scope: Option<(&super::task_scope::ScopeLaunch, Option<u64>)>,
     #[cfg(windows)] memory_file_gate: bool,
     #[cfg(windows)] memory_cmd_waiter: bool,
 ) -> Result<PtyRuntime, String> {
@@ -491,6 +509,27 @@ fn try_spawn_pty(
         monitor.attach(child_pid.ok_or("memory cap launch PID missing")?)?;
         publish_memory_policy(&monitor.policy)?;
     }
+    #[cfg(target_os = "linux")]
+    if let Some((scope, memory_mib)) = scope {
+        let pid = child_pid.ok_or("task scope launch PID missing")?;
+        let root = child.root;
+        let launcher = child
+            .child
+            .as_deref_mut()
+            .ok_or("task scope launch child missing")?;
+        let exited = || {
+            matches!(
+                crate::agent_commands::try_wait_pty(launcher, root),
+                Ok(Some(_))
+            )
+        };
+        *memory_monitor = registry.place_pty_task_scope(scope, pid, exited, memory_mib)?;
+        if let Some(monitor) = memory_monitor.as_ref() {
+            publish_memory_policy(&monitor.policy)?;
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let _ = scope;
     let killer = child.child.as_ref().unwrap().clone_killer();
     #[cfg(test)]
     fail_pty_setup_for_test(child_pid)?;
@@ -520,10 +559,11 @@ fn try_spawn_pty(
     if memory_monitor.is_some() || defer_bootstrap || {
         #[cfg(unix)]
         {
-            spawn_plan
-                .prepared_task()
-                .and_then(|task| task.secret_runtime())
-                .is_some()
+            scope.is_some()
+                || spawn_plan
+                    .prepared_task()
+                    .and_then(|task| task.secret_runtime())
+                    .is_some()
         }
         #[cfg(not(unix))]
         {
@@ -1360,6 +1400,7 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         &mut None,
         &mut |_| Ok(()),
         false,
+        None,
     );
     let pid = pid.load(Ordering::SeqCst);
     assert_ne!(pid, 0);
@@ -1403,6 +1444,7 @@ fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
                 &mut None,
                 &mut |_| Ok(()),
                 false,
+                None,
             )
         })
     }));

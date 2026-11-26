@@ -63,15 +63,13 @@ use super::persistence::{
     write_kill_marker_if_absent, write_task_at, BgMode, ExitMarker, PersistedTask, ResolvedTask,
     TaskArtifact, TaskIoHandles, TaskPaths,
 };
-#[cfg(unix)]
-use super::process::terminate_pgid;
 #[cfg(windows)]
 use super::process::terminate_pid;
 use super::process::{
     is_process_alive, is_recorded_process_alive, live_process_group_members, GroupListing,
     LiveDescendant, LiveDescendantsUnavailable, ProcessIdentity,
 };
-use super::pty_process::spawn_pty_for_command;
+use super::pty_process::{spawn_pty_for_command, PTY_SCOPE_RETRY};
 use super::pty_runtime::PtyRuntime;
 use super::watches::{
     PatternMatch, WatchPattern, WatchRegistry, WATCH_TARGET_ERASED_CONTEXT,
@@ -363,53 +361,6 @@ enum KillSignalPlan {
     },
 }
 
-/// Signal a piped task: SIGTERM to its process group, a grace period that
-/// ends early once the whole group exits, then SIGKILL (Unix); `taskkill`
-/// on the process tree (Windows).
-fn terminate_piped_task(
-    task_id: &str,
-    pgid: Option<i32>,
-    child_pid: Option<u32>,
-    reason: &str,
-    #[allow(unused_mut)] mut child: Option<&mut Child>,
-) {
-    #[cfg(all(test, unix))]
-    if TERM_ONLY_KILL_TASKS
-        .get()
-        .is_some_and(|tasks| tasks.lock().unwrap().remove(task_id))
-    {
-        if let Some(pgid) = pgid {
-            unsafe {
-                libc::killpg(pgid, libc::SIGTERM);
-            }
-        }
-        return;
-    }
-    #[cfg(unix)]
-    {
-        if let Some(pgid) = pgid {
-            log_bash_kill(task_id, child_pid, Some(pgid), reason);
-            super::process::terminate_pgid_with(pgid, || {
-                child
-                    .as_deref_mut()
-                    .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        let _ = pgid;
-        if let Some(pid) = child.as_ref().map(|child| child.id()).or(child_pid) {
-            log_bash_kill(task_id, Some(pid), None, reason);
-        }
-        if let Some(child) = child {
-            super::process::terminate_process(child);
-        } else if let Some(pid) = child_pid {
-            terminate_pid(pid);
-        }
-    }
-}
-
 pub(super) fn log_bash_kill(task_id: &str, pid: Option<u32>, pgid: Option<i32>, reason: &str) {
     let target = pid.or_else(|| pgid.and_then(|pgid| u32::try_from(pgid).ok()));
     match target {
@@ -576,14 +527,7 @@ fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
 /// with the start time AFT recorded. Without such evidence it is left alone,
 /// even when a check could not see every member.
 fn finished_group_is_still_the_tasks(metadata: &PersistedTask, pgid: i32) -> bool {
-    let leader = u32::try_from(pgid)
-        .ok()
-        .zip(metadata.child_start_time_ms)
-        .map(|(pid, started_at_ms)| ProcessIdentity::from_epoch(pid, started_at_ms));
-    leader
-        .iter()
-        .chain(&metadata.group_member_identities)
-        .any(|identity| super::process::is_running_in_group(identity, pgid))
+    verified_kill::GroupEvidence::for_task(metadata, pgid, None).proven()
 }
 
 /// Store the outcome of one check of a task's process group: the surviving
@@ -644,13 +588,6 @@ fn close_pty_master_off_thread(master: Option<Box<dyn portable_pty::MasterPty + 
     if let Err(error) = spawned {
         crate::slog_warn!("[pty-close] could not close the pseudoconsole off-thread: {error}");
     }
-}
-
-fn terminate_pty_group(pid: u32) {
-    #[cfg(unix)]
-    terminate_pgid(pid as i32, None);
-    #[cfg(windows)]
-    terminate_pid(pid);
 }
 
 /// Test gates that park a piped-task kill after it has published `Killing`
@@ -5460,6 +5397,7 @@ impl BgTaskRegistry {
             project_root,
             rows,
             cols,
+            false,
         )
         .map_err(|error| error.to_string())
     }
@@ -6043,6 +5981,7 @@ impl BgTaskRegistry {
         project_root: Option<PathBuf>,
         rows: u16,
         cols: u16,
+        linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let canonical_project_root =
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
@@ -6131,7 +6070,33 @@ impl BgTaskRegistry {
         metadata.pty_rows = Some(rows);
         metadata.pty_cols = Some(cols);
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
-        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+        // Like a piped task, a terminal command runs in its own Linux task
+        // scope when the daemon's scope policy applies, so a kill reaches
+        // descendants that left its process group.
+        #[cfg(target_os = "linux")]
+        let mut scope = self
+            .inner
+            .task_scopes
+            .policy(linux_scope, None, spawn_plan.is_native_launcher())
+            .map(|policy| {
+                let root = super::persistence::task_store_root(&paths.session_dir)
+                    .ok_or("task store root is unavailable")?;
+                self.inner
+                    .task_scopes
+                    .prepare(policy, &task_id, hard_kill, memory_limit_mib, root)
+            })
+            .transpose()?
+            .flatten();
+        #[cfg(not(target_os = "linux"))]
+        let mut scope: Option<super::task_scope::ScopeLaunch> = {
+            let _ = linux_scope;
+            None
+        };
+        let mut memory_monitor = if scope.is_some() {
+            None
+        } else {
+            Self::prepare_memory_limit(memory_limit_mib, &task_id)?
+        };
         metadata.memory_policy = memory_monitor
             .as_ref()
             .map(|monitor| monitor.policy.clone());
@@ -6152,14 +6117,14 @@ impl BgTaskRegistry {
         self.dual_write_task(&paths, &metadata);
 
         let mut spawned_pgid = None;
-        let spawned = {
+        let spawned = loop {
             // Attach may choose sampling; publish that policy before opening the gate.
             let mut publish_memory_policy = |policy: &super::memory_limit::MemoryPolicy| {
                 metadata.memory_policy = Some(policy.clone());
                 self.persist_task(&paths, &metadata)
                     .map_err(|error| error.to_string())
             };
-            spawn_pty_for_command(
+            let spawned = spawn_pty_for_command(
                 self,
                 &spawn_plan,
                 &task_id,
@@ -6178,8 +6143,23 @@ impl BgTaskRegistry {
                 &mut memory_monitor,
                 &mut publish_memory_policy,
                 defer_bootstrap,
-            )
+                scope.as_ref().map(|scope| (scope, memory_limit_mib)),
+            );
+            // The scope could not be created; the command never ran, so it
+            // starts again without one, as a piped task does.
+            if scope.is_some()
+                && spawned.as_ref().err().map(String::as_str) == Some(PTY_SCOPE_RETRY)
+            {
+                scope = None;
+                memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+                continue;
+            }
+            break spawned;
         };
+        #[cfg(target_os = "linux")]
+        if spawned.is_ok() {
+            metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
+        }
         let mut runtime = match spawned {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -8073,7 +8053,7 @@ impl BgTaskRegistry {
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     } else {
                         let completion_was_delivered = metadata.completion_delivered;
-                        pty_replay::settle_unattached_pty(&mut metadata, &paths, process_alive);
+                        verified_kill::settle_unattached_pty(self, &mut metadata, &paths);
                         metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_replay_completion_if_needed(
@@ -8105,41 +8085,12 @@ impl BgTaskRegistry {
                 } else if metadata.status == BgTaskStatus::Killing {
                     // Killing records intent, not proof that the daemon sent a
                     // signal. Finish that work before publishing its outcome.
-                    if process_alive {
-                        terminate_piped_task(
-                            &metadata.task_id,
-                            metadata.pgid,
-                            metadata.child_pid,
-                            "resume_interrupted_kill",
-                            None,
-                        );
-                        #[cfg(target_os = "linux")]
-                        self.inner.task_scopes.kill_with_audit(
-                            &metadata.task_id,
-                            metadata
-                                .memory_policy
-                                .as_ref()
-                                .filter(|policy| {
-                                    policy.kind
-                                        == super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
-                                })
-                                .and_then(|policy| policy.cgroup.as_deref()),
-                            metadata.child_pid,
-                            metadata.pgid,
-                            "resume_interrupted_kill",
-                        )?;
-                        settle_killed_process_group(&metadata.task_id, metadata.pgid);
-                    }
-                    let recovered = "recovered from inconsistent killing state on replay";
-                    let reason = match write_kill_marker_if_absent(&paths) {
-                        Ok(()) => recovered.to_string(),
-                        Err(error) => kill_marker_failure_reason(
-                            Some(recovered),
-                            &format!("failed to write kill marker: {error}"),
-                        ),
-                    };
                     let completion_was_delivered = metadata.completion_delivered;
-                    metadata.mark_terminal(BgTaskStatus::Killed, None, Some(reason));
+                    self.resume_replay_kill(
+                        &mut metadata,
+                        &paths,
+                        "recovered from inconsistent killing state on replay",
+                    );
                     metadata.completion_delivered |= completion_was_delivered;
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
@@ -14159,6 +14110,7 @@ impl BgTaskRegistry {
         };
 
         let mut scope_kill_attempted = false;
+        let mut coverage_note = None;
         match plan {
             KillSignalPlan::Nothing => {}
             #[cfg(any(windows, test, feature = "test-support"))]
@@ -14170,10 +14122,10 @@ impl BgTaskRegistry {
             }
             KillSignalPlan::AwaitOtherKill => self.await_kill_in_flight(&task),
             KillSignalPlan::TerminalSurvivors { pgid, live_count } => {
-                kill_signaled = true;
                 kill_reached = live_count;
                 log_bash_kill(task_id, None, Some(pgid), kill_reason);
-                self.terminate_terminal_survivors(&task, pgid, kill_reason)?;
+                (kill_signaled, coverage_note) =
+                    self.terminate_terminal_survivors(&task, pgid, kill_reason)?;
             }
             KillSignalPlan::Piped {
                 pgid,
@@ -14210,8 +14162,14 @@ impl BgTaskRegistry {
                 if scope_diagnostic {
                     crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
                 }
-                terminate_piped_task(&task.task_id, pgid, child_pid, kill_reason, child.as_mut());
-                let scope_result = self.kill_task_scope_with_reason(&task.task_id, kill_reason);
+                let (scope_result, note) = self.signal_live_piped_kill(
+                    &task,
+                    pgid,
+                    child_pid,
+                    kill_reason,
+                    child.as_mut(),
+                );
+                coverage_note = note;
                 scope_kill_attempted = true;
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
@@ -14321,7 +14279,7 @@ impl BgTaskRegistry {
                 #[cfg(windows)]
                 log_bash_kill(task_id, pid, None, kill_reason);
                 if let Some(pid) = pid {
-                    terminate_pty_group(pid);
+                    coverage_note = self.signal_live_pty_kill(&task, pid);
                 }
                 #[cfg(windows)]
                 {
@@ -14375,7 +14333,8 @@ impl BgTaskRegistry {
         }
         snapshot.kill_signaled = kill_signaled;
         snapshot.kill_reached = kill_reached;
-        snapshot.kill_state_warning = saves.into_warning();
+        snapshot.kill_state_warning =
+            verified_kill::join_kill_warnings(saves.into_warning(), coverage_note);
         #[cfg(feature = "test-timing-hooks")]
         if scope_diagnostic {
             crate::slog_info!(
@@ -14385,42 +14344,6 @@ impl BgTaskRegistry {
             );
         }
         Ok(snapshot)
-    }
-
-    /// Signal the surviving members of an already-terminal task's process
-    /// group, then record what is still alive. Runs without the state lock
-    /// held across the signal and its grace period.
-    #[cfg(unix)]
-    fn terminate_terminal_survivors(
-        &self,
-        task: &Arc<BgTask>,
-        pgid: i32,
-        reason: &str,
-    ) -> Result<(), String> {
-        terminate_pgid(pgid, None);
-        self.kill_task_scope_with_reason(&task.task_id, reason)?;
-        settle_killed_process_group(&task.task_id, Some(pgid));
-        let sample = live_process_group_members(pgid);
-        let mut db = DeferredDbWrites::new(self, task);
-        let mut state = task
-            .lock_state()
-            .map_err(|_| "background task lock poisoned".to_string())?;
-        state.metadata.group_kill_sent = true;
-        record_group_check(&mut state.metadata, &sample);
-        self.persist_task_locked(task, &state.metadata, &mut db)
-            .map_err(|error| format!("failed to persist post-kill descendant sample: {error}"))
-    }
-
-    /// Process groups are not enumerated or signaled as a group on this
-    /// platform, so a terminal task has no survivors to signal.
-    #[cfg(not(unix))]
-    fn terminate_terminal_survivors(
-        &self,
-        _task: &Arc<BgTask>,
-        _pgid: i32,
-        _reason: &str,
-    ) -> Result<(), String> {
-        Ok(())
     }
 
     /// Check the process group of a task whose terminal state was published by
@@ -18051,8 +17974,8 @@ mod completion_preview;
 #[path = "watch_scan.rs"]
 mod watch_scan;
 
-#[path = "pty_replay.rs"]
-mod pty_replay;
+#[path = "verified_kill.rs"]
+mod verified_kill;
 
 #[path = "pty_input_write.rs"]
 mod pty_input_write;

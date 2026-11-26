@@ -176,7 +176,7 @@ mod linux {
             Ok(())
         }
 
-        fn resolve_handle(
+        pub(crate) fn resolve_handle(
             &self,
             task_id: &str,
             recorded: Option<&Path>,
@@ -1164,6 +1164,19 @@ mod linux {
                 }
             });
             super::scope_kill::kill(&self.cgroup)
+        }
+        /// SIGTERM every process in the scope, then wait the termination
+        /// grace period, ending early once the scope is empty. `reap` runs on
+        /// each check so a direct child that exits does not linger as a zombie.
+        /// The caller ends the scope with [`Self::kill`] afterwards.
+        pub(crate) fn terminate_members(&self, reap: impl FnMut()) {
+            #[cfg(test)]
+            KILL_EVENTS.with(|slot| {
+                if let Some(events) = slot.borrow().as_ref() {
+                    events.lock().unwrap().push("scope-term");
+                }
+            });
+            super::scope_kill::terminate_members(&self.cgroup, reap);
         }
         pub(crate) fn stop(&self) -> Result<(), String> {
             stop_unit_with(&self.manager, &self.unit)

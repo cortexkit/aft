@@ -765,6 +765,9 @@ fn finished_task_on_group(
     );
     metadata.mark_running(pgid as u32, pgid);
     metadata.child_start_time_ms = leader_start;
+    // A record of only the epoch start: the native birth `mark_running` read
+    // belongs to whatever process now holds the pid, not the task's leader.
+    metadata.child_native_birth = None;
     metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
     metadata.live_descendants = (!members.is_empty()).then(|| {
         members

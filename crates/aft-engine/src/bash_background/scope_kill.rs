@@ -1,9 +1,80 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 pub(super) fn kill(cgroup: &Path) -> io::Result<()> {
     kill_with(cgroup, |file| file.write_all(b"1"))
+}
+
+/// The processes in a cgroup and every cgroup below it, sorted. A cgroup that
+/// is gone, or cannot be read, lists none.
+fn member_pids(cgroup: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut pending = vec![cgroup.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if let Ok(text) = std::fs::read_to_string(directory.join("cgroup.procs")) {
+            pids.extend(
+                text.split_whitespace()
+                    .filter_map(|pid| pid.parse::<u32>().ok()),
+            );
+        }
+        for entry in std::fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn pidfd_open(pid: u32) -> Option<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// SIGTERM every process in `cgroup`, then wait the termination grace period,
+/// ending early once the cgroup is empty. A listed pid can exit and be given
+/// to an unrelated process before it is signalled, so each is signalled
+/// through a pidfd, which names one process for good. A pid still listed after
+/// its pidfd was opened belongs to that pidfd's process, if that process is
+/// still alive when signalled; a dead one makes the signal fail harmlessly.
+pub(super) fn terminate_members(cgroup: &Path, mut reap: impl FnMut()) {
+    let opened: Vec<(u32, OwnedFd)> = member_pids(cgroup)
+        .into_iter()
+        .filter_map(|pid| pidfd_open(pid).map(|fd| (pid, fd)))
+        .collect();
+    let still_listed = member_pids(cgroup);
+    for (pid, fd) in &opened {
+        if still_listed.binary_search(pid).is_ok() {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGTERM,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0_u32,
+                );
+            }
+        }
+    }
+    drop(opened);
+    let started = Instant::now();
+    while started.elapsed() < super::super::process::TERMINATE_GRACE {
+        reap();
+        if member_pids(cgroup).is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn open_kill_file(path: &Path) -> io::Result<File> {

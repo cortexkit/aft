@@ -971,7 +971,52 @@ mod grace_tests {
 }
 
 #[cfg(unix)]
-fn terminate_pgid_until(pgid: i32, mut check: impl FnMut() -> GraceCheck) {
+fn terminate_pgid_until(pgid: i32, check: impl FnMut() -> GraceCheck) {
+    terminate_proven_pgid_until(pgid, check, || true);
+}
+
+/// How far a termination of a process group whose number had to be proven
+/// the task's own went.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupTermination {
+    /// TERM was sent, then KILL unless the group was seen gone first.
+    Signalled,
+    /// Nothing proved the group was still the task's, so nothing was sent.
+    Refused,
+    /// TERM was sent, but by the end of the grace period nothing proved the
+    /// group was still the task's, so the KILL was withheld.
+    KillWithheld,
+}
+
+/// SIGTERM a process group, wait the grace period, then SIGKILL it, asking
+/// `proven` immediately before each signal whether the number still names the
+/// task's group. A group number is free for reuse once every member exits, so
+/// a check made earlier says nothing about the moment of the signal.
+#[cfg(unix)]
+pub(crate) fn terminate_proven_pgid(pgid: i32, proven: impl FnMut() -> bool) -> GroupTermination {
+    terminate_proven_pgid_until(
+        pgid,
+        || {
+            if termination_group_exited(pgid) {
+                GraceCheck::GroupGone
+            } else {
+                GraceCheck::Running
+            }
+        },
+        proven,
+    )
+}
+
+#[cfg(unix)]
+fn terminate_proven_pgid_until(
+    pgid: i32,
+    mut check: impl FnMut() -> GraceCheck,
+    mut proven: impl FnMut() -> bool,
+) -> GroupTermination {
+    if !proven() {
+        return GroupTermination::Refused;
+    }
     #[cfg(all(test, target_os = "linux"))]
     test_hooks::signal_event(pgid, "group-term");
     unsafe {
@@ -987,17 +1032,58 @@ fn terminate_pgid_until(pgid: i32, mut check: impl FnMut() -> GraceCheck) {
         thread::sleep(Duration::from_millis(50));
     }
     if !group_kill_needed(last_check) {
-        return;
+        return GroupTermination::Signalled;
     }
     #[cfg(test)]
     if test_hooks::sigkill_denied(pgid) {
-        return;
+        return GroupTermination::Signalled;
+    }
+    if !proven() {
+        return GroupTermination::KillWithheld;
     }
     #[cfg(all(test, target_os = "linux"))]
     test_hooks::signal_event(pgid, "group-kill");
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
     }
+    GroupTermination::Signalled
+}
+
+/// Whether a process group has no live member left.
+#[cfg(unix)]
+pub(crate) fn group_exited(pgid: i32) -> bool {
+    termination_group_exited(pgid)
+}
+
+/// Whether `pid` is a child of this process that has not been reaped yet.
+/// Until it is reaped its pid, and the process group it leads, cannot be
+/// given to another process. Checked without reaping it.
+#[cfg(unix)]
+pub(crate) fn child_unreaped(pid: u32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == 0
+    }
+}
+
+/// How many of `identities` are still the same running processes but no
+/// longer in process group `pgid`: processes recorded for a task that a
+/// signal to that group did not reach.
+pub(crate) fn running_outside_group(identities: &[ProcessIdentity], pgid: i32) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    identities
+        .iter()
+        .filter(|identity| seen.insert(identity.pid))
+        .filter(|identity| {
+            ProcessIdentity::of(identity.pid).is_some_and(|current| identity.same_process(&current))
+                && process_group_of(identity.pid).is_some_and(|group| group != pgid)
+        })
+        .count()
 }
 
 #[cfg(unix)]

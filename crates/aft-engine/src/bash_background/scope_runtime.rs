@@ -257,6 +257,46 @@ impl BgTaskRegistry {
         }
     }
 
+    /// Confirm that a PTY launched through `systemd-run --scope` was placed
+    /// in its task scope, before its launch gate is released. Registers the
+    /// scope and returns the memory monitor reading it, if a cap applies. When
+    /// the launcher exited without placing it, the command never ran, so the
+    /// error is [`PTY_SCOPE_RETRY`](super::super::pty_process::PTY_SCOPE_RETRY)
+    /// and the caller starts it again without a scope.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn place_pty_task_scope(
+        &self,
+        scope: &super::super::task_scope::ScopeLaunch,
+        pid: u32,
+        exited: impl FnOnce() -> bool,
+        memory_mib: Option<u64>,
+    ) -> Result<Option<super::super::memory_limit::Monitor>, String> {
+        match scope.await_placement(pid, Duration::from_secs(1)) {
+            Ok(handle) => {
+                self.inner.task_scopes.register(handle);
+                self.scoped_memory_limit(memory_mib, scope.task_id())
+            }
+            Err(error) => {
+                let exited = exited();
+                log_bash_kill(
+                    scope.task_id(),
+                    Some(pid),
+                    None,
+                    "spawn_scope_placement_failed",
+                );
+                let _ = scope.stop();
+                if !exited {
+                    return Err(error);
+                }
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    crate::slog_info!("task scope creation failed before PTY payload release; spawning without a scope: {error}");
+                });
+                Err(super::super::pty_process::PTY_SCOPE_RETRY.into())
+            }
+        }
+    }
+
     pub(super) fn prepare_memory_limit(
         memory_limit_mib: Option<u64>,
         task_id: &str,

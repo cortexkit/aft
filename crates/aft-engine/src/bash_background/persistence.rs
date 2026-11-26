@@ -769,7 +769,6 @@ impl PersistedTask {
         self.child_native_birth = identity.and_then(|value| value.native_birth);
     }
 
-    #[cfg(target_os = "linux")]
     pub(super) fn child_identity(&self, pid: u32) -> Option<ProcessIdentity> {
         Some(ProcessIdentity {
             pid,

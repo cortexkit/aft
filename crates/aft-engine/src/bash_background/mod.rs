@@ -1585,6 +1585,7 @@ pub fn spawn_with_secrets(
             project_root,
             pty_rows,
             pty_cols,
+            config.bash.linux_scope,
         )
     } else {
         ctx.bash_background().spawn_with_shell_in_slot_typed(
