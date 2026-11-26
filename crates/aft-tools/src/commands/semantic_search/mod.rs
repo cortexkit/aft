@@ -11139,6 +11139,62 @@ mod tests {
         assert!(crate::search_hot_path_measurements::counts().project_walks >= 1);
     }
 
+    #[test]
+    fn path_lookup_discloses_only_matching_excluded_test_files() {
+        let (_project, ctx) = presence_project(&[
+            ("docs/notes.md", "See new-file.rs for the syntax.\n"),
+            ("tests/new-file.rs", "fn example() {}\n"),
+            ("fixtures/new-file.rs", "fn fixture() {}\n"),
+        ]);
+        let note = "Matching test or test-support files were excluded. Use includeTests: true to include them.";
+        for semantic_fallback in [true, false] {
+            *ctx.semantic_index_status().write().unwrap() = if semantic_fallback {
+                building("embedding")
+            } else {
+                SemanticIndexStatus::Disabled
+            };
+            for watcher_live in [false, true] {
+                with_watcher_live_for_test(watcher_live, || {
+                    for (query, include_tests, expected_notice) in [
+                        ("where is new-file.rs", false, true),
+                        ("where is new-file.rs", true, false),
+                        ("where is notes.md", false, false),
+                    ] {
+                        let mut request = semantic_request(query, 10);
+                        request.params["include_tests"] = serde_json::json!(include_tests);
+                        let response = handle_semantic_search(&request, &ctx);
+                        assert!(response.success, "{:?}", response.data);
+                        let rendered =
+                            crate::subc_format::format_response("search", &response, false);
+                        if semantic_fallback {
+                            assert!(
+                                rendered.contains("lexical fallback results follow"),
+                                "{rendered}"
+                            );
+                        }
+                        assert_eq!(
+                            rendered.lines().filter(|line| *line == note).count(),
+                            usize::from(expected_notice),
+                            "{rendered}"
+                        );
+                        let results = response.data["results"].as_array().unwrap();
+                        for expected_path in ["tests/new-file.rs", "fixtures/new-file.rs"] {
+                            assert_eq!(
+                                results
+                                    .iter()
+                                    .any(|result| result["file"].as_str().is_some_and(|path| path
+                                        .replace('\\', "/")
+                                        .ends_with(expected_path))),
+                                include_tests,
+                                "{rendered}"
+                            );
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     const BASH_WAIT_DETACH_ABSENT: &str = "No file contains `bash_wait_detach(`.";
 
     /// The common case: the first exact candidate holds the literal. One file
