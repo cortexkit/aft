@@ -36,6 +36,11 @@ pub use crate::commands::{
 };
 pub use crate::upper_test_context::{test_app, test_context};
 
+pub fn data_callgraph_is_building_for_test(ctx: &crate::context::AppContext) -> bool {
+    use crate::commands::data_callgraph::{access, Access};
+    matches!(access(ctx), Access::Building)
+}
+
 /// Prepare a deferred inspect using the caller's test clock.
 pub fn inspect_with_clock(
     request: &crate::protocol::RawRequest,

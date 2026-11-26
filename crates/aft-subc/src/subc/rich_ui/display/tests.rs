@@ -1089,7 +1089,6 @@ fn edit_no_match_startup_then_daemon_registration_captures_once() {
 
     // Activate the capture without `enter`, which also registers lower hooks.
     let _active = Guard(ACTIVE.with(|slot| slot.replace(Some(Arc::clone(&f.capture)))));
-    f.capture.lock().unwrap().masker = Some(crate::log_redact::SecretValues::from_environment([]));
     assert_eq!(run_edit(), unregistered);
     assert_eq!(edit_hunks::NO_MATCH_CAPTURES.with(std::cell::Cell::get), 1);
     let capture = f.capture.lock().unwrap();

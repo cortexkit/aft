@@ -159,6 +159,10 @@ pub mod lsp {
     pub mod manager {
         use crate::lsp::manager::LspManager;
 
+        pub fn applicability_full_walks_for_test(root: &std::path::Path) -> u64 {
+            crate::lsp::manager::applicability_metrics(root).full_walks
+        }
+
         pub mod regression_tests {
             #[cfg(unix)]
             pub use crate::lsp::manager::idle_fixture::{

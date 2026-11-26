@@ -25,7 +25,7 @@ fn notice_records_match_occipital_phone_reader_sample_contract() {
     let samples = &sample["result"]["notices"];
     let published: Value = serde_json::from_str(include_str!("../shipped.json")).unwrap();
     let aft_samples = read(
-        include_bytes!("../../../../../tests/fixtures/notice-records/phone-reader-notice-records-aft-v2/04-notice-views.json"),
+        include_bytes!("../../../../../../aft/tests/fixtures/notice-records/phone-reader-notice-records-aft-v2/04-notice-views.json"),
         "c603f584e840c3c759c24914c0ef1ada10e1a611e86a8326ed9f805878a9cc83",
     );
     assert_eq!(samples["msg_5"]["key"], samples["msg_6"]["key"]);

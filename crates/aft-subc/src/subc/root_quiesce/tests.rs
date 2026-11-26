@@ -1,5 +1,6 @@
 use super::*;
 use crate::subc::test_support::{route_identity, test_ctx, test_root};
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 
 struct Attach {
     executor: Arc<Executor>,
@@ -223,7 +224,7 @@ fn rebind_queues_ack_while_watcher_observation_database_is_locked() {
     let checkout = ctx
         .data_checkout()
         .expect("test root binds to the index store");
-    let crate::data_layer::runtime::Fresh::Ready(before) =
+    let aft_engine::data_layer::runtime::Fresh::Ready(before) =
         checkout.fresh_view(Duration::from_secs(60))
     else {
         panic!("initial call graph did not publish");
@@ -261,7 +262,7 @@ fn rebind_queues_ack_while_watcher_observation_database_is_locked() {
                     )
                     .await
                     .expect("the live watcher rescan closes the gap");
-                    let crate::data_layer::runtime::Fresh::Ready(refreshed) =
+                    let aft_engine::data_layer::runtime::Fresh::Ready(refreshed) =
                         checkout.fresh_view(Duration::from_secs(60))
                     else {
                         panic!("call graph did not refresh once watcher coverage recovered");
@@ -285,10 +286,7 @@ fn rebind_queues_ack_while_watcher_observation_database_is_locked() {
             let grep = crate::commands::grep::handle_grep(&request, &ctx);
             assert!(grep.success, "{:?}", grep.data);
             assert_eq!(grep.data["total_matches"], 1);
-            assert!(matches!(
-                crate::commands::data_callgraph::access(&ctx),
-                crate::commands::data_callgraph::Access::Building
-            ));
+            assert!(aft_tools::tools_test_support::data_callgraph_is_building_for_test(&ctx));
         }
         // Always release the guard before joining, including when the old
         // frame loop is parked inside watcher preparation.
@@ -538,13 +536,16 @@ async fn attach_goodbye_burst_replay() {
             tokio::time::advance(Duration::from_millis(250)).await;
             attach.settle(false);
         }
-        let lsp = crate::lsp::manager::applicability_metrics(root.as_path());
+        let lsp_full_walks =
+            aft_engine::test_bridge::search_misc::lsp::manager::applicability_full_walks_for_test(
+                root.as_path(),
+            );
         // The synchronous warning-walk test hook lets this replay count actual
         // disk walks in the captured records, not just pending warnings.
         let warning_walks = std::env::var_os("AFT_TEST_CONFIGURE_FORCE_SYNCHRONOUS_DEFERRED_WALK")
             .is_some()
             .then_some(warning_walks);
-        println!("burst grace={grace} binds=4 goodbyes=4 quiesces={quiesces} cancelled_configure_tails={cancelled_configure_tails} watcher_starts={watcher_starts} config_publications={config_publications} warning_disk_walks={warning_walks:?} lsp_full_walks={}", lsp.full_walks);
+        println!("burst grace={grace} binds=4 goodbyes=4 quiesces={quiesces} cancelled_configure_tails={cancelled_configure_tails} watcher_starts={watcher_starts} config_publications={config_publications} warning_disk_walks={warning_walks:?} lsp_full_walks={}", lsp_full_walks);
         if grace {
             assert_eq!(quiesces, 0);
             assert_eq!(cancelled_configure_tails, 0);

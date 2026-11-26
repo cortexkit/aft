@@ -6552,7 +6552,7 @@ mod grant_path_tests {
                 &executor,
                 &root,
                 dispatch_registered_task,
-                json!({"command": task.task_id, "wait": true}),
+                json!({"command": task.task_id(), "wait": true}),
                 receipt,
                 true,
             )
@@ -6562,11 +6562,11 @@ mod grant_path_tests {
             .expect("remote timeout metadata must not suppress promotion at the wait cap")
             .unwrap();
         let response = completion.response_for_test();
-        assert_eq!(response.data["task_id"], task.task_id);
+        assert_eq!(response.data["task_id"], task.task_id());
         assert_eq!(response.data["status"], "running");
-        let state = task.state.lock().unwrap();
-        assert!(!state.metadata.is_terminal());
-        assert!(!state.metadata.remote.as_ref().unwrap().cancel_requested);
+        let state = task.test_lock_state().unwrap();
+        assert!(!state.metadata().is_terminal());
+        assert!(!state.metadata().remote.as_ref().unwrap().cancel_requested);
     }
 
     /// The fake runner's connection file for [`remote_runon_stub`]; a dispatch

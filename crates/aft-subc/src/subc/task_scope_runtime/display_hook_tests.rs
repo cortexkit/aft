@@ -240,5 +240,8 @@ async fn assert_publications(storage: &Path) {
         .into_iter()
         .find(|(candidate, _)| candidate == pin)
         .unwrap();
-    assert!(writer.0.contains(&(views::key(pin), bytes)));
+    assert!(writer
+        .0
+        .iter()
+        .any(|(key, value)| key == &views::key(pin) && value == bytes));
 }

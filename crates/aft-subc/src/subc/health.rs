@@ -7282,7 +7282,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bash_deadline_watchdog_uses_the_internal_reply_budget() {
-        use crate::commands::blocking_wait::ReplyBudget;
+        use crate::blocking_wait::ReplyBudget;
         use std::cell::RefCell;
 
         let metrics = DispatchPathMetrics::new();
