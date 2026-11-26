@@ -2,16 +2,22 @@ use super::*;
 use crate::lsp::analysis_progress::{Transition, ANALYSIS_TOKEN_LIMIT};
 use crate::lsp::event_ingress::IngressOverflow;
 
+fn earliest_settle(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
+    current.into_iter().chain(candidate).min()
+}
+
 impl LspManager {
     /// Drain all pending LSP events. Call from the main loop.
     pub fn drain_events(&mut self) -> DrainedLspEvents {
         self.drain_events_bounded(usize::MAX)
     }
 
-    /// Whether LSP events are waiting to be drained. Cheap channel peek for
-    /// the maintenance scheduler's skip probe.
+    /// Whether the maintenance scheduler should run an LSP drain.
     pub fn has_pending_events(&self) -> bool {
         !self.event_rx.is_empty()
+            || self
+                .rust_publish_settle_at
+                .is_some_and(|deadline| deadline <= self.retry_clock.now())
             || self.event_tx.pending(|key, id| self.ingress_ready(key, id))
             || self
                 .clients
@@ -157,8 +163,20 @@ impl LspManager {
             }
         }
         let mut completed_checks = Vec::new();
+        let now = self.retry_clock.now();
+        // Only future deadlines can need another timer-driven drain. A due
+        // check that still lacks authority needs a new server event instead.
+        self.rust_publish_settle_at = None;
         for (key, client) in &mut self.clients {
-            if client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
+            let Some(deadline) = client.rust_publish_settle_deadline() else {
+                continue;
+            };
+            if deadline > now {
+                self.rust_publish_settle_at =
+                    earliest_settle(self.rust_publish_settle_at, Some(deadline));
+                continue;
+            }
+            if client.rust_check_completed_current(now, FLYCHECK_PUBLISH_SETTLE)
                 && !client.diagnostics_are_provisional()
             {
                 if let Some(check) = client
@@ -233,6 +251,14 @@ impl LspManager {
         })
     }
 
+    /// The next moment a rust-analyzer check can change without a new event,
+    /// such as a deferred save falling due or the publish-settle window closing.
+    pub(crate) fn rust_check_next_timed_change(&self, server_key: &ServerKey) -> Option<Instant> {
+        self.clients.get(server_key).and_then(|client| {
+            client.rust_check_next_timed_change(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
+        })
+    }
+
     pub(super) fn handle_analysis_progress(&mut self, receipt: &ReceivedLspEvent) {
         let Some((token, transition)) = Transition::from_event(&receipt.event) else {
             return;
@@ -297,19 +323,26 @@ impl LspManager {
                     title.unwrap_or("-")
                 );
             }
-            if client.record_rust_progress(&token, kind, title, order)
-                && value
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|message| {
-                        let message = message.to_lowercase();
-                        message.contains("cancel") || message.contains("fail")
-                    })
+            if !client.record_rust_progress(&token, kind, title, order) {
+                return;
+            }
+            if value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|message| {
+                    let message = message.to_lowercase();
+                    message.contains("cancel") || message.contains("fail")
+                })
             {
                 if let Some(cache) = client.completed_rust_check.as_mut() {
                     cache.abort();
                 }
             }
+            // A synchronous waiter can handle END outside the main drain.
+            self.rust_publish_settle_at = earliest_settle(
+                self.rust_publish_settle_at,
+                client.rust_publish_settle_deadline(),
+            );
         }
     }
 

@@ -1310,6 +1310,67 @@ fn send_progress_fixture_event(manager: &LspManager, key: &ServerKey, order: u64
         .unwrap();
 }
 
+#[cfg(unix)]
+pub(crate) fn drain_flycheck_end_for_maintenance_test(
+    manager: &mut LspManager,
+    root: &Path,
+    storage: &Path,
+) -> Instant {
+    use super::super::completed_rust_check::{CompletedRustCheck, Runtime};
+    use std::sync::atomic::Ordering;
+    use std::time::SystemTime;
+
+    let key = ServerKey {
+        kind: ServerKind::Rust,
+        root: canonicalize_for_lsp(root).unwrap(),
+    };
+    let mut client =
+        lifecycle_fake_client_with_env(manager, &key, [("AFT_FAKE_LSP_SERVER_STATUS", "disabled")]);
+    client.set_rust_analyzer_quiescent(true);
+    let mut cache = CompletedRustCheck::new(
+        &key.root,
+        &key.root,
+        storage,
+        Runtime {
+            binary: crate::fake_lsp_test_helper::fake_server_binary(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            options: None,
+            launch_env: None,
+            validation_gate: None,
+        },
+    )
+    .unwrap();
+    // Place BEGIN beyond the timestamp guard for the newly written Cargo inputs.
+    cache.begin(SystemTime::now() + Duration::from_secs(3));
+    client.completed_rust_check = Some(cache);
+    let (_, begins) = client.startup_notification_writer().unwrap();
+    begins.store(1, Ordering::Release);
+    let instance = client.instance;
+    manager.clients.insert(key.clone(), client);
+    for kind in ["begin", "end"] {
+        manager
+            .event_tx
+            .send(ReceivedLspEvent {
+                event: LspEvent::Notification {
+                    server_kind: key.kind.clone(),
+                    root: key.root.clone(),
+                    method: "$/progress".into(),
+                    params: Some(json!({
+                        "token": "rust-analyzer/flycheck/0", "value": {"kind": kind}
+                    })),
+                },
+                instance: Some(instance),
+                receive_order: None,
+            })
+            .unwrap();
+    }
+    manager.drain_events();
+    manager.clients[&key]
+        .rust_publish_settle_deadline()
+        .unwrap()
+}
+
 #[test]
 fn flycheck_overflow_leaves_no_running_or_completed_check_and_rearms() {
     let tmp = tempfile::tempdir().unwrap();

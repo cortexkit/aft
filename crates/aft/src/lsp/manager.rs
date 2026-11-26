@@ -1040,6 +1040,8 @@ pub struct LspManager {
         ServerKey,
         Arc<parking_lot::Mutex<super::completed_rust_check::CompletedRustCheck>>,
     >,
+    /// Earliest publish-settle deadline that still needs an event drain.
+    rust_publish_settle_at: Option<Instant>,
     /// Binary names for active server instances. Kept separate from
     /// `LspClient` so crash handling can report the installable binary name
     /// after a post-initialize process exit.
@@ -1181,7 +1183,7 @@ pub struct LspManager {
     /// replaces them, a scoped inspect asks for a new check instead of
     /// certifying the pulled report.
     unproven_rust_compiler_reports: HashMap<(ServerKey, PathBuf), Option<[u8; 32]>>,
-    /// Times the retry window of transient start failures in `failed_spawns`.
+    /// Times server-start retry windows and Rust publish settling.
     retry_clock: RetryClock,
     /// Project-wide diagnostic producer expectations survive walks limited to
     /// part of the project: those walks cannot prove an outside producer vanished.
@@ -1235,10 +1237,8 @@ const INITIALIZE_EXIT_WAIT: Duration = Duration::from_millis(250);
 /// server (a diagnostics producer) could not start.
 const PRODUCER_FAILURE_REASON_BYTES: usize = 500;
 
-/// Monotonic time source that decides when a server whose start failed for
-/// a transient reason may be started again. Production reads
-/// `Instant::now()`; tests substitute a clock they can move forward so a
-/// retry window can pass without the test sleeping through it.
+/// Monotonic clock for LSP start retries and publish settling. Tests can
+/// advance it without sleeping through a deadline.
 #[derive(Clone)]
 pub struct RetryClock(Arc<dyn Fn() -> Instant + Send + Sync>);
 
@@ -1393,6 +1393,7 @@ impl LspManager {
             background_pull_pauses: 0,
             background_pull_idle_waiters: Vec::new(),
             inspect_rust_checks: HashMap::new(),
+            rust_publish_settle_at: None,
             server_binaries: HashMap::new(),
             documents: HashMap::new(),
             diagnostics: DiagnosticsStore::new(),
@@ -4565,16 +4566,6 @@ impl LspManager {
         self.post_edit_waiters.remove(&wait.waiter_id);
     }
 
-    /// The next moment a rust-analyzer server's check state (or a due save)
-    /// can change without the server sending anything: a deferred save
-    /// falling due, a check start grace ending, or the publish settle window
-    /// closing. A waiter sleeps until the earlier of this and its next event.
-    pub(crate) fn rust_check_next_timed_change(&self, server_key: &ServerKey) -> Option<Instant> {
-        self.clients.get(server_key).and_then(|client| {
-            client.rust_check_next_timed_change(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
-        })
-    }
-
     /// Wait for fresh per-server diagnostics matching the just-sent document
     /// version. Cached pre-edit entries and provisional warming reports remain
     /// pending; a server exit is reported separately.
@@ -5168,6 +5159,7 @@ impl LspManager {
         self.starting.clear();
         self.ready_startup_events.clear();
         self.pending_diagnostic_observations.clear();
+        self.rust_publish_settle_at = None;
         let clients: Vec<_> = self.clients.drain().collect();
         self.clients_generation = self.clients_generation.wrapping_add(1);
         self.forget_server_state(None);

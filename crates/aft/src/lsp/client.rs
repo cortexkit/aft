@@ -2168,6 +2168,14 @@ impl LspClient {
         }
     }
 
+    pub(super) fn rust_publish_settle_deadline(&self) -> Option<Instant> {
+        self.completed_rust_check
+            .as_ref()
+            .filter(|cache| cache.finished)?;
+        self.rust_flycheck_finished_at
+            .map(|finished| finished + FLYCHECK_PUBLISH_SETTLE)
+    }
+
     pub(super) fn has_lost_flycheck(&self) -> bool {
         self.rust_flycheck_lost
     }

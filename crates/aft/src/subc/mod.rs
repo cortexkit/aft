@@ -18008,6 +18008,9 @@ mod tests {
         assert_eq!(meta.maintenance_jobs_in_flight, 0);
     }
 
+    #[cfg(unix)]
+    mod rust_check_maintenance;
+
     #[tokio::test]
     async fn quiesced_lsp_maintenance_drains_final_events_without_resubmission_loop() {
         let (_dir, root) = test_root("quiesced-lsp-drain");
