@@ -1639,14 +1639,14 @@ mod linux {
                     adopt_with(
                         id,
                         &ProcessIdentity::from_epoch(42, 99),
-                        |pid| {
+                        |_| {
                             Ok(ScopeLookup::Present(handle_for_test(
                                 id,
                                 format!("/sys/fs/cgroup/aft.slice/aft-task-{id}.scope").into(),
                             )))
                         },
                         |_| Ok(format!("0::/aft.slice/aft-task-{id}.scope\n")),
-                        |_| {
+                        |pid| {
                             let value = if reads >= changed_at { 100 } else { 99 };
                             reads += 1;
                             Ok(ProcessIdentity::from_epoch(pid, value))

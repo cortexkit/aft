@@ -435,8 +435,12 @@ fn process_group_gone(pgid: i32) -> bool {
 
 /// Both the saved birth and current group membership must still match.
 pub(crate) fn is_running_in_group(identity: &ProcessIdentity, pgid: i32) -> bool {
-    ProcessIdentity::of(identity.pid).is_some_and(|current| identity.same_process(&current))
-        && process_group_of(identity.pid) == Some(pgid)
+    let matches = if identity.native_birth.is_some() {
+        ProcessIdentity::of(identity.pid).is_some_and(|current| identity.same_process(&current))
+    } else {
+        crate::process_identity::process_start_time_ms(identity.pid) == Some(identity.started_at_ms)
+    };
+    matches && process_group_of(identity.pid) == Some(pgid)
 }
 
 /// The process group a process belongs to, read the same way for every user's
