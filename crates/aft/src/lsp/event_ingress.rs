@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,8 @@ use super::client::{LspEvent, ReceivedLspEvent, ServerInstanceId};
 use super::roots::ServerKey;
 
 pub(super) const EVENT_CAP: usize = 64;
+// Give a scoped document room for its open reports and a late close reply.
+const SCOPED_EVENTS_PER_DOCUMENT: usize = 4;
 
 #[derive(Clone)]
 pub(crate) struct EventIngress {
@@ -26,44 +28,32 @@ pub(super) struct EventReceiver {
 
 struct Inbox {
     ready: Sender<()>,
-    next: u64,
-    ordinary: usize,
-    pending: BTreeMap<u64, Queued>,
-    scoped: HashMap<ServerInstanceId, HashMap<String, Slot>>,
-}
-
-struct Queued {
-    event: ReceivedLspEvent,
-    scoped_uri: Option<String>,
-}
-
-#[derive(Default)]
-struct Slot {
-    users: usize,
-    pending: Option<u64>,
+    pending: VecDeque<ReceivedLspEvent>,
+    reservations: HashMap<(ServerInstanceId, String), usize>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ScopedReportLease {
     inbox: Weak<Mutex<Inbox>>,
-    slots: Vec<(ServerInstanceId, String)>,
+    reservations: Vec<(ServerInstanceId, String)>,
 }
 
 impl ScopedReportLease {
     pub(super) fn reserve(
         &mut self,
         selected: impl IntoIterator<Item = (ServerInstanceId, String)>,
-        per_server_cap: usize,
+        reservation_cap: usize,
     ) {
         if let Some(inbox) = self.inbox.upgrade() {
             let mut inbox = inbox.lock();
-            for (instance, uri) in selected {
-                let slots = inbox.scoped.entry(instance).or_default();
-                if !slots.contains_key(&uri) && slots.len() >= per_server_cap {
+            for document in selected {
+                if inbox.reservations.len() >= reservation_cap
+                    && !inbox.reservations.contains_key(&document)
+                {
                     continue;
                 }
-                slots.entry(uri.clone()).or_default().users += 1;
-                self.slots.push((instance, uri));
+                *inbox.reservations.entry(document.clone()).or_default() += 1;
+                self.reservations.push(document);
             }
         }
     }
@@ -75,15 +65,14 @@ impl Drop for ScopedReportLease {
             return;
         };
         let mut inbox = inbox.lock();
-        for (instance, uri) in &self.slots {
-            let slots = inbox.scoped.get_mut(instance).expect("registered instance");
-            let slot = slots.get_mut(uri).expect("registered document");
-            slot.users -= 1;
-            if slot.users == 0 && slot.pending.is_none() {
-                slots.remove(uri);
-                if slots.is_empty() {
-                    inbox.scoped.remove(instance);
-                }
+        for document in &self.reservations {
+            let users = inbox
+                .reservations
+                .get_mut(document)
+                .expect("reserved document");
+            *users -= 1;
+            if *users == 0 {
+                inbox.reservations.remove(document);
             }
         }
     }
@@ -105,28 +94,13 @@ impl EventReceiver {
     pub(super) fn try_recv(&self) -> Result<ReceivedLspEvent, TryRecvError> {
         let mut inbox = self.inbox.lock();
         let _ = self.ready.try_recv();
-        let Some((_, queued)) = inbox.pending.pop_first() else {
+        let Some(event) = inbox.pending.pop_front() else {
             return Err(TryRecvError::Empty);
         };
-        if let Some(uri) = queued.scoped_uri {
-            let instance = queued.event.instance.expect("scoped publish instance");
-            let slots = inbox.scoped.get_mut(&instance).unwrap();
-            let slot = slots.get_mut(&uri).unwrap();
-            if slot.users == 0 {
-                slots.remove(&uri);
-                if slots.is_empty() {
-                    inbox.scoped.remove(&instance);
-                }
-            } else {
-                slot.pending = None;
-            }
-        } else {
-            inbox.ordinary -= 1;
-        }
         if !inbox.pending.is_empty() {
             let _ = inbox.ready.try_send(());
         }
-        Ok(queued.event)
+        Ok(event)
     }
 
     pub(super) fn recv_timeout(
@@ -149,60 +123,15 @@ impl EventReceiver {
     }
 }
 
-fn document_publish(event: &LspEvent) -> Option<(&str, Option<i64>)> {
-    match event {
-        LspEvent::Notification {
-            method,
-            params: Some(params),
-            ..
-        } if method == "textDocument/publishDiagnostics" => Some((
-            params.get("uri")?.as_str()?,
-            params.get("version").and_then(serde_json::Value::as_i64),
-        )),
-        _ => None,
-    }
-}
-
 impl Inbox {
     fn push(&mut self, event: ReceivedLspEvent) -> Result<(), TrySendError<ReceivedLspEvent>> {
-        let scoped_uri = if let Some((instance, (uri, version))) =
-            event.instance.zip(document_publish(&event.event))
-        {
-            if let Some(slot) = self
-                .scoped
-                .get_mut(&instance)
-                .and_then(|slots| slots.get_mut(uri))
-                .filter(|slot| slot.users != 0)
-            {
-                if let Some(previous) = slot.pending {
-                    let previous_version = document_publish(&self.pending[&previous].event.event)
-                        .and_then(|(_, version)| version);
-                    if previous_version
-                        .zip(version)
-                        .is_some_and(|(previous, next)| previous > next)
-                    {
-                        return Ok(());
-                    }
-                    self.pending.remove(&previous);
-                }
-                slot.pending = Some(self.next);
-                Some(uri.to_owned())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if scoped_uri.is_none() {
-            if self.ordinary == EVENT_CAP {
-                return Err(TrySendError::Full(event));
-            }
-            self.ordinary += 1;
+        let limit = EVENT_CAP + self.reservations.len() * SCOPED_EVENTS_PER_DOCUMENT;
+        // A lease may have ended with events still queued. Keep them in order
+        // and resume accepting new events once the queue is below the limit.
+        if self.pending.len() >= limit {
+            return Err(TrySendError::Full(event));
         }
-        // Put a replacement in its new receive position. Progress and
-        // registration notifications that came before it must still run first.
-        self.pending.insert(self.next, Queued { event, scoped_uri });
-        self.next += 1;
+        self.pending.push_back(event);
         let _ = self.ready.try_send(());
         Ok(())
     }
@@ -245,10 +174,8 @@ impl EventIngress {
         let (wake, hints) = bounded(1);
         let inbox = Arc::new(Mutex::new(Inbox {
             ready,
-            next: 0,
-            ordinary: 0,
-            pending: BTreeMap::new(),
-            scoped: HashMap::new(),
+            pending: VecDeque::new(),
+            reservations: HashMap::new(),
         }));
         (
             Self {
@@ -267,7 +194,7 @@ impl EventIngress {
     pub(super) fn scoped_report_lease(&self) -> ScopedReportLease {
         ScopedReportLease {
             inbox: self.inbox.clone(),
-            slots: Vec::new(),
+            reservations: Vec::new(),
         }
     }
 
@@ -460,7 +387,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn scoped_inbox_keeps_the_latest_version_in_receive_order() {
+    fn scoped_inbox_preserves_every_publish_in_receive_order() {
         let (ingress, events, _) = EventIngress::new();
         let key = ServerKey {
             kind: ServerKind::Rust,
@@ -496,20 +423,72 @@ mod tests {
                 .send(notify(order, "fixture/ordinary", None))
                 .unwrap();
         }
-        let latest_order = EVENT_CAP as u64 + 2;
-        ingress.send(publish(latest_order, 3)).unwrap();
-        ingress.send(publish(latest_order + 1, 2)).unwrap();
-        assert_eq!(events.len(), EVENT_CAP + 1);
+        let newest_order = EVENT_CAP as u64 + 2;
+        ingress.send(publish(newest_order, 3)).unwrap();
+        ingress.send(publish(newest_order + 1, 2)).unwrap();
+        assert_eq!(events.len(), EVENT_CAP + 3);
         assert!(ingress.take_overflows(|_, _| true).is_empty());
-        drop(lease);
 
-        // A pending report survives release, but it cannot jump ahead of
-        // ordinary events received before the newer publication.
-        for order in 2..latest_order {
+        for order in 1..=newest_order + 1 {
             assert_eq!(events.try_recv().unwrap().receive_order, Some(order));
         }
-        assert_eq!(events.try_recv().unwrap().receive_order, Some(latest_order));
         assert!(events.is_empty());
-        assert!(events.inbox.lock().scoped.is_empty());
+    }
+
+    #[test]
+    fn releasing_the_last_scoped_lease_returns_capacity_without_removing_events() {
+        let (ingress, events, _) = EventIngress::new();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: "fixture".into(),
+        };
+        let instance = ServerInstanceId::next();
+        let _registration = ingress.register(instance, key.clone());
+        let notify = |order| ReceivedLspEvent {
+            event: LspEvent::Notification {
+                server_kind: key.kind.clone(),
+                root: key.root.clone(),
+                method: "fixture/ordinary".into(),
+                params: None,
+            },
+            instance: Some(instance),
+            receive_order: Some(order),
+        };
+        let mut first = ingress.scoped_report_lease();
+        let mut second = ingress.scoped_report_lease();
+        let document = (instance, "file:///fixture/lib.rs".to_owned());
+        let another = (ServerInstanceId::next(), document.1.clone());
+        first.reserve([document.clone()], 1);
+        second.reserve([document, another], 1);
+        assert_eq!(events.inbox.lock().reservations.len(), 1);
+        drop(first);
+
+        let raised_limit = EVENT_CAP + SCOPED_EVENTS_PER_DOCUMENT;
+        for order in 1..=raised_limit as u64 {
+            ingress.send(notify(order)).unwrap();
+        }
+        assert_eq!(events.len(), raised_limit);
+        assert!(ingress.take_overflows(|_, _| true).is_empty());
+
+        drop(second);
+        assert!(events.inbox.lock().reservations.is_empty());
+        for order in 1..=2 {
+            assert_eq!(events.try_recv().unwrap().receive_order, Some(order));
+        }
+        // There would be room if the old raised limit were still in effect.
+        let rejected = raised_limit as u64 + 1;
+        ingress.send(notify(rejected)).unwrap();
+        assert_eq!(events.len(), raised_limit - 2);
+        assert!(matches!(
+            ingress.take_overflows(|_, _| true).as_slice(),
+            [(_, IngressOverflow::Dropped { through, .. })] if *through == rejected
+        ));
+        for order in 3..=(SCOPED_EVENTS_PER_DOCUMENT + 1) as u64 {
+            assert_eq!(events.try_recv().unwrap().receive_order, Some(order));
+        }
+        assert_eq!(events.len(), EVENT_CAP - 1);
+        ingress.send(notify(rejected + 1)).unwrap();
+        assert_eq!(events.len(), EVENT_CAP);
+        assert!(ingress.take_overflows(|_, _| true).is_empty());
     }
 }
