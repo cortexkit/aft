@@ -1211,9 +1211,9 @@ root=none route=plugin forced=false inside-absolute write-location
   false: ask permission_required
   true: ask permission_required
 root=none route=plugin forced=false inside-missing-absolute read
-  absent: ask permission_required
-  false: ask permission_required
-  true: ask permission_required
+  absent: err path_not_found: path does not exist: <dir>/root/new.txt
+  false: err path_not_found: path does not exist: <dir>/root/new.txt
+  true: err path_not_found: path does not exist: <dir>/root/new.txt
 root=none route=plugin forced=false inside-missing-absolute mutate
   absent: ask permission_required
   false: ask permission_required
@@ -1355,9 +1355,9 @@ root=none route=elicitation forced=false inside-absolute write-location
   false: ask access_ask_required
   true: ask access_ask_required
 root=none route=elicitation forced=false inside-missing-absolute read
-  absent: ask access_ask_required
-  false: ask access_ask_required
-  true: ask access_ask_required
+  absent: err path_not_found: path does not exist: <dir>/root/new.txt
+  false: err path_not_found: path does not exist: <dir>/root/new.txt
+  true: err path_not_found: path does not exist: <dir>/root/new.txt
 root=none route=elicitation forced=false inside-missing-absolute mutate
   absent: ask access_ask_required
   false: ask access_ask_required
