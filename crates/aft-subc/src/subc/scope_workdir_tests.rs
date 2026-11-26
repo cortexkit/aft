@@ -79,6 +79,21 @@ fn bind_observed(
     expected_project_root: &Path,
     after_ack: impl FnOnce(&mut Option<oneshot::Receiver<()>>, &RouteIdentity, &AppContext),
 ) -> (Vec<String>, Vec<u8>) {
+    bind_observed_with_scope_setup(root, scope, expected_project_root, None, after_ack)
+}
+
+pub(super) struct ScopeSetup<'a> {
+    pub principal: Principal,
+    pub seed: &'a dyn Fn(&RouteIdentity, &AppContext),
+}
+
+pub(super) fn bind_observed_with_scope_setup(
+    root: &Path,
+    scope: Option<ScopeStamp>,
+    expected_project_root: &Path,
+    setup: Option<ScopeSetup<'_>>,
+    after_ack: impl FnOnce(&mut Option<oneshot::Receiver<()>>, &RouteIdentity, &AppContext),
+) -> (Vec<String>, Vec<u8>) {
     // The bind resolves its storage root through the process environment,
     // where AFT_STORAGE_DIR overrides the configured root. A test that sets
     // it holds this lock; binding meanwhile would open that test's storage
@@ -106,6 +121,11 @@ fn bind_observed(
                 lossy_seq: Arc::new(AtomicU64::new(0)),
                 fleet_status_client: FleetStatusClient::channel(1).0,
             };
+            let principal = Some(
+                setup
+                    .as_ref()
+                    .map_or(Principal::Direct, |setup| setup.principal.clone()),
+            );
             let request = {
                 let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
                     route_channel: 7,
@@ -114,7 +134,7 @@ fn bind_observed(
                         module_id: "aft".into(),
                     },
                     identity: subc_protocol::BindIdentity::new("opencode", "folder-session"),
-                    principal: Some(Principal::Direct),
+                    principal: principal.clone(),
                     consumer_capabilities: None,
                     admission_facts: Default::default(),
                     scope: scope.clone(),
@@ -220,7 +240,10 @@ fn bind_observed(
             assert_eq!(completion.identity.root, expected_root);
             assert_eq!(completion.identity.project_root, expected_project_root);
             assert_eq!(completion.identity.scope, scope);
-            assert_eq!(completion.identity.trust, BindTrust::FirstParty);
+            assert_eq!(
+                completion.identity.trust,
+                trust_for_bind("opencode", &principal)
+            );
             match &completion.identity.spawn_principal {
                 AuthenticatedPrincipal::RouteBind {
                     project_root,
@@ -238,6 +261,10 @@ fn bind_observed(
             );
             assert_eq!(executor.actor_count(), 1);
             assert_eq!(executor.actor_entries()[0].0, expected_root);
+            if let Some(setup) = &setup {
+                let ctx = executor.actor_context(&expected_root).unwrap();
+                (setup.seed)(&completion.identity, &ctx);
+            }
             handle_route_bind_completion(
                 &writer_tx,
                 completion,
@@ -294,6 +321,22 @@ fn bind_observed(
             );
             let identity = &routes[&route_key(7, 1)];
             let ctx = executor.actor_context(&identity.root).unwrap();
+            if setup.is_some() {
+                // The mutating lane runs this after any scope registration queued by the bind.
+                let barrier = executor.submit_async(
+                    identity.root.clone(),
+                    Lane::Mutating,
+                    "observe-scope-bind".into(),
+                    Box::new(|_| Response::success("observe-scope-bind", json!({}))),
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(10), barrier)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .success
+                );
+            }
             after_ack(&mut observed, identity, &ctx);
             if let Some(observed) = observed {
                 tokio::time::timeout(Duration::from_secs(8), observed)

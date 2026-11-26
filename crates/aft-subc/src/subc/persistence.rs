@@ -8,6 +8,44 @@ pub(super) const WAIT_BUDGET: Duration = Duration::from_secs(10);
 const MAX_WAITERS: usize = 256;
 const MAX_CONFINEMENT_READS: usize = 8;
 
+pub(super) fn register_bound_scope(
+    executor: &Arc<Executor>,
+    route: RouteChannel,
+    identity: &RouteIdentity,
+) {
+    // A delegated read borrows the scope key; it cannot register its own policy there.
+    if identity.scope.is_none() || flow_read::is_head_read_route(identity) {
+        return;
+    }
+    let identity = identity.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let consent_executor = Arc::clone(executor);
+    let _ = executor.submit_async(
+        identity.root.clone(),
+        Lane::Mutating,
+        format!("scope-bind-{}", route.channel),
+        Box::new(move |ctx| {
+            crate::database_open::run_staged_open(
+                ctx,
+                crate::database_open::DatabaseOpenRunner::ConfigureTail,
+                true,
+            );
+            match access_grants::register(&identity, ctx) {
+                Ok(()) => {
+                    codemode_owners::save(ctx, &identity);
+                    // After a restart, asks this worker left open are sent
+                    // again under their original call keys, never withdrawn.
+                    if let Some(ctx) = consent_executor.actor_context(&identity.root) {
+                        consent::reattach(&ctx, &identity, &runtime);
+                    }
+                    Response::success("scope-bind", json!({}))
+                }
+                Err(error) => Response::error("scope-bind", "grants_unavailable", error.message),
+            }
+        }),
+    );
+}
+
 fn carrier_precheck_failed(identity: &RouteIdentity, body: &Value) -> bool {
     identity.role == tool_provider::RouteRole::ToolProviderV1
         && super::occipital_route(identity)

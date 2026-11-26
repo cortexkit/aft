@@ -5352,7 +5352,7 @@ where
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         a0.cancel(channel);
-                        if let Some(stamp) = routes.get(&channel).and_then(|identity| identity.scope.clone()) {
+                        if let Some(stamp) = routes.get(&channel).filter(|identity| !flow_read::is_head_read_route(identity)).and_then(|identity| identity.scope.clone()) {
                             scope_describes.goodbye(stamp);
                         }
                         if let Err(error) = teardown_installed_route(
@@ -5482,6 +5482,13 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        // Exact-read carriers cannot use the request handlers below that bypass tool dispatch.
+                        if let Some(identity) = routes.get(&route).filter(|identity| flow_read::is_head_read_route(identity)) {
+                            if let Err(error) = flow_read::dispatch_head_read_route(&writer_tx, &dispatch_path_metrics, &decoded, identity, &routes, &executor, &active_tool_calls, Some(&control)).await {
+                                break Err(error);
+                            }
+                            continue;
+                        }
                         if let Some(identity @ ManagementIdentity { admission: ManagementAdmission::RemoteTools(binding), .. }) = management_routes.get(&route) {
                             let body = decoded.body().ok().cloned();
                             remote_calls.request(decoded.frame, body, identity, binding);
@@ -7382,39 +7389,8 @@ async fn handle_route_bind_completion(
 
     debug_assert!(ack_written);
     start_post_ack_database_open(executor, &completion.bind_root_id);
-    if let Some(identity) = routes
-        .get(&route_id)
-        .filter(|identity| identity.scope.is_some())
-        .cloned()
-    {
-        let runtime = tokio::runtime::Handle::current();
-        let consent_executor = Arc::clone(executor);
-        let _ = executor.submit_async(
-            identity.root.clone(),
-            Lane::Mutating,
-            format!("scope-bind-{}", route_id.channel),
-            Box::new(move |ctx| {
-                crate::database_open::run_staged_open(
-                    ctx,
-                    crate::database_open::DatabaseOpenRunner::ConfigureTail,
-                    true,
-                );
-                match access_grants::register(&identity, ctx) {
-                    Ok(()) => {
-                        codemode_owners::save(ctx, &identity);
-                        // After a restart, asks this worker left open are sent
-                        // again under their original call keys, never withdrawn.
-                        if let Some(ctx) = consent_executor.actor_context(&identity.root) {
-                            consent::reattach(&ctx, &identity, &runtime);
-                        }
-                        Response::success("scope-bind", json!({}))
-                    }
-                    Err(error) => {
-                        Response::error("scope-bind", "grants_unavailable", error.message)
-                    }
-                }
-            }),
-        );
+    if let Some(identity) = routes.get(&route_id) {
+        persistence::register_bound_scope(executor, route_id, identity);
     }
     queue_post_bind_configure_and_completion_maintenance(&completion.bind_root_id, live_roots);
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
@@ -7736,11 +7712,11 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if let Err(refusal) = if project_free {
-                    Ok(())
-                } else {
-                    flow_read::admit_management(scope.as_ref())
-                } {
+                if let Err(refusal) = flow_read::admit_bind_surface(
+                    scope.as_ref(),
+                    principal_id(&principal).as_deref(),
+                    project_free,
+                ) {
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
                 }
                 if !matches!(&target, RouteTarget::ManagementSurface { module_id } | RouteTarget::ToolProvider { module_id } if module_id == "aft")

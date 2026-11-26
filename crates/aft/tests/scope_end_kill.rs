@@ -120,6 +120,9 @@ fn stamp(owner: &str, epoch: u64) -> subc_protocol::scope::ScopeStamp {
         subc_protocol::scope::ScopeKind::Head,
     )
     .with_owner_authorized(true)
+    .with_attributes(
+        subc_protocol::scope::ScopeAttributes::new().with_agent_id(Some("head-agent".into())),
+    )
 }
 fn sleep_command(seconds: u64) -> String {
     #[cfg(windows)]
@@ -1600,8 +1603,8 @@ async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
 }
 
 // Basal reads exact files over an ordinary tool-provider/v1 route to AFT,
-// bound with the head's bind identity under a `flow-read/` child of the head's
-// scope, sending the flat `{"op":"file.read_exact","path":...}` body rather
+// carrying either the head's scope or its `flow-read/` child, sending the
+// flat `{"op":"file.read_exact","path":...}` body rather
 // than a `{name, arguments, call_key}` tool-call envelope.
 fn flow_owner() -> Principal {
     Principal::Reserved {
@@ -1639,6 +1642,15 @@ fn flow_read_stamp() -> subc_protocol::scope::ScopeStamp {
 
 #[tokio::test]
 async fn flow_read_scope_on_tool_provider_v1_route_returns_exact_bytes() {
+    exact_flow_bytes(flow_read_stamp(), false).await;
+}
+
+#[tokio::test]
+async fn flow_read_head_scope_on_tool_provider_v1_route_is_exact_read_only() {
+    exact_flow_bytes(flow_head_stamp(), true).await;
+}
+
+async fn exact_flow_bytes(carrier: subc_protocol::scope::ScopeStamp, check_read_only: bool) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("module");
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
@@ -1658,16 +1670,19 @@ async fn flow_read_scope_on_tool_provider_v1_route_returns_exact_bytes() {
     // bind is acknowledged. Nothing here orders that registration before the
     // read: the read itself must wait for it.
     daemon
-        .bind_route(
-            2,
-            1,
-            "basal",
-            Some(flow_read_stamp()),
-            false,
-            "head-session",
-            false,
-        )
+        .bind_route(2, 1, "basal", Some(carrier), false, "head-session", false)
         .await;
+    if check_read_only {
+        for request in [
+            json!({"op":"tool.call","name":"read","preset":"head","arguments":{"path":"flow-script.txt"}}),
+            json!({"op":cortexkit_role_tool_display::DISPLAY_READ}),
+        ] {
+            let refused = daemon.call(2, request).await;
+            assert_eq!(refused.header.ty, FrameType::Error, "{}", body(&refused));
+            assert_eq!(body(&refused)["code"], "file_read_exact_route_not_admitted");
+            assert_eq!(body(&refused)["message"], "Route not admitted: operation.");
+        }
+    }
     let corr = daemon
         .start(
             2,
