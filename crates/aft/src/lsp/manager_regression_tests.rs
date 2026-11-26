@@ -1122,6 +1122,47 @@ fn review_gpt5_event_overflow_preserves_response_and_exit() {
 }
 
 #[test]
+fn event_overflow_does_not_strand_analysis_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = ServerKey {
+        kind: ServerKind::Python,
+        root: canonicalize_for_lsp(tmp.path()).unwrap(),
+    };
+    let mut manager = LspManager::new();
+    let client = lifecycle_fake_client(&manager, &key);
+    let instance = client.instance;
+    manager.clients.insert(key.clone(), client);
+    let progress = |order, kind| ReceivedLspEvent {
+        event: LspEvent::Notification {
+            server_kind: key.kind.clone(),
+            root: key.root.clone(),
+            method: "$/progress".into(),
+            params: Some(json!({"token": "analysis", "value": {"kind": kind}})),
+        },
+        instance: Some(instance),
+        receive_order: Some(order),
+    };
+
+    manager.event_tx.send(progress(1, "begin")).unwrap();
+    manager.drain_events();
+    assert!(manager.clients[&key].analysis_progress_running());
+
+    for order in 2..=EVENT_CAP as u64 + 1 {
+        manager.event_tx.send(progress(order, "report")).unwrap();
+    }
+    assert_eq!(manager.event_rx.len(), EVENT_CAP);
+    manager
+        .event_tx
+        .send(progress(EVENT_CAP as u64 + 2, "end"))
+        .unwrap();
+    manager.drain_events();
+    assert!(
+        !manager.clients[&key].analysis_progress_running(),
+        "analysis finished while the ordinary queue was full"
+    );
+}
+
+#[test]
 fn review_opus9_pulls_all_matching_dynamic_providers_with_their_own_result_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let root = canonicalize_for_lsp(tmp.path()).unwrap();
