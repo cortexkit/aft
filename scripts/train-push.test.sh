@@ -1735,6 +1735,60 @@ HOOK
   fi
 }
 
+# Exercise metadata with a real, dependency-free workspace and a path package
+# explicitly excluded from it. Stop after the dirty-tree check so no CI is run.
+test_lock_workspace_membership() {
+  local mode dir work before name
+  for mode in member sibling unavailable malformed; do
+    dir="$(new_fixture "lock-membership-$mode")"
+    work="$dir/work"
+    mkdir -p "$work/member/src" "$work/sibling/src"
+    printf '[workspace]\nmembers = ["member"]\nexclude = ["sibling"]\nresolver = "2"\n' > "$work/Cargo.toml"
+    printf '[package]\nname = "member"\nversion = "1.0.0"\nedition = "2021"\n[dependencies]\nsibling = { path = "../sibling" }\n' > "$work/member/Cargo.toml"
+    printf '[package]\nname = "sibling"\nversion = "2.0.0"\nedition = "2021"\n' > "$work/sibling/Cargo.toml"
+    : > "$work/member/src/lib.rs"
+    : > "$work/sibling/src/lib.rs"
+    (cd "$work" && cargo generate-lockfile --offline)
+    git -C "$work" add Cargo.toml Cargo.lock member sibling
+    git -C "$work" rm -q scripts/check-path-deps.py
+    git -C "$work" commit -qm "workspace fixture"
+    add_train_commit "$work" "lock-membership-$mode"
+    if [ "$mode" = member ]; then
+      sed -i.bak 's/^version = "1.0.0"$/version = "1.0.1"/' "$work/Cargo.lock"
+    else
+      sed -i.bak 's/^version = "2.0.0"$/version = "2.0.1"/' "$work/Cargo.lock"
+    fi
+    rm -f "$work/Cargo.lock.bak"
+    before="$(git -C "$work" diff -- Cargo.lock)"
+    case "$mode" in
+      unavailable) printf '#!/bin/sh\nexit 1\n' > "$BIN_DIR/cargo"; chmod +x "$BIN_DIR/cargo" ;;
+      malformed) printf '#!/bin/sh\nprintf "not json\\n"\n' > "$BIN_DIR/cargo"; chmod +x "$BIN_DIR/cargo" ;;
+    esac
+    run_train "$dir" "lock-membership-$mode"
+    rm -f "$BIN_DIR/cargo"
+    expect_rc 2 "$mode lock drift stops before pushing"
+    if [ "$mode" = sibling ]; then
+      expect_out "restored Cargo.lock: sibling path-dependency drift in sibling" "non-member path drift is restored"
+      expect_out "scripts/check-path-deps.py not found" "restored tree passes the dirty-tree check"
+      git -C "$work" diff --quiet -- Cargo.lock || fail "sibling lock drift was not restored"
+    else
+      if [ "$mode" = member ]; then name=member; else name=sibling; fi
+      expect_out "not restoring Cargo.lock: workspace membership could not exclude drift in $name" "$mode refusal names the package"
+      expect_out "working tree is not clean" "$mode drift reaches the dirty-tree refusal"
+      expect_no_out "restored Cargo.lock" "$mode drift is not restored"
+      [ "$(git -C "$work" diff -- Cargo.lock)" = "$before" ] || fail "$mode lock edit was changed"
+    fi
+    [ -z "$(origin_ref "$dir" "refs/heads/train/lock-membership-$mode")" ] || fail "$mode fixture pushed a train"
+  done
+}
+
+if [ "${TRAIN_PUSH_TEST_CASE:-}" = lock-workspace ]; then
+  test_lock_workspace_membership
+  [ "$failures" = 0 ] || exit 1
+  echo "train-push.test.sh: lock workspace cases passed ($checks checks)"
+  exit 0
+fi
+
 case "${TRAIN_PUSH_TEST_CASE:-}" in
   stack-base) test_stack_base_not_on_main ;;
   stack-red) test_stack_parent_red ;;
@@ -1779,6 +1833,7 @@ if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}"
   exit 0
 fi
 run_stack_tests
+test_lock_workspace_membership
 
 # --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture no-path-checker)"
@@ -2206,7 +2261,10 @@ train_sha="$(git -C "$dir/work" rev-parse HEAD)"
 # also has a git copy of the same name; the git copy's block is untouched.
 sed -i.bak -e 's/^version = "0.17.45"$/version = "0.17.48"/' -e 's/^version = "0.2.2"$/version = "0.2.3"/' "$dir/work/Cargo.lock"
 rm -f "$dir/work/Cargo.lock.bak"
+printf '#!/bin/sh\nprintf '\''{"workspace_members":["root-id"],"packages":[{"id":"root-id","name":"root"}]}\\n'\''\n' > "$BIN_DIR/cargo"
+chmod +x "$BIN_DIR/cargo"
 run_train "$dir" lockdrift
+rm -f "$BIN_DIR/cargo"
 expect_rc 0 "path-dependency-only lock drift is restored and the train lands"
 expect_out "restored Cargo.lock: sibling path-dependency drift in pathdep,twin" "the restore names every drifted package"
 expect_no_out "working tree is not clean" "lock drift alone is not a dirty tree"
@@ -2302,7 +2360,10 @@ add_train_commit "$dir/work" "lockmutant"
 sed -i.bak -e 's/^version = "0.2.1"$/version = "0.2.9"/' "$dir/work/Cargo.lock"
 rm -f "$dir/work/Cargo.lock.bak"
 TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
+printf '#!/bin/sh\nprintf '\''{"workspace_members":["root-id"],"packages":[{"id":"root-id","name":"root"}]}\\n'\''\n' > "$BIN_DIR/cargo"
+chmod +x "$BIN_DIR/cargo"
 run_train "$dir" lockmutant
+rm -f "$BIN_DIR/cargo"
 TRAIN_PUSH="$TRAIN_PUSH_SAVED"
 expect_out "restored Cargo.lock" "the mutant without the source-less check wrongly restores a sourced twin bump (proves the twin arm bites)"
 expect_no_out "working tree is not clean" "the mutant does not refuse where the real predicate does"
