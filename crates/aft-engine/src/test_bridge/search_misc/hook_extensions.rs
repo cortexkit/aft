@@ -160,6 +160,11 @@ pub mod lsp {
         use crate::lsp::manager::LspManager;
 
         pub mod regression_tests {
+            #[cfg(unix)]
+            pub use crate::lsp::manager::idle_fixture::{
+                drain_flycheck_end_for_maintenance_test, finish_flycheck_for_maintenance_test,
+                overflow_flycheck_inbox_for_maintenance_test, FLYCHECK_PUBLISH_SETTLE_FOR_TEST,
+            };
             pub use crate::lsp::manager::idle_fixture::{
                 enqueue_maintenance_backlog_for_test, publish_after_document_sync_for_test,
                 IdleLspFixture,

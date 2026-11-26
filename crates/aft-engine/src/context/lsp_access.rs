@@ -1,7 +1,8 @@
 use super::*;
 
 impl AppContext {
-    pub(crate) fn current_lsp_observations(
+    #[doc(hidden)]
+    pub fn current_lsp_observations(
         &self,
         mut snapshots: Vec<crate::alert_state::AcceptedDiagnosticSnapshot>,
     ) -> Vec<crate::alert_state::AcceptedDiagnosticSnapshot> {

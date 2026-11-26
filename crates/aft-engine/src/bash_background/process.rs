@@ -91,8 +91,8 @@ impl GroupListing {
 /// means the group was checked and has no live member; an incomplete one keeps
 /// the members it found; an error says why the group could not be checked.
 pub fn live_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
-    #[cfg(test)]
-    if test_hooks::listing_fails(pgid) {
+    #[cfg(any(test, all(unix, feature = "test-support")))]
+    if group_listing_test::listing_fails(pgid) {
         return Err(LiveDescendantsUnavailable::ListingFailed);
     }
     #[cfg(target_os = "linux")]
@@ -113,13 +113,49 @@ pub fn live_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescend
 
 /// Fault injection for tests, keyed by process group so parallel tests do not
 /// collide.
+#[cfg(any(test, all(unix, feature = "test-support")))]
+pub(crate) mod group_listing_test {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static LISTING_FAILS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn fail_listing(pgid: i32) {
+        LISTING_FAILS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(pgid);
+    }
+
+    #[cfg(all(unix, feature = "test-support"))]
+    pub(crate) fn scoped_listing_failure(pgid: i32) -> impl Drop {
+        struct RestoreListing(i32);
+
+        impl Drop for RestoreListing {
+            fn drop(&mut self) {
+                LISTING_FAILS.get().unwrap().lock().unwrap().remove(&self.0);
+            }
+        }
+
+        fail_listing(pgid);
+        RestoreListing(pgid)
+    }
+
+    pub(super) fn listing_fails(pgid: i32) -> bool {
+        LISTING_FAILS
+            .get()
+            .is_some_and(|groups| groups.lock().unwrap().contains(&pgid))
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod test_hooks {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
-    static LISTING_FAILS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     static SIGKILL_DENIED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     static MEMBERS_INVISIBLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     static MEMBERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
@@ -204,31 +240,7 @@ pub(crate) mod test_hooks {
 
     /// Make every listing of this group fail, as an unreadable `/proc` would.
     pub(crate) fn fail_listing(pgid: i32) {
-        LISTING_FAILS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .insert(pgid);
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn scoped_listing_failure(pgid: i32) -> impl Drop {
-        struct RestoreListing(i32);
-
-        impl Drop for RestoreListing {
-            fn drop(&mut self) {
-                LISTING_FAILS.get().unwrap().lock().unwrap().remove(&self.0);
-            }
-        }
-
-        fail_listing(pgid);
-        RestoreListing(pgid)
-    }
-
-    pub(super) fn listing_fails(pgid: i32) -> bool {
-        LISTING_FAILS
-            .get()
-            .is_some_and(|groups| groups.lock().unwrap().contains(&pgid))
+        super::group_listing_test::fail_listing(pgid);
     }
 
     /// Make the group SIGKILL reach no member of this group, as it does for

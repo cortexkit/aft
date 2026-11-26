@@ -18,6 +18,16 @@ pub fn watch_pty_write_start_for_test(task_id: &str) -> crossbeam_channel::Recei
     background::pty_process::watch_pty_write_start_for_test(task_id)
 }
 
+#[cfg(unix)]
+pub fn take_stderr_scans(path: &Path) -> (usize, u64) {
+    background::buffer::take_stderr_scans(path)
+}
+
+#[cfg(unix)]
+pub fn scoped_listing_failure(pgid: i32) -> impl Drop {
+    background::process::group_listing_test::scoped_listing_failure(pgid)
+}
+
 pub fn canonical_root_path(path: &Path) -> std::io::Result<PathBuf> {
     persistence::canonical_root_path(path)
 }

@@ -1,11 +1,9 @@
 use super::*;
-use crate::lsp::client::FLYCHECK_PUBLISH_SETTLE;
-use crate::lsp::manager::{
-    regression_tests::{
-        drain_flycheck_end_for_maintenance_test, finish_flycheck_for_maintenance_test,
-        overflow_flycheck_inbox_for_maintenance_test,
-    },
-    RetryClock,
+use crate::lsp::manager::RetryClock;
+use aft_engine::test_bridge::search_misc::lsp::manager::regression_tests::{
+    drain_flycheck_end_for_maintenance_test, finish_flycheck_for_maintenance_test,
+    overflow_flycheck_inbox_for_maintenance_test,
+    FLYCHECK_PUBLISH_SETTLE_FOR_TEST as FLYCHECK_PUBLISH_SETTLE,
 };
 
 #[tokio::test]
@@ -39,11 +37,16 @@ async fn assert_idle_flycheck_persistence(overflow: bool) {
         let mut lsp = ctx.lsp();
         let read_clock = Arc::clone(&clock);
         lsp.set_retry_clock(RetryClock::from_fn(move || *read_clock.lock()));
-        let settle_at =
-            drain_flycheck_end_for_maintenance_test(&mut lsp, root.as_path(), storage.path());
+        let fixture = drain_flycheck_end_for_maintenance_test(
+            &mut lsp,
+            root.as_path(),
+            storage.path(),
+            &crate::fake_lsp_test_helper::fake_server_binary(),
+        );
         assert_eq!(lsp.pending_event_count_for_test(), 0);
-        settle_at
+        fixture
     };
+    let end_at = settle_at - FLYCHECK_PUBLISH_SETTLE;
     let persisted_record = || {
         std::fs::read_dir(storage.path().join("rust-completed-checks"))
             .unwrap()
@@ -62,7 +65,6 @@ async fn assert_idle_flycheck_persistence(overflow: bool) {
         )
         .0
     };
-    let end_at = settle_at - FLYCHECK_PUBLISH_SETTLE;
     *clock.lock() = end_at + DRAIN_TICK_PERIOD;
     assert!(probe(&mut live_roots).is_empty());
     assert!(persisted_record().is_none());

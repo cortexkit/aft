@@ -2207,7 +2207,8 @@ pub fn format_validation_errors(errors: &[format::ValidationError]) -> String {
 }
 
 impl WriteResult {
-    pub(crate) fn append_rollback_skipped_to(&self, result: &mut serde_json::Value) {
+    #[doc(hidden)]
+    pub fn append_rollback_skipped_to(&self, result: &mut serde_json::Value) {
         if let Some(reason) = self.rollback_skipped_reason {
             result["rollback_skipped_reason"] = serde_json::json!(reason);
             result["rolled_back"] = serde_json::json!(false);

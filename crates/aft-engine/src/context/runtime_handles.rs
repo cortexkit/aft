@@ -4,7 +4,7 @@ use super::*;
 pub(super) struct WatcherGap {
     // Odd epochs are unverified. A delayed rescan clears only its own epoch.
     epoch: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     cleared: tokio::sync::Notify,
 }
 
@@ -28,15 +28,18 @@ pub(super) fn configure_background_scope(registry: &BgTaskRegistry, app: &App, c
 }
 
 impl AppContext {
-    pub(crate) fn watcher_gap_pending(&self) -> bool {
+    #[doc(hidden)]
+    pub fn watcher_gap_pending(&self) -> bool {
         self.watcher_gap_epoch() & 1 != 0
     }
 
-    pub(crate) fn watcher_gap_epoch(&self) -> u64 {
+    #[doc(hidden)]
+    pub fn watcher_gap_epoch(&self) -> u64 {
         self.watcher_gap.epoch.load(Ordering::Acquire)
     }
 
-    pub(crate) fn mark_watcher_gap_pending(&self) {
+    #[doc(hidden)]
+    pub fn mark_watcher_gap_pending(&self) {
         let mut epoch = self.watcher_gap_epoch();
         loop {
             match self.watcher_gap.epoch.compare_exchange_weak(
@@ -51,7 +54,7 @@ impl AppContext {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn await_watcher_gap_rescan_for_test(&self) {
         while self.watcher_gap_pending() {
             let cleared = self.watcher_gap.cleared.notified();
@@ -67,7 +70,8 @@ impl AppContext {
     /// The watcher is live before taking this snapshot of bound checkouts.
     /// New checkouts bind against disk; current ones must catch up before
     /// their retained text and call-graph views are eligible again.
-    pub(crate) fn rescan_after_watcher_gap(&self, expected_generation: u64, epoch: u64) {
+    #[doc(hidden)]
+    pub fn rescan_after_watcher_gap(&self, expected_generation: u64, epoch: u64) {
         if epoch & 1 == 0
             || self.watcher_gap_epoch() != epoch
             || self.subc_unbound_quiesced()
@@ -89,7 +93,7 @@ impl AppContext {
                     )
                     .is_ok()
             {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 gap.cleared.notify_waiters();
             }
         };

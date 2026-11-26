@@ -2170,7 +2170,7 @@ impl LspClient {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     pub(super) fn receive_flycheck_begin_for_test(&self, order: u64, began: SystemTime) {
         let ordinal = self.rust_check_begins_read.fetch_add(1, Ordering::SeqCst) + 1;
         self.rust_check_begin_receipts

@@ -1046,7 +1046,8 @@ fn unanalyzed_macro_note(
     })
 }
 
-pub(crate) fn macro_gap_paths(
+#[doc(hidden)]
+pub fn macro_gap_paths(
     store: &impl CallGraphRead,
     file: &str,
 ) -> StoreAdapterResult<Vec<std::path::PathBuf>> {
@@ -1069,7 +1070,8 @@ pub(crate) fn macro_gap_paths(
         .collect())
 }
 
-pub(crate) fn disclose_macro_gaps(response: &mut Response, paths: Vec<std::path::PathBuf>) {
+#[doc(hidden)]
+pub fn disclose_macro_gaps(response: &mut Response, paths: Vec<std::path::PathBuf>) {
     if !response.success || paths.is_empty() {
         return;
     }

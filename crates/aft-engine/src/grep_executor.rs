@@ -91,7 +91,8 @@ pub(crate) fn note_fallback_walk_for_test() {
     FALLBACK_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
-pub(crate) fn fallback_walk_limit() -> usize {
+#[doc(hidden)]
+pub fn fallback_walk_limit() -> usize {
     #[cfg(any(test, feature = "test-support"))]
     {
         WALK_LIMIT.with(|limit| limit.get())
@@ -1554,13 +1555,15 @@ fn merge_grep_results_with_canonicalizer(
 /// Observations made inside the walker predicate, where rejected entries
 /// cannot be recovered from the iterator.
 #[derive(Clone, Default)]
-pub(crate) struct WalkCoverage {
+#[doc(hidden)]
+pub struct WalkCoverage {
     foreign_mounts: Arc<AtomicUsize>,
     first_error: Arc<Mutex<Option<String>>>,
 }
 
 impl WalkCoverage {
-    pub(crate) fn skipped_foreign_mounts(&self) -> usize {
+    #[doc(hidden)]
+    pub fn skipped_foreign_mounts(&self) -> usize {
         self.foreign_mounts.load(Ordering::Relaxed)
     }
 
@@ -1571,7 +1574,8 @@ impl WalkCoverage {
             .clone()
     }
 
-    pub(crate) fn record_error(&self, path: &Path, error: impl std::fmt::Display) {
+    #[doc(hidden)]
+    pub fn record_error(&self, path: &Path, error: impl std::fmt::Display) {
         let reason = error.to_string();
         crate::bounded_io::note_skipped_file(path, &reason);
         self.first_error
@@ -1580,7 +1584,8 @@ impl WalkCoverage {
             .get_or_insert(reason);
     }
 
-    pub(crate) fn complete(&self) -> bool {
+    #[doc(hidden)]
+    pub fn complete(&self) -> bool {
         self.skipped_foreign_mounts() == 0 && self.error().is_none()
     }
 

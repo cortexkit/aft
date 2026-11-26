@@ -333,12 +333,12 @@ impl BgBuffer {
 
     pub(super) fn stderr_reader(&self) -> Option<impl io::BufRead> {
         let source = self.source(StreamKind::Stderr)?;
-        #[cfg(test)]
+        #[cfg(all(unix, any(test, feature = "test-support")))]
         record_stderr_scan(source.path(), 0, true);
         source.open().ok().map(|file| {
             io::BufReader::new(ScanReader {
                 inner: file,
-                #[cfg(test)]
+                #[cfg(all(unix, any(test, feature = "test-support")))]
                 path: source.path().to_path_buf(),
             })
         })
@@ -500,24 +500,24 @@ pub(crate) fn tail_read_count(path: &Path) -> usize {
 /// the bytes read through it.
 struct ScanReader<R> {
     inner: R,
-    #[cfg(test)]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     path: PathBuf,
 }
 
 impl<R: io::Read> io::Read for ScanReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buf)?;
-        #[cfg(test)]
+        #[cfg(all(unix, any(test, feature = "test-support")))]
         record_stderr_scan(&self.path, read as u64, false);
         Ok(read)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 static STDERR_SCANS: OnceLock<Mutex<std::collections::HashMap<PathBuf, (usize, u64)>>> =
     OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 fn record_stderr_scan(path: &Path, bytes: u64, opened: bool) {
     if let Ok(mut scans) = STDERR_SCANS.get_or_init(Default::default).lock() {
         let entry = scans.entry(path.to_path_buf()).or_default();
@@ -527,7 +527,7 @@ fn record_stderr_scan(path: &Path, bytes: u64, opened: bool) {
 }
 
 /// Opens of `path` for a stderr scan, and the bytes read through them.
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 pub(crate) fn take_stderr_scans(path: &Path) -> (usize, u64) {
     STDERR_SCANS
         .get_or_init(Default::default)

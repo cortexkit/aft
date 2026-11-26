@@ -3482,7 +3482,8 @@ impl SemanticEmbeddingModel {
         }
     }
 
-    pub(crate) fn discard_rejected_query(&self, query: &str, vector: &[f32]) {
+    #[doc(hidden)]
+    pub fn discard_rejected_query(&self, query: &str, vector: &[f32]) {
         let key = query_embedding_text(query, self.query_instruction.as_deref());
         let mut cache = self
             .query_embedding_cache

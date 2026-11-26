@@ -1,5 +1,9 @@
 use super::*;
 
+pub(super) fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyedSubmission {
     pub(super) key: String,

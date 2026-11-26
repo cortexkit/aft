@@ -245,8 +245,9 @@ fn deleted_root_is_not_blocked_by_another_roots_running_task() {
 
 #[test]
 fn deleted_root_reclaim_retries_after_failed_terminal_group_sample() {
-    use crate::bash_background::process::{test_hooks, LiveDescendantsUnavailable};
+    use crate::bash_background::process::LiveDescendantsUnavailable;
     use crate::bash_background::registry::install_kill_signal_gate_for_test;
+    use aft_engine::test_bridge::bash_remote::scoped_listing_failure;
 
     let mut fixture = ReclaimFixture::new();
     let registry = fixture.ctx.bash_background().clone();
@@ -292,7 +293,7 @@ fn deleted_root_reclaim_retries_after_failed_terminal_group_sample() {
     terminal_published
         .recv_timeout(Duration::from_secs(10))
         .expect("kill published terminal state before sampling the group");
-    let listing_failure = test_hooks::scoped_listing_failure(pgid);
+    let listing_failure = scoped_listing_failure(pgid);
     release.send(()).unwrap();
     assert_eq!(worker.join().unwrap(), 1);
     drop(listing_failure);

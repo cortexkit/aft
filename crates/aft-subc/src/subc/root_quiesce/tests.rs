@@ -257,7 +257,7 @@ fn rebind_queues_ack_while_watcher_observation_database_is_locked() {
                     queued.send(ack_queued).unwrap();
                     tokio::time::timeout(
                         Duration::from_secs(60),
-                        ctx_for_bind.await_watcher_gap_rescan_for_test(),
+                        aft_engine::test_bridge::display_data::context::await_watcher_gap_rescan_for_test(&ctx_for_bind),
                     )
                     .await
                     .expect("the live watcher rescan closes the gap");

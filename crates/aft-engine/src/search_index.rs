@@ -3566,30 +3566,7 @@ fn project_walk_builder_with_admission(
     project_walk_builder_pruned(search_root, excludes, |_| true)
 }
 
-/// The ordinary index walk, with coverage accounting for the unpublished corpus.
-pub(crate) fn checked_project_walk_builder(
-    root: &Path,
-    coverage: crate::grep_executor::WalkCoverage,
-) -> WalkBuilder {
-    crate::io_accounting::WORK
-        .full_walks
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let boundary = crate::walk_boundary::DeviceBoundary::for_root(root)
-        .inspect_err(|error| coverage.record_error(root, error))
-        .ok();
-    project_walk_builder_pruned(root, checked_project_content_excludes, move |entry| {
-        !entry.file_type().is_some_and(|kind| kind.is_dir())
-            || coverage.allows_device(entry.path(), boundary.as_ref())
-    })
-}
-
-fn checked_project_content_excludes(path: &Path, kind: Option<&std::fs::FileType>) -> bool {
-    if crate::project_content::is_cortexkit_data_read_denied(path) {
-        crate::data_layer::read_fence::capture().record_floor(path);
-        return true;
-    }
-    crate::project_content::is_excluded_with_file_type(path, kind)
-}
+pub use indexed_glob::checked_project_walk_builder;
 
 /// The project walk with one more condition, `descend`, on every entry below
 /// the root. Every decision the walk makes about an entry it does visit is

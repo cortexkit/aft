@@ -45,7 +45,7 @@ fn runon_read_only_note_scans_stderr_once_within_its_budget() {
         .stderr_path()
         .unwrap()
         .to_path_buf();
-    let take_stderr_scans = crate::bash_background::buffer::take_stderr_scans;
+    use aft_engine::test_bridge::bash_remote::take_stderr_scans;
     let record = TerminalRecord::new(id(), Outcome::Exit { code: 1 }, 2, 0, 0)
         .with_ran(Ran::Remote)
         .with_workspace_changes(Vec::new())

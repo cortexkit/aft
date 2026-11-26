@@ -7,6 +7,14 @@ use occipital_lang::{
 use occipital_registry::{view as registry, Template};
 use serde_json::json;
 
+fn fixture_json<T: serde::de::DeserializeOwned>(relative: &str) -> T {
+    let path = crate::test_support::manifest_dir()
+        .join("../aft/tests/fixtures")
+        .join(relative);
+    let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    serde_json::from_slice(&bytes).unwrap_or_else(|err| panic!("decode {}: {err}", path.display()))
+}
+
 #[test]
 #[ignore = "exports every served pin for occipital-check and measures its page"]
 fn export_occipital_check_inputs() {
@@ -58,9 +66,8 @@ fn tool_samples(name: &str, schema: &Value, record_schema: &RecordSchema) -> Vec
     match name {
         "bash" => bash_samples(record_schema.completion_fields.contains_key("tail")),
         "edit" => {
-            let page: Value = serde_json::from_str(include_str!(
-                "../../../../aft/tests/fixtures/tool_views/phone-reader-tool-display-v8/01-page-with-call-keys.json"
-            )).unwrap();
+            let page: Value =
+                fixture_json("tool_views/phone-reader-tool-display-v8/01-page-with-call-keys.json");
             let path = &page["result"]["messages"][0]["parts"][1]["input"]["path"];
             let input = if schema["properties"].get("patch").is_some() {
                 json!({"path":path,"patch":"1:ab|old\n1:ab|new"})
@@ -75,10 +82,8 @@ fn tool_samples(name: &str, schema: &Value, record_schema: &RecordSchema) -> Vec
             })]
         }
         "write" | "apply_patch" => {
-            let files: BTreeMap<String, Vec<Value>> = serde_json::from_str(include_str!(
-                "../../../../aft/tests/fixtures/tool_views/write-and-apply-patch-samples.json"
-            ))
-            .unwrap();
+            let files: BTreeMap<String, Vec<Value>> =
+                fixture_json("tool_views/write-and-apply-patch-samples.json");
             files[name].clone()
         }
         _ => unreachable!(),
@@ -109,24 +114,19 @@ fn bash_samples(has_tail: bool) -> Vec<Value> {
         ]);
     }
     samples.push(json!({"input":input,"record":record,"completion":completion}));
-    let page: Value = serde_json::from_str(include_str!(
-        "../../../../aft/tests/fixtures/tool_views/phone-reader-tool-display-v8/01-page-with-call-keys.json"
-    )).unwrap();
-    let display: Value = serde_json::from_str(include_str!(
-        "../../../../aft/tests/fixtures/tool_views/phone-reader-tool-display-v8/05-records.json"
-    ))
-    .unwrap();
+    let page: Value =
+        fixture_json("tool_views/phone-reader-tool-display-v8/01-page-with-call-keys.json");
+    let display: Value = fixture_json("tool_views/phone-reader-tool-display-v8/05-records.json");
     let display_record = &display["result"]["calls"]["ck_ls"];
     samples.push(json!({
         "input":page["result"]["messages"][0]["parts"][0]["input"],
         "record":display_record["record"], "completion":display_record["completion"]
     }));
     if has_tail {
-        for bytes in [
-            include_str!("../../../../aft/tests/fixtures/tool_views/phone-reader-tool-tail-v3/03-records.json"),
-            include_str!("../../../../aft/tests/fixtures/tool_views/phone-reader-tool-versions-v2/05-records-grown.json"),
+        for sample in [
+            fixture_json::<Value>("tool_views/phone-reader-tool-tail-v3/03-records.json"),
+            fixture_json::<Value>("tool_views/phone-reader-tool-versions-v2/05-records-grown.json"),
         ] {
-            let sample: Value = serde_json::from_str(bytes).unwrap();
             samples.push(json!({"input":{"command":"cargo test"},
                 "completion":sample["result"]["calls"]["ck_test"]["completion"]}));
         }
@@ -135,12 +135,11 @@ fn bash_samples(has_tail: bool) -> Vec<Value> {
 }
 
 fn notice_samples(pin: &str) -> Vec<Value> {
-    let wake: Value = serde_json::from_str(include_str!(
-        "../../../../aft/tests/fixtures/notice-records/phone-reader-notice-records-aft-v2/02-wake-records-with-notices.json"
-    )).unwrap();
-    let riding: Value = serde_json::from_str(include_str!(
-        "../../../../aft/tests/fixtures/notice-records/phone-reader-notice-records-aft-v2/03-notices-riding.json"
-    )).unwrap();
+    let wake: Value = fixture_json(
+        "notice-records/phone-reader-notice-records-aft-v2/02-wake-records-with-notices.json",
+    );
+    let riding: Value =
+        fixture_json("notice-records/phone-reader-notice-records-aft-v2/03-notices-riding.json");
     wake["result"]["notices"]
         .as_object()
         .unwrap()

@@ -8,7 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 use std::sync::Mutex;
 
 use portable_pty::PtySize;

@@ -912,7 +912,7 @@ pub struct RemoteTask {
     pub stderr_len: u64,
     #[serde(default)]
     pub unknown_len: u64,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(default, skip_serializing_if = "remote_types::is_zero_u64")]
     pub output_limit_dropped_bytes: u64,
     pub cancel_requested: bool,
     /// A cancellation the runner still has to be sent (or to answer): set,
@@ -983,10 +983,6 @@ pub struct RemoteTask {
     /// could not fill them: lost output or differently sized chunks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expired_gap_unverified: Vec<(u64, u64)>,
-}
-
-fn is_zero_u64(value: &u64) -> bool {
-    *value == 0
 }
 
 #[path = "remote_types.rs"]

@@ -186,7 +186,8 @@ impl ViewScope {
     }
 
     /// Every file in scope with its modification time, without a search snapshot.
-    pub(crate) fn listing_rows(&self) -> impl Iterator<Item = (PathBuf, SystemTime)> + '_ {
+    #[doc(hidden)]
+    pub fn listing_rows(&self) -> impl Iterator<Item = (PathBuf, SystemTime)> + '_ {
         self.files().filter_map(|(path, _, modified)| {
             absolute(self.view.root(), path).map(|path| (path, modified))
         })

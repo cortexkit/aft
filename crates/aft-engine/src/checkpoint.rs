@@ -659,7 +659,8 @@ impl CheckpointStore {
 
     /// Snapshot a previously authorized tracked set without reacquiring the
     /// backup store. An all-unreadable tracked set still makes an empty checkpoint.
-    pub(crate) fn create_for_tracked_files(
+    #[doc(hidden)]
+    pub fn create_for_tracked_files(
         &mut self,
         session: &str,
         name: &str,

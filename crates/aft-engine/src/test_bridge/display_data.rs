@@ -178,6 +178,10 @@ pub mod late_result_bus {
 }
 
 pub mod context {
+    pub async fn await_watcher_gap_rescan_for_test(ctx: &crate::context::AppContext) {
+        ctx.await_watcher_gap_rescan_for_test().await;
+    }
+
     use crate::context::{self, AppContext};
 
     pub use context::maintenance_probe_fixture::MaintenanceProbeLock;
