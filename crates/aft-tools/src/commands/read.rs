@@ -3210,6 +3210,82 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[test]
+    fn repeat_read_image_rewrite_with_same_summary_restarts_guidance_count() {
+        use crate::run_tool_call::RepeatObservation;
+
+        let _decoder_guard = image_decoder_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("image.png");
+        let ctx = ctx_for(dir.path());
+        let req = request(&file, serde_json::json!({}));
+        let args = serde_json::json!({ "path": file });
+        let start = Instant::now();
+        let write_image = |channels| {
+            image::RgbImage::from_pixel(1, 1, image::Rgb(channels))
+                .save(&file)
+                .unwrap();
+        };
+        let read = || {
+            let response = handle_read(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["attachments"][0]["mime"], "image/png");
+            crate::run_tool_call::finish_tool_call_response(
+                "read",
+                &Default::default(),
+                response,
+                false,
+                None,
+                None,
+            )
+        };
+        let observe = |result: &mut crate::run_tool_call::ToolCallResult, seconds| {
+            RepeatObservation::for_agent_call("image-repeat", "read", &args, false, true, true)
+                .unwrap()
+                .observe_at(
+                    &ctx,
+                    &mut result.response,
+                    &mut result.text,
+                    start + Duration::from_secs(seconds),
+                );
+        };
+
+        write_image([1, 2, 3]);
+        let mut first = read();
+        observe(&mut first, 0);
+        let mut second = read();
+        observe(&mut second, 20);
+        assert_eq!(first.text, second.text);
+
+        write_image([4, 5, 6]);
+        let mut rewritten = read();
+        assert_ne!(
+            first.response.data["attachments"][0]["data"],
+            rewritten.response.data["attachments"][0]["data"],
+            "the read must return the new PNG payload",
+        );
+        assert_eq!(
+            first.text, rewritten.text,
+            "the image summary did not change"
+        );
+        observe(&mut rewritten, 40);
+        assert_eq!(
+            first.text, rewritten.text,
+            "new pixels must not trigger guidance"
+        );
+
+        let mut repeated = read();
+        observe(&mut repeated, 60);
+        assert_eq!(rewritten.text, repeated.text);
+        let mut unchanged = read();
+        observe(&mut unchanged, 80);
+        assert!(
+            unchanged.text.contains("3rd identical call"),
+            "{}",
+            unchanged.text
+        );
+    }
+
     fn noisy_fit_fixture(transparent: bool) -> Vec<u8> {
         let mut state = 0x12345678u32;
         let image = image::RgbaImage::from_fn(1024, 1024, |_, _| {
