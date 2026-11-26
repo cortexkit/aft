@@ -105,6 +105,10 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         .filter_map(|r| r.fuzzy_match.clone())
         .collect();
 
+    // Identity replacements have nothing to write and must not conflict with
+    // changes to the same range. Compare after matching and reindentation.
+    resolved.retain(|r| source.get(r.byte_start..r.byte_end) != Some(r.replacement.as_str()));
+
     // Phase 2: Sort edits by byte_start descending (bottom-to-top) to prevent drift
     resolved.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
 
