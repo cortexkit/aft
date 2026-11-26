@@ -717,6 +717,8 @@ fn remove_stale_lock(path: &Path, seen: &[u8], nonce: &str) -> bool {
         let _ = std::fs::remove_file(&aside);
         return true;
     }
+    #[cfg(test)]
+    tests::migration_lock_hook(tests::LockStep::Contended);
     // A link never replaces a lock taken after the move; that holder keeps it.
     if let Err(error) = std::fs::hard_link(&aside, path) {
         log::warn!("config migration lock could not be restored: {error}");
@@ -757,11 +759,7 @@ fn acquire_migration_lock(target: &Path) -> LockAttempt {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if let Some(seen) = stale_lock(&path) {
                     #[cfg(test)]
-                    tests::STALE_LOCK_OBSERVED.with(|hook| {
-                        if let Some(hook) = hook.borrow_mut().as_mut() {
-                            hook();
-                        }
-                    });
+                    tests::migration_lock_hook(tests::LockStep::BeforeAttempt);
                     // A lock that cannot be moved aside falls through to the
                     // deadline check, so it cannot become a busy loop.
                     if remove_stale_lock(&path, &seen, &nonce) {

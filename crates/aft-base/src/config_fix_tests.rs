@@ -1419,16 +1419,33 @@ fn settings_shapes_rewrite_user_with_backup_and_project_with_notice() {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LockStep {
+    BeforeAttempt,
+    Contended,
+}
+
+type LockHook = Box<dyn FnMut(LockStep)>;
+
 thread_local! {
-    /// Runs on this thread after it finds a stale migration lock and before it
-    /// removes that lock, so a test can let another process act in between.
-    pub(super) static STALE_LOCK_OBSERVED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
-        const { std::cell::RefCell::new(None) };
+    static MIGRATION_LOCK_HOOK: std::cell::RefCell<Option<LockHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(super) fn migration_lock_hook(step: LockStep) {
+    MIGRATION_LOCK_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
 }
 
 #[test]
-fn stale_migration_lock_removal_cannot_take_a_fresh_lock() {
+fn three_migration_loaders_never_hold_the_lock_at_once() {
+    use std::sync::mpsc::channel;
     use std::time::{Duration, SystemTime};
+
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("aft.jsonc");
     let lock = dir.path().join(".aft.jsonc.migrate.lock");
@@ -1437,38 +1454,52 @@ fn stale_migration_lock_removal_cannot_take_a_fresh_lock() {
         .set_modified(SystemTime::now() - MIGRATION_LOCK_STALE - Duration::from_secs(60))
         .unwrap();
     drop(stale);
-    let (observed_tx, observed_rx) = std::sync::mpsc::channel::<()>();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    // The late loader decides the lock is stale, then waits while the first
-    // loader removes it and takes a fresh lock.
-    let late = {
+    let (step_tx, step_rx) = channel();
+    let (go_tx, go_rx) = channel();
+    let loader_a = {
         let target = target.clone();
         std::thread::spawn(move || {
-            let mut once = Some((observed_tx, go_rx));
-            STALE_LOCK_OBSERVED.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move || {
-                    if let Some((observed, go)) = once.take() {
-                        observed.send(()).unwrap();
-                        go.recv().unwrap();
+            let mut steps = [LockStep::BeforeAttempt, LockStep::Contended].into_iter();
+            let mut next = steps.next();
+            MIGRATION_LOCK_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |step| {
+                    if next == Some(step) {
+                        next = steps.next();
+                        step_tx.send(step).unwrap();
+                        go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                     }
-                }))
+                }));
             });
             acquire_migration_lock(&target)
         })
     };
-    observed_rx.recv().unwrap();
-    let first = acquire_migration_lock(&target);
-    assert!(matches!(first, LockAttempt::Acquired(_)));
-    go_tx.send(()).unwrap();
-    let second = late.join().unwrap();
-    assert!(
-        matches!(second, LockAttempt::Busy),
-        "a second loader took the lock the first one holds"
+
+    // A sees the old lock file. B takes the lock while A is paused.
+    assert_eq!(
+        step_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        LockStep::BeforeAttempt
     );
-    assert!(lock.exists(), "the first loader's lock was removed");
-    drop(second);
-    drop(first);
-    assert!(!lock.exists(), "the holder's lock is released on drop");
+    let loader_b = acquire_migration_lock(&target);
+    assert!(matches!(loader_b, LockAttempt::Acquired(_)));
+    go_tx.send(()).unwrap();
+
+    // A has encountered B's live lock. C tries to acquire it while A is
+    // paused again and B is still holding it.
+    assert_eq!(
+        step_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        LockStep::Contended
+    );
+    let loader_c = acquire_migration_lock(&target);
+    go_tx.send(()).unwrap();
+    let loader_a = loader_a.join().unwrap();
+
+    let holders = [&loader_a, &loader_b, &loader_c]
+        .into_iter()
+        .filter(|attempt| matches!(attempt, LockAttempt::Acquired(_)))
+        .count();
+    assert_eq!(holders, 1, "more than one loader holds the migration lock");
+    assert!(matches!(loader_a, LockAttempt::Busy));
+    assert!(matches!(loader_c, LockAttempt::Busy));
 }
 
 #[test]
