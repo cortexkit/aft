@@ -1306,6 +1306,74 @@ fn send_progress_fixture_event(manager: &LspManager, key: &ServerKey, order: u64
 }
 
 #[test]
+fn flycheck_overflow_leaves_no_running_or_completed_check_and_rearms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = ServerKey {
+        kind: ServerKind::Rust,
+        root: canonicalize_for_lsp(tmp.path()).unwrap(),
+    };
+    let log = key.root.join("checks.log");
+    let mut manager = LspManager::new();
+    let mut client = lifecycle_fake_client_with_env(
+        &manager,
+        &key,
+        [
+            ("AFT_FAKE_LSP_CHECK_ON_SAVE", "1"),
+            ("AFT_FAKE_LSP_CHECK_DROP", "load"),
+            ("AFT_FAKE_LSP_CHECK_LOG", log.to_str().unwrap()),
+        ],
+    );
+    client.set_rust_analyzer_quiescent(true);
+    let instance = client.instance;
+    manager.clients.insert(key.clone(), client);
+    let progress = |kind: &str| ReceivedLspEvent {
+        event: LspEvent::Notification {
+            server_kind: ServerKind::Rust,
+            root: key.root.clone(),
+            method: "$/progress".into(),
+            params: Some(
+                json!({"token": "rust-analyzer/flycheck/42", "value": {"kind": kind, "title": "cargo check", "message": "cancelled"}}),
+            ),
+        },
+        instance: Some(instance),
+        receive_order: None,
+    };
+    manager.event_tx.send(progress("begin")).unwrap();
+    manager.drain_events();
+    assert_eq!(manager.rust_check_state(&key), RustCheckState::Running);
+
+    fill_progress_queue(&manager, &key, 1);
+    manager.event_tx.send(progress("end")).unwrap();
+    manager.drain_events();
+    assert_eq!(
+        manager.rust_check_state(&key),
+        RustCheckState::Unreported,
+        "inspect must not keep waiting for a flycheck run that lost its END"
+    );
+    assert!(!manager.rust_check_completed_current(&key));
+
+    manager.event_tx.send(progress("end")).unwrap();
+    manager.drain_events();
+    assert_eq!(manager.rust_check_state(&key), RustCheckState::Unreported);
+    assert!(!manager.rust_check_completed_current(&key));
+
+    manager.rearm_unreported_rust_check(&key);
+    manager.rearm_unreported_rust_check(&key);
+    assert_eq!(manager.rust_check_state(&key), RustCheckState::Running);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !manager.rust_check_completed_current(&key) {
+        assert!(
+            Instant::now() < deadline,
+            "the replacement check did not complete"
+        );
+        manager.drain_events();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let checks = std::fs::read_to_string(log).unwrap();
+    assert_eq!(checks.lines().filter(|line| *line == "run").count(), 1);
+}
+
+#[test]
 fn review_opus9_pulls_all_matching_dynamic_providers_with_their_own_result_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let root = canonicalize_for_lsp(tmp.path()).unwrap();
