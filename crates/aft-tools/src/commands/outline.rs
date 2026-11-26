@@ -89,6 +89,9 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(directory) = req.params.get("directory").and_then(|v| v.as_str()) {
         let dir_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(directory)) {
             Ok(path) => path,
+            Err(resp) if resp.data["code"] == "path_not_found" => {
+                return outline_directory_not_found(&req.id, directory);
+            }
             Err(resp) => return resp,
         };
         // In a confined call, refuse a directory outside the confined root or
@@ -97,11 +100,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             return refusal;
         }
         if !crate::bounded_io::metadata(&dir_path).is_ok_and(|m| m.is_dir()) {
-            return Response::error(
-                &req.id,
-                "file_not_found",
-                format!("directory not found: {}", directory),
-            );
+            return outline_directory_not_found(&req.id, directory);
         }
 
         let discovery = discover_outline_files(&dir_path);
@@ -233,6 +232,18 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     outline_single_target(req, ctx, file)
 }
 
+fn outline_directory_not_found(id: &str, directory: &str) -> Response {
+    Response::error(
+        id,
+        "file_not_found",
+        format!("directory not found: {directory}"),
+    )
+}
+
+fn outline_file_not_found(id: &str, file: &str) -> Response {
+    Response::error(id, "file_not_found", format!("file not found: {file}"))
+}
+
 /// Resolve and outline one target, sharing URL fetching and rendering between
 /// single-target calls and entries in a batch.
 fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Response {
@@ -242,6 +253,9 @@ fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Resp
 
     let path = match resolve_file_or_url(req, ctx, file) {
         Ok(path) => path,
+        Err(resp) if resp.data["code"] == "path_not_found" => {
+            return outline_file_not_found(&req.id, file);
+        }
         Err(resp) => return resp,
     };
     match crate::bounded_io::metadata(&path) {
@@ -249,13 +263,7 @@ fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Resp
             crate::run_tool_call::read_trace::note_file(metadata.len());
         }
         Ok(_) => {}
-        Err(_) => {
-            return Response::error(
-                &req.id,
-                "file_not_found",
-                format!("file not found: {}", file),
-            );
-        }
+        Err(_) => return outline_file_not_found(&req.id, file),
     }
 
     if is_http_url(file)
@@ -1545,6 +1553,9 @@ fn handle_outline_files_mode(
         }
         let dir_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(&target)) {
             Ok(path) => path,
+            Err(response) if response.data["code"] == "path_not_found" => {
+                return outline_directory_not_found(&req.id, &target);
+            }
             Err(response) if multiple_targets && response.data["code"] == "denied_floor" => {
                 skipped_files.push(SkippedFile::new(&target, "denied_floor"));
                 continue;
@@ -1558,11 +1569,7 @@ fn handle_outline_files_mode(
         }
 
         if crate::bounded_io::metadata(&dir_path).is_err() {
-            return Response::error(
-                &req.id,
-                "file_not_found",
-                format!("directory not found: {}", target),
-            );
+            return outline_directory_not_found(&req.id, &target);
         }
         if !crate::bounded_io::metadata(&dir_path).is_ok_and(|m| m.is_dir()) {
             return Response::error(
@@ -2725,6 +2732,9 @@ fn outline_many_files(
             }
             Err(response) if response.data["code"] == "denied_floor" => {
                 skipped_files.push(((index, 0), SkippedFile::new(file, "denied_floor")));
+            }
+            Err(response) if response.data["code"] == "path_not_found" => {
+                skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
             }
             Err(response) => return Err(response),
         }

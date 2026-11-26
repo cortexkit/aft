@@ -2095,8 +2095,11 @@ fn handle_read_local(
         );
     }
 
-    let path = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
+    let path = match ctx.validate_read_path(&req.id, req.session(), requested) {
         Ok(path) => path,
+        Err(resp) if resp.data["code"] == "path_not_found" => {
+            return read_file_not_found(&req.id, &ctx.resolve_relative_path(requested));
+        }
         Err(resp) => return resp,
     };
 
@@ -2172,6 +2175,14 @@ fn handle_read_local(
     }
 }
 
+fn read_file_not_found(id: &str, path: &Path) -> Response {
+    Response::error(
+        id,
+        "not_found",
+        format!("read: file not found: {}", path.display()),
+    )
+}
+
 fn handle_read_path(
     req: &RawRequest,
     path: &Path,
@@ -2179,14 +2190,9 @@ fn handle_read_path(
     captured_source: &mut Option<CapturedRead>,
     observed_size: &mut Option<u64>,
 ) -> PreparedPathRead {
-    let file = path.to_string_lossy();
     // Check existence
     if !path.exists() {
-        return PreparedPathRead::Response(Response::error(
-            &req.id,
-            "not_found",
-            format!("read: file not found: {}", file),
-        ));
+        return PreparedPathRead::Response(read_file_not_found(&req.id, path));
     }
 
     // Directory listing

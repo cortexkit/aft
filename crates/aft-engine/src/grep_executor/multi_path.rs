@@ -35,6 +35,14 @@ where
 {
     let single_root = match validate(Path::new(raw)) {
         Ok(validated) => Some(search_root(project_root, &validated)),
+        // A missing literal may be a list of paths. Authorize each fragment
+        // separately; the literal's not-found result grants no access.
+        Err(error)
+            if error.data["code"] == "path_not_found"
+                && raw.split_whitespace().nth(1).is_some() =>
+        {
+            None
+        }
         Err(error)
             if windows
                 && raw.chars().any(char::is_whitespace)
@@ -63,19 +71,18 @@ where
 
     let mut roots = Vec::with_capacity(fragments.len());
     for fragment in &fragments {
-        let validated = validate(Path::new(fragment))?;
+        let candidate = Path::new(fragment);
+        let validated = match validate(candidate) {
+            Ok(path) => path,
+            Err(error) if error.data["code"] == "path_not_found" => {
+                let root = crate::path_identity::lexical_normalize(&project_root.join(candidate));
+                return Err(missing_fragment(req_id, &root, fragments.len()));
+            }
+            Err(error) => return Err(error),
+        };
         let root = search_root(project_root, &validated);
         if crate::bounded_io::metadata(&root).is_err() {
-            return Err(Response::error(
-                req_id,
-                "path_not_found",
-                format!(
-                    "path does not exist: {} (interpreted as one of {} space-separated paths; \
-                     if this was meant as a single path containing a space, quote it)",
-                    root.display(),
-                    fragments.len(),
-                ),
-            ));
+            return Err(missing_fragment(req_id, &root, fragments.len()));
         }
         roots.push(root);
     }
@@ -88,6 +95,18 @@ where
     } else {
         Ok(SearchPathResolution::Multi(roots))
     }
+}
+
+fn missing_fragment(req_id: &str, root: &Path, count: usize) -> Response {
+    Response::error(
+        req_id,
+        "path_not_found",
+        format!(
+            "path does not exist: {} (interpreted as one of {count} space-separated paths; \
+             if this was meant as a single path containing a space, quote it)",
+            root.display(),
+        ),
+    )
 }
 
 pub(crate) fn dedupe_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {

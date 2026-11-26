@@ -1951,6 +1951,13 @@ pub enum WorkerSearchTool {
     AstGrepSearch,
 }
 
+#[derive(Clone, Copy)]
+enum ReadPathPurpose {
+    File,
+    Search(WorkerSearchTool),
+    Revision,
+}
+
 /// Per-context memo for the configured project root used by containment checks.
 ///
 /// `resolved_root` is the bare output from `fs::canonicalize`; it must not be
@@ -1969,6 +1976,9 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 mod checkout_suggestion;
 use checkout_suggestion::checkout_counterpart;
+#[doc(hidden)]
+pub mod path_approval;
+use path_approval::ReadAsk;
 
 #[cfg(test)]
 mod lexical_comparison_tests {
@@ -9640,7 +9650,7 @@ impl AppContext {
         // Mutating tools validate here, so a helper that is merely slow to be
         // scheduled must not refuse the user's change (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
-        self.validate_path_with_artifact_session(req_id, path, None, None, true)
+        self.validate_path_with_artifact_session(req_id, path, None, ReadPathPurpose::File, true)
     }
 
     /// Validate a write location without following its final path component.
@@ -9688,7 +9698,15 @@ impl AppContext {
             // is what gets checked, and the handler must touch the same one
             // rather than resolve the spelling against the daemon's cwd.
             let rooted = self.resolve_relative_path(path);
-            let identity = self.check_path_access(req_id, path, &rooted, None, None, true, true)?;
+            let identity = self.check_path_access(
+                req_id,
+                path,
+                &rooted,
+                None,
+                ReadPathPurpose::File,
+                true,
+                true,
+            )?;
             return Ok((rooted, identity));
         };
         let Some(file_name) = path_for_resolution.file_name() else {
@@ -9719,7 +9737,15 @@ impl AppContext {
         })??;
         let resolved = resolved_parent.join(file_name);
 
-        let identity = self.check_path_access(req_id, path, &resolved, None, None, true, true)?;
+        let identity = self.check_path_access(
+            req_id,
+            path,
+            &resolved,
+            None,
+            ReadPathPurpose::File,
+            true,
+            true,
+        )?;
         Ok((resolved, identity))
     }
 
@@ -9735,7 +9761,24 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        self.validate_read_path_with_approval(req_id, session_id, path, true)
+        self.validate_read_path_with_approval(req_id, session_id, path, ReadPathPurpose::File, true)
+    }
+
+    /// Keep the live path policy check for zoom at a Git ref, without requiring
+    /// the file to exist in today's checkout.
+    pub fn validate_revision_read_path(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<PathBuf, crate::protocol::Response> {
+        self.validate_read_path_with_approval(
+            req_id,
+            session_id,
+            path,
+            ReadPathPurpose::Revision,
+            true,
+        )
     }
 
     /// Apply the normal session read policy without entering an approval route.
@@ -9747,7 +9790,13 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        self.validate_read_path_with_approval(req_id, session_id, path, false)
+        self.validate_read_path_with_approval(
+            req_id,
+            session_id,
+            path,
+            ReadPathPurpose::File,
+            false,
+        )
     }
 
     fn validate_read_path_with_approval(
@@ -9755,6 +9804,7 @@ impl AppContext {
         req_id: &str,
         session_id: &str,
         path: &Path,
+        purpose: ReadPathPurpose,
         allow_approval: bool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         self.output_files
@@ -9763,7 +9813,7 @@ impl AppContext {
             req_id,
             path,
             Some(session_id),
-            None,
+            purpose,
             allow_approval,
         );
         if crate::context::confinement::for_request(req_id) {
@@ -9786,7 +9836,7 @@ impl AppContext {
             req_id,
             path,
             Some(session_id),
-            Some(search_tool),
+            ReadPathPurpose::Search(search_tool),
             true,
         )
     }
@@ -9829,7 +9879,7 @@ impl AppContext {
         req_id: &str,
         path: &Path,
         artifact_session_id: Option<&str>,
-        search_tool: Option<WorkerSearchTool>,
+        purpose: ReadPathPurpose,
         allow_approval: bool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
@@ -9867,7 +9917,7 @@ impl AppContext {
                         path,
                         &resolved,
                         artifact_session_id,
-                        search_tool,
+                        purpose,
                         false,
                         allow_approval,
                     )?;
@@ -9879,7 +9929,7 @@ impl AppContext {
                 path,
                 &rooted,
                 artifact_session_id,
-                search_tool,
+                purpose,
                 false,
                 allow_approval,
             )?;
@@ -9925,7 +9975,7 @@ impl AppContext {
             path,
             &resolved,
             artifact_session_id,
-            search_tool,
+            purpose,
             false,
             allow_approval,
         )?;
@@ -10321,7 +10371,7 @@ impl AppContext {
             ));
         }
         if decision == AccessDecision::Ask {
-            self.answer_ask(req_id, location, &identity, AccessOperation::Read)?;
+            self.answer_ask(req_id, location, &identity, AccessOperation::Read, None)?;
         }
         Ok(())
     }
@@ -10348,143 +10398,6 @@ impl AppContext {
         crate::access_policy::plugin::Scope::new(&self.standalone_approval_route, session)
     }
 
-    /// Resolve an `ask` decision for the call on this thread. A lowered route
-    /// treats the ask as allow. Plugins echo exact engine ask IDs; consent
-    /// (`allow_once`) and reverse-elicitation routes allow only what was
-    /// approved for this dispatch; anything else refuses with the internal ask
-    /// code, carrying the capability to request. No UI means a path denial,
-    /// not an implicit approval.
-    fn answer_ask(
-        &self,
-        req_id: &str,
-        original: &Path,
-        identity: &Path,
-        operation: crate::access_policy::AccessOperation,
-    ) -> Result<(), crate::protocol::Response> {
-        #[cfg(any(test, all(unix, feature = "test-support")))]
-        confinement::note_ask();
-        use crate::access_policy::{AskRoute, GrantKind};
-        let route = crate::access_policy::current_ask_route();
-        // Codemode programs and fork calls cannot put a question to anyone.
-        if let Some(refusal) =
-            crate::access_policy::unasked_refusal(&route, req_id, original, identity, operation)
-        {
-            return Err(refusal);
-        }
-        match &route {
-            AskRoute::Lowered => return Ok(()),
-            AskRoute::Deny => {
-                let root = self.config().project_root.clone().unwrap_or_default();
-                return Err(path_error_response(req_id, original, &root));
-            }
-            _ => {}
-        }
-        // A directory is asked for as a subtree so one answer covers what the
-        // tool reads beneath it. The probe stays on the bounded helper when
-        // one is active, like every other path probe on the request path.
-        let probe = identity.to_path_buf();
-        let is_dir = if crate::bounded_io::current().is_some() {
-            crate::bounded_io::run(&probe, None, |path| match std::fs::metadata(path) {
-                Ok(metadata) => Ok(metadata.is_dir()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(error),
-            })
-            .map_err(|error| {
-                crate::protocol::Response::error(
-                    req_id,
-                    crate::bounded_io::timeout_code(&error),
-                    error.to_string(),
-                )
-            })?
-        } else {
-            probe.is_dir()
-        };
-        let kind = if is_dir {
-            GrantKind::Subtree
-        } else {
-            GrantKind::File
-        };
-        let grant = crate::access_policy::AccessGrant {
-            path: identity.to_path_buf(),
-            kind,
-            operation,
-        };
-        if let AskRoute::Consent { once, .. } | AskRoute::Elicitation { once } = &route {
-            if once
-                .iter()
-                .any(|approved| approved.covers_kind(operation, identity, kind))
-            {
-                return Ok(());
-            }
-        }
-        // Missing outside paths with an unambiguous checkout counterpart need
-        // correction, not permission to read the missing location.
-        if let Some(suggestion) = self.checkout_path_suggestion(original, operation) {
-            return Err(crate::protocol::Response::error(
-                req_id,
-                "path_not_found_did_you_mean",
-                format!(
-                    "path not found: {}; did you mean {}?",
-                    original.display(),
-                    crate::path_identity::normalize_path(&suggestion).display()
-                ),
-            ));
-        }
-
-        if let AskRoute::Plugin { scope, once } = route {
-            // A file approval must not become a tree approval if the target
-            // changed into a directory while the host prompt was open.
-            if once
-                .iter()
-                .any(|approved| approved.covers_kind(operation, identity, kind))
-            {
-                return Ok(());
-            }
-            let id = crate::access_policy::plugin::issue(&scope, &grant);
-            // OpenCode's `*` includes every descendant. Use the same folder
-            // eligibility as consent cards so saving a file approval cannot
-            // silently approve home, a volume root, or a system tree.
-            let saved_scope = crate::access_policy::directory_scope(&grant);
-            let pattern = match saved_scope.kind {
-                GrantKind::File => saved_scope.path,
-                GrantKind::Subtree => saved_scope.path.join("*"),
-            };
-            let mut ask = serde_json::json!({
-                "kind": "external_directory", "patterns": [pattern], "always": [pattern],
-                "grant_id": id, "path": identity, "operation": operation,
-                "parentDir": if is_dir { identity } else { identity.parent().unwrap_or(identity) },
-            });
-            // Expiry and route replacement invalidate the old approval, not
-            // the request. The host can ask again for the new route's token.
-            if let Some(reason) = scope.retry_refusal_reason(&grant, !once.is_empty()) {
-                scope.log_retry_refusal(operation, identity, reason);
-                if matches!(reason, "approval_expired" | "approval_route_replaced") {
-                    ask["reason"] = serde_json::json!(reason);
-                }
-            }
-            return Err(crate::protocol::Response::error_with_data(
-                req_id,
-                crate::protocol::ERROR_PERMISSION_REQUIRED,
-                format!(
-                    "path '{}' needs outside-access permission",
-                    original.display()
-                ),
-                serde_json::json!({"asks": [ask]}),
-            ));
-        }
-        Err(crate::protocol::Response::error_with_data(
-            req_id,
-            crate::access_policy::ACCESS_ASK_REQUIRED,
-            format!(
-                "path '{}' is outside this worker's worktree and needs permission",
-                original.display()
-            ),
-            serde_json::json!({
-                "ask": grant,
-            }),
-        ))
-    }
-
     /// Authorize `resolved` (the location for `original`) and return the
     /// identity the policy judged: the canonical path, or for a write
     /// location its canonical parent plus the final component as spelled.
@@ -10494,12 +10407,16 @@ impl AppContext {
         original: &Path,
         resolved: &Path,
         artifact_session: Option<&str>,
-        search_tool: Option<WorkerSearchTool>,
+        purpose: ReadPathPurpose,
         preserve_final: bool,
         allow_approval: bool,
     ) -> Result<PathBuf, crate::protocol::Response> {
         use crate::access_policy::{AccessDecision, AccessDenial, AccessOperation};
         use crate::policy_path::policy_path;
+        let search_tool = match purpose {
+            ReadPathPurpose::Search(tool) => Some(tool),
+            _ => None,
+        };
         if let Some(response) = self.worker_root_search_refusal(req_id, original, search_tool) {
             return Err(response);
         }
@@ -10724,7 +10641,13 @@ impl AppContext {
                         }
                     }
                 }
-                self.answer_ask(req_id, original, &identity, operation)?;
+                let read = (operation == AccessOperation::Read
+                    && !matches!(purpose, ReadPathPurpose::Revision))
+                .then_some(ReadAsk {
+                    path: resolved,
+                    search_tool,
+                });
+                self.answer_ask(req_id, original, &identity, operation, read)?;
                 crate::bounded_io::probe_access(req_id, &identity).map(|()| identity)
             }
             AccessDecision::Deny(AccessDenial::ReadOnly) => Err(crate::protocol::Response::error(

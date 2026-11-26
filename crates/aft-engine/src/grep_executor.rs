@@ -708,10 +708,10 @@ pub fn resolve_grep_scope(
     let mut explicit_single_file = false;
     for root in &search_roots {
         let Ok(metadata) = crate::bounded_io::metadata(root) else {
-            return Err(Response::error(
+            return Err(crate::context::path_approval::missing_read_response(
                 req_id,
-                "path_not_found",
-                format!("grep: search path does not exist: {}", root.display()),
+                root,
+                Some(crate::context::WorkerSearchTool::Grep),
             ));
         };
         explicit_single_file = search_roots.len() == 1

@@ -1105,7 +1105,7 @@ impl Fixture {
         corr: u64,
         dispatch: DispatchFn,
     ) -> (WriterSender, mpsc::Receiver<WriterFrame>) {
-        self.send_tool_options(identity, name, arguments, corr, dispatch, false)
+        self.send_tool_options(identity, name, arguments, corr, dispatch, false, None)
             .await
     }
 
@@ -1117,6 +1117,7 @@ impl Fixture {
         corr: u64,
         dispatch: DispatchFn,
         preview: bool,
+        preset: Option<&str>,
     ) -> (WriterSender, mpsc::Receiver<WriterFrame>) {
         if self.executor.actor_context(&identity.root).is_none() {
             self.executor
@@ -1128,6 +1129,9 @@ impl Fixture {
             "preset": if identity.run_owner.as_ref().is_some_and(|owner| matches!(owner.kind, super::super::codemode::RunKind::Agent { .. })) || identity.scope.as_ref().is_some_and(|s| s.kind == subc_protocol::scope::ScopeKind::Head) { "head" } else { "worker" },
             "arguments": arguments,
         });
+        if let Some(preset) = preset {
+            body["preset"] = json!(preset);
+        }
         if preview {
             body["preview"] = json!(true);
         }
@@ -5528,7 +5532,15 @@ async fn standalone_plugin_preview_renews_approval_once_for_apply() {
     inner.role = tool_provider::RouteRole::Legacy;
     let args = json!({"path":target, "content":"approved mutation"});
     let (_, mut replies) = f
-        .send_tool_options(&route, "write", args.clone(), 91, scope_dispatch, true)
+        .send_tool_options(
+            &route,
+            "write",
+            args.clone(),
+            91,
+            scope_dispatch,
+            true,
+            None,
+        )
         .await;
     let ask = standalone_reply(&mut replies).await;
     let token = ask["structuredContent"]["asks"][0]["grant_id"]
@@ -5537,7 +5549,7 @@ async fn standalone_plugin_preview_renews_approval_once_for_apply() {
     let mut approved = args.clone();
     approved["permissions_granted"] = json!([token]);
     let (_, mut replies) = f
-        .send_tool_options(&route, "write", approved, 92, scope_dispatch, true)
+        .send_tool_options(&route, "write", approved, 92, scope_dispatch, true, None)
         .await;
     let preview = standalone_reply(&mut replies).await;
     assert_eq!(preview["isError"], false, "{preview}");
@@ -5551,7 +5563,15 @@ async fn standalone_plugin_preview_renews_approval_once_for_apply() {
     let mut apply = args;
     apply["permissions_granted"] = json!([renewal]);
     let (_, mut replies) = f
-        .send_tool_options(&route, "write", apply.clone(), 93, scope_dispatch, false)
+        .send_tool_options(
+            &route,
+            "write",
+            apply.clone(),
+            93,
+            scope_dispatch,
+            false,
+            None,
+        )
         .await;
     let result = standalone_reply(&mut replies).await;
     assert_eq!(result["isError"], false, "{result}");
@@ -5560,7 +5580,7 @@ async fn standalone_plugin_preview_renews_approval_once_for_apply() {
         "approved mutation"
     );
     let (_, mut replies) = f
-        .send_tool_options(&route, "write", apply, 94, scope_dispatch, false)
+        .send_tool_options(&route, "write", apply, 94, scope_dispatch, false, None)
         .await;
     assert_eq!(
         code(&standalone_reply(&mut replies).await),
@@ -8128,80 +8148,8 @@ async fn consent_worker_read_family_suggests_unique_indexed_suffix_without_askin
     assert!(f.asks().is_empty());
 }
 
-#[tokio::test]
-async fn consent_worker_ambiguous_longest_indexed_suffix_still_asks() {
-    let _lock = CONSENT_TEST_LOCK.lock().await;
-    let f = suffix_fixture();
-    set_hold_budget_for_test(Some(Duration::from_millis(300)));
-    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
-    worker_suffix_file(&f, "other/broca-session-loop/src/run.rs");
-    build_suffix_inventory(&f);
-    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
-
-    let reply = f.read(&f.worker, &requested, 7).await;
-
-    assert_worker_outside_read_denied(&f, &reply);
-    assert!(!text(&reply).contains("did you mean"));
-}
-
-#[tokio::test]
-async fn consent_worker_one_component_indexed_suffix_still_asks() {
-    let _lock = CONSENT_TEST_LOCK.lock().await;
-    let f = suffix_fixture();
-    set_hold_budget_for_test(Some(Duration::from_millis(300)));
-    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
-    build_suffix_inventory(&f);
-    let requested = f.dir.path().join("not-src/run.rs");
-
-    let reply = f.read(&f.worker, &requested, 7).await;
-
-    assert_worker_outside_read_denied(&f, &reply);
-    assert!(!text(&reply).contains("did you mean"));
-}
-
-#[tokio::test]
-async fn consent_worker_unready_indexed_suffix_still_asks() {
-    let _lock = CONSENT_TEST_LOCK.lock().await;
-    let f = suffix_fixture();
-    set_hold_budget_for_test(Some(Duration::from_millis(300)));
-    worker_suffix_file(&f, "crates/broca-session-loop/src/run.rs");
-    let requested = f.dir.path().join("broca-session-loop/src/run.rs");
-
-    let reply = f.read(&f.worker, &requested, 7).await;
-
-    assert_worker_outside_read_denied(&f, &reply);
-    assert!(!text(&reply).contains("did you mean"));
-}
-
-#[tokio::test]
-async fn consent_worker_existing_outside_path_still_asks_once() {
-    let _lock = CONSENT_TEST_LOCK.lock().await;
-    let f = fixture(FakeCingulate::up());
-    set_hold_budget_for_test(Some(Duration::from_millis(300)));
-    let target = f.dir.path().join("elsewhere.txt");
-
-    let reply = f.read(&f.worker, &target, 7).await;
-
-    assert_worker_outside_read_denied(&f, &reply);
-}
-
-#[tokio::test]
-async fn consent_worker_missing_path_without_checkout_counterpart_still_asks() {
-    let _lock = CONSENT_TEST_LOCK.lock().await;
-    let f = fixture(FakeCingulate::up());
-    set_hold_budget_for_test(Some(Duration::from_millis(300)));
-    let name = format!(
-        "missing-worker-path-{}",
-        f.dir.path().file_name().unwrap().to_string_lossy()
-    );
-    let target = worker_filesystem_root(&f).join(name);
-    assert!(std::fs::symlink_metadata(&target).is_err());
-
-    let reply = f.read(&f.worker, &target, 7).await;
-
-    assert_worker_outside_read_denied(&f, &reply);
-    assert!(!text(&reply).contains("did you mean"));
-}
+#[path = "consent_missing_path_tests.rs"]
+mod missing_path;
 
 #[tokio::test]
 async fn consent_worker_dotdot_and_symlink_escapes_are_not_suggested() {
@@ -8220,8 +8168,9 @@ async fn consent_worker_dotdot_and_symlink_escapes_are_not_suggested() {
     assert!(std::fs::symlink_metadata(&normalized_requested).is_err());
 
     let dotdot_reply = f.read(&f.worker, &requested, 7).await;
-    assert_worker_outside_read_denied(&f, &dotdot_reply);
+    assert_eq!(code(&dotdot_reply), "not_found", "{dotdot_reply}");
     assert!(!text(&dotdot_reply).contains("did you mean"));
+    assert!(f.fake.calls("consent.request").is_empty());
 
     #[cfg(unix)]
     {
@@ -8235,7 +8184,7 @@ async fn consent_worker_dotdot_and_symlink_escapes_are_not_suggested() {
         let symlink_reply = f.read(&f.worker, &Path::new("/").join(link_name), 8).await;
         assert_eq!(code(&symlink_reply), "access_pending", "{symlink_reply}");
         assert!(!text(&symlink_reply).contains("did you mean"));
-        assert_eq!(f.fake.calls("consent.request").len(), 2);
+        assert_eq!(f.fake.calls("consent.request").len(), 1);
     }
 }
 

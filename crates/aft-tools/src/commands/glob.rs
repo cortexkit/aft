@@ -116,13 +116,10 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .iter()
         .find(|root| crate::bounded_io::metadata(root).is_err())
     {
-        return Response::error(
+        return crate::context::path_approval::missing_read_response(
             &req.id,
-            "path_not_found",
-            format!(
-                "glob: search path does not exist: {}",
-                missing_root.display()
-            ),
+            missing_root,
+            Some(crate::context::WorkerSearchTool::Glob),
         );
     }
     let total_started = Instant::now();

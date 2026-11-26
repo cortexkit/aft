@@ -3332,15 +3332,15 @@ fn parse_scope(
         } else {
             project_root.join(raw_path)
         };
-        let validated = ctx.validate_read_path(&req.id, req.session(), &candidate)?;
-        if !validated.exists() {
-            missing.push(scope);
-            continue;
+        match ctx.validate_read_path(&req.id, req.session(), &candidate) {
+            Ok(path) if path.exists() => {
+                // Strip Windows' verbatim prefix for workspace and file membership checks.
+                roots.push(crate::path_identity::canonicalize_normalized(&path));
+            }
+            Ok(_) => missing.push(scope),
+            Err(response) if response.data["code"] == "path_not_found" => missing.push(scope),
+            Err(response) => return Err(response),
         }
-        // Never `fs::canonicalize` directly: its Windows result is a verbatim
-        // path, and every downstream comparison (workspace ownership, job
-        // scope, analyzed-file membership) is against non-verbatim roots.
-        roots.push(crate::path_identity::canonicalize_normalized(&validated));
     }
 
     if !missing.is_empty() {
