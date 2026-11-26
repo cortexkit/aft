@@ -52,6 +52,7 @@ pub fn report_file_with_input_paths(
     }
 }
 
+use std::borrow::Cow;
 use std::path::Path;
 
 #[cfg(windows)]
@@ -1182,6 +1183,63 @@ pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {
     }
 
     source.len()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    /// Mixed files use their majority ending; ties and files without newlines use LF.
+    pub(crate) fn dominant(source: &str) -> Self {
+        let (mut lf, mut crlf) = (0, 0);
+        for (index, _) in source.match_indices('\n') {
+            if index > 0 && source.as_bytes()[index - 1] == b'\r' {
+                crlf += 1;
+            } else {
+                lf += 1;
+            }
+        }
+        if crlf > lf {
+            Self::Crlf
+        } else {
+            Self::Lf
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+        }
+    }
+
+    pub(crate) fn normalize(self, text: &str) -> Cow<'_, str> {
+        let wants_crlf = matches!(self, Self::Crlf);
+        if !text.match_indices('\n').any(|(index, _)| {
+            let has_crlf = index > 0 && text.as_bytes()[index - 1] == b'\r';
+            has_crlf != wants_crlf
+        }) {
+            return Cow::Borrowed(text);
+        }
+        let mut normalized = String::with_capacity(text.len());
+        self.push_normalized(&mut normalized, text);
+        Cow::Owned(normalized)
+    }
+
+    /// Normalize only the inserted text. A carriage return not followed by LF is content.
+    pub(crate) fn push_normalized(self, output: &mut String, text: &str) {
+        for segment in text.split_inclusive('\n') {
+            if let Some(line) = segment.strip_suffix('\n') {
+                output.push_str(line.strip_suffix('\r').unwrap_or(line));
+                output.push_str(self.as_str());
+            } else {
+                output.push_str(segment);
+            }
+        }
+    }
 }
 
 /// Byte starts shared by all line-range edits against one captured source.

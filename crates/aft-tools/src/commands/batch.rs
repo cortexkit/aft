@@ -86,10 +86,12 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut resolved: Vec<ResolvedEdit> = Vec::with_capacity(edits.len());
 
     let line_offsets = edit::LineOffsets::new(&source);
+    let line_ending = edit::LineEnding::dominant(&source);
     for (i, edit_val) in edits.iter().enumerate() {
         match resolve_edit_with_offsets(
             &source,
             &line_offsets,
+            line_ending,
             edit_val,
             i,
             &req.id,
@@ -451,13 +453,22 @@ fn resolve_edit(
     req_id: &str,
 ) -> Result<Vec<ResolvedEdit>, Response> {
     let line_offsets = edit::LineOffsets::new(source);
-    resolve_edit_with_offsets(source, &line_offsets, edit_val, index, req_id, None)
+    resolve_edit_with_offsets(
+        source,
+        &line_offsets,
+        edit::LineEnding::dominant(source),
+        edit_val,
+        index,
+        req_id,
+        None,
+    )
 }
 
 /// Resolve one edit, reusing line starts computed once for the whole batch.
 fn resolve_edit_with_offsets(
     source: &str,
     line_offsets: &edit::LineOffsets,
+    line_ending: edit::LineEnding,
     edit_val: &serde_json::Value,
     index: usize,
     req_id: &str,
@@ -545,19 +556,19 @@ fn resolve_edit_with_offsets(
 
         // A plan covers every match one replacement applies to, so finding
         // string lines parses the file at most once for all of them.
-        let effective_replacement = |plan: &crate::fuzzy_match::ReindentPlan<'_>,
-                                     at: usize|
-         -> Result<String, Response> {
-            let mut output = String::new();
-            super::edit_match::push_fuzzy_replacement(&mut output, plan, at).map_err(|error| {
-                Response::error(
-                    req_id,
-                    error.code(),
-                    format!("batch: edit[{}] {}", index, error),
-                )
-            })?;
-            Ok(output)
-        };
+        let effective_replacement =
+            |plan: &crate::fuzzy_match::ReindentPlan<'_>, at: usize| -> Result<String, Response> {
+                let mut output = String::new();
+                super::edit_match::push_fuzzy_replacement(&mut output, plan, at, Some(line_ending))
+                    .map_err(|error| {
+                        Response::error(
+                            req_id,
+                            error.code(),
+                            format!("batch: edit[{}] {}", index, error),
+                        )
+                    })?;
+                Ok(output)
+            };
 
         if fuzzy_matches.is_empty() {
             if let Some(path) = path {
@@ -779,14 +790,18 @@ fn resolve_edit_with_offsets(
         // Append at EOF: line_start == total_lines means insert after last line
         if line_start == total_lines {
             let byte_pos = source.len();
-            let mut replacement_str = content.to_string();
+            let mut replacement_str = line_ending.normalize(content).into_owned();
+            let separator = line_ending.as_str();
             // An empty file has no preceding line to separate from the append.
             // Only add a leading newline when existing content needs separation.
-            if !source.is_empty() && !source.ends_with('\n') && !replacement_str.starts_with('\n') {
-                replacement_str.insert(0, '\n');
+            if !source.is_empty()
+                && !source.ends_with('\n')
+                && !replacement_str.starts_with(separator)
+            {
+                replacement_str.insert_str(0, separator);
             }
             if !replacement_str.ends_with('\n') {
-                replacement_str.push('\n');
+                replacement_str.push_str(separator);
             }
             return Ok(vec![ResolvedEdit {
                 byte_start: byte_pos,
@@ -820,9 +835,9 @@ fn resolve_edit_with_offsets(
                 && line_start > line_end)
         {
             let byte_pos = line_offsets.offset(line_start);
-            let mut replacement_str = content.to_string();
+            let mut replacement_str = line_ending.normalize(content).into_owned();
             if !replacement_str.ends_with('\n') {
-                replacement_str.push('\n');
+                replacement_str.push_str(line_ending.as_str());
             }
             return Ok(vec![ResolvedEdit {
                 byte_start: byte_pos,
@@ -847,13 +862,13 @@ fn resolve_edit_with_offsets(
         // Empty content = delete lines entirely (no trailing newline added)
         // Non-empty content = if the replaced range had a trailing newline, auto-append
         // one to prevent the next line from merging.
-        let mut replacement_str = content.to_string();
+        let mut replacement_str = line_ending.normalize(content).into_owned();
         if !replacement_str.is_empty() {
             let range_has_trailing_nl = byte_end > 0
                 && byte_end <= source.len()
                 && source.as_bytes()[byte_end - 1] == b'\n';
             if range_has_trailing_nl && !replacement_str.ends_with('\n') {
-                replacement_str.push('\n');
+                replacement_str.push_str(line_ending.as_str());
             }
         }
 
@@ -1351,10 +1366,12 @@ mod audit11_regressions {
         aft_engine::test_bridge::search_misc::edit::LINE_OFFSET_BYTES_SCANNED
             .with(|count| count.set(0));
         let offsets = edit::LineOffsets::new(source);
+        let line_ending = edit::LineEnding::dominant(source);
         let edit = serde_json::json!({"line_start": 2, "line_end": 2, "content": "new"});
         for _ in 0..100 {
             let resolved =
-                resolve_edit_with_offsets(source, &offsets, &edit, 0, "test", None).unwrap();
+                resolve_edit_with_offsets(source, &offsets, line_ending, &edit, 0, "test", None)
+                    .unwrap();
             assert_eq!((resolved[0].byte_start, resolved[0].byte_end), (10, 14));
             let content =
                 edit::replace_byte_range(source, 10, 14, &resolved[0].replacement).unwrap();
@@ -1374,7 +1391,7 @@ mod audit11_regressions {
             .unwrap();
             assert_eq!(
                 std::fs::read(path).unwrap(),
-                "\u{feff}first\r\nnew\nthree\rfour\r\ntail".as_bytes()
+                "\u{feff}first\r\nnew\r\nthree\rfour\r\ntail".as_bytes()
             );
         }
         assert_eq!(
@@ -1397,9 +1414,16 @@ mod audit11_regressions {
             "replaceAll": true,
         });
         STRING_LINE_PARSES.with(|count| count.set(0));
-        let resolved =
-            resolve_edit_with_offsets(&source, &offsets, &edit, 0, "t", Some(Path::new("t.py")))
-                .unwrap_or_else(|_| panic!("batch replace-all should resolve"));
+        let resolved = resolve_edit_with_offsets(
+            &source,
+            &offsets,
+            edit::LineEnding::dominant(&source),
+            &edit,
+            0,
+            "t",
+            Some(Path::new("t.py")),
+        )
+        .unwrap_or_else(|_| panic!("batch replace-all should resolve"));
         assert_eq!(resolved.len(), 1_000);
         assert!(resolved
             .iter()

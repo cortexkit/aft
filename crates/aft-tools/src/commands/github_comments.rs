@@ -341,6 +341,7 @@ fn apply_comment_match(
             match_text,
             replacement,
             None,
+            None,
         )
         .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         Ok((updated, matches.len()))
@@ -354,7 +355,7 @@ fn apply_comment_match(
             None,
             std::slice::from_ref(matched),
         );
-        super::edit_match::push_fuzzy_replacement(&mut effective, &plan, 0)
+        super::edit_match::push_fuzzy_replacement(&mut effective, &plan, 0, None)
             .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         let updated = crate::edit::replace_byte_range(
             source,

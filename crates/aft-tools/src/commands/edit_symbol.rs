@@ -266,20 +266,21 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         (start_byte - replaced_indent, end_byte)
     };
 
+    let line_ending = edit::LineEnding::dominant(&source);
     let new_source = match operation {
         "replace" => {
-            let replacement = replacement_content.unwrap_or_default();
-            edit::replace_byte_range(&source, start_byte, end_byte, replacement)
+            let replacement = line_ending.normalize(replacement_content.unwrap_or_default());
+            edit::replace_byte_range(&source, start_byte, end_byte, &replacement)
         }
         "delete" => edit::replace_byte_range(&source, start_byte, end_byte, ""),
         "insert_before" => {
-            let insertion = insertion_content.unwrap_or_default();
-            let insert_text = format!("{}\n", insertion);
+            let insertion = line_ending.normalize(insertion_content.unwrap_or_default());
+            let insert_text = format!("{insertion}{}", line_ending.as_str());
             edit::replace_byte_range(&source, start_byte, start_byte, &insert_text)
         }
         "insert_after" => {
-            let insertion = insertion_content.unwrap_or_default();
-            let insert_text = format!("\n{}", insertion);
+            let insertion = line_ending.normalize(insertion_content.unwrap_or_default());
+            let insert_text = format!("{}{insertion}", line_ending.as_str());
             edit::replace_byte_range(&source, end_byte, end_byte, &insert_text)
         }
         _ => {
