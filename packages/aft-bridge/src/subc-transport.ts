@@ -42,6 +42,7 @@ import {
 
 import { log, warn } from "./active-logger.js";
 import { isTerminalStatus } from "./bash-format.js";
+import { BgReattachSchedule } from "./bg-reattach-schedule.js";
 import type { BridgeClock, StatusSnapshot } from "./bridge.js";
 import { isRouteOpenReloadWindowError, isRouteRequestReloadRefusal } from "./error-contract.js";
 import {
@@ -504,22 +505,22 @@ const RECONNECT_RETRY_CAP_MS = 2_000;
 const SUBC_DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
- * Longest a call waits out route.open refusals while the AFT module reloads,
- * however long the call's own timeout is. A restart drains the old module for at
- * most the daemon's 30 s drain ceiling (reported as `drain_timeout_ms` by
+ * Ceiling for scheduling another retry after a reload refusal. A retry already
+ * in flight can still succeed within the caller's own deadline. A restart drains
+ * the old module for at most the daemon's 30 s ceiling (reported as `drain_timeout_ms` by
  * `ck module status aft`), then starts the new module (normally well under a
  * second or two); 45 s covers that worst case with margin. The ceiling exists
  * because a module that is genuinely down must reach the caller's fallback (for
  * example bash host fallback) promptly instead of after a long transport timeout.
  */
-const ROUTE_OPEN_RELOAD_WAIT_CEILING_MS = 45_000;
+const RELOAD_REFUSAL_RETRY_CEILING_MS = 45_000;
 
 /** Resolution of the timer a call races its route.open against when its deadline passes first. */
 const CALL_DEADLINE_EXPIRED: unique symbol = Symbol("call deadline expired");
 
 function reloadWaitExhaustedSuffix(callDeadlineMs: number): string {
-  if (callDeadlineMs > ROUTE_OPEN_RELOAD_WAIT_CEILING_MS) {
-    const ceilingSeconds = ROUTE_OPEN_RELOAD_WAIT_CEILING_MS / 1000;
+  if (callDeadlineMs > RELOAD_REFUSAL_RETRY_CEILING_MS) {
+    const ceilingSeconds = RELOAD_REFUSAL_RETRY_CEILING_MS / 1000;
     return ` The AFT daemon module did not return within the ${ceilingSeconds}s reload-wait ceiling.`;
   }
   const seconds = Math.round(callDeadlineMs / 100) / 10;
@@ -557,7 +558,7 @@ const DEFAULT_SESSION_ID = "__default__";
 const LOCALLY_SATISFIED_COMMANDS = new Set(["configure"]);
 
 export interface SubcTransportPoolOptions {
-  /** Wall/awake clocks and scheduler for caller-owned admission deadlines. */
+  /** Wall/awake clocks and scheduler for admission deadlines and background reattach. */
   clock?: BridgeClock;
   /** Absolute path to the subc connection file (user-tier `subc.connection_file`). */
   connectionFile: string;
@@ -765,7 +766,7 @@ class BgSubscription {
     private readonly dropClient: (client: SubcClientLike, cause: ClientDropCause) => void,
     private readonly openRoute: (client: SubcClientLike) => Promise<RouteHandle>,
     private readonly onNudge: (observedEvent: boolean) => void,
-    private readonly sleep: ((ms: number) => Promise<void>) | undefined,
+    private readonly reattach: BgReattachSchedule<SubcClientLike>,
     private readonly canAttach: () => boolean,
     private readonly onRootAttachFailure: (error: unknown) => boolean,
     private readonly onDormant: () => void,
@@ -899,24 +900,21 @@ class BgSubscription {
         this.onDormant();
         return;
       }
-      if (reconnecting) {
-        this.info("reconnect-attempt", `reconnect attempt=${reconnectAttempt}`);
-      }
-
-      let client: SubcClientLike;
+      let client: SubcClientLike | null;
       try {
-        client = await this.acquireClient();
+        client = reconnecting
+          ? await this.waitForReattach(backoffAttempt++)
+          : await this.acquireClient();
       } catch (err) {
         if (!reconnecting) beginReconnect();
         this.info(
           "reconnect-error",
           `reconnect error attempt=${reconnectAttempt} error=${this.errorText(err)}`,
         );
-        await this.backoff(backoffAttempt++);
-        if (reconnecting) reconnectAttempt += 1;
+        reconnectAttempt += 1;
         continue;
       }
-      if (this.stopped) {
+      if (!client || this.stopped) {
         if (reconnecting) giveUp("stopped");
         return;
       }
@@ -928,6 +926,9 @@ class BgSubscription {
         if (reconnecting) giveUp("root-dormant");
         this.onDormant();
         return;
+      }
+      if (reconnecting) {
+        this.info("reconnect-attempt", `reconnect attempt=${reconnectAttempt}`);
       }
 
       let route: RouteHandle;
@@ -961,8 +962,7 @@ class BgSubscription {
           "reconnect-error",
           `reconnect error attempt=${reconnectAttempt} error=${this.errorText(err)}`,
         );
-        await this.backoff(backoffAttempt++);
-        if (reconnecting) reconnectAttempt += 1;
+        reconnectAttempt += 1;
         continue;
       }
       if (this.stopped || !this.isCurrent()) {
@@ -1051,39 +1051,19 @@ class BgSubscription {
         this.route = null;
         safeCloseRoute(client, route);
       }
-      await this.backoff(backoffAttempt++);
     }
 
     if (reconnecting) giveUp("stopped");
   }
 
-  private async backoff(attempt: number): Promise<void> {
-    if (this.stopped) return;
-    await new Promise<void>((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let finished = false;
-      const settle = (error?: unknown): void => {
-        if (finished) return;
-        finished = true;
-        if (timer) clearTimeout(timer);
-        this.cancelBackoff = null;
-        if (error !== undefined) reject(error);
-        else resolve();
-      };
-      this.cancelBackoff = () => settle();
-      const delay = reconnectBackoffMs(attempt);
-      if (this.sleep) {
-        // An injected sleeper may not be cancellable. Observe its eventual
-        // rejection, but let stop release the subscription without awaiting it.
-        try {
-          void this.sleep(delay).then(() => settle(), settle);
-        } catch (error) {
-          settle(error);
-        }
-      } else {
-        timer = setTimeout(() => settle(), delay);
-      }
-    });
+  private async waitForReattach(attempt: number): Promise<SubcClientLike | null> {
+    const { ready, cancel } = this.reattach.wait(reconnectBackoffMs(attempt));
+    this.cancelBackoff = cancel;
+    try {
+      return await ready;
+    } finally {
+      this.cancelBackoff = null;
+    }
   }
 }
 
@@ -1531,7 +1511,7 @@ export class SubcTransportPool implements AftTransportPool {
 
   private readonly onBgEventsNudge?: (projectRoot: string, session: string) => void;
   private readonly onBgEventsNudgeRef?: (ref: BgNudgeRef) => void;
-  private readonly bgBackoffSleep: ((ms: number) => Promise<void>) | undefined;
+  private readonly bgReattach: BgReattachSchedule<SubcClientLike>;
   private readonly routeRetrySleep: (ms: number) => Promise<void>;
   private readonly bgDispatchProbeIntervalMs: number;
   private readonly livenessProbeTimeoutMs: number;
@@ -1612,7 +1592,12 @@ export class SubcTransportPool implements AftTransportPool {
     this.connectFn = options.connect ?? ((opts) => SubcClient.connect(opts));
     this.onBgEventsNudge = options.onBgEventsNudge;
     this.onBgEventsNudgeRef = options.onBgEventsNudgeRef;
-    this.bgBackoffSleep = options.bgBackoffSleep;
+    this.bgReattach = new BgReattachSchedule(
+      this.clock,
+      () => this.waitClock.now(),
+      () => this.ensureClient(),
+      options.bgBackoffSleep,
+    );
     this.routeRetrySleep =
       options.routeRetrySleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.bgDispatchProbeIntervalMs =
@@ -2548,16 +2533,16 @@ export class SubcTransportPool implements AftTransportPool {
         }
       };
 
-      // A module reload (drain, restart, warm-up) refuses route.open for as long
-      // as it lasts. The call waits it out for as long as its own deadline allows,
-      // but never longer than ROUTE_OPEN_RELOAD_WAIT_CEILING_MS, and then surfaces
-      // the refusal (which lets a caller such as bash fall back).
+      // A module reload (drain, restart, warm-up) can refuse route.open. The
+      // refusal budget decides whether to schedule another retry or surface the
+      // refusal (which lets a caller such as bash fall back). Once a retry has
+      // started, only the caller's own deadline limits its wait for the reply.
       //
       // Everything the call does counts against its deadline: route opens
       // (a bind relay can hold one for about 12 s), retry sleeps, and the
       // request itself, which is sent with only the time that is left. So the
       // call never outlives the deadline it was given, whichever path it takes.
-      const reloadWaitBudgetMs = Math.min(callDeadlineMs, ROUTE_OPEN_RELOAD_WAIT_CEILING_MS);
+      const reloadRefusalBudgetMs = Math.min(callDeadlineMs, RELOAD_REFUSAL_RETRY_CEILING_MS);
       // The most recent route refusal, so a deadline that passes mid-open still
       // names the daemon's reason instead of a bare timeout.
       let lastRefusal: unknown;
@@ -2602,7 +2587,7 @@ export class SubcTransportPool implements AftTransportPool {
             lastRefusal = error;
             // Check the budget before starting (or joining) the shared retry
             // timer, so a call that gives up leaves no orphan timer behind.
-            if (spentMs() + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
+            if (spentMs() + this.nextRouteReopenDelayMs() >= reloadRefusalBudgetMs) {
               throw reloadWindowExhaustedError(error, callDeadlineMs);
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
@@ -2761,14 +2746,14 @@ export class SubcTransportPool implements AftTransportPool {
           // requests refused by the daemon for as long as the drain lasts. The
           // refusal happens before the request is forwarded, so it is handled
           // like a refused route.open: drop the stale route, then reopen and
-          // resend within the same reload-wait budget. Only once that budget is
-          // spent does the refusal surface (and let bash fall back to the host).
+          // resend under the same budget for scheduling retries. Once another
+          // retry cannot fit, surface the refusal (and let bash fall back to the host).
           // A healthy connection answered, so it does not count as a transport
           // failure.
           if (ownsRoute && isRouteRequestReloadRefusal(error)) {
             clearRouteEntry(routeAndEntry.entry);
             lastRefusal = error;
-            if (spentMs() + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
+            if (spentMs() + this.nextRouteReopenDelayMs() >= reloadRefusalBudgetMs) {
               throw reloadWindowExhaustedError(error, callDeadlineMs);
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
@@ -3605,7 +3590,7 @@ export class SubcTransportPool implements AftTransportPool {
         return this.openHostToolRoute(client, identity, record, binding, "bg_events");
       },
       onNudge,
-      this.bgBackoffSleep,
+      this.bgReattach,
       () => this.rootCanAttach(record.canonicalRoot),
       (error) => {
         if (!isAbsentRootRouteError(error)) return false;

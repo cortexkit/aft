@@ -240,20 +240,29 @@ export function registerAftRpc(
         );
       });
 
-    // Only the bound session's active task IDs may reach the status and kill
-    // commands; those commands also support broader task lookups for agents.
-    const ownedTasks = async (sessionID: string, signal: AbortSignal) => {
+    const ownsSession = async (sessionID: string): Promise<boolean> => {
       if (
-        !toolContext ||
         typeof context.session?.get !== "function" ||
         context.location?.directory !== root ||
         context.location.workspaceID !== location.workspaceID
       ) {
+        return false;
+      }
+      return (await getSessionDirectoryForEvent(context, sessionID, root)) === root;
+    };
+
+    // Only the bound session's active task IDs may reach the status and kill
+    // commands; those commands also support broader task lookups for agents.
+    const ownedTasks = async (sessionID: string, signal: AbortSignal) => {
+      if (!toolContext || !(await ownsSession(sessionID))) {
         throw new Error("AFT background task session could not be verified");
       }
-      const directory = await getSessionDirectoryForEvent(context, sessionID, root);
-      if (directory !== root) throw new Error("AFT background task session could not be verified");
-      const runtime = { sessionID, directory, directoryIsSessionRoot: true, effectAbort: signal };
+      const runtime = {
+        sessionID,
+        directory: root,
+        directoryIsSessionRoot: true,
+        effectAbort: signal,
+      };
       const { success, task_ids: ids } = await callBashBridge(
         toolContext,
         runtime,
@@ -352,11 +361,15 @@ export function registerAftRpc(
         void emit("showStatusDialog", sessionID ? { sessionID } : {}).catch(() => {});
       },
     });
+    const forwardStatusChange = async (sessionID: string | undefined): Promise<void> => {
+      // The compatibility bus is process-wide. Only sessionless invalidations
+      // belong to every Location; a tagged one needs host ownership proof.
+      if (sessionID === undefined) await emit("statusInvalidated", {});
+      else if (await ownsSession(sessionID)) await emit("statusInvalidated", { sessionID });
+    };
     const removeStatusChangeSink = registerStatusChangeSink({
-      send(event) {
-        void emit("statusInvalidated", event.sessionId ? { sessionID: event.sessionId } : {}).catch(
-          () => {},
-        );
+      send({ sessionId }) {
+        void forwardStatusChange(sessionId).catch(() => {});
       },
     });
 

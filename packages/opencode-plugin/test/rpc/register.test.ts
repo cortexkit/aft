@@ -11,6 +11,9 @@ import {
 import {
   __resetRpcNotificationsForTest,
   pushNotification,
+  pushStatusChange,
+  type RpcStatusChange,
+  registerStatusChangeSink,
 } from "../../src/shared/rpc-notifications.js";
 import type { AftStatusSnapshot } from "../../src/shared/status.js";
 import { formatAftStatusSegment } from "../../src/tui/v2-status.js";
@@ -300,6 +303,55 @@ describe("registerAftRpc", () => {
       payload: { sessionID: "ses_dialog" },
     });
     await registered.dispose();
+  });
+
+  test("routes a tagged status invalidation only to the owning Location", async () => {
+    const owner = { directory: "/work/project", workspaceID: "owner" };
+    const other = { ...owner, workspaceID: "other" };
+    const sessionID = "ses_location_invalidation";
+    const session = { get: () => Effect.succeed({ location: owner }) };
+    const ownerHost = hostHarness();
+    const otherHost = hostHarness();
+    const ownerRpc = await Effect.runPromise(
+      Effect.scoped(
+        registerAftRpc(
+          { ...ownerHost.context, location: owner, session },
+          owner,
+          poolHarness(null),
+        ),
+      ),
+    );
+    const otherRpc = await Effect.runPromise(
+      Effect.scoped(
+        registerAftRpc(
+          { ...otherHost.context, location: other, session },
+          other,
+          poolHarness(null),
+        ),
+      ),
+    );
+    const legacyEvents: RpcStatusChange[] = [];
+    const unregister = registerStatusChangeSink({ send: (event) => legacyEvents.push(event) });
+    try {
+      pushStatusChange(sessionID);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(ownerHost.clients.tui).toEqual([
+        { name: "statusInvalidated", payload: { sessionID } },
+      ]);
+      expect(otherHost.clients.tui).toEqual([]);
+      expect(legacyEvents).toEqual([{ sessionId: sessionID }]);
+
+      pushStatusChange();
+      await settleEmits();
+      expect(ownerHost.clients.tui.at(-1)).toEqual({ name: "statusInvalidated", payload: {} });
+      expect(otherHost.clients.tui).toEqual([{ name: "statusInvalidated", payload: {} }]);
+      expect(legacyEvents).toEqual([{ sessionId: sessionID }, {}]);
+    } finally {
+      unregister();
+      await ownerRpc.dispose();
+      await otherRpc.dispose();
+    }
   });
 
   test("re-registers after Location reload and disposes each supervisor registration", async () => {
