@@ -87,17 +87,36 @@ pub struct GithubReadCacheEntry {
 /// The nullable metadata column keeps the cache compatible with older builds:
 /// their queries name columns explicitly and can ignore the new column.
 pub fn ensure_github_read_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(CREATE_GITHUB_READ_CACHE_SCHEMA)?;
-    if !has_document_gap_column(conn)? {
-        let result = conn.execute_batch(
-            "ALTER TABLE github_read_cache ADD COLUMN document_gap_with_text_hash BLOB",
-        );
-        // Another connection may have added the column since our check.
-        if result.is_err() && !has_document_gap_column(conn)? {
-            return result;
-        }
+    prepare_github_read_cache_schema(conn, false).map(|_| ())
+}
+
+/// Prepare a lookup, returning whether this connection can read gap metadata.
+pub fn prepare_github_read_cache_lookup(conn: &Connection) -> rusqlite::Result<bool> {
+    prepare_github_read_cache_schema(conn, true)
+}
+
+fn prepare_github_read_cache_schema(
+    conn: &Connection,
+    allow_legacy: bool,
+) -> rusqlite::Result<bool> {
+    // A read-only connection can look up legacy rows without creating the index
+    // or trying to add the metadata column.
+    if allow_legacy && conn.is_readonly(rusqlite::DatabaseName::Main)? {
+        return has_document_gap_column(conn);
     }
-    Ok(())
+    conn.execute_batch(CREATE_GITHUB_READ_CACHE_SCHEMA)?;
+    if has_document_gap_column(conn)? {
+        return Ok(true);
+    }
+    match conn
+        .execute_batch("ALTER TABLE github_read_cache ADD COLUMN document_gap_with_text_hash BLOB")
+    {
+        Ok(()) => Ok(true),
+        // Another connection may have added the column since our check.
+        Err(_) if has_document_gap_column(conn)? => Ok(true),
+        Err(_) if allow_legacy => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn has_document_gap_column(conn: &Connection) -> rusqlite::Result<bool> {
@@ -128,24 +147,34 @@ pub fn lookup_github_read_cache_entry(
     conn: &Connection,
     key: &GithubReadCacheKey,
 ) -> rusqlite::Result<Option<GithubReadCacheEntry>> {
-    ensure_github_read_cache_schema(conn)?;
-    lookup_github_read_cache_entry_after_schema(conn, key)
+    let has_document_gap = prepare_github_read_cache_lookup(conn)?;
+    lookup_github_read_cache_entry_after_schema(conn, key, has_document_gap)
 }
 
 /// [`lookup_github_read_cache_entry`] for a caller that already ran
-/// [`ensure_github_read_cache_schema`] on this connection, so a hot read path
-/// does not repeat the schema statements on every call.
+/// [`prepare_github_read_cache_lookup`] on this connection and kept its result.
 pub fn lookup_github_read_cache_entry_after_schema(
     conn: &Connection,
     key: &GithubReadCacheKey,
+    has_document_gap: bool,
 ) -> rusqlite::Result<Option<GithubReadCacheEntry>> {
-    conn.query_row(
+    let sql = if has_document_gap {
         "SELECT canonical_text, fetched_at_ms, updated_at_ms, document_gap_with_text_hash
          FROM github_read_cache
          WHERE resource_kind = ?1
            AND repository = ?2
            AND resource_number = ?3
-           AND authentication_identity_hash = ?4",
+           AND authentication_identity_hash = ?4"
+    } else {
+        "SELECT canonical_text, fetched_at_ms, updated_at_ms, NULL
+         FROM github_read_cache
+         WHERE resource_kind = ?1
+           AND repository = ?2
+           AND resource_number = ?3
+           AND authentication_identity_hash = ?4"
+    };
+    conn.query_row(
+        sql,
         params![
             key.resource_kind.as_str(),
             &key.normalized_repository,

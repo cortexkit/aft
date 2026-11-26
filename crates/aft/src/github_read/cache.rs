@@ -8,8 +8,9 @@ use parking_lot::Mutex;
 use crate::config::GithubConfig;
 use crate::db::github_read_cache::{
     ensure_github_read_cache_schema, invalidate_github_read_cache_resource_after_schema,
-    lookup_github_read_cache_entry_after_schema, upsert_github_read_cache_entry_after_schema,
-    GithubReadCacheEntry, GithubReadCacheKey, GithubReadResourceKind,
+    lookup_github_read_cache_entry_after_schema, prepare_github_read_cache_lookup,
+    upsert_github_read_cache_entry_after_schema, GithubReadCacheEntry, GithubReadCacheKey,
+    GithubReadResourceKind,
 };
 
 use super::attachments::{
@@ -80,9 +81,9 @@ pub struct SqliteGithubReadCacheStore {
     /// Weak, so the store never keeps a connection open after the context
     /// has let it go.
     resident: Mutex<std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>>,
-    /// Address of the resident connection the cache table was last created
-    /// on. Cleared after any failure so the next operation creates it again.
-    schema_ready_on: Mutex<Option<usize>>,
+    /// Resident connection address and whether its cache has gap metadata.
+    /// Cleared if a cache statement fails so the next operation checks again.
+    schema_ready_on: Mutex<Option<(usize, bool)>>,
 }
 
 impl SqliteGithubReadCacheStore {
@@ -105,26 +106,42 @@ impl SqliteGithubReadCacheStore {
     fn run<T>(
         &self,
         what: &str,
-        operation: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+        needs_gap_column: bool,
+        operation: impl FnOnce(&rusqlite::Connection, bool) -> rusqlite::Result<T>,
     ) -> Result<T, String> {
         let failed =
             |error: rusqlite::Error| format!("failed to {what} GitHub read cache: {error}");
+        let prepare = |connection: &rusqlite::Connection| {
+            if needs_gap_column {
+                ensure_github_read_cache_schema(connection).map(|()| true)
+            } else {
+                prepare_github_read_cache_lookup(connection)
+            }
+        };
         let resident = self.resident.lock().upgrade();
         let Some(shared) = resident else {
             let connection = self.connection()?;
-            ensure_github_read_cache_schema(&connection).map_err(failed)?;
-            return operation(&connection).map_err(failed);
+            let has_gap_column = prepare(&connection).map_err(failed)?;
+            return operation(&connection, has_gap_column).map_err(failed);
         };
         let connection = shared
             .lock()
             .map_err(|_| format!("failed to {what} GitHub read cache: connection lock poisoned"))?;
         let address = Arc::as_ptr(&shared) as usize;
         let mut ready = self.schema_ready_on.lock();
-        if *ready != Some(address) {
-            ensure_github_read_cache_schema(&connection).map_err(failed)?;
-            *ready = Some(address);
-        }
-        operation(&connection).map_err(|error| {
+        let has_gap_column = match *ready {
+            Some((prepared_on, has_gap_column))
+                if prepared_on == address && (has_gap_column || !needs_gap_column) =>
+            {
+                has_gap_column
+            }
+            _ => {
+                let has_gap_column = prepare(&connection).map_err(failed)?;
+                *ready = Some((address, has_gap_column));
+                has_gap_column
+            }
+        };
+        operation(&connection, has_gap_column).map_err(|error| {
             *ready = None;
             failed(error)
         })
@@ -133,8 +150,8 @@ impl SqliteGithubReadCacheStore {
 
 impl GithubReadCacheStore for SqliteGithubReadCacheStore {
     fn lookup(&self, key: &GithubReadCacheKey) -> Result<Option<GithubReadCacheEntry>, String> {
-        self.run("look up", |connection| {
-            lookup_github_read_cache_entry_after_schema(connection, key)
+        self.run("look up", false, |connection, has_gap_column| {
+            lookup_github_read_cache_entry_after_schema(connection, key, has_gap_column)
         })
     }
 
@@ -145,7 +162,7 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
         fetched_at_ms: i64,
         document_gap: bool,
     ) -> Result<(), String> {
-        self.run("update", |connection| {
+        self.run("update", true, |connection, _| {
             upsert_github_read_cache_entry_after_schema(
                 connection,
                 key,
@@ -165,7 +182,7 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
     ) -> Result<usize, String> {
         let number = i64::try_from(number)
             .map_err(|_| "GitHub resource number exceeds cache storage range".to_string())?;
-        self.run("invalidate", |connection| {
+        self.run("invalidate", true, |connection, _| {
             invalidate_github_read_cache_resource_after_schema(
                 connection,
                 database_kind(kind),
@@ -1099,6 +1116,54 @@ mod tests {
         drop(resident);
         assert_eq!(store.lookup(&key).unwrap(), None);
         assert!(crate::db::schema_peek_count_for_test() > peeks);
+    }
+
+    #[test]
+    fn sqlite_store_reuses_legacy_lookup_schema_after_a_failed_migration() {
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("aft.db");
+        let connection = crate::db::open(&database).unwrap();
+        let key = GithubReadCacheKey::new(GithubReadResourceKind::Issue, "owner/repo", 7, "id");
+        crate::db::github_read_cache::upsert_github_read_cache_entry(
+            &connection,
+            &key,
+            "# Legacy",
+            1_000,
+            false,
+        )
+        .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE github_read_cache DROP COLUMN document_gap_with_text_hash;
+                 PRAGMA query_only = ON;",
+            )
+            .unwrap();
+        let resident = Arc::new(std::sync::Mutex::new(connection));
+        let store = SqliteGithubReadCacheStore::new(&database);
+        store.attach_resident_connection(Some(&resident));
+
+        let entry = store.lookup(&key).unwrap().unwrap();
+        assert_eq!(entry.canonical_text, "# Legacy");
+        assert_eq!(entry.document_gap, None);
+        assert!(store.upsert(&key, "# Updated", 2_000, true).is_err());
+
+        resident
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only = OFF")
+            .unwrap();
+        assert_eq!(store.lookup(&key).unwrap(), Some(entry));
+        // A warm lookup uses the saved legacy schema instead of retrying migration.
+        assert!(resident
+            .lock()
+            .unwrap()
+            .prepare("SELECT document_gap_with_text_hash FROM github_read_cache")
+            .is_err());
+
+        store.upsert(&key, "# Updated", 2_000, true).unwrap();
+        let entry = store.lookup(&key).unwrap().unwrap();
+        assert_eq!(entry.canonical_text, "# Updated");
+        assert_eq!(entry.document_gap, Some(true));
     }
 
     #[derive(Default)]
