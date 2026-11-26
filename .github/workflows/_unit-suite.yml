@@ -1614,7 +1614,9 @@ jobs:
     name: Cargo test archive (Windows)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     runs-on: windows-2025
-    timeout-minutes: 25
+    # Pull requests build this archive cold (the compiler cache is read-only
+    # there); on GitHub's 4-core Windows runner that alone takes 21-25 minutes.
+    timeout-minutes: 60
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -2004,7 +2006,7 @@ jobs:
     name: Cargo check deny-warnings (Windows)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
