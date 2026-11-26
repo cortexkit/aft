@@ -1,0 +1,11 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/path_lookup.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "The filename lane still admits and orders the same candidates. The search reply discloses an observed filename match filtered out by includeTests without enumerating additional candidates."
+}

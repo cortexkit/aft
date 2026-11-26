@@ -16,6 +16,7 @@ pub mod lexical_lane;
 pub use crate::search_state::memo;
 mod nearest_names;
 pub mod paging;
+mod path_lookup;
 pub use crate::search_b2::plan_table;
 pub mod planner;
 pub mod provenance;
@@ -102,6 +103,7 @@ pub fn register_lane(registry: &mut LaneRegistry, lane: Arc<dyn SearchLane>) {
 }
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -130,9 +132,8 @@ use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::search_index::{
-    sort_grep_matches_by_mtime_desc, walk_project_files_from_matching, GrepMatch,
-    GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
-    INTERACTIVE_ARTIFACT_READ_BUDGET,
+    sort_grep_matches_by_mtime_desc, GrepMatch, GrepPathExclusion, GrepResult, IndexStatus,
+    PathFilters, SearchIndex, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
     query_embedding_is_busy, query_embedding_timeout_budget, strip_query_embedding_busy_marker,
@@ -144,6 +145,9 @@ use checkout_gaps::CheckoutSemanticGaps;
 use extensions::try_read_with_budget;
 pub use first_text_wait::first_text_index_wait_needed;
 use first_text_wait::wait_for_first_text_index;
+#[cfg(test)]
+use path_lookup::with_watcher_live_for_test;
+use path_lookup::{disclose_excluded_test_match, path_lookup_paths};
 
 const DEFAULT_TOP_K: usize = 10;
 
@@ -1577,6 +1581,7 @@ fn handle_split_search<'a>(
         Some(ctx),
         None,
     );
+    disclose_excluded_test_match(ranked.excluded_test_name_match, &mut text);
     let summary = patterns.summary(&prose_found);
     let mut header = vec![summary.line(
         &patterns.pattern,
@@ -3235,6 +3240,7 @@ impl SearchLane for PreparedEngineLane {
 
 struct EngineRanking {
     results: Vec<HybridResult>,
+    excluded_test_name_match: bool,
     more_available: bool,
     engine_capped: bool,
     results_list_envelope: ListEnvelope,
@@ -4898,96 +4904,6 @@ fn take_windows_semantic_preview(
     metadata.remove(&semantic_path)
 }
 
-/// The path-lookup lane's files: those under `project_root` that
-/// `candidate_filter` admits and whose name, or `/`-separated path relative
-/// to the root, ends with one of `tokens`, newest first.
-///
-/// With the data layer's view of the root, while this context's file
-/// watcher keeps that view current, the files come from the view's path
-/// list, which holds every path the project walk would reach; otherwise (no
-/// view yet, no watcher, or a view that cannot stand in for the walk) from
-/// that walk. Both apply the same test to each file and the same order, so
-/// the lane's answer does not depend on which one ran.
-fn path_lookup_paths(
-    ctx: &AppContext,
-    data_text: Option<&crate::commands::data_search::DataText>,
-    project_root: &Path,
-    tokens: &[&str],
-    candidate_filter: &dyn Fn(&Path) -> bool,
-) -> Vec<PathBuf> {
-    let tokens = tokens
-        .iter()
-        .map(|token| token.replace('\\', "/"))
-        .collect::<Vec<_>>();
-    let matches = |path: &Path| {
-        if !candidate_filter(path) {
-            return false;
-        }
-        let relative = path
-            .strip_prefix(project_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let file_name = path.file_name().and_then(|name| name.to_str());
-        tokens.iter().any(|normalized| {
-            file_name == Some(normalized.as_str()) || relative.ends_with(normalized.as_str())
-        })
-    };
-    if let Some(text) = data_text.filter(|_| watcher_keeps_view_current(ctx)) {
-        // A file `matches` keeps has a relative path ending with a token (a
-        // file name equal to the token ends it too), so only those members
-        // need spelling out.
-        let ends_with_token = |relative: &[u8]| {
-            tokens
-                .iter()
-                .any(|token| relative.ends_with(token.as_bytes()))
-        };
-        if let Some(files) = waits::timed(waits::SearchWait::TextSearch, || {
-            text.files_matching(project_root, ends_with_token, matches)
-        }) {
-            return files;
-        }
-    }
-    // Reject unrelated filenames before the walker builds metadata and
-    // canonical display keys for sorting; the surviving order is unchanged.
-    let _walk = waits::time(waits::SearchWait::Walk);
-    walk_project_files_from_matching(project_root, project_root, &PathFilters::default(), matches)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Stands in for [`AppContext::watcher_runtime_active`] on this thread.
-    static WATCHER_LIVE_FOR_TEST: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Runs `run` with this thread's path lookups treating the file watcher as
-/// running (`live`) or not, whatever the context's watcher does.
-#[cfg(test)]
-fn with_watcher_live_for_test<R>(live: bool, run: impl FnOnce() -> R) -> R {
-    struct Restore(Option<bool>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            WATCHER_LIVE_FOR_TEST.with(|slot| slot.set(self.0));
-        }
-    }
-    let _restore = Restore(WATCHER_LIVE_FOR_TEST.with(|slot| slot.replace(Some(live))));
-    run()
-}
-
-/// Whether this context's file watcher is running. Only then does the data
-/// layer's view learn of a file created outside AFT soon after it appears
-/// (a change still in the watcher's hands is disclosed on the reply as a
-/// pending-change gap); without a watcher the view keeps missing it, and a
-/// lookup by file name must walk the folder to find it.
-fn watcher_keeps_view_current(ctx: &AppContext) -> bool {
-    #[cfg(test)]
-    if let Some(live) = WATCHER_LIVE_FOR_TEST.with(std::cell::Cell::get) {
-        return live;
-    }
-    ctx.watcher_runtime_active()
-}
-
 fn run_engine_ranking(
     request_id: &str,
     ctx: &AppContext,
@@ -5354,6 +5270,7 @@ fn run_engine_ranking(
         })
         .map(str::to_string);
 
+    let excluded_test_name_match = Cell::new(false);
     let path_lookup_candidates = if plan.contains(SearchLaneKind::PathLookup) {
         let query_path_tokens = query
             .split_whitespace()
@@ -5374,7 +5291,19 @@ fn run_engine_ranking(
             data_text.as_ref(),
             project_root,
             &query_path_tokens,
-            &candidate_filter,
+            &|path| {
+                let allowed = candidate_filter(path);
+                // A stale indexed path would not be admitted even with tests enabled.
+                if !allowed
+                    && !excluded_test_name_match.get()
+                    && path
+                        .symlink_metadata()
+                        .is_ok_and(|metadata| metadata.is_file())
+                {
+                    excluded_test_name_match.set(true);
+                }
+                allowed
+            },
         )
         .into_iter()
         .map(|path| {
@@ -6125,6 +6054,7 @@ fn run_engine_ranking(
         );
         return Ok(EngineRanking {
             results,
+            excluded_test_name_match: excluded_test_name_match.get(),
             more_available: false,
             engine_capped: false,
             results_list_envelope,
@@ -6145,6 +6075,7 @@ fn run_engine_ranking(
     }
     Ok(EngineRanking {
         results,
+        excluded_test_name_match: excluded_test_name_match.get(),
         // Lane exhaustion describes the materialized page, not the separately
         // bounded identifier fallback. A cap cannot certify no further results.
         more_available: identifier_exact_capped
@@ -6296,6 +6227,7 @@ fn handle_engine_only_search(
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
     disclose_rerank_note(&ranked.rerank_note, &mut text);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
+    disclose_excluded_test_match(ranked.excluded_test_name_match, &mut text);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
     disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
     search_response(
@@ -6703,6 +6635,7 @@ fn handle_semantic_or_hybrid_search(
     disclose_missing_on_disk(engine_ranking.missing_on_disk, &mut text, &mut extras);
     disclose_rerank_note(&engine_ranking.rerank_note, &mut text);
     disclose_anchored_admission(engine_ranking.anchored_admission, &mut text, &mut extras);
+    disclose_excluded_test_match(engine_ranking.excluded_test_name_match, &mut text);
     disclose_exact_gaps(&engine_ranking.exact_disclosures, &mut text, &mut extras);
     disclose_index_gaps(&engine_ranking.index_disclosures, &mut text, &mut extras);
     if let Some(gaps) = &semantic_gaps {
@@ -6849,6 +6782,7 @@ fn zero_result_escalation_response(
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
     disclose_rerank_note(&ranked.rerank_note, &mut text);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
+    disclose_excluded_test_match(ranked.excluded_test_name_match, &mut text);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
     disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
     extras.insert("structuredContent".to_string(), ranked.structured_content);
@@ -7122,6 +7056,7 @@ fn semantic_unavailable_or_fallback_response(
         disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
         disclose_rerank_note(&ranked.rerank_note, &mut text);
         disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
+        disclose_excluded_test_match(ranked.excluded_test_name_match, &mut text);
         disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
         disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
 

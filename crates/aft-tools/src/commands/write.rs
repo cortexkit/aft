@@ -54,7 +54,19 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(path) => path,
         Err(resp) => return resp,
     };
-    let existed = path.exists();
+    let metadata = path.metadata();
+    let existed = metadata.is_ok();
+    if metadata.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        && path.is_symlink()
+    {
+        return Response::error(
+            &req.id,
+            "dangling_symlink",
+            format!(
+                "Cannot write through dangling symlink '{file}'. Write to the target path instead."
+            ),
+        );
+    }
 
     // Capture pre-write content when the file exists so we can detect no-op
     // writes (file content byte-identical to original) and emit honest

@@ -321,6 +321,7 @@ fn slices() -> Vec<Slice> {
         Slice {
             id: "search-layer-boundaries",
             fence: vec![
+                FenceRule::Exact("crates/aft-tools/src/commands/semantic_search/path_lookup.rs"),
                 FenceRule::Prefix("crates/aft-tools/src/commands/semantic_search/planner/"),
                 FenceRule::Exact("crates/aft-tools/src/commands/data_search.rs"),
                 FenceRule::Exact("crates/aft-engine/src/data_layer/meaning_query.rs"),
@@ -337,6 +338,7 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("crates/aft-engine/src/inspect/manager/flight_lifetime.rs"),
             ],
             landed_paths: vec![
+                "crates/aft-tools/src/commands/semantic_search/path_lookup.rs",
                 "crates/aft-tools/src/commands/semantic_search/planner/mod.rs",
                 "crates/aft-tools/src/commands/semantic_search/planner/lane_plan.rs",
                 "crates/aft-tools/src/commands/semantic_search/planner/readiness.rs",

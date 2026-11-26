@@ -333,8 +333,18 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let all_candidates_checked = presence.unexamined == 0;
     let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
 
-    let (text, rendered_files) =
-        format_glob_output(&files, pattern, &project_root, result_truncated);
+    let total_bound = crate::list_surfaces::glob::glob_total_bound(
+        total,
+        result_truncated,
+        walk_failed || walk_truncated || skipped_foreign_mounts > 0,
+    );
+    let (text, rendered_files) = format_glob_output(
+        &files,
+        pattern,
+        &project_root,
+        result_truncated,
+        total_bound,
+    );
     let mut body = serde_json::json!({
         "text": text,
         "rendered_files": rendered_files,
@@ -895,7 +905,8 @@ fn format_glob_text(
     project_root: &Path,
     truncated: bool,
 ) -> String {
-    format_glob_output(files, pattern, project_root, truncated).0
+    let total = crate::list_surfaces::glob::glob_total_bound(files.len(), truncated, false);
+    format_glob_output(files, pattern, project_root, truncated, total).0
 }
 
 fn format_glob_output(
@@ -903,13 +914,13 @@ fn format_glob_output(
     pattern: &str,
     project_root: &Path,
     truncated: bool,
+    total: crate::list_envelope::Total,
 ) -> (String, usize) {
     // The existing file-prefix selector must fit long paths too, not only a
     // fixed number of names. The envelope counts only filenames actually printed.
     let mut end = files.len();
     loop {
-        let output =
-            format_glob_selected(&files[..end], files.len(), pattern, project_root, truncated);
+        let output = format_glob_selected(&files[..end], total, pattern, project_root, truncated);
         if output.0.len() <= crate::tool_output::LIST_BODY_BYTES || end == 0 {
             return output;
         }
@@ -919,7 +930,7 @@ fn format_glob_output(
 
 fn format_glob_selected(
     files: &[PathBuf],
-    reported_files: usize,
+    total: crate::list_envelope::Total,
     pattern: &str,
     project_root: &Path,
     truncated: bool,
@@ -930,12 +941,10 @@ fn format_glob_selected(
         .map(|p| p.strip_prefix(project_root).unwrap_or(p).to_path_buf())
         .collect();
 
-    let header = format!(
-        "{} {} matching {}",
-        reported_files,
-        if reported_files == 1 { "file" } else { "files" },
-        pattern
-    );
+    let reported_files = total.value();
+    let bound = if total.is_at_least() { "≥" } else { "" };
+    let unit = if reported_files == 1 { "file" } else { "files" };
+    let header = format!("{bound}{reported_files} {unit} matching {pattern}");
 
     let mut shown = 0;
     let text = if relative_files.is_empty() {
@@ -1464,7 +1473,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "1 file matching **/*.rs\n\nsrc/a.rs\n\n(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)"
+            "≥1 file matching **/*.rs\n\nsrc/a.rs\n\n(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)"
         );
     }
 }
