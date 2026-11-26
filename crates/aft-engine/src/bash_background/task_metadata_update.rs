@@ -25,6 +25,7 @@ where
         // changing the terminal command's original spawn identity.
         let lifecycle_scope = metadata.lifecycle_scope.clone();
         let completion_delivered = metadata.completion_delivered;
+        let awaited_work = metadata.awaited_work;
         let runner_completion_offers = metadata
             .runner_completion_offers
             .max(original.runner_completion_offers);
@@ -42,6 +43,7 @@ where
         metadata = original;
         metadata.lifecycle_scope = lifecycle_scope;
         metadata.completion_delivered = completion_delivered;
+        metadata.awaited_work = awaited_work;
         metadata.runner_completion_offers = runner_completion_offers;
         metadata.runner_completion_notice = runner_completion_notice;
         metadata.runner_completion_delivery = runner_completion_delivery;
