@@ -93,6 +93,35 @@ fn match_uses_lf_when_endings_are_tied() {
     );
 }
 
+#[test]
+fn glob_match_uses_each_files_line_ending() {
+    let dir = tempfile::tempdir().unwrap();
+    let crlf = dir.path().join("crlf.txt");
+    let lf = dir.path().join("lf.txt");
+    fs::write(&crlf, b"bravo\r\n").unwrap();
+    fs::write(&lf, b"bravo\n").unwrap();
+    let mut aft = start_aft(dir.path());
+    let mut request = match_edit("BRAVO\nagain");
+    request["file"] = json!(format!("{}/*.txt", dir.path().display()));
+    let reply = aft.send(&request.to_string());
+    assert_eq!(reply["success"], true, "{reply:?}");
+    assert!(aft.shutdown().success());
+    assert_eq!(fs::read(crlf).unwrap(), b"BRAVO\r\nagain\r\n");
+    assert_eq!(fs::read(lf).unwrap(), b"BRAVO\nagain\n");
+}
+
+#[test]
+fn fuzzy_match_restores_separator_using_majority_ending() {
+    let mut request = match_edit("BRAVO");
+    request["match"] = json!("bravo \n");
+    assert_edit(
+        request,
+        "notes.txt",
+        b"alpha\nbravo\r\ncharlie\n",
+        b"alpha\nBRAVO\ncharlie\n",
+    );
+}
+
 fn batch_edit(edits: Value) -> Value {
     json!({
         "id": "edit", "command": "tool_call", "name": "edit",
@@ -123,6 +152,19 @@ fn batch_line_ranges_keep_crlf() {
         "notes.txt",
         b"alpha\r\nbravo\r\ncharlie\r\ndelta\r\n",
         b"alpha\r\nBRAVO\r\nsecond\r\ncharlie\r\nDELTA\r\nfourth\r\n",
+    );
+}
+
+#[test]
+fn batch_line_range_append_keeps_crlf_and_lone_cr() {
+    assert_edit(
+        json!({
+            "id": "edit", "command": "batch", "file": "notes.txt",
+            "edits": [{ "line_start": 3, "line_end": 3, "content": "CHARLIE\r" }],
+        }),
+        "notes.txt",
+        b"alpha\r\nbravo\r",
+        b"alpha\r\nbravo\r\r\nCHARLIE\r\r\n",
     );
 }
 
