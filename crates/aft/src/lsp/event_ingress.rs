@@ -4,6 +4,7 @@ use std::sync::{Arc, Weak};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 
+use super::analysis_progress::{self, AnalysisProgressShadow, Transition};
 use super::client::{LspEvent, ReceivedLspEvent, ServerInstanceId};
 use super::roots::ServerKey;
 
@@ -20,8 +21,15 @@ struct Control {
     key: ServerKey,
     last_dropped: u64,
     overflowed: bool,
+    progress: Option<AnalysisProgressShadow>,
+    progress_limit_exceeded: bool,
     exit: Option<ReceivedLspEvent>,
     watched_dropped: usize,
+}
+
+pub(super) enum IngressOverflow {
+    Dropped(Option<AnalysisProgressShadow>),
+    ProgressLimit,
 }
 
 pub(super) struct EventIngressLease {
@@ -56,9 +64,12 @@ impl EventIngress {
         self.controls.lock().insert(
             instance,
             Control {
+                progress: analysis_progress::uses_analysis_progress(&key.kind)
+                    .then(AnalysisProgressShadow::default),
                 key,
                 last_dropped: 0,
                 overflowed: false,
+                progress_limit_exceeded: false,
                 exit: None,
                 watched_dropped: 0,
             },
@@ -73,6 +84,26 @@ impl EventIngress {
         &self,
         event: ReceivedLspEvent,
     ) -> Result<(), TrySendError<ReceivedLspEvent>> {
+        if let Some(((instance, order), (token, transition))) = event
+            .instance
+            .zip(event.receive_order)
+            .zip(Transition::from_event(&event.event))
+        {
+            let mut controls = self.controls.lock();
+            if let Some(control) = controls.get_mut(&instance) {
+                if control.progress_limit_exceeded {
+                    return Ok(());
+                }
+                if let Some(progress) = &mut control.progress {
+                    if !progress.record(token.to_string(), transition, order) {
+                        control.progress_limit_exceeded = true;
+                        control.overflowed = true;
+                        let _ = self.wake.try_send(());
+                        return Ok(());
+                    }
+                }
+            }
+        }
         match self.ordinary.try_send(event) {
             Err(TrySendError::Full(event)) => {
                 if matches!(event.event, LspEvent::ServerExited { .. }) {
@@ -106,18 +137,44 @@ impl EventIngress {
         let Some((id, order)) = event.instance.zip(event.receive_order) else {
             return false;
         };
-        self.controls
-            .lock()
-            .get(&id)
-            .is_some_and(|control| control.last_dropped != 0 && order <= control.last_dropped)
+        self.controls.lock().get(&id).is_some_and(|control| {
+            control.progress_limit_exceeded
+                || (control.last_dropped != 0 && order <= control.last_dropped)
+        })
     }
 
-    pub(super) fn take_overflows(&self) -> Vec<(ServerInstanceId, ServerKey)> {
+    pub(super) fn overflow_pending_for(&self, event: &ReceivedLspEvent) -> bool {
+        event.instance.is_some_and(|instance| {
+            self.controls
+                .lock()
+                .get(&instance)
+                .is_some_and(|control| control.overflowed)
+        })
+    }
+
+    pub(super) fn take_overflows(
+        &self,
+        ready: impl Fn(&ServerKey, ServerInstanceId) -> bool,
+    ) -> Vec<(ServerKey, IngressOverflow)> {
         self.controls
             .lock()
             .iter_mut()
             .filter_map(|(&id, control)| {
-                std::mem::take(&mut control.overflowed).then(|| (id, control.key.clone()))
+                if !control.overflowed || !ready(&control.key, id) {
+                    return None;
+                }
+                control.overflowed = false;
+                let overflow = if control.progress_limit_exceeded {
+                    IngressOverflow::ProgressLimit
+                } else {
+                    // The snapshot replaces every transition through its last
+                    // receipt. Do not replay ordinary events from that interval.
+                    if let Some(progress) = &control.progress {
+                        control.last_dropped = control.last_dropped.max(progress.last_transition);
+                    }
+                    IngressOverflow::Dropped(control.progress.clone())
+                };
+                Some((control.key.clone(), overflow))
             })
             .collect()
     }
@@ -129,11 +186,10 @@ impl EventIngress {
             .find_map(|control| control.exit.take())
     }
 
-    pub(super) fn pending(&self) -> bool {
-        self.controls
-            .lock()
-            .values()
-            .any(|control| control.overflowed || control.exit.is_some())
+    pub(super) fn pending(&self, ready: impl Fn(&ServerKey, ServerInstanceId) -> bool) -> bool {
+        self.controls.lock().iter().any(|(&id, control)| {
+            (control.overflowed && ready(&control.key, id)) || control.exit.is_some()
+        })
     }
 
     pub(super) fn record_watched_drop(&self, raw: &std::path::Path, resolved: &std::path::Path) {

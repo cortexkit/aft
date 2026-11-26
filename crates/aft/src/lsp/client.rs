@@ -840,8 +840,8 @@ pub(crate) struct RustWorkspaceState {
 /// Per-server work-done runs used to certify background analysis.
 #[derive(Default)]
 struct WorkDoneAnalysis {
-    active: std::collections::HashSet<String>,
-    announced: std::collections::HashSet<String>,
+    tokens: super::analysis_progress::AnalysisTokens,
+    last_transition: u64,
     observed: bool,
     opens: HashMap<PathBuf, OpenAnalysis>,
     latest_input: Option<AnalysisInput>,
@@ -907,9 +907,8 @@ impl WorkDoneAnalysis {
         }
     }
 
-    fn announced(&mut self, token: String) {
+    fn started(&mut self) {
         self.observed = true;
-        self.announced.insert(token);
         for open in self.opens.values_mut() {
             open.requires_end = true;
         }
@@ -919,39 +918,55 @@ impl WorkDoneAnalysis {
     }
 
     fn running(&self) -> bool {
-        !self.active.is_empty() || !self.announced.is_empty()
+        self.tokens.running()
     }
 
     fn covered_by_end(&self, epoch: u64) -> bool {
         self.completed_through_epoch.is_some_and(|end| epoch <= end)
     }
 
-    fn record(&mut self, token: String, kind: &str, diagnostics_epoch: u64) {
-        match kind {
-            "begin" => {
-                self.observed = true;
-                self.announced.remove(&token);
-                self.active.insert(token);
-                for open in self.opens.values_mut() {
-                    open.requires_end = true;
-                }
-                if let Some(input) = &mut self.latest_input {
-                    input.requires_end = true;
-                }
-            }
-            "end" => {
-                if self.active.remove(&token) {
-                    if !self.running() {
-                        self.completed_through_epoch = Some(diagnostics_epoch);
-                        self.last_published_epoch =
-                            self.last_published_epoch.max(diagnostics_epoch);
-                        self.short_publication_seen = false;
-                        self.latest_input = None;
-                    }
-                }
-            }
-            _ => {}
+    fn completed(&mut self, diagnostics_epoch: u64) {
+        self.completed_through_epoch = Some(diagnostics_epoch);
+        self.last_published_epoch = self.last_published_epoch.max(diagnostics_epoch);
+        self.short_publication_seen = false;
+        self.latest_input = None;
+    }
+
+    fn record(
+        &mut self,
+        token: String,
+        transition: super::analysis_progress::Transition,
+        diagnostics_epoch: u64,
+    ) {
+        if !matches!(transition, super::analysis_progress::Transition::End) {
+            self.started();
         }
+        if self.tokens.record(token, transition) {
+            self.completed(diagnostics_epoch);
+        }
+    }
+
+    fn recover(
+        &mut self,
+        shadow: super::analysis_progress::AnalysisProgressShadow,
+        diagnostics_epoch: u64,
+    ) {
+        if shadow.last_transition <= self.last_transition {
+            return;
+        }
+        let start = shadow.last_start > self.last_transition;
+        let complete = shadow.last_completion > self.last_transition;
+        if start && shadow.last_start < shadow.last_completion {
+            self.started();
+        }
+        if complete {
+            self.completed(diagnostics_epoch);
+        }
+        if start && shadow.last_start > shadow.last_completion {
+            self.started();
+        }
+        self.tokens = shadow.tokens;
+        self.last_transition = shadow.last_transition;
     }
 
     fn pending(&self) -> bool {
@@ -1845,8 +1860,7 @@ impl LspClient {
     }
 
     pub(crate) fn uses_analysis_progress(&self) -> bool {
-        matches!(self.kind, ServerKind::Python)
-            || matches!(&self.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+        super::analysis_progress::uses_analysis_progress(&self.kind)
     }
 
     pub(crate) fn analysis_progress_authority(&self) -> Option<&'static str> {
@@ -1859,14 +1873,29 @@ impl LspClient {
         })
     }
 
-    pub(crate) fn record_analysis_progress(&mut self, params: &Value, diagnostics_epoch: u64) {
-        if let (Some(token), Some(kind)) = (
-            params.get("token"),
-            params.pointer("/value/kind").and_then(Value::as_str),
-        ) {
-            self.analysis_progress
-                .record(token.to_string(), kind, diagnostics_epoch);
+    pub(super) fn record_analysis_progress(
+        &mut self,
+        token: &Value,
+        transition: super::analysis_progress::Transition,
+        order: Option<u64>,
+        diagnostics_epoch: u64,
+    ) {
+        if let Some(order) = order {
+            if order <= self.analysis_progress.last_transition {
+                return;
+            }
+            self.analysis_progress.last_transition = order;
         }
+        self.analysis_progress
+            .record(token.to_string(), transition, diagnostics_epoch);
+    }
+
+    pub(super) fn recover_analysis_progress(
+        &mut self,
+        shadow: super::analysis_progress::AnalysisProgressShadow,
+        diagnostics_epoch: u64,
+    ) {
+        self.analysis_progress.recover(shadow, diagnostics_epoch);
     }
 
     pub(crate) fn analysis_progress_certifies(
@@ -1886,12 +1915,6 @@ impl LspClient {
 
     pub(crate) fn has_analysis_progress(&self) -> bool {
         self.uses_analysis_progress() && self.analysis_progress.observed
-    }
-
-    pub(crate) fn note_analysis_progress_support(&mut self, params: &Value) {
-        if let Some(token) = params.get("token") {
-            self.analysis_progress.announced(token.to_string());
-        }
     }
 
     pub(crate) fn note_analysis_publication(
@@ -3495,45 +3518,48 @@ mod tests {
 
     #[test]
     fn analysis_progress_end_before_publication_cannot_certify_the_report() {
+        use crate::lsp::analysis_progress::Transition::*;
         let file = PathBuf::from("checked.py");
         let mut progress = WorkDoneAnalysis::default();
-        progress.record("old".into(), "begin", 0);
+        progress.record("old".into(), Begin, 0);
         progress.opened(file.clone());
-        progress.record("old".into(), "end", 1);
+        progress.record("old".into(), End, 1);
         progress.published(&file, 2, Some(Instant::now()));
         assert!(!progress.certifies(&file, 2, Some(Instant::now())));
-        progress.record("new".into(), "begin", 2);
-        progress.record("new".into(), "end", 2);
+        progress.record("new".into(), Begin, 2);
+        progress.record("new".into(), End, 2);
         assert!(progress.certifies(&file, 2, Some(Instant::now())));
         assert_eq!(progress.authority(), "work_done_progress");
     }
 
     #[test]
     fn analysis_progress_nested_tokens_and_no_progress_fallback_are_distinct() {
+        use crate::lsp::analysis_progress::Transition::*;
         let file = PathBuf::from("checked.py");
         let mut progress = WorkDoneAnalysis::default();
         progress.opened(file.clone());
         progress.published(&file, 1, Some(Instant::now()));
         progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
         assert_eq!(progress.authority(), "first_publish_no_analysis_progress");
-        progress.record("outer".into(), "begin", 0);
-        progress.record("inner".into(), "begin", 0);
-        progress.record("inner".into(), "end", 1);
+        progress.record("outer".into(), Begin, 0);
+        progress.record("inner".into(), Begin, 0);
+        progress.record("inner".into(), End, 1);
         assert!(progress.pending());
-        progress.record("outer".into(), "end", 1);
+        progress.record("outer".into(), End, 1);
         assert!(!progress.pending());
         progress.opened(file.clone());
         progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
-        progress.announced("next".into());
+        progress.record("next".into(), Announce, 0);
         assert_eq!(progress.authority(), "analysis_progress_pending");
     }
 
     #[test]
     fn analysis_progress_short_run_requires_its_own_post_open_publication() {
+        use crate::lsp::analysis_progress::Transition::*;
         let file = PathBuf::from("small.py");
         let mut progress = WorkDoneAnalysis::default();
-        progress.record("warmup".into(), "begin", 0);
-        progress.record("warmup".into(), "end", 1);
+        progress.record("warmup".into(), Begin, 0);
+        progress.record("warmup".into(), End, 1);
         progress.opened(file.clone());
         progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
         assert!(
@@ -3554,21 +3580,22 @@ mod tests {
         assert!(progress.certifies(&file, 3, published_at));
         progress.certified(true);
         assert_eq!(progress.authority(), "post_input_publish_no_analysis_run");
-        progress.record("recheck".into(), "begin", 3);
+        progress.record("recheck".into(), Begin, 3);
         assert!(!progress.certifies(&file, 3, published_at));
-        progress.record("recheck".into(), "end", 3);
+        progress.record("recheck".into(), End, 3);
         assert!(progress.certifies(&file, 3, published_at));
     }
 
     #[test]
     fn analysis_progress_short_batch_can_update_a_dependent_file() {
+        use crate::lsp::analysis_progress::Transition::*;
         let first = PathBuf::from("consumer.py");
         let second = PathBuf::from("dependency.py");
         let mut progress = WorkDoneAnalysis::default();
         progress.opened(first.clone());
         progress.published(&first, 1, Some(Instant::now()));
-        progress.record("warmup".into(), "begin", 1);
-        progress.record("warmup".into(), "end", 1);
+        progress.record("warmup".into(), Begin, 1);
+        progress.record("warmup".into(), End, 1);
         progress.opened(second.clone());
         let old = Instant::now() - WorkDoneAnalysis::GRACE - Duration::from_secs(1);
         progress.latest_input.as_mut().unwrap().at = old;
@@ -3582,13 +3609,13 @@ mod tests {
             !progress.certifies(&first, 3, at),
             "another file's epoch cannot settle the consumer"
         );
-        progress.announced("next".into());
+        progress.record("next".into(), Announce, 0);
         assert!(
             !progress.certifies(&first, 2, at),
             "a promised run cannot fall back after the grace"
         );
-        progress.record("next".into(), "begin", 3);
-        progress.record("next".into(), "end", 3);
+        progress.record("next".into(), Begin, 3);
+        progress.record("next".into(), End, 3);
         assert!(progress.certifies(&first, 2, at));
     }
     // Only the Unix-gated reap tests below spawn real children and name paths.

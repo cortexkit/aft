@@ -6261,34 +6261,8 @@ impl LspManager {
                 root,
                 method,
                 params: Some(params),
-            } if method == "$/progress" => {
-                if *server_kind == ServerKind::Rust {
-                    self.handle_rust_progress(root.clone(), params);
-                } else if let Some(client) = self.clients.get_mut(&ServerKey {
-                    kind: server_kind.clone(),
-                    root: root.clone(),
-                }) {
-                    if client.uses_analysis_progress() {
-                        client.record_analysis_progress(params, self.diagnostics.current_epoch());
-                    }
-                }
-                None
-            }
-            LspEvent::ServerRequest {
-                server_kind,
-                root,
-                method,
-                params: Some(params),
-                ..
-            } if method == "window/workDoneProgress/create" => {
-                if let Some(client) = self.clients.get_mut(&ServerKey {
-                    kind: server_kind.clone(),
-                    root: root.clone(),
-                }) {
-                    if client.uses_analysis_progress() {
-                        client.note_analysis_progress_support(params);
-                    }
-                }
+            } if method == "$/progress" && *server_kind == ServerKind::Rust => {
+                self.handle_rust_progress(root.clone(), params);
                 None
             }
             LspEvent::ServerExited {
@@ -6331,7 +6305,10 @@ impl LspManager {
                     None
                 }
             }
-            _ => None,
+            _ => {
+                self.handle_analysis_progress(receipt);
+                None
+            }
         };
         if matches!(event, LspEvent::ServerRequest { method, .. } if method == "client/registerCapability")
         {

@@ -1123,43 +1123,186 @@ fn review_gpt5_event_overflow_preserves_response_and_exit() {
 
 #[test]
 fn event_overflow_does_not_strand_analysis_progress() {
-    let tmp = tempfile::tempdir().unwrap();
-    let key = ServerKey {
-        kind: ServerKind::Python,
-        root: canonicalize_for_lsp(tmp.path()).unwrap(),
-    };
-    let mut manager = LspManager::new();
-    let client = lifecycle_fake_client(&manager, &key);
-    let instance = client.instance;
-    manager.clients.insert(key.clone(), client);
-    let progress = |order, kind| ReceivedLspEvent {
-        event: LspEvent::Notification {
-            server_kind: key.kind.clone(),
-            root: key.root.clone(),
-            method: "$/progress".into(),
-            params: Some(json!({"token": "analysis", "value": {"kind": kind}})),
-        },
-        instance: Some(instance),
-        receive_order: Some(order),
-    };
+    let (_tmp, mut manager, key) = progress_overflow_client(ServerKind::Python);
+    let file = key.root.join("main.py");
+    std::fs::write(&file, "n = 1\n").unwrap();
 
-    manager.event_tx.send(progress(1, "begin")).unwrap();
+    send_work_done(&manager, &key, 1, "analysis", "begin");
+    publish_for_progress(&manager, &key, 2, &file);
     manager.drain_events();
     assert!(manager.clients[&key].analysis_progress_running());
+    assert!(manager.diagnostics.entries_for_file(&file)[0].1.provisional);
+    let before_end = manager.diagnostics.current_epoch();
 
-    for order in 2..=EVENT_CAP as u64 + 1 {
-        manager.event_tx.send(progress(order, "report")).unwrap();
-    }
-    assert_eq!(manager.event_rx.len(), EVENT_CAP);
-    manager
-        .event_tx
-        .send(progress(EVENT_CAP as u64 + 2, "end"))
-        .unwrap();
+    let end = fill_progress_queue(&manager, &key, 3);
+    send_work_done(&manager, &key, end, "analysis", "end");
     manager.drain_events();
     assert!(
         !manager.clients[&key].analysis_progress_running(),
         "analysis finished while the ordinary queue was full"
     );
+    assert!(manager.clients[&key].analysis_progress_covered_by_end(before_end));
+    assert!(!manager.diagnostics.has_report_for_server_file(&key, &file));
+
+    publish_for_progress(&manager, &key, end + 1, &file);
+    manager.drain_events();
+    assert!(
+        manager.diagnostics.entries_for_file(&file)[0].1.provisional,
+        "a report received after the recovered END cannot borrow its authority"
+    );
+
+    send_work_done(&manager, &key, end + 2, "next", "begin");
+    publish_for_progress(&manager, &key, end + 3, &file);
+    send_work_done(&manager, &key, end + 4, "next", "end");
+    manager.drain_events();
+    assert!(!manager.diagnostics.entries_for_file(&file)[0].1.provisional);
+    assert!(manager.producer_has_settled(&key));
+}
+
+#[test]
+fn event_overflow_retains_queued_begin_and_create() {
+    let (_tmp, mut manager, key) = progress_overflow_client(ServerKind::Python);
+    let file = key.root.join("main.py");
+    std::fs::write(&file, "n = 1\n").unwrap();
+    send_work_done(&manager, &key, 1, "active", "begin");
+    send_work_done(&manager, &key, 2, "announced", "create");
+    let dropped = fill_progress_queue(&manager, &key, 3);
+    send_work_done(&manager, &key, dropped, "active", "report");
+    manager.drain_events();
+    assert!(manager.clients[&key].analysis_progress_running());
+
+    publish_for_progress(&manager, &key, dropped + 1, &file);
+    send_work_done(&manager, &key, dropped + 2, "announced", "begin");
+    send_work_done(&manager, &key, dropped + 3, "announced", "end");
+    manager.drain_events();
+    assert!(
+        manager.diagnostics.entries_for_file(&file)[0].1.provisional,
+        "the active token still has no END"
+    );
+
+    send_work_done(&manager, &key, dropped + 4, "pending", "create");
+    let dropped = fill_progress_queue(&manager, &key, dropped + 5);
+    send_work_done(&manager, &key, dropped, "active", "end");
+    manager.drain_events();
+
+    send_work_done(&manager, &key, dropped + 1, "another", "begin");
+    publish_for_progress(&manager, &key, dropped + 2, &file);
+    send_work_done(&manager, &key, dropped + 3, "another", "end");
+    manager.drain_events();
+    assert!(
+        manager.diagnostics.entries_for_file(&file)[0].1.provisional,
+        "the queued create still promises another run"
+    );
+
+    send_work_done(&manager, &key, dropped + 4, "pending", "begin");
+    send_work_done(&manager, &key, dropped + 5, "pending", "end");
+    manager.drain_events();
+    assert!(!manager.diagnostics.entries_for_file(&file)[0].1.provisional);
+}
+
+#[test]
+fn analysis_progress_token_limit_retires_instance_without_certifying() {
+    use crate::lsp::analysis_progress::ANALYSIS_TOKEN_LIMIT;
+
+    let (_tmp, mut manager, key) = progress_overflow_client(ServerKind::Python);
+    let file = key.root.join("main.py");
+    std::fs::write(&file, "n = 1\n").unwrap();
+    publish_for_progress(&manager, &key, 1, &file);
+    manager.drain_events();
+    assert!(manager.has_authoritative_report_for_server(&key));
+
+    let mut order = 2;
+    for index in 0..=ANALYSIS_TOKEN_LIMIT {
+        let token = index.to_string();
+        send_work_done(&manager, &key, order, &token, "begin");
+        send_work_done(&manager, &key, order + 1, &token, "end");
+        order += 2;
+    }
+    manager.drain_events();
+    assert!(
+        manager.has_client(&key),
+        "finished tokens do not occupy slots"
+    );
+
+    for index in 0..ANALYSIS_TOKEN_LIMIT {
+        send_work_done(&manager, &key, order, &index.to_string(), "begin");
+        order += 1;
+    }
+    manager.drain_events();
+    assert!(manager.has_client(&key), "the limit itself is allowed");
+
+    send_work_done(&manager, &key, order, "excess", "begin");
+    publish_for_progress(&manager, &key, order + 1, &file);
+    manager.drain_events();
+    assert!(!manager.has_client(&key));
+    assert!(!manager.has_authoritative_report_for_server(&key));
+    assert!(!manager.diagnostics.has_report_for_server_file(&key, &file));
+}
+
+fn progress_overflow_client(kind: ServerKind) -> (tempfile::TempDir, LspManager, ServerKey) {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = ServerKey {
+        kind,
+        root: canonicalize_for_lsp(tmp.path()).unwrap(),
+    };
+    let mut manager = LspManager::new();
+    let client = lifecycle_fake_client(&manager, &key);
+    manager.clients.insert(key.clone(), client);
+    (tmp, manager, key)
+}
+
+fn fill_progress_queue(manager: &LspManager, key: &ServerKey, mut order: u64) -> u64 {
+    while manager.event_rx.len() < EVENT_CAP {
+        send_work_done(manager, key, order, "ignored", "report");
+        order += 1;
+    }
+    assert_eq!(manager.event_rx.len(), EVENT_CAP);
+    order
+}
+
+fn send_work_done(manager: &LspManager, key: &ServerKey, order: u64, token: &str, kind: &str) {
+    let event = if kind == "create" {
+        LspEvent::ServerRequest {
+            server_kind: key.kind.clone(),
+            root: key.root.clone(),
+            id: crate::lsp::jsonrpc::RequestId::Int(1),
+            method: "window/workDoneProgress/create".into(),
+            params: Some(json!({"token": token})),
+        }
+    } else {
+        LspEvent::Notification {
+            server_kind: key.kind.clone(),
+            root: key.root.clone(),
+            method: "$/progress".into(),
+            params: Some(json!({"token": token, "value": {"kind": kind, "title": "cargo check"}})),
+        }
+    };
+    send_progress_fixture_event(manager, key, order, event);
+}
+
+fn publish_for_progress(manager: &LspManager, key: &ServerKey, order: u64, file: &Path) {
+    send_progress_fixture_event(
+        manager,
+        key,
+        order,
+        LspEvent::Notification {
+            server_kind: key.kind.clone(),
+            root: key.root.clone(),
+            method: "textDocument/publishDiagnostics".into(),
+            params: Some(json!({"uri": uri_for_path(file).unwrap(), "diagnostics": []})),
+        },
+    );
+}
+
+fn send_progress_fixture_event(manager: &LspManager, key: &ServerKey, order: u64, event: LspEvent) {
+    manager
+        .event_tx
+        .send(ReceivedLspEvent {
+            event,
+            instance: Some(manager.clients[key].instance),
+            receive_order: Some(order),
+        })
+        .unwrap();
 }
 
 #[test]

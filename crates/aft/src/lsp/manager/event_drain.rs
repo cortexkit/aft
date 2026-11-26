@@ -1,4 +1,6 @@
 use super::*;
+use crate::lsp::analysis_progress::{Transition, ANALYSIS_TOKEN_LIMIT};
+use crate::lsp::event_ingress::IngressOverflow;
 
 impl LspManager {
     /// Drain all pending LSP events. Call from the main loop.
@@ -10,7 +12,7 @@ impl LspManager {
     /// the maintenance scheduler's skip probe.
     pub fn has_pending_events(&self) -> bool {
         !self.event_rx.is_empty()
-            || self.event_tx.pending()
+            || self.event_tx.pending(|key, id| self.ingress_ready(key, id))
             || self
                 .clients
                 .values()
@@ -86,6 +88,9 @@ impl LspManager {
                 break;
             };
             processed += 1;
+            if self.event_tx.overflow_pending_for(&event) {
+                overflowed.extend(self.apply_ingress_overflows());
+            }
             if preserve_pull_observations
                 && matches!(event.event, LspEvent::DocumentDiagnosticsPulled { .. })
             {
@@ -116,7 +121,7 @@ impl LspManager {
         }
         let has_more = processed >= max_events
             && (!self.event_rx.is_empty()
-                || self.event_tx.pending()
+                || self.event_tx.pending(|key, id| self.ingress_ready(key, id))
                 || (!preserve_pull_observations && !self.ready_startup_events.is_empty()));
         self.send_due_rust_saves();
         let mut promoted_reports = Vec::new();
@@ -221,20 +226,75 @@ impl LspManager {
         }
     }
 
+    fn ingress_ready(&self, key: &ServerKey, id: ServerInstanceId) -> bool {
+        self.clients.get(key).is_some_and(|client| {
+            client.instance == id
+                && (!client.uses_analysis_progress() || !self.starting.contains_key(key))
+        })
+    }
+
+    pub(super) fn handle_analysis_progress(&mut self, receipt: &ReceivedLspEvent) {
+        let Some((token, transition)) = Transition::from_event(&receipt.event) else {
+            return;
+        };
+        let (LspEvent::Notification {
+            server_kind, root, ..
+        }
+        | LspEvent::ServerRequest {
+            server_kind, root, ..
+        }) = &receipt.event
+        else {
+            return;
+        };
+        let key = ServerKey {
+            kind: server_kind.clone(),
+            root: root.clone(),
+        };
+        if let Some(client) = self
+            .clients
+            .get_mut(&key)
+            .filter(|client| client.uses_analysis_progress())
+        {
+            client.record_analysis_progress(
+                token,
+                transition,
+                receipt.receive_order,
+                self.diagnostics.current_epoch(),
+            );
+        }
+    }
+
     pub(super) fn apply_ingress_overflows(&mut self) -> Vec<ServerKey> {
+        let overflows = self
+            .event_tx
+            .take_overflows(|key, id| self.ingress_ready(key, id));
         let mut affected = Vec::new();
-        for (instance, key) in self.event_tx.take_overflows() {
-            if !self
-                .clients
-                .get(&key)
-                .is_some_and(|client| client.instance == instance)
-            {
-                continue;
+        let mut retired = Vec::new();
+        for (key, overflow) in overflows {
+            match overflow {
+                IngressOverflow::Dropped(progress) => {
+                    if let Some(progress) = progress {
+                        self.clients
+                            .get_mut(&key)
+                            .unwrap()
+                            .recover_analysis_progress(progress, self.diagnostics.current_epoch());
+                    }
+                    slog_warn!(
+                        "discarded language server events for {key:?}: event queue overflow"
+                    );
+                    self.invalidate_server_diagnostics(&key);
+                }
+                IngressOverflow::ProgressLimit => {
+                    slog_warn!("retiring language server {key:?}: exceeded the limit of {ANALYSIS_TOKEN_LIMIT} unfinished analysis progress tokens");
+                    retired.push((key.clone(), self.detach_idle_client(&key)));
+                }
             }
-            slog_warn!("discarded language server events for {key:?}: event queue overflow");
-            self.invalidate_server_diagnostics(&key);
             affected.push(key);
         }
+        if !affected.is_empty() {
+            self.wake_post_edit_waiters();
+        }
+        Self::spawn_idle_lsp_reap(retired);
         affected
     }
 

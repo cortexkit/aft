@@ -1,3 +1,4 @@
+mod analysis_progress;
 mod applicability_cache;
 pub mod child_registry;
 pub mod client;
