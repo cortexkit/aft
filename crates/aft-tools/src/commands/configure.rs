@@ -4638,6 +4638,8 @@ fn run_configure_maintenance_unit_inner(
                         storage_dir.display(),
                         err
                     );
+                } else {
+                    aft_engine::interrupted_storage::schedule_sweeps(&storage_dir);
                 }
                 ctx.backup().lock().set_storage_dir_for_harness(
                     storage_dir.clone(),

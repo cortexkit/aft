@@ -18,6 +18,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::health::DispatchPathMetrics;
 use crate::context::DispatchLoopLiveness;
+use aft_engine::interrupted_storage::{
+    exact_liveness, old_enough, owned_metadata, predates_boot, storage_child_dir, ArtifactOwner,
+    ChildState, ONE_HOUR,
+};
+use crate::process_identity::ProcessLiveness::{Alive, Gone};
 
 /// How long a loop may owe work without progressing before it is a stall.
 pub(super) const STALL_THRESHOLD: Duration = Duration::from_secs(15);
@@ -41,6 +46,7 @@ pub(super) const CAPTURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 pub(super) const KEEP_CAPTURES: usize = 5;
 const CAPTURE_FILE_PREFIX: &str = "stall-";
 const CAPTURE_FILE_SUFFIX: &str = ".txt";
+const CAPTURE_OWNER_EXTENSION: &str = "owner";
 
 /// Stall counters the health report reads. Written only by the watchdog.
 #[derive(Default)]
@@ -520,6 +526,8 @@ fn start_capture(
         &config.diagnostics_dir,
         config.keep_captures.saturating_sub(1),
     );
+    let owner = path.with_extension(CAPTURE_OWNER_EXTENSION);
+    let _ = ArtifactOwner::current(ChildState::Pending).write(&owner);
     // This in-process snapshot needs no permission to attach an external
     // profiler. Store it separately from macOS `sample` output, which may be
     // empty if that command fails.
@@ -535,6 +543,7 @@ fn start_capture(
     let output_path = path.with_extension("profiler");
     match config.capture.capture(config.pid, &output_path) {
         Ok(CaptureStarted::Spawned(child)) => {
+            ArtifactOwner::record_child(&owner, child.id());
             children.push(CaptureChild {
                 child,
                 path: path.clone(),
@@ -547,6 +556,7 @@ fn start_capture(
             path.display().to_string()
         }
         Ok(CaptureStarted::Unsupported) => {
+            let _ = ArtifactOwner::current(ChildState::Finished).write(&owner);
             (config.log)(&format!(
                 "stall watchdog: profiler unsupported snapshot={}",
                 path.display()
@@ -641,6 +651,8 @@ fn finish_capture(
     ));
     let _ = std::fs::remove_file(output_path);
     let _ = std::fs::remove_file(stderr_path);
+    let _ = ArtifactOwner::current(ChildState::Finished)
+        .write(&path.with_extension(CAPTURE_OWNER_EXTENSION));
 }
 
 /// `stall-<UTC yyyymmddThhmmssZ>-<pid>.txt`. The timestamp leads so names sort
@@ -660,25 +672,127 @@ fn capture_file_name(at: SystemTime, pid: u32) -> String {
     )
 }
 
-/// Deletes all but the newest `keep` capture files in `dir`.
+/// Retires old, inactive captures and sweeps sidecars left without a snapshot.
 fn prune_captures(dir: &Path, keep: usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut captures = entries
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with(CAPTURE_FILE_PREFIX) && name.ends_with(CAPTURE_FILE_SUFFIX)
-        })
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    captures.sort();
-    let excess = captures.len().saturating_sub(keep);
-    for path in captures.into_iter().take(excess) {
-        let _ = std::fs::remove_file(path);
+    let kept = prune_captures_at(
+        dir,
+        keep,
+        SystemTime::now(),
+        crate::process_identity::boot_time(),
+    );
+    if kept > 0 {
+        crate::slog_info!("stall capture cleanup kept {kept} unprovable orphan candidate(s)");
     }
+}
+
+fn prune_captures_at(dir: &Path, keep: usize, now: SystemTime, boot: Option<SystemTime>) -> usize {
+    const EXTENSIONS: [&str; 4] = ["txt", "profiler", "stderr", CAPTURE_OWNER_EXTENSION];
+    let Some(boundary) = dir
+        .parent()
+        .zip(dir.file_name().and_then(|name| name.to_str()))
+        .and_then(|(root, name)| storage_child_dir(root, name))
+    else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut stems = std::collections::BTreeSet::new();
+    let mut snapshots = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((stem, extension)) = name.to_str().and_then(|name| name.rsplit_once('.')) else {
+            continue;
+        };
+        if !EXTENSIONS.contains(&extension) || !valid_capture_stem(stem) {
+            continue;
+        }
+        if owned_metadata(&entry.path()).is_ok_and(|meta| meta.is_file()) {
+            stems.insert(stem.to_owned());
+            if extension == "txt" {
+                snapshots.push(stem.to_owned());
+            }
+        }
+    }
+    snapshots.sort();
+    let excess = snapshots.len().saturating_sub(keep);
+    let mut unprovable = 0;
+    'capture: for stem in stems {
+        let mut files = Vec::new();
+        let mut latest = None;
+        for extension in EXTENSIONS {
+            let path = dir.join(format!("{stem}.{extension}"));
+            match owned_metadata(&path) {
+                Ok(meta) if meta.is_file() && boundary.should_descend(&path).unwrap_or(false) => {
+                    let Ok(modified) = meta.modified() else {
+                        continue 'capture;
+                    };
+                    if !old_enough(modified, now, ONE_HOUR) {
+                        continue 'capture;
+                    }
+                    latest =
+                        Some(latest.map_or(modified, |latest: SystemTime| latest.max(modified)));
+                    files.push((extension, path));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => continue 'capture,
+            }
+        }
+        let Some(latest) = latest else { continue };
+        if files.iter().any(|(extension, _)| *extension == "txt")
+            && snapshots[..excess].binary_search(&stem).is_err()
+        {
+            continue;
+        }
+        let marker = ArtifactOwner::read(&dir.join(format!("{stem}.{CAPTURE_OWNER_EXTENSION}")));
+        match marker {
+            Some(ArtifactOwner {
+                child: ChildState::Finished,
+                ..
+            }) => {}
+            _ => {
+                let owner = marker.as_ref().and_then(|marker| marker.owner.as_ref().map(exact_liveness));
+                let child = match marker.map(|marker| marker.child) {
+                    Some(ChildState::Running(identity)) => Some(exact_liveness(&identity)),
+                    _ => None,
+                };
+                if owner == Some(Alive) || child == Some(Alive) {
+                    continue;
+                }
+                if !(owner == Some(Gone) && child == Some(Gone)) && !predates_boot(latest, boot) {
+                    unprovable += 1;
+                    continue;
+                }
+            }
+        }
+        // Leave the liveness record until its payload has been unlinked. If
+        // one deletion fails, the next maintenance pass can retry safely.
+        for (_, path) in files {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => continue 'capture,
+            }
+        }
+    }
+    unprovable
+}
+
+fn valid_capture_stem(stem: &str) -> bool {
+    let Some((stamp, pid)) = stem
+        .strip_prefix(CAPTURE_FILE_PREFIX)
+        .and_then(|name| name.split_once('-'))
+    else {
+        return false;
+    };
+    stamp.len() == 16
+        && stamp.bytes().enumerate().all(|(index, byte)| match index {
+            8 => byte == b'T',
+            15 => byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && pid.parse::<u32>().is_ok_and(|pid| pid > 0)
 }
 
 /// A progress signal of one loop. Implementations must read atomics only:
@@ -1054,11 +1168,16 @@ mod tests {
                 && line.contains("task_for_pid denied")),
             "{lines:?}"
         );
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            1,
-            "only the nonempty snapshot remains"
-        );
+        let snapshot = Path::new(&snapshot);
+        assert!(!snapshot.with_extension("profiler").exists());
+        assert!(!snapshot.with_extension("stderr").exists());
+        assert!(matches!(
+            ArtifactOwner::read(&snapshot.with_extension(CAPTURE_OWNER_EXTENSION)),
+            Some(ArtifactOwner {
+                child: ChildState::Finished,
+                ..
+            })
+        ));
     }
 
     /// Whether a diagnostic line names the executor's scheduler lock site as
@@ -1875,17 +1994,19 @@ mod tests {
     #[test]
     fn pruning_keeps_only_the_newest_capture_files() {
         let dir = tempfile::tempdir().expect("diagnostics dir");
+        let now = SystemTime::now();
+        let boot = now - ONE_HOUR;
         for second in 0..8 {
-            std::fs::write(
-                dir.path()
-                    .join(format!("stall-20260924T12000{second}Z-1.txt")),
-                "x",
-            )
-            .unwrap();
+            let path = dir
+                .path()
+                .join(format!("stall-20260924T12000{second}Z-1.txt"));
+            std::fs::write(&path, "x").unwrap();
+            filetime::set_file_mtime(path, filetime::FileTime::from_system_time(boot - ONE_HOUR))
+                .unwrap();
         }
         std::fs::write(dir.path().join("unrelated.txt"), "keep").unwrap();
 
-        prune_captures(dir.path(), KEEP_CAPTURES - 1);
+        prune_captures_at(dir.path(), KEEP_CAPTURES - 1, now, Some(boot));
 
         let mut left = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1902,6 +2023,74 @@ mod tests {
                 "unrelated.txt",
             ]
         );
+    }
+
+    #[test]
+    fn interrupted_run_cleanup_prunes_profiler_sidecars_only_when_inactive() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let boot = now - 3 * ONE_HOUR;
+        let path = |index, extension| {
+            dir.path()
+                .join(format!("stall-20260924T12000{index}Z-1.{extension}"))
+        };
+        let write = |index, extension, modified| {
+            let file = path(index, extension);
+            std::fs::write(&file, "evidence").unwrap();
+            filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(modified))
+                .unwrap();
+            file
+        };
+        let mark = |index, owner: ArtifactOwner| {
+            let file = path(index, CAPTURE_OWNER_EXTENSION);
+            owner.write(&file).unwrap();
+            filetime::set_file_mtime(
+                &file,
+                filetime::FileTime::from_system_time(now - 2 * ONE_HOUR),
+            )
+            .unwrap();
+            file
+        };
+        let old = now - 2 * ONE_HOUR;
+        let retired = [
+            write(0, "txt", old),
+            write(0, "profiler", old),
+            write(0, "stderr", old),
+            mark(0, ArtifactOwner::current(ChildState::Finished)),
+        ];
+        let orphan = write(1, "profiler", boot - ONE_HOUR);
+        let recent = write(2, "stderr", now);
+        let unknown = write(3, "profiler", old);
+        let active = write(4, "stderr", old);
+        let child =
+            crate::bash_background::process::ProcessIdentity::of(std::process::id()).unwrap();
+        let active_marker = mark(
+            4,
+            ArtifactOwner {
+                owner: None,
+                child: ChildState::Running(child),
+            },
+        );
+        let kept_snapshot = write(5, "txt", old);
+        let kept_sidecar = write(5, "stderr", old);
+        let unrelated = dir.path().join("stall-unrelated.profiler");
+        std::fs::write(&unrelated, "unrelated").unwrap();
+
+        assert_eq!(prune_captures_at(dir.path(), 1, now, Some(boot)), 1);
+        for file in retired.into_iter().chain([orphan]) {
+            assert!(!file.exists(), "{} survived", file.display());
+        }
+        for file in [
+            recent,
+            unknown,
+            active,
+            active_marker,
+            kept_snapshot,
+            kept_sidecar,
+            unrelated,
+        ] {
+            assert!(file.is_file(), "{} was swept", file.display());
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -183,6 +183,76 @@ pub fn with_linux_boot_time_for_test<T>(seconds: u64, run: impl FnOnce() -> T) -
     run()
 }
 
+#[cfg(target_os = "linux")]
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(boot_time_secs()?))
+}
+
+#[cfg(target_os = "macos")]
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    let mut time: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&time);
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&mut time as *mut libc::timeval).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || len != std::mem::size_of_val(&time) || time.tv_sec <= 0 {
+        return None;
+    }
+    // Round down so an artifact from the boot second is never treated as old.
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(time.tv_sec as u64))
+}
+
+#[cfg(windows)]
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    #[repr(C)]
+    struct TimeOfDay {
+        boot_time: i64,
+        current_time: i64,
+        time_zone_bias: i64,
+        time_zone_id: u32,
+        reserved: u32,
+        boot_time_bias: u64,
+        sleep_time_bias: u64,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQuerySystemInformation(
+            class: u32,
+            buffer: *mut std::ffi::c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    let mut info: TimeOfDay = unsafe { std::mem::zeroed() };
+    let len = std::mem::size_of_val(&info) as u32;
+    let status = unsafe {
+        // SystemTimeOfDayInformation (3) reports kernel boot time as FILETIME.
+        NtQuerySystemInformation(
+            3,
+            (&mut info as *mut TimeOfDay).cast(),
+            len,
+            std::ptr::null_mut(),
+        )
+    };
+    if status < 0 || info.boot_time >= info.current_time {
+        return None;
+    }
+    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+    let ticks = u64::try_from(info.boot_time.checked_sub(UNIX_EPOCH_TICKS)?).ok()?;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(ticks / 10_000_000))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    None
+}
+
 /// Keep the legacy epoch conversion consistent within one AFT process.
 /// Shared with the platform-independent test that proves the reader runs once.
 #[cfg(any(target_os = "linux", any(test, feature = "test-support")))]

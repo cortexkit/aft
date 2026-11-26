@@ -13,6 +13,7 @@ use lsp_types::{
 };
 
 use super::event_ingress::{EventIngress, EventReceiver, EVENT_CAP};
+use super::typescript_temp::typescript_server_temp_dir;
 use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
@@ -7889,52 +7890,6 @@ enum SpawnFailure {
     },
 }
 
-pub(crate) struct TypeScriptTempDir(PathBuf);
-
-impl TypeScriptTempDir {
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TypeScriptTempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn typescript_server_temp_dir(
-    kind: &ServerKind,
-    storage_root: &Path,
-    env: &mut HashMap<String, String>,
-) -> std::io::Result<Option<TypeScriptTempDir>> {
-    if !matches!(kind, ServerKind::TypeScript(_)) {
-        return Ok(None);
-    }
-    let parent = storage_root.join("lsp-tmp");
-    crate::private_storage::create_dir_all(&parent)?;
-    let mut random = [0u8; 16];
-    getrandom::fill(&mut random).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let path = parent.join(format!("typescript-{:032x}", u128::from_le_bytes(random)));
-    // A private, randomly named directory is created atomically; an existing
-    // path is never reused, including remnants of an abruptly stopped AFT.
-    crate::private_storage::create_dir(&path)?;
-    let directory = TypeScriptTempDir(path);
-    let path = directory.path().to_str().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "TypeScript temp path is not UTF-8",
-        )
-    })?;
-    // typescript-language-server creates a per-UID folder with a racy
-    // existsSync/mkdirSync pair during macOS startup. Different SDK versions
-    // can start together for one root, so even a per-workspace TMPDIR collides.
-    for key in ["TMPDIR", "TMP", "TEMP"] {
-        env.insert(key.into(), path.into());
-    }
-    Ok(Some(directory))
-}
-
 impl PreparedSpawn {
     fn inspect_initialize_timeout(&self) -> Duration {
         self.test_initialize_timeout()
@@ -8047,7 +8002,8 @@ impl PreparedSpawn {
                 });
             }
         };
-        client._typescript_temp_dir = typescript_temp_dir;
+        client._typescript_temp_dir =
+            typescript_temp_dir.inspect(|dir| dir.record_server(client.child_pid()));
         #[cfg(test)]
         if let Some(hook) = &self.spawned_hook {
             hook(client.child_pid());

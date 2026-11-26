@@ -1416,14 +1416,17 @@ impl CheckpointStore {
         let Some(harness) = self.storage_harness.clone() else {
             return Ok(());
         };
+        let key = (storage_dir, harness);
         if !CHECKPOINT_MAINTENANCE_KEYS
             .lock()
             .unwrap()
-            .insert((storage_dir, harness))
+            .insert(key.clone())
         {
             return Ok(());
         }
-        self.cleanup_locked()?;
+        if !self.cleanup_locked()? {
+            CHECKPOINT_MAINTENANCE_KEYS.lock().unwrap().remove(&key);
+        }
         self.tighten_permissions_locked();
         Ok(())
     }
@@ -1439,7 +1442,7 @@ impl CheckpointStore {
         }
     }
 
-    fn cleanup_locked(&mut self) -> Result<(), AftError> {
+    fn cleanup_locked(&mut self) -> Result<bool, AftError> {
         self.hydrated_checkpoints
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1452,8 +1455,21 @@ impl CheckpointStore {
             !session_checkpoints.is_empty()
         });
 
-        if let Some(checkpoints_dir) = self.durable_checkpoints_dir() {
-            sweep_expired_durable_checkpoints(&checkpoints_dir, now);
+        let mut swept = true;
+        if let Some((storage, harness)) = self
+            .storage_dir
+            .as_deref()
+            .zip(self.storage_harness.as_deref())
+        {
+            if let Some(boundary) = crate::interrupted_storage::storage_child_dir(storage, harness)
+            {
+                let checkpoints_dir = storage.join(harness).join("checkpoints");
+                if checkpoint_sweep_directory(&checkpoints_dir)
+                    && boundary.should_descend(&checkpoints_dir).unwrap_or(false)
+                {
+                    swept = sweep_expired_durable_checkpoints(&checkpoints_dir, now);
+                }
+            }
         }
         if let Some(checkpoints_root) = self.lock_path.parent().and_then(Path::parent) {
             // Fail-closed guard: the sweep root is DERIVED from lock_path depth, and a
@@ -1465,7 +1481,7 @@ impl CheckpointStore {
                 sweep_empty_scope_dirs(checkpoints_root);
             }
         }
-        Ok(())
+        Ok(swept)
     }
 
     fn hydrate_session_locked(&mut self, session: &str) -> Result<(), AftError> {
@@ -1553,15 +1569,19 @@ impl CheckpointStore {
         session: &str,
         checkpoint: &Checkpoint,
     ) -> Result<(), AftError> {
-        let Some(checkpoint_dir) = self.durable_checkpoint_dir(session, &checkpoint.name) else {
+        let Some(checkpoints_dir) = self.durable_checkpoints_dir() else {
             return Ok(());
         };
-        crate::backup::create_private_durable_dir(&checkpoint_dir).map_err(|error| {
-            AftError::IoError {
-                path: checkpoint_dir.display().to_string(),
-                message: format!("failed to create durable checkpoint directory: {error}"),
-            }
-        })?;
+        let checkpoint_dir = checkpoints_dir
+            .join(hash_session(session))
+            .join(&checkpoint.name);
+        let creation_error = |error| AftError::IoError {
+            path: checkpoint_dir.display().to_string(),
+            message: format!("failed to create durable checkpoint directory: {error}"),
+        };
+        let _namespace_writer =
+            lock_durable_checkpoint_writer(&checkpoints_dir).map_err(creation_error)?;
+        crate::backup::create_private_durable_dir(&checkpoint_dir).map_err(creation_error)?;
         if let Some(root) = self.storage_dir.as_deref() {
             crate::private_storage::tighten_open_dir(root, &checkpoint_dir);
         }
@@ -2243,28 +2263,68 @@ fn prune_unreferenced_checkpoint_blobs(
     Ok(())
 }
 
-fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
+fn open_checkpoint_namespace_lock(checkpoints_dir: &Path) -> io::Result<fs::File> {
+    // Keep the coordination inode next to the namespace so migration can
+    // rename the checkpoint directory without moving the lock with it.
+    let path = checkpoints_dir.with_file_name(".aft-checkpoint-writers.lock");
+    crate::production_storage::refuse_write(&path)?;
+    let mut options = crate::private_storage::options();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let lock = options.open(&path)?;
+    if !lock.metadata()?.is_file() || !crate::interrupted_storage::owned_metadata(&path)?.is_file()
+    {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    Ok(lock)
+}
+
+fn lock_durable_checkpoint_writer(checkpoints_dir: &Path) -> io::Result<fs::File> {
+    crate::backup::create_private_durable_dir(checkpoints_dir)?;
+    let lock = open_checkpoint_namespace_lock(checkpoints_dir)?;
+    lock.lock_shared()?;
+    Ok(lock)
+}
+
+fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) -> bool {
     // A vanished mounted child can make ReadDir::drop panic after closedir
     // returns ENXIO, aborting the daemon. This background sweep must not open
     // checkpoint directories on a different filesystem.
     let boundary = match crate::walk_boundary::DeviceBoundary::for_root(checkpoints_dir) {
         Ok(boundary) => boundary,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
         Err(_) => {
             crate::slog_warn!(
                 "cannot establish filesystem boundary for checkpoint sweep {}",
                 checkpoints_dir.display()
             );
-            return;
+            return true;
         }
     };
+    // Different project mutation locks can share this durable namespace. An
+    // unpublished checkpoint is not an orphan while any writer can publish it.
+    let Ok(namespace) = open_checkpoint_namespace_lock(checkpoints_dir) else {
+        return false;
+    };
+    if namespace.try_lock().is_err() {
+        return false;
+    }
     let mut skipped_foreign_mounts = 0usize;
     let Ok(session_entries) = fs::read_dir(checkpoints_dir) else {
-        return;
+        return false;
     };
     for session_entry in session_entries.flatten() {
         let session_dir = session_entry.path();
-        if !session_dir.is_dir() {
+        if !checkpoint_sweep_directory(&session_dir) {
             continue;
         }
         if !boundary.should_descend(&session_dir).unwrap_or(false) {
@@ -2276,7 +2336,7 @@ fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
         };
         for checkpoint_entry in checkpoint_entries.flatten() {
             let checkpoint_dir = checkpoint_entry.path();
-            if !checkpoint_dir.is_dir() {
+            if !checkpoint_sweep_directory(&checkpoint_dir) {
                 continue;
             }
             if !boundary.should_descend(&checkpoint_dir).unwrap_or(false) {
@@ -2284,13 +2344,18 @@ fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
                 continue;
             }
             let meta_path = checkpoint_dir.join("meta.json");
-            let Ok(bytes) = fs::read(&meta_path) else {
-                continue;
+            let expired = match fs::read(&meta_path) {
+                Ok(bytes) => {
+                    serde_json::from_slice::<DiskCheckpointMeta>(&bytes).is_ok_and(|meta| {
+                        now.saturating_sub(meta.created_at) >= NAMED_CHECKPOINT_RETENTION_SECS
+                    })
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    incomplete_checkpoint_expired(&checkpoint_dir, &meta_path, &boundary, now)
+                }
+                Err(_) => false,
             };
-            let Ok(meta) = serde_json::from_slice::<DiskCheckpointMeta>(&bytes) else {
-                continue;
-            };
-            if now.saturating_sub(meta.created_at) < NAMED_CHECKPOINT_RETENTION_SECS {
+            if !expired {
                 continue;
             }
             if let Err(error) = fs::remove_dir_all(&checkpoint_dir) {
@@ -2310,6 +2375,66 @@ fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
             checkpoints_dir.display()
         );
     }
+    true
+}
+
+fn checkpoint_sweep_directory(path: &Path) -> bool {
+    crate::interrupted_storage::owned_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+fn incomplete_checkpoint_expired(
+    checkpoint: &Path,
+    meta_path: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    now: u64,
+) -> bool {
+    use crate::interrupted_storage::{hex_name, owned_metadata};
+    // A broken metadata symlink also makes read return NotFound. Treat only
+    // actual absence as an interrupted first publication.
+    matches!(fs::symlink_metadata(meta_path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        && checkpoint.parent().and_then(Path::file_name).and_then(|name| name.to_str())
+            .is_some_and(|name| hex_name(name, 16))
+        && checkpoint.file_name().and_then(|name| name.to_str())
+            .is_some_and(|name| validate_checkpoint_name(name).is_ok())
+        && owned_metadata(checkpoint).is_ok_and(|meta| checkpoint_mtime_expired(&meta, now))
+        // Before recursively removing an unpublished checkpoint, verify that
+        // its only contents are old files produced by the checkpoint writer.
+        && fs::read_dir(checkpoint).is_ok_and(|mut entries| entries.all(|entry| {
+            entry.is_ok_and(|entry| {
+                entry.file_name().to_str().is_some_and(checkpoint_sweep_artifact_name)
+                    && owned_metadata(&entry.path()).is_ok_and(|meta| {
+                        meta.is_file() && checkpoint_mtime_expired(&meta, now)
+                    })
+                    && boundary.should_descend(&entry.path()).unwrap_or(false)
+            })
+        }))
+}
+
+fn checkpoint_mtime_expired(meta: &fs::Metadata, now: u64) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|modified| {
+            now.saturating_sub(modified.as_secs()) >= NAMED_CHECKPOINT_RETENTION_SECS
+        })
+}
+
+fn checkpoint_sweep_artifact_name(name: &str) -> bool {
+    if let Some(id) = name
+        .strip_prefix(".aft-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    {
+        return crate::interrupted_storage::hex_name(id, 32);
+    }
+    let Some(blob) = name
+        .strip_prefix("file_")
+        .and_then(|name| name.strip_suffix(".blob"))
+    else {
+        return false;
+    };
+    let mut parts = blob.split('_');
+    (0..3).all(|_| parts.next().is_some_and(|part| part.parse::<u64>().is_ok()))
+        && parts.next().is_none()
 }
 
 fn absolute_checkpoint_path(path: PathBuf) -> PathBuf {
@@ -3241,6 +3366,93 @@ mod tests {
             victim.exists(),
             "cleanup must not sweep empty dirs outside a `checkpoints` root"
         );
+    }
+
+    #[test]
+    fn interrupted_run_cleanup_expires_only_old_unpublished_checkpoint_artifacts() {
+        let (mut store, _storage) = checkpoint_store();
+        let old = filetime::FileTime::from_unix_time(
+            (current_timestamp() - NAMED_CHECKPOINT_RETENTION_SECS - 60) as i64,
+            0,
+        );
+        let create = |name: &str, artifact: &str, aged: bool| {
+            let dir = store
+                .durable_checkpoint_dir(DEFAULT_SESSION_ID, name)
+                .unwrap();
+            fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(artifact);
+            fs::write(&file, "written before first publication").unwrap();
+            if aged {
+                filetime::set_file_mtime(file, old).unwrap();
+                filetime::set_file_mtime(&dir, old).unwrap();
+            }
+            dir
+        };
+        let expired = create("expired", "file_1_0_2.blob", true);
+        let fresh = create("fresh", "file_2_0_3.blob", false);
+        let unreadable_metadata = create("not-absent", "meta.json", true);
+        let unrelated = create("unrelated", "not-a-checkpoint-artifact", true);
+        let replaced = create("interrupted.aft-replaced", "file_1_0_2.blob", true);
+        #[cfg(unix)]
+        let broken_metadata = {
+            let dir = create("broken-metadata", "file_1_0_2.blob", true);
+            std::os::unix::fs::symlink("missing", dir.join("meta.json")).unwrap();
+            filetime::set_file_mtime(&dir, old).unwrap();
+            dir
+        };
+
+        store.cleanup();
+
+        assert!(!expired.exists());
+        for preserved in [fresh, unreadable_metadata, unrelated, replaced] {
+            assert!(preserved.is_dir(), "{} was swept", preserved.display());
+        }
+        #[cfg(unix)]
+        assert!(broken_metadata.is_dir());
+    }
+
+    #[test]
+    fn interrupted_run_cleanup_defers_to_a_different_projects_checkpoint_writer() {
+        let (mut sweeper, storage) = checkpoint_store();
+        let mut writer = CheckpointStore::with_lock_path(
+            storage
+                .path()
+                .join("checkpoints/other-project/checkpoint.lock"),
+            CHECKPOINT_LOCK_TIMEOUT,
+        );
+        writer.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+        );
+        let namespace = writer.durable_checkpoints_dir().unwrap();
+        assert_eq!(sweeper.durable_checkpoints_dir().as_ref(), Some(&namespace));
+        assert_ne!(sweeper.lock_path, writer.lock_path);
+        let project_lock = writer.acquire_mutation_lock().unwrap();
+        let namespace_lock = lock_durable_checkpoint_writer(&namespace).unwrap();
+        let dir = writer
+            .durable_checkpoint_dir(DEFAULT_SESSION_ID, "interrupted")
+            .unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let blob = dir.join("file_1_0_1.blob");
+        fs::write(&blob, "partial checkpoint").unwrap();
+        let old = filetime::FileTime::from_unix_time(
+            (current_timestamp() - NAMED_CHECKPOINT_RETENTION_SECS - 60) as i64,
+            0,
+        );
+        filetime::set_file_mtime(blob, old).unwrap();
+        filetime::set_file_mtime(&dir, old).unwrap();
+
+        let mutation_lock = sweeper.acquire_mutation_lock().unwrap();
+        assert!(
+            !sweeper.cleanup_locked().unwrap(),
+            "the sweep should not wait for a different project's writer"
+        );
+        assert!(dir.is_dir());
+        drop(mutation_lock);
+        drop(namespace_lock);
+        drop(project_lock);
+        sweeper.cleanup();
+        assert!(!dir.exists());
     }
 
     #[cfg(unix)]

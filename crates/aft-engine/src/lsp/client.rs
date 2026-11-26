@@ -1049,7 +1049,7 @@ pub struct LspClient {
     // Held until the child exits or Drop kills/reaps it, including failed handshakes.
     _rust_analyzer_permit: Option<RustAnalyzerPermit>,
     // Drop runs after the process group has been killed and reaped.
-    pub(crate) _typescript_temp_dir: Option<super::manager::TypeScriptTempDir>,
+    pub(crate) _typescript_temp_dir: Option<super::typescript_temp::TypeScriptTempDir>,
     /// Child PID captured at spawn time. Used by Drop to untrack the
     /// PID from the shared registry; we capture once rather than reading
     /// `child.id()` later because Drop ordering with the Child can race.

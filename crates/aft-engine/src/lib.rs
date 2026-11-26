@@ -161,6 +161,8 @@ pub use aft_base::host_tool_names;
 pub mod imports;
 pub mod indent;
 pub mod inspect;
+#[doc(hidden)]
+pub mod interrupted_storage;
 pub use aft_base::inspect_category;
 #[doc(hidden)]
 pub mod io_accounting;

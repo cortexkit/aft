@@ -24,6 +24,7 @@ pub mod tsconfig_membership;
 pub(crate) mod typescript_diagnostics;
 #[doc(hidden)]
 pub mod typescript_project;
+pub(crate) mod typescript_temp;
 mod writer;
 
 /// LSP subsystem error type.
