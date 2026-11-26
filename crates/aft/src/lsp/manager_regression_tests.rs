@@ -1074,14 +1074,15 @@ fn lifecycle_fake_client_with_env<'a>(
 fn scoped_publish_fixture() -> (tempfile::TempDir, LspManager, ServerKey, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = canonicalize_for_lsp(tmp.path()).unwrap();
-    let file = root.join("main.kt");
-    std::fs::write(&file, "fun main() {}\n").unwrap();
+    let file = root.join("main.ts");
+    std::fs::write(&file, "export const n = 1;\n").unwrap();
     let key = ServerKey {
-        kind: ServerKind::KotlinLs,
+        kind: ServerKind::Biome,
         root,
     };
     let mut manager = LspManager::new();
-    let client = lifecycle_fake_client(&manager, &key);
+    let client =
+        lifecycle_fake_client_with_env(&manager, &key, [("AFT_FAKE_LSP_PULL_FROM_CONTENT", "1")]);
     manager.clients.insert(key.clone(), client);
     (tmp, manager, key, file)
 }
@@ -1126,6 +1127,29 @@ fn scoped_publish_teaches_version_support_even_before_an_unversioned_publish() {
     assert!(
         manager.is_late_close_reply(&key, &file, false, true),
         "a later unversioned publish must not hide the evidence that the server versions reports"
+    );
+}
+
+#[test]
+fn scoped_publish_preserves_certified_history_for_a_stale_replacement() {
+    let (_tmp, mut manager, key, file) = scoped_publish_fixture();
+    let mut lease = manager.scoped_report_lease();
+    manager.reserve_scoped_reports_for_file(&mut lease, &file, std::slice::from_ref(&key), 1);
+    manager
+        .open_document_for_servers(&file, std::slice::from_ref(&key))
+        .unwrap();
+    let version = manager.documents[&key].version(&file).unwrap();
+    queue_scoped_publish(&manager, &key, &file, Some(version), serde_json::json!([]));
+    queue_scoped_publish(&manager, &key, &file, None, serde_json::json!([]));
+    manager.drain_events();
+
+    assert!(
+        manager
+            .diagnostics
+            .report_for_server_file(&key, &file)
+            .unwrap()
+            .needs_recertification(),
+        "a stale replacement must remember the earlier content-certified publish"
     );
 }
 
