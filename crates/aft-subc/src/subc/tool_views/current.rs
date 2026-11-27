@@ -20,7 +20,17 @@ pub(super) fn append(entry: &mut Shipped) {
 
 pub(super) fn append_bash_row(entry: &mut Shipped) {
     let mut manifest = entry.history.last().expect("redeclared bash view").clone();
-    manifest.template["row"]["source"] = json!(include_str!("bash.row.ui"));
+    manifest.template["row"]["source"] = json!(with_bash_title(include_str!("bash.row.ui")));
     manifest.template_revision += 1;
     entry.history.push(manifest);
+}
+
+pub(in crate::subc) fn with_bash_title(template: &str) -> String {
+    // Expand the placeholder in place to preserve the published bash row digest.
+    let prelude = include_str!("bash-title.ui");
+    let body = template.replace(
+        "$BASH_TITLE",
+        "input.description ?? (hasRest ? rest : input.command)",
+    );
+    format!("{prelude}\n{body}")
 }

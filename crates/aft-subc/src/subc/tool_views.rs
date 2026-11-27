@@ -417,7 +417,9 @@ mod tests {
                 if entry.tool.name == "bash" {
                     assert_eq!(prior["catalog"]["digest"], current::CATALOG_DIGEST);
                     if slot == "row" {
-                        prior["source"] = json!(include_str!("tool_views/bash.row.ui"));
+                        prior["source"] = json!(current::with_bash_title(include_str!(
+                            "tool_views/bash.row.ui"
+                        )));
                     }
                 } else {
                     assert_eq!(
