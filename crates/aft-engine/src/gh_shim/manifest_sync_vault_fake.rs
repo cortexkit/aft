@@ -276,6 +276,29 @@ async fn run_fake(paths: StatePaths, connection_file: &Path) {
 }
 
 #[tokio::test]
+async fn manifest_sync_does_not_advance_the_cursor_for_a_rejected_candidate() {
+    let vault = Vault::start(State::default());
+    let directory = tempfile::tempdir().unwrap();
+    let paths = paths(&directory);
+    let read: &ReadRoot = &|| {
+        Box::pin(async {
+            Ok(trust_root::Reply::Root {
+                pin: None,
+                generation: 2,
+            })
+        })
+    };
+    let session = ManagementSession::for_test(&vault.path).await.unwrap();
+    let mut cursor = Cursor::default();
+    let report = refresh(&session, &paths, &RootRefresh::new(read), &mut cursor, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.verdict, "invalid");
+    assert_eq!(cursor.read_version, None);
+}
+
+#[tokio::test]
 async fn manifest_sync_watch_seq_gap_epoch_change_and_stream_end_read_latest_again() {
     let vault = Vault::start(State::default());
     let directory = tempfile::tempdir().unwrap();

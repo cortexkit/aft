@@ -8505,6 +8505,12 @@ pub(crate) mod tests {
         assert_eq!(calls, 0);
 
         write_signed_manifest(&paths, fixture_manifest(), unix_seconds());
+        let changed = guard.delegate(&os_args(&["pr", "merge", "1", "--squash"]), |_| {
+            panic!("a native action classified before activation must not run")
+        });
+        assert_eq!(changed, 86);
+
+        let guard = manifest_guard::ManifestGuard::new(&paths);
         let status = guard.delegate(&os_args(&["pr", "merge", "1", "--squash"]), |_| {
             calls += 1;
             73
@@ -15017,7 +15023,10 @@ INHERITED FLAGS
 
         // A failed validation immediately enters the regressed arm; time passing
         // does not participate in manifest validity.
-        let ManifestResolution::Regressed { manifest, problem } = resolve_manifest(&paths, now)
+        let ManifestResolution::Regressed {
+            mut manifest,
+            problem,
+        } = resolve_manifest(&paths, now)
         else {
             panic!("expected the regressed arm");
         };
@@ -15059,6 +15068,24 @@ INHERITED FLAGS
                 code: RefusalCode::Unclassified,
                 ..
             }
+        ));
+        manifest
+            .tiers
+            .entry(Tier::Mechanical)
+            .or_default()
+            .push(TupleDecl::Details {
+                tuple: "alias set".into(),
+                platform: vec!["macos".into()],
+                api_match: None,
+                rationale: None,
+            });
+        assert!(matches!(
+            classify(&undeclared, &manifest, "macos"),
+            Classification::Mechanical
+        ));
+        assert!(matches!(
+            regressed_disposition(&undeclared, &manifest, "macos", &problem),
+            RegressedDisposition::Refuse { .. }
         ));
 
         // The self report is loud about the regressed validation failure.
