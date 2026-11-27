@@ -42,10 +42,21 @@ const router = {
   },
 };
 
-function setup(harness: "omp" | "pi" = "omp", withRouter = true, hashline = false, cwd?: string) {
+function setup(
+  harness: "omp" | "pi" = "omp",
+  withRouter = true,
+  hashline = false,
+  cwd?: string,
+  restrictToProjectRoot = false,
+) {
   const { api, tools } = makeMockApi();
   const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "AFT", output: "AFT" }));
-  const config = { disabled_tools: [], bash: true, github: { read: true, write: true } };
+  const config = {
+    disabled_tools: [],
+    bash: true,
+    github: { read: true, write: true },
+    restrict_to_project_root: restrictToProjectRoot,
+  };
   const ctx = makePluginContext(bridge, {
     config,
     hashlineEffective: hashline,
@@ -78,7 +89,7 @@ async function withFilesystemTool(
     mkdirSync(join(root, "tests"));
     const file = join(root, "src/example.ts");
     writeFileSync(file, "before\n");
-    await run({ ...setup("omp", true, false, root), root });
+    await run({ ...setup("omp", true, false, root, name === "grep"), root });
     expect(readFileSync(file, "utf8")).toBe("before\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -479,18 +490,28 @@ describe("OMP internal URL hand-back", () => {
   });
 
   test("grep filesystem errors name native arguments and the AFT form", async () => {
-    const s = setup();
-    await expect(
-      executeTool(
-        s.tools.get("grep")!,
-        { path: "src", pattern: "x", case: false, gitignore: false, skip: null },
-        s.extCtx,
-      ),
-    ).rejects.toThrow(/case.*gitignore.*skip.*offset/);
-    await expect(
-      executeTool(s.tools.get("grep")!, { path: ["src"], pattern: "x" }, s.extCtx),
-    ).rejects.toThrow(/path.*string path/);
-    expect(s.calls).toHaveLength(0);
+    await withFilesystemTool("grep", async (s) => {
+      const tool = s.tools.get("grep")!;
+      const { prepareArguments } = tool as unknown as {
+        prepareArguments(args: unknown): Record<string, unknown>;
+      };
+      for (const [field, value] of [
+        ["gitignore", false],
+        ["skip", 2],
+        ["paths", ["src"]],
+        ["path", []],
+        ["path", ["src", ""]],
+        ["path", ["src", 42]],
+        ["case", "false"],
+      ] as const) {
+        const params = { path: "src", pattern: "x", case: false, skip: null, [field]: value };
+        const refusal = `grep: invalid AFT filesystem arguments: ${field}.`;
+        expect(() => prepareArguments(params)).toThrow(refusal);
+        await expect(executeTool(tool, params, s.extCtx)).rejects.toThrow(refusal);
+      }
+      expect(s.calls).toHaveLength(0);
+      expect(s.invocations).toHaveLength(0);
+    });
   });
 
   test("bash filesystem errors name native arguments and the AFT form", async () => {
@@ -522,6 +543,61 @@ describe("OMP internal URL hand-back", () => {
       s.extCtx,
     );
     expect(s.calls).toHaveLength(1);
+  });
+
+  test("grep filesystem route accepts explicit paths and forwards the case flag", async () => {
+    await withFilesystemTool("grep", async (s) => {
+      const tool = s.tools.get("grep")!;
+      const { prepareArguments } = tool as unknown as {
+        prepareArguments(args: unknown): Record<string, unknown>;
+      };
+      const padded = {
+        pattern: "example",
+        path: ["src", "tests"],
+        case: false,
+        gitignore: true,
+        paths: [],
+        skip: null,
+      };
+      expect(Value.Check(tool.parameters as TSchema, padded)).toBe(true);
+      await executeTool(tool, prepareArguments(padded), s.extCtx);
+      await executeTool(tool, padded, s.extCtx);
+      const expected = {
+        pattern: "example",
+        path: [join(s.root, "src"), join(s.root, "tests")],
+        case_sensitive: false,
+      };
+      expect(s.calls.map(({ params }) => params.arguments)).toEqual([expected, expected]);
+
+      const native = { ...padded, path: ["src", "local://fixture"] };
+      expect(prepareArguments(native)).toBe(native);
+      await executeTool(tool, native, s.extCtx);
+      expect(s.invocations[0]).toBe(native);
+      expect(s.calls).toHaveLength(2);
+
+      mkdirSync(join(s.root, "src with spaces"));
+      await executeTool(
+        tool,
+        { ...padded, path: ["src with spaces", "missing tests"], case: true, skip: 0 },
+        s.extCtx,
+      );
+      expect(s.calls[2]?.params.arguments).toEqual({
+        pattern: "example",
+        path: [join(s.root, "src with spaces"), "missing tests"],
+        case_sensitive: true,
+      });
+
+      const { approval } = tool as unknown as { approval(args: unknown): string };
+      expect(approval(prepareArguments(padded))).toBe("read");
+      const outside = { ...padded, path: ["src", "../outside with spaces", "tests"] };
+      expect(approval(prepareArguments(outside))).toBe("exec");
+      await expect(executeTool(tool, outside, s.extCtx)).rejects.toThrow(
+        /outside with spaces.*outside the project root/,
+      );
+      expect(s.calls.slice(3).map(({ command, params }) => [command, params.path])).toEqual([
+        ["bash_artifact_owned", join(s.root, "../outside with spaces")],
+      ]);
+    });
   });
 
   test("URL arguments without invokeTool render as normal AFT output", async () => {

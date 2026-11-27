@@ -1,4 +1,4 @@
-import { coerceOptionalInt } from "@cortexkit/aft-bridge";
+import { coerceOptionalInt, isWellFormedUnicodeString } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionContext,
@@ -59,6 +59,13 @@ type OmpContext = ExtensionContext & {
     options?: { signal?: AbortSignal; onUpdate?: (result: AgentToolResult<unknown>) => void },
   ) => Promise<AgentToolResult<unknown>>;
 };
+
+export const OMP_FILESYSTEM_GREP = Symbol("OMP filesystem grep options");
+
+export interface OmpFilesystemGrepOptions {
+  path?: string[];
+  case?: boolean;
+}
 
 function pathEntries(value: unknown): string[] {
   if (Array.isArray(value)) return value.flatMap(pathEntries);
@@ -300,6 +307,30 @@ function normalizeFilesystemArguments(name: string, params: unknown): unknown {
   return normalized;
 }
 
+function separateOmpGrepOptions(args: Record<string, unknown>) {
+  const normalized = { ...args };
+  if (args.gitignore === true) delete normalized.gitignore;
+  if (args.skip === null || args.skip === 0) delete normalized.skip;
+  if (Array.isArray(args.paths) && args.paths.length === 0) delete normalized.paths;
+
+  const options: OmpFilesystemGrepOptions = {};
+  if (typeof args.case === "boolean") {
+    options.case = args.case;
+    delete normalized.case;
+  }
+  if (
+    Array.isArray(args.path) &&
+    args.path.length > 0 &&
+    Array.from(args.path).every(
+      (entry) => typeof entry === "string" && entry.length > 0 && isWellFormedUnicodeString(entry),
+    )
+  ) {
+    options.path = [...args.path];
+    delete normalized.path;
+  }
+  return { normalized, options };
+}
+
 function editEntries(value: unknown): unknown[] {
   if (typeof value === "string") {
     // The filesystem tool also accepts JSON-encoded edits. Inspect them before
@@ -382,16 +413,25 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
   if (!router || !["read", "write", "edit", "grep", "bash"].includes(tool.name)) return tool;
   const filesystemSchema = schemaDocument(tool.parameters);
   type PreparedArgs = Parameters<typeof tool.execute>[1];
-  function prepareFilesystem(params: unknown, normalize: boolean): PreparedArgs {
+  function prepareFilesystem(params: unknown, normalize: boolean) {
+    const args = asRecord(params);
+    if (tool.name === "grep" && normalize && args) {
+      // Keep OMP's explicit paths out of the string-only Pi schema. The grep
+      // executor uses the same permission check for each string or array target.
+      const { normalized, options } = separateOmpGrepOptions(args);
+      rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
+      const prepared = tool.prepareArguments ? tool.prepareArguments(normalized) : normalized;
+      return { prepared: prepared as PreparedArgs, grepOptions: options };
+    }
     const normalized = normalize ? normalizeFilesystemArguments(tool.name, params) : params;
     try {
       rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
-      if (tool.prepareArguments) return tool.prepareArguments(normalized);
+      if (tool.prepareArguments) return { prepared: tool.prepareArguments(normalized) };
       if (tool.name === "edit" && normalized !== params) {
         // Patch-only editing has no preparation hook to rule out incomplete edits.
         validateFilesystemArguments(tool.name, filesystemSchema, normalized);
       }
-      return normalized as PreparedArgs;
+      return { prepared: normalized as PreparedArgs };
     } catch (error) {
       // Blank native fields cannot turn an incomplete or conflicting edit into
       // a valid one. Keep the native-field refusal when the remaining edit fails.
@@ -408,7 +448,8 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
     prepareArguments(args) {
       // Native URL inputs must not undergo AFT's path/edit alias normalization.
       if (internalTarget(tool.name, args, router)) return args as PreparedArgs;
-      return prepareFilesystem(args, true);
+      const { prepared, grepOptions } = prepareFilesystem(args, true);
+      return grepOptions ? { ...prepared, ...grepOptions } : prepared;
     },
     async execute(id, params, signal, onUpdate, context) {
       const native = context as OmpContext;
@@ -426,11 +467,17 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
         });
         return delegatedResult(result, target) as AgentToolResult<TDetails>;
       }
-      const prepared = prepareFilesystem(params, !target);
+      const { prepared, grepOptions } = prepareFilesystem(params, !target);
       // The OMP schema is intentionally wider. Ordinary filesystem calls still
       // obey AFT's original schema and runtime validation (e.g. required content).
       validateFilesystemArguments(tool.name, filesystemSchema, prepared);
-      return tool.execute(id, prepared, signal, onUpdate, context);
+      return tool.execute(
+        id,
+        grepOptions ? { ...prepared, [OMP_FILESYSTEM_GREP]: grepOptions } : prepared,
+        signal,
+        onUpdate,
+        context,
+      );
     },
     renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
       const renderContext = context as RenderContextLike;

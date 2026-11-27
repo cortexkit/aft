@@ -10,7 +10,15 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
-import { createHarness, type Harness, prepareBinary, withoutTrailingStatusBar } from "./helpers.js";
+import { registerPiToolSurface, resolvePiToolSurface } from "../../tool-registration.js";
+import { executeTool, makeExtContext, makeMockApi } from "../tool-test-utils.js";
+import {
+  createHarness,
+  type Harness,
+  prepareBinary,
+  withoutTrailingStatusBar,
+  writeFixture,
+} from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = initialBinary.binaryPath ? describe : describe.skip;
@@ -162,5 +170,49 @@ maybeDescribe("hoisted tools (real bridge)", () => {
     });
     const text = harness.text(result);
     expect(text).toContain("multi-match.ts");
+  });
+
+  test("OMP grep honors case and explicit path scopes through the real bridge", async () => {
+    await writeFixture(harness, "grep scope/lower.txt", "ompCaseMarker\n");
+    await writeFixture(harness, "grep other/upper.txt", "OMPCASEMARKER\n");
+    await writeFixture(harness, "not selected.txt", "OMPCASEMARKER\n");
+    const { api, tools } = makeMockApi();
+    const config = { disabled_tools: [] };
+    registerPiToolSurface(
+      api,
+      {
+        pool: harness.pool,
+        config,
+        storageDir: harness.path(".aft-storage"),
+        ompRouter: {
+          canHandle: () => false,
+          canResolve: () => false,
+          writeTarget: () => undefined,
+        },
+      },
+      resolvePiToolSurface(config),
+      "omp",
+    );
+    const tool = tools.get("grep")!;
+    const args = {
+      pattern: "ompCaseMarker",
+      path: ["grep scope", "grep other"],
+      gitignore: true,
+      paths: [],
+      skip: null,
+    };
+    const grep = async (params: Record<string, unknown>) => {
+      const result = await executeTool(tool, params, makeExtContext(harness.tempDir));
+      return harness.text(result as Awaited<ReturnType<Harness["callTool"]>>);
+    };
+    const insensitive = await grep({ ...args, case: false });
+    expect(insensitive).toContain("lower.txt");
+    expect(insensitive).toContain("upper.txt");
+    expect(insensitive).not.toContain("not selected.txt");
+    for (const params of [args, { ...args, case: true }]) {
+      const sensitive = await grep(params);
+      expect(sensitive).toContain("lower.txt");
+      expect(sensitive).not.toContain("upper.txt");
+    }
   });
 });
