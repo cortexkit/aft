@@ -423,6 +423,52 @@ class CISpeedWorkflowTests(unittest.TestCase):
             self.assertNotIn("$RUNNER_TEMP", call)
             self.assertNotIn('"$archive"', call)
 
+    @unittest.skipIf(os.name == "nt", "uses POSIX executables for curl and tar stubs")
+    def test_nextest_dns_fallback_still_checks_the_archive_before_extraction(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        action = workflow_gates.parse_workflow(str(root / ".github/actions/setup-nextest/action.yml"))
+        install = next(step for step in action["runs"]["steps"] if step.get("name") == "Download and install cargo-nextest")
+        primary = "https://get.nexte.st/0.9.138/mac"
+        fallback = ("https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.138/"
+                    "cargo-nextest-0.9.138-universal-apple-darwin.tar.gz")
+        for valid in (True, False):
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as tmp:
+                fixture = Path(tmp)
+                curl = fixture / "curl"
+                curl.write_text(textwrap.dedent("""\
+                    #!/bin/bash
+                    for arg in "$@"; do
+                      if [[ "$output_next" == 1 ]]; then output="$arg"; output_next=0; fi
+                      if [[ "$arg" == --output ]]; then output_next=1; fi
+                    done
+                    url="${!#}"
+                    printf '%s\\n' "$url" >> "$DOWNLOADS"
+                    case "$url" in
+                      https://get.nexte.st/*) exit 6 ;;
+                      *) printf '%s\\n' "$PAYLOAD" > "$output" ;;
+                    esac
+                    """))
+                curl.chmod(0o755)
+                tar = fixture / "tar"
+                tar.write_text('#!/bin/bash\nprintf "%s\\n" "$1" >> "$EXTRACTIONS"\necho cargo-nextest\n')
+                tar.chmod(0o755)
+                downloads, tar_calls = fixture / "downloads", fixture / "tar-calls"
+                env = dict(os.environ, PATH=f"{fixture}:{os.environ['PATH']}", HOME=tmp, RUNNER_TEMP=tmp,
+                           RUNNER_ENVIRONMENT="github-hosted", NEXTEST_VERSION="0.9.138", NEXTEST_RUNNER_OS="macOS",
+                           DOWNLOADS=str(downloads), EXTRACTIONS=str(tar_calls),
+                           PAYLOAD="fixture archive" if valid else "corrupt archive")
+                # Keep the actual checksum command but give it a small, known payload.
+                pin = "124baa34d160355fa8a8bed053856270cfcf132659e76a0bc8bbcdfc093266b7"
+                script = install["run"].replace(pin, hashlib.sha256(b"fixture archive\n").hexdigest())
+                result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(downloads.read_text().splitlines(), [primary, fallback], result.stderr)
+                if valid:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(tar_calls.read_text().splitlines(), ["-tzf", "-xzf"])
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(tar_calls.exists(), "a mismatched fallback may not reach tar")
+
     def test_tool_downloads_are_never_piped_to_tar(self) -> None:
         root = Path(__file__).resolve().parents[2] / ".github"
         violations = []
@@ -444,7 +490,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
         download_sites = [
             path.relative_to(root).as_posix()
             for path in github.rglob("*.yml")
-            if "get.nexte.st/" in path.read_text()
+            if re.search(r"get\.nexte\.st/|github\.com/nextest-rs/nextest/releases/download/", path.read_text())
         ]
         self.assertEqual(download_sites, [".github/actions/setup-nextest/action.yml"])
 
