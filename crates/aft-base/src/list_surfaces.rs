@@ -431,7 +431,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming, test_verdict, cap_test_verdict, bounded_failure_sections",
+            predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming, test_verdict, cap_test_verdict, cap_required_lines, bounded_failure_sections",
         }],
     },
     SurfaceEntry { requires: None, command: "bash", mode: "changed_files", list_id: "bash.changed_files", unit: Unit::Files, narrow: &[], reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "render" }, ReasonEntry { reason: Reason::TimeLimit, kind: ReasonKind::Bounding, predicate_name: "render" }] },

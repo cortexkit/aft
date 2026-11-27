@@ -1,6 +1,10 @@
 use crate::compress::generic::{ceil_char_boundary, floor_char_boundary};
 
 pub const FINAL_OUTPUT_CAP_BYTES: usize = 16 * 1024;
+// Reserve room for `\nshown N of M lines (cap)` in the status preview.
+pub(super) const FINAL_OUTPUT_BODY_CAP_BYTES: usize = FINAL_OUTPUT_CAP_BYTES
+    - "\nshown  of  lines (cap)".len()
+    - 2 * (usize::MAX.ilog10() as usize + 1);
 pub const FINAL_OUTPUT_HEAD_BYTES: usize = 6 * 1024;
 pub const FINAL_OUTPUT_TAIL_BYTES: usize = 10 * 1024;
 
@@ -185,11 +189,11 @@ fn offset_in(input: &str, line: &str) -> usize {
 }
 
 pub fn cap_final_output(input: &str) -> CappedText {
-    cap_final_output_preserving(input, None, &[], false)
+    cap_final_output_at_threshold(input, None, &[], false, FINAL_OUTPUT_CAP_BYTES)
 }
 
 pub fn cap_final_output_with_marker(input: &str, marker: &str) -> CappedText {
-    cap_final_output_preserving(input, Some(marker), &[], false)
+    cap_final_output_at_threshold(input, Some(marker), &[], false, FINAL_OUTPUT_CAP_BYTES)
 }
 
 /// A compressed reply must retain the ending of each capture, not just the
@@ -202,11 +206,27 @@ pub(crate) fn cap_final_output_preserving(
     final_lines: &[String],
     failed: bool,
 ) -> CappedText {
+    cap_final_output_at_threshold(
+        input,
+        marker,
+        final_lines,
+        failed,
+        FINAL_OUTPUT_BODY_CAP_BYTES,
+    )
+}
+
+fn cap_final_output_at_threshold(
+    input: &str,
+    marker: Option<&str>,
+    final_lines: &[String],
+    failed: bool,
+    threshold: usize,
+) -> CappedText {
     let (pieced, truncated) = cap_preserving_pieces(
         input,
-        FINAL_OUTPUT_CAP_BYTES,
+        threshold,
         FINAL_OUTPUT_HEAD_BYTES,
-        FINAL_OUTPUT_TAIL_BYTES,
+        FINAL_OUTPUT_TAIL_BYTES.min(threshold - FINAL_OUTPUT_HEAD_BYTES),
         marker,
         final_lines,
         failed,
@@ -224,7 +244,7 @@ fn cap_preserving_pieces(
     marker: Option<&str>,
     final_lines: &[String],
     rescue_failures: bool,
-    bound_ordinary_last_line: bool,
+    completion_preview: bool,
 ) -> (PiecedText, bool) {
     cap_test_verdict(
         input,
@@ -234,7 +254,7 @@ fn cap_preserving_pieces(
         marker,
         final_lines,
         rescue_failures,
-        bound_ordinary_last_line,
+        completion_preview,
     )
     .map(|pieced| (pieced, true))
     .unwrap_or_else(|| match marker {
@@ -314,11 +334,9 @@ pub(crate) fn cap_completion_output_preserving_pieces(
 /// to stderr; concatenating those streams puts the results in the *middle*.
 /// A chronological byte cut can therefore hide every failure in a failed run.
 ///
-/// The byte cap is soft when mandatory names/totals or final command lines
-/// themselves exceed it: the verdict takes precedence over the preview budget.
-/// With `bound_ordinary_last_line` (completion previews), an ordinary last line
-/// too long for the budget is not made mandatory: with no verdict or stream
-/// ending to protect, the ordinary head/tail cut keeps a marked fragment.
+/// Status previews keep even required lines within the byte budget. Completion
+/// previews keep the existing policy: explicit verdicts and stream endings take
+/// precedence, but an oversized ordinary last line goes through the head/tail cut.
 #[allow(clippy::too_many_arguments)]
 fn cap_test_verdict(
     input: &str,
@@ -328,17 +346,15 @@ fn cap_test_verdict(
     marker: Option<&str>,
     final_lines: &[String],
     rescue_failures: bool,
-    bound_ordinary_last_line: bool,
+    completion_preview: bool,
 ) -> Option<PiecedText> {
     if input.len() + marker.map_or(0, |marker| marker.len() + 1) <= threshold {
         return None;
     }
     let lines: Vec<&str> = input.trim_end().lines().collect();
     let verdict = crate::compress::cargo::test_verdict(&lines);
-    // Even a non-runner command's last line is never split by a compressed
-    // byte cap. Ordinary fitting tails retain their original cap policy.
     let last = lines.len().checked_sub(1)?;
-    let last_line_overflows = bound_ordinary_last_line && lines[last].len() >= threshold;
+    let last_line_overflows = completion_preview && lines[last].len() >= threshold;
     if !rescue_failures
         && verdict.is_none()
         && final_lines.is_empty()
@@ -379,11 +395,10 @@ fn cap_test_verdict(
             *is_empty = false;
         }
     }
-    // Each kept line is copied from the input; the empty-target summary and
-    // the joining newlines are written by the cap.
+    let empty_summary = format!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out ({empty_count} empty test targets)");
     let mut context = PiecedText::default();
-    let mut essentials = PiecedText::default();
-    let (mut context_lines, mut essential_lines) = (0, 0);
+    let mut essentials = Vec::new();
+    let mut context_lines = 0;
     let mut counted_empty = false;
     for (index, line) in lines.iter().enumerate() {
         let line_range = offset_in(input, line)..offset_in(input, line) + line.len();
@@ -391,14 +406,10 @@ fn cap_test_verdict(
             if empty[index] && counted_empty {
                 continue;
             }
-            if essential_lines > 0 {
-                essentials.insert("\n");
-            }
-            essential_lines += 1;
             if required[index] {
-                essentials.copy(input, line_range);
+                essentials.push((Some(line_range.start), *line));
             } else {
-                essentials.insert(&format!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out ({empty_count} empty test targets)"));
+                essentials.push((None, empty_summary.as_str()));
                 counted_empty = true;
             }
         } else {
@@ -409,7 +420,28 @@ fn cap_test_verdict(
             context.copy(input, line_range);
         }
     }
-    let marker = marker.unwrap_or("[truncated output; full output unavailable]");
+    let marker = marker
+        .filter(|marker| !marker.is_empty())
+        .unwrap_or("[truncated output; full output unavailable]");
+    let marker = if completion_preview {
+        marker
+    } else {
+        &marker[..floor_char_boundary(
+            marker,
+            threshold
+                .saturating_sub(REQUIRED_LINE_MIN_BYTES + 2)
+                .min(marker.len()),
+        )]
+    };
+    let essentials = cap_required_lines(
+        input,
+        &essentials,
+        if completion_preview {
+            usize::MAX
+        } else {
+            threshold.saturating_sub(marker.len() + 2)
+        },
+    );
     let available = threshold.saturating_sub(essentials.text.len() + marker.len() + 2);
     // Keep the familiar head plus up to twenty final context lines, bounded by
     // the compressor tail window. Mandatory verdict lines do not spend that
@@ -445,10 +477,10 @@ fn cap_test_verdict(
     // lines again from the new cut; the third pass reserves the block's
     // largest possible size, so it always fits.
     let mut rescued = PiecedText::default();
-    if rescue_failures {
+    if rescue_failures && available > crate::compress::PRESERVED_FAILURES_LABEL.len() + 2 {
         let mut reserve = 0;
         for attempt in 0..3 {
-            rescued = rescued_failure_lines(&context.text, &capped);
+            rescued = rescued_failure_lines(&context.text, &capped, available);
             let needed = if rescued.text.is_empty() {
                 0
             } else {
@@ -476,6 +508,65 @@ fn cap_test_verdict(
     Some(capped)
 }
 
+// A cut line needs room for the byte-count marker and some actual output.
+const REQUIRED_LINE_MIN_BYTES: usize = 64;
+
+fn cap_required_lines(input: &str, lines: &[(Option<usize>, &str)], budget: usize) -> PiecedText {
+    let total = lines
+        .iter()
+        .map(|(_, line)| line.len() + 1)
+        .sum::<usize>()
+        .saturating_sub(1);
+    let (lines, per_line) = if total <= budget {
+        (lines, usize::MAX)
+    } else {
+        // If even small fragments won't all fit, keep the most recent verdicts
+        // and the final line. Give short lines their exact size before sharing
+        // the remaining bytes evenly among the long lines.
+        let first = lines
+            .len()
+            .saturating_sub((budget + 1) / (REQUIRED_LINE_MIN_BYTES + 1));
+        let lines = &lines[first..];
+        let mut lengths: Vec<_> = lines.iter().map(|(_, line)| line.len()).collect();
+        lengths.sort_unstable();
+        let mut room = budget.saturating_sub(lines.len().saturating_sub(1));
+        let mut per_line = 0;
+        for (index, len) in lengths.into_iter().enumerate() {
+            per_line = room / (lines.len() - index);
+            if len > per_line {
+                break;
+            }
+            room -= len;
+        }
+        (lines, per_line)
+    };
+
+    let mut output = PiecedText::default();
+    for (index, &(start, line)) in lines.iter().enumerate() {
+        if index > 0 {
+            output.insert("\n");
+        }
+        let append = |output: &mut PiecedText, range: std::ops::Range<usize>| match start {
+            Some(start) => output.copy(input, start + range.start..start + range.end),
+            None => output.insert(&line[range]),
+        };
+        if line.len() <= per_line {
+            append(&mut output, 0..line.len());
+        } else {
+            // Keep the cut marker inline so one input line still counts as one
+            // displayed line in the bash output.
+            let marker_len = "...<truncated  bytes>...".len() + line.len().ilog10() as usize + 1;
+            let room = per_line - marker_len;
+            let head = floor_char_boundary(line, room / 3);
+            let tail = ceil_char_boundary(line, line.len() - (room - head));
+            append(&mut output, 0..head);
+            output.insert(&format!("...<truncated {} bytes>...", tail - head));
+            append(&mut output, tail..line.len());
+        }
+    }
+    output
+}
+
 /// Most failure lines a failed command's reply keeps from the cut middle of
 /// its output, and the most bytes those lines may take together.
 const RESCUED_FAILURE_LINES: usize = 20;
@@ -496,7 +587,7 @@ thread_local! {
 /// dropped, in output order, in `context` coordinates. Empty when none was
 /// dropped. Scanning stops at the line limit; a line larger than the bytes
 /// left is skipped. A line already shown, or rescued once, is not repeated.
-fn rescued_failure_lines(context: &str, capped: &PiecedText) -> PiecedText {
+fn rescued_failure_lines(context: &str, capped: &PiecedText, available: usize) -> PiecedText {
     let mut gaps = Vec::new();
     let mut kept_to = 0;
     for piece in &capped.pieces {
@@ -537,7 +628,15 @@ fn rescued_failure_lines(context: &str, capped: &PiecedText) -> PiecedText {
             let line_start = start;
             start = end + 1;
             let trimmed = line.trim();
-            if trimmed.is_empty() || bytes + line.len() > RESCUED_FAILURE_BYTES {
+            let block_size = if block.text.is_empty() {
+                crate::compress::PRESERVED_FAILURES_LABEL.len()
+            } else {
+                block.text.len()
+            };
+            if trimmed.is_empty()
+                || bytes + line.len() > RESCUED_FAILURE_BYTES
+                || block_size + line.len() + 2 > available
+            {
                 continue;
             }
             lower.clear();
@@ -852,6 +951,14 @@ pub fn retained_json_output_pointer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_preview_reserves_space_for_list_trailer() {
+        let input = "0123456789abcde\n".repeat(FINAL_OUTPUT_CAP_BYTES / 16);
+        let preview = cap_final_output_preserving(&input, None, &[], false);
+        assert!(preview.truncated);
+        assert!(preview.text.len() <= FINAL_OUTPUT_BODY_CAP_BYTES);
+    }
 
     #[test]
     fn capped_pieces_rebuild_the_capped_text_from_input_ranges() {

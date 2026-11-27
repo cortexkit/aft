@@ -53,7 +53,7 @@ use super::buffer::{combine_streams, BgBuffer, DiskTruncation, StreamKind, Token
 use super::output::{
     completion_preview_threshold, json_output_pointer, quote_path, retained_json_output_pointer,
     COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES, COMPRESS_INPUT_TAIL_BYTES,
-    FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
+    FINAL_OUTPUT_BODY_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
     RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
 };
 use super::persistence::{
@@ -15411,7 +15411,7 @@ fn render_body_with_recovery_marker(body: &str, recovery: &mut RecoveryContext) 
     render_body_with_recovery_marker_at_cap(
         body,
         recovery,
-        FINAL_OUTPUT_CAP_BYTES,
+        FINAL_OUTPUT_BODY_CAP_BYTES,
         |input| super::output::cap_final_output_preserving(input, None, &final_lines, failed),
         |input, marker| {
             super::output::cap_final_output_preserving(input, Some(marker), &final_lines, failed)
@@ -17447,6 +17447,8 @@ mod memory_limit_tests;
 
 #[cfg(test)]
 mod tests {
+    use crate::bash_background::output::FINAL_OUTPUT_CAP_BYTES;
+
     #[test]
     fn bash_background_saved_render_golden() {
         let dir = tempfile::tempdir().unwrap();
@@ -22292,9 +22294,15 @@ mod tests {
     }
 
     #[test]
-    fn gate_tail_byte_caps_keep_both_streams_oversized_final_lines() {
-        let stdout_last = format!("STDOUT VERDICT {}", "🦀".repeat(FINAL_OUTPUT_CAP_BYTES));
-        let stderr_last = format!("STDERR VERDICT {}", "é".repeat(FINAL_OUTPUT_CAP_BYTES));
+    fn gate_tail_byte_caps_keep_fragments_of_both_oversized_stream_endings() {
+        let stdout_last = format!(
+            "STDOUT VERDICT {} stdout-end",
+            "🦀".repeat(FINAL_OUTPUT_CAP_BYTES)
+        );
+        let stderr_last = format!(
+            "STDERR VERDICT {} stderr-end",
+            "é".repeat(FINAL_OUTPUT_CAP_BYTES)
+        );
         let stdout = format!(
             "{}\n{stdout_last}\n\n  \n",
             cargo_verdict_noise("stdout context", 2000)
@@ -22304,11 +22312,85 @@ mod tests {
             cargo_verdict_noise("stderr context", 2000)
         );
         let (foreground, completion) = gate_tail_agent_text("custom-command", &stdout, &stderr);
-        for text in [foreground, completion] {
-            assert!(text.contains(&stdout_last), "stdout's final line was cut");
-            assert!(text.contains(&stderr_last), "stderr's final line was cut");
-            assert_eq!(text.matches(&stdout_last).count(), 1);
-            assert_eq!(text.matches(&stderr_last).count(), 1);
+        assert!(
+            foreground.len() <= FINAL_OUTPUT_CAP_BYTES,
+            "{} bytes",
+            foreground.len()
+        );
+        for fragment in [
+            "STDOUT VERDICT",
+            "stdout-end",
+            "STDERR VERDICT",
+            "stderr-end",
+        ] {
+            assert_eq!(foreground.matches(fragment).count(), 1, "{fragment}");
+        }
+        assert_eq!(foreground.matches("...<truncated ").count(), 2);
+        assert!(!completion.contains(&stdout_last));
+        assert!(!completion.contains(&stderr_last));
+    }
+
+    #[test]
+    fn bash_status_preview_caps_sampled_long_final_line() {
+        const MIB: usize = 1024 * 1024;
+        const HEAD: &str = "long-line-start ";
+        const TAIL: &str = " long-line-end";
+        const VERDICT: &str =
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
+
+        for (prefix_bytes, line_bytes) in [(100 * MIB, 8 * MIB), (0, 4 * MIB)] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = BgTaskRegistry::default();
+            let mut stdout = String::with_capacity(prefix_bytes + line_bytes + 1);
+            let line = format!("{:063}\n", 0);
+            for _ in 0..prefix_bytes / line.len() {
+                stdout.push_str(&line);
+            }
+            stdout.push_str(HEAD);
+            stdout.extend(std::iter::repeat_n(
+                'x',
+                line_bytes - HEAD.len() - TAIL.len(),
+            ));
+            stdout.push_str(TAIL);
+            stdout.push('\n');
+            let (task_id, task) = insert_terminal_piped_task(
+                &registry,
+                &dir,
+                "custom-command",
+                &stdout,
+                &format!("{VERDICT}\n"),
+                true,
+            );
+            task.lock_state()
+                .unwrap()
+                .metadata
+                .mark_terminal(BgTaskStatus::Failed, Some(1), None);
+            drop(stdout);
+
+            let snapshot = registry
+                .status(
+                    &task_id,
+                    "session",
+                    None,
+                    Some(dir.path()),
+                    RUNNING_OUTPUT_PREVIEW_BYTES,
+                )
+                .unwrap();
+            let preview = &snapshot.output_preview;
+            assert!(
+                preview.len() <= FINAL_OUTPUT_CAP_BYTES,
+                "{line_bytes}-byte line produced {} preview bytes",
+                preview.len()
+            );
+            assert!(snapshot.output_truncated);
+            assert!(preview.contains(VERDICT));
+            assert!(preview.contains(TAIL));
+            assert!(preview.contains("...<truncated "));
+            if prefix_bytes == 0 {
+                assert!(preview.contains(HEAD));
+            }
+            assert_eq!(snapshot.output_path.as_deref(), task.paths.stdout.to_str());
+            assert!(preview.contains("output: read") || preview.contains("use bash_status("));
         }
     }
 
