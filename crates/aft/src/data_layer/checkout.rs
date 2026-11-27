@@ -7518,8 +7518,10 @@ pub fn other() { callee(); }
         });
         assert_eq!(layer.engines.reap_idle_at_for_test(0), Some(2_000));
 
-        // A keeper probe can own a populated slot. A missed census sample
-        // does not mean the engine went away; inspect the slot itself.
+        // The idle keeper briefly locks a populated slot while it checks it.
+        // While that lock is held, the memory report for this checkout's
+        // engine comes back empty, which doesn't mean the engine went away.
+        // So check the slot itself.
         let held = checkout.engine.lock().unwrap();
         assert!(held.is_some());
         assert!(checkout.engine_census_bytes().is_none());
