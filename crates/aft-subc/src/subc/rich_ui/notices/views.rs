@@ -15,31 +15,41 @@ struct Published {
     template: NoticeViewTemplates,
 }
 
-static VIEWS: LazyLock<BTreeMap<String, NoticeView>> = LazyLock::new(|| {
-    // The three notice kinds share the same published schema and templates.
-    let mut published: Published =
-        serde_json::from_str(include_str!("shipped.json")).expect("committed notice view");
-    redeclare(&mut published.template.row);
-    redeclare(&mut published.template.page);
-    Kind::ALL
-        .into_iter()
-        .map(|kind| {
-            let pin =
-                notice_view_key("aft", kind.name(), Kind::VERSION).expect("shipped notice pin");
-            let view = NoticeView::new(
-                NoticeViewDefinition::new(
-                    kind.name(),
-                    Kind::VERSION,
-                    published.data_schema.clone(),
-                ),
-                published.template.clone(),
-                published.template_revision + 1,
-            );
-            view.check_pin("aft", &pin).expect("shipped notice view");
-            (pin, view)
-        })
-        .collect()
-});
+static VIEWS: LazyLock<BTreeMap<String, NoticeView>> =
+    LazyLock::new(|| {
+        // All notice kinds started with the same schema and templates.
+        let mut published: Published =
+            serde_json::from_str(include_str!("shipped.json")).expect("committed notice view");
+        redeclare(&mut published.template.row);
+        redeclare(&mut published.template.page);
+        Kind::ALL
+            .into_iter()
+            .map(|kind| {
+                let pin =
+                    notice_view_key("aft", kind.name(), Kind::VERSION).expect("shipped notice pin");
+                let mut template = published.template.clone();
+                let mut revision = published.template_revision + 1;
+                if matches!(kind, Kind::Finished) {
+                    template.page["source"] =
+                        serde_json::json!(crate::subc::tool_views::current::with_bash_title(
+                            concat!(include_str!("status.ui"), "\n", include_str!("page.ui"))
+                        ));
+                    revision += 1;
+                }
+                let view = NoticeView::new(
+                    NoticeViewDefinition::new(
+                        kind.name(),
+                        Kind::VERSION,
+                        published.data_schema.clone(),
+                    ),
+                    template,
+                    revision,
+                );
+                view.check_pin("aft", &pin).expect("shipped notice view");
+                (pin, view)
+            })
+            .collect()
+    });
 
 pub(in crate::subc) fn view_pins() -> impl Iterator<Item = &'static String> {
     VIEWS.keys()

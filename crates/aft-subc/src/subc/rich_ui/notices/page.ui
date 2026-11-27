@@ -12,4 +12,4 @@
 
 {input.output_cut ? <ToolText text="Earlier output isn't shown." tone="muted" /> : null}
 
-<OpenItem id={"shell:" + input.task_id} label={"Shell " + input.task_id} />
+<OpenItem id={"shell:" + input.task_id} label={$BASH_TITLE} />

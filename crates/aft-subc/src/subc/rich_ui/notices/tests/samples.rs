@@ -112,7 +112,8 @@ fn notice_records_match_occipital_phone_reader_sample_contract() {
             aft_sample["templateRevision"],
             published["template_revision"]
         );
-        assert_eq!(view.template_revision, 2);
+        let finished = name == "finished";
+        assert_eq!(view.template_revision, if finished { 3 } else { 2 });
         assert_eq!(view.notice.data_schema, published["data_schema"]);
         for (slot, document, old_digest, digest) in [
             (
@@ -142,8 +143,15 @@ fn notice_records_match_occipital_phone_reader_sample_contract() {
             };
             let mut prior = published["template"][slot].clone();
             assert_eq!(hash(&prior), old_digest);
-            assert_eq!(hash(document), digest);
             prior["catalog"]["digest"] = document["catalog"]["digest"].clone();
+            let digest = if finished && slot == "page" {
+                assert_eq!(hash(&prior), digest);
+                prior["source"] = document["source"].clone();
+                "sha256:be7eff349c9011a45bdfaf6f6e3adcff37e35affc2fae4e32d63f73580a5f580"
+            } else {
+                digest
+            };
+            assert_eq!(hash(document), digest);
             assert_eq!(&prior, document);
         }
     }

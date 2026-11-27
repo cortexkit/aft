@@ -8,6 +8,8 @@ use occipital_lang::{
 use occipital_registry::{view as registry, Template};
 use serde_json::json;
 
+const FINISHED_NOTICE: &str = "nv1:aft:bash_finished:1";
+
 fn fixture_json<T: serde::de::DeserializeOwned>(relative: &str) -> T {
     let path = crate::test_support::manifest_dir()
         .join("../aft/tests/fixtures")
@@ -35,10 +37,7 @@ fn export_occipital_check_inputs() {
             let view = notices::view(pin).unwrap();
             // The CLI takes a tool view. A notice has its data in input and does
             // not have a tool record or completion; use an empty record schema.
-            let manifest = json!({
-                "record_schema":{"name":"aft/notice/1", "revision":1, "fields":{}},
-                "reads":[], "template":view.template
-            });
+            let manifest = notice_manifest(&view);
             (
                 view.notice.data_schema.clone(),
                 manifest,
@@ -61,6 +60,13 @@ fn export_occipital_check_inputs() {
         let document = json!({"input_schema":input_schema,"view":view,"samples":samples});
         std::fs::write(dir.join(filename), serde_json::to_vec(&document).unwrap()).unwrap();
     }
+}
+
+fn notice_manifest(view: &cortexkit_role_tool_provider::views::NoticeView) -> Value {
+    json!({
+        "record_schema":{"name":"aft/notice/1", "revision":1, "fields":{}},
+        "reads":[], "template":view.template
+    })
 }
 
 fn tool_samples(name: &str, schema: &Value, record_schema: &RecordSchema) -> Vec<Value> {
@@ -234,14 +240,64 @@ fn notice_samples(pin: &str) -> Vec<Value> {
     );
     let riding: Value =
         fixture_json("notice-records/phone-reader-notice-records-aft-v2/03-notices-riding.json");
-    wake["result"]["notices"]
+    let mut samples: Vec<_> = wake["result"]["notices"]
         .as_object()
         .unwrap()
         .values()
         .chain([&riding["result"]["calls"]["ck_one"][0]["noticeRecord"]])
         .filter(|record| record["view"] == pin)
         .map(|record| json!({"input":record["data"]}))
-        .collect()
+        .collect();
+    if pin == FINISHED_NOTICE {
+        samples.extend(finished_notice_samples());
+    }
+    samples
+}
+
+fn finished_notice_samples() -> impl Iterator<Item = Value> {
+    bash_row_samples().into_iter().map(|sample| {
+        let mut input = sample["input"].as_object().unwrap().clone();
+        input.extend([
+            ("kind".into(), json!("finished")),
+            ("status".into(), json!("completed")),
+            ("task_id".into(), json!("bash-demo1")),
+            ("output_preview".into(), json!("")),
+            ("output_cut".into(), json!(false)),
+        ]);
+        json!({"input":input,"label":sample["title"]})
+    })
+}
+
+#[test]
+fn finished_notice_link_uses_bash_title_without_changing_destination() {
+    let view = notices::view(FINISHED_NOTICE).unwrap();
+    let manifest = notice_manifest(&view);
+    let schema = serde_json::from_value(manifest["record_schema"].clone()).unwrap();
+    for sample in finished_notice_samples() {
+        let tree = evaluate(
+            FINISHED_NOTICE,
+            &manifest["template"]["page"],
+            &schema,
+            &view.notice.data_schema,
+            &sample,
+            Profile::ToolPage,
+        );
+        let Some(TreeNode::Markdown { children, .. }) = tree.blocks.last() else {
+            panic!("expected an inline link at the bottom of the finished card: {tree:?}");
+        };
+        let [TreeNode::Component { name, props, .. }] = children.as_slice() else {
+            panic!("expected the Shells link, got {children:?}");
+        };
+        assert_eq!(name.as_str(), "OpenItem");
+        let prop = |key| {
+            props.iter().find_map(|(name, value)| match value {
+                TreeValue::String(value) if name.as_str() == key => Some(value.as_str()),
+                _ => None,
+            })
+        };
+        assert_eq!(prop("id"), Some("shell:bash-demo1"));
+        assert_eq!(prop("label"), sample["label"].as_str(), "{sample}");
+    }
 }
 
 // The CLI checks page source but only measures rows. Measure the evaluated
