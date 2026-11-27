@@ -192,6 +192,9 @@ The **Since** column names the minimum signed manifest version unless noted.
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
 | `api` POST `/repos/*/*/actions/runs/*/approve` | ADMINISTRATION (fork-run safety check) | v30 |
 | `secret list` (repository scope, names and update dates only) | ADMINISTRATION (operator read) | v30 |
+| `api` PUT `/repos/*/*/environments/*` | ADMINISTRATION | v30 |
+| `api` POST `/repos/*/*/environments/*/deployment-branch-policies` | ADMINISTRATION | v30 |
+| `secret set NAME --env ENV` (repository scope, value from stdin) | ADMINISTRATION | v30 |
 | `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
 | `repo rename`, `repo create` | ADMINISTRATION-AS-OPERATOR | v19 |
 | `workflow disable`, `workflow enable` | ADMINISTRATION-AS-OPERATOR | v19 |
@@ -245,6 +248,22 @@ values. Select a repository with `-R OWNER/REPO` or let the shim use `GH_REPO`
 or the current checkout's GitHub origin. The `--app` choices are `actions`,
 `dependabot`, and `codespaces`; `--json` accepts `name` and `updatedAt`.
 Organization, user, and environment scopes are refused.
+
+Deployment environment writes require the signed v30 rows and the audited
+operator bypass, even for unbound repositories. PUT an environment or POST a
+deployment branch/tag policy by naming an explicit GitHub repository and one
+environment path segment. Supply the API body as `--input -` or as `-f`/`-F`
+fields, not both. File-based input and extra options are refused. Field-free
+GETs and previously declared operations keep their existing routing. An
+undeclared write to an environment or its subresources, or `secret delete`
+with an environment selector, cannot use the generic unbound bypass.
+
+For `secret set NAME --env ENV`, select the repository with `-R OWNER/REPO`
+or use the current repository. Pipe or redirect the value into stdin;
+interactive input, `--body`/`-b`, `--env-file`, and other scopes and options
+are refused. The shim sends stdin directly to upstream gh and suppresses its
+output; the exit status still reports success or failure. The audit identifies
+the repository, environment, and secret name, not the value.
 
 Every row is declared for `macos` and `linux`: the schema requires a non-empty
 `platform` list on tuples and API rules alike, so no row is OS-neutral.

@@ -5,6 +5,10 @@
       {
         "tuple": "secret list",
         "platform": ["macos", "linux"]
+      },
+      {
+        "tuple": "secret set",
+        "platform": ["macos", "linux"]
       }
     ]
   },
@@ -12,6 +16,18 @@
     {
       "method": "POST",
       "path_glob": "/repos/*/*/actions/runs/*/approve",
+      "tier": "admin",
+      "platform": ["macos", "linux"]
+    },
+    {
+      "method": "PUT",
+      "path_glob": "/repos/*/*/environments/*",
+      "tier": "admin",
+      "platform": ["macos", "linux"]
+    },
+    {
+      "method": "POST",
+      "path_glob": "/repos/*/*/environments/*/deployment-branch-policies",
       "tier": "admin",
       "platform": ["macos", "linux"]
     }

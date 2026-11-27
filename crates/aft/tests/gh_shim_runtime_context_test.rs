@@ -494,6 +494,9 @@ mod rename_guard;
 #[path = "gh_shim/manifest_unavailable.rs"]
 mod manifest_unavailable;
 
+#[path = "gh_shim/environment_secret_stdin.rs"]
+mod environment_secret_stdin;
+
 #[test]
 fn gh_shim_child_override_leaves_operator_state_canary_untouched() {
     let temp = tempfile::tempdir().expect("create test root");

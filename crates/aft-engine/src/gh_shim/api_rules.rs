@@ -14,6 +14,8 @@ pub(super) fn api_rule_matches_path(rule: &ApiRule, path: &str) -> bool {
             | STACK_UNSTACK_PATH_GLOB
             | MERGE_ASYNC_PATH_GLOB
             | super::workflow_approval::PATH_GLOB
+            | super::environment_admin::PUT_GLOB
+            | super::environment_admin::POLICY_GLOB
     ) {
         // glob's `*` can span slashes. These reviewed endpoints need each `*`
         // to match one path segment, not a subtree.

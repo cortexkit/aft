@@ -1,6 +1,7 @@
 //! Native gh is an operator-only exit from the shim, never a worker fallback.
 
 use super::*;
+use std::process::Stdio;
 
 /// True when the operator asked to run administration under their own `gh`.
 pub(super) fn operator_bypass_requested() -> bool {
@@ -144,4 +145,73 @@ pub(super) fn dispatch(
     native: impl FnOnce(&[OsString]) -> i32,
 ) -> i32 {
     dispatch_with(args, relay, signals, relay_client::worker_session, native)
+}
+
+pub(super) fn delegate(args: &[OsString]) -> i32 {
+    dispatch(
+        args,
+        &RelayContext::from_process(),
+        ShellSignals::from_process(),
+        delegate_allowed,
+    )
+}
+
+fn delegate_allowed(args: &[OsString]) -> i32 {
+    let Some(real_gh) = resolve_real_gh(&executing_image()) else {
+        return refuse(
+            RefusalCode::NoRealGh,
+            "PATH contains no upstream gh after skipping the executing shim image",
+        );
+    };
+    if environment_admin::targets_secret(args) {
+        return quiet_secret_gh(real_gh, args);
+    }
+    exec_real_gh(real_gh, args)
+}
+
+fn quiet_secret_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
+    // stdin goes straight to gh. Do not surface even failure output: an
+    // upstream diagnostic or debug dump could include the input value.
+    match Command::new(real_gh)
+        .args(args)
+        .env_remove("GH_DEBUG")
+        .env_remove("DEBUG")
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => 0,
+        Ok(status) => {
+            eprintln!("gh-shim: upstream gh failed to set the environment secret; its output was suppressed to protect the secret value");
+            status.code().unwrap_or(1)
+        }
+        Err(_) => refuse(
+            RefusalCode::NoRealGh,
+            "unable to start upstream gh for environment secret set",
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
+    use std::os::unix::process::CommandExt;
+    let error = Command::new(real_gh).args(args).exec();
+    // `exec` returns only on failure; a candidate can disappear after the PATH scan.
+    refuse(
+        RefusalCode::NoRealGh,
+        &format!("unable to exec upstream gh: {error}"),
+    )
+}
+
+#[cfg(not(unix))]
+fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
+    match Command::new(real_gh).args(args).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(error) => refuse(
+            RefusalCode::NoRealGh,
+            &format!("unable to exec upstream gh: {error}"),
+        ),
+    }
 }

@@ -35,6 +35,7 @@ use subc_protocol::{BindIdentity, RouteTarget};
 mod api_rules;
 mod captured_dispatch;
 mod enable_gate;
+mod environment_admin;
 mod manifest_guard;
 pub mod manifest_sync;
 mod manifest_wire;
@@ -54,6 +55,7 @@ use api_rules::{api_rule_matches_path, api_tuple, is_api_tuple};
 use captured_dispatch::run_captured_protected;
 #[cfg(test)]
 use captured_dispatch::{captured_plan, captured_rung_refusal};
+use native_guard::delegate;
 
 use prefrontal_route::select_route_holder;
 
@@ -875,6 +877,9 @@ fn run_with(
     }
     if workflow_approval::targets_approval(args) {
         return workflow_approval::dispatch(args, &paths, now, delegate);
+    }
+    if let Some(status) = environment_admin::dispatch(args, &paths, &cwd, now, &mut delegate) {
+        return status;
     }
     // Explicit operator administration keeps its audited path; worker writes
     // have already been refused above, regardless of the bypass request.
@@ -4925,6 +4930,9 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
     if tuple == secret_list::TUPLE {
         return secret_list::classify(manifest, platform);
     }
+    if tuple == environment_admin::SECRET_SET {
+        return environment_admin::classify_secret(args, manifest, platform);
+    }
     // Only a signed queue declaration may reinterpret the queue-shaped merge
     // invocation. Direct merges and disabling auto-merge retain their admin row.
     if tuple == "pr merge"
@@ -5023,6 +5031,10 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     if workflow_approval::is_approval_path(&shape.path) {
         return workflow_approval::classify(&shape, manifest, platform);
     }
+    if let Some(classification) = environment_admin::classify_api(args, &shape, manifest, platform)
+    {
+        return classification;
+    }
     // The method upstream `gh` sends: a field or `--input` payload without a
     // named method is a POST, which is how a review reply is usually written.
     // Before v22 no POST rule exists, so an implicit POST stays undeclared
@@ -5042,7 +5054,10 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
         .api_rules
         .iter()
         .filter(|rule| {
-            rule.method.eq_ignore_ascii_case(&method)
+            !matches!(
+                (method.as_str(), rule.path_glob.as_str()),
+                ("PUT", environment_admin::PUT_GLOB) | ("POST", environment_admin::POLICY_GLOB)
+            ) && rule.method.eq_ignore_ascii_case(&method)
                 && platform_matches(&rule.platform, platform)
                 && api_rule_matches_path(rule, &path)
         })
@@ -8124,26 +8139,6 @@ fn executing_image_path_positions(image: &Path) -> Vec<usize> {
         .collect()
 }
 
-fn delegate(args: &[OsString]) -> i32 {
-    native_guard::dispatch(
-        args,
-        &RelayContext::from_process(),
-        native_guard::ShellSignals::from_process(),
-        |args| delegate_allowed(args),
-    )
-}
-
-fn delegate_allowed(args: &[OsString]) -> i32 {
-    let image = executing_image();
-    let Some(real_gh) = resolve_real_gh(&image) else {
-        return refuse(
-            RefusalCode::NoRealGh,
-            "PATH contains no upstream gh after skipping the executing shim image",
-        );
-    };
-    exec_real_gh(real_gh, args)
-}
-
 fn resolve_real_gh(executing_image: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let shims_dir = crate::environment::non_empty_os_var("AFT_GH_SHIMS_DIR").map(PathBuf::from);
@@ -8213,30 +8208,6 @@ fn same_image(left: &Path, right: &Path) -> bool {
         }
     }
     false
-}
-
-#[cfg(unix)]
-fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
-    use std::os::unix::process::CommandExt;
-    let error = Command::new(real_gh).args(args).exec();
-    // `exec` returns only if a candidate disappeared after the PATH scan. This
-    // remains a shim refusal, rather than silently treating a failed exec as a
-    // successful no-op.
-    refuse(
-        RefusalCode::NoRealGh,
-        &format!("unable to exec upstream gh: {error}"),
-    )
-}
-
-#[cfg(not(unix))]
-fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
-    match Command::new(real_gh).args(args).status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(error) => refuse(
-            RefusalCode::NoRealGh,
-            &format!("unable to exec upstream gh: {error}"),
-        ),
-    }
 }
 
 fn refusal_line(code: RefusalCode, text: &str) -> String {
