@@ -23,7 +23,7 @@ use self::multi_path::{
 };
 #[cfg(test)]
 use crate::context::AppContext;
-use crate::data_layer::host::IndexHost;
+use crate::data_layer::host::{IndexHost, TextView};
 use crate::large_read::{MatchVisit, ScanLines};
 use crate::pattern_compile::CompiledPattern;
 use crate::protocol::Response;
@@ -1122,11 +1122,7 @@ fn execute_root_profiled(
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary detection still applies.
     if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-        let index_status = if root.use_index && !crate::data_layer::read_fence::active() {
-            current_index_status(ctx)
-        } else {
-            IndexStatus::Fallback
-        };
+        let index_status = IndexStatus::Fallback;
         let result = if !explicit_file_matches(&root.filter_root, &root.search_root, filters)
             || params
                 .path_exclusion
@@ -1169,37 +1165,35 @@ fn execute_root_profiled(
         );
     }
 
-    if root.use_index && !root.ignored_target {
-        if let Some(view) = crate::data_layer::text_scope::ready_view(ctx) {
-            if let Some(answer) = execute_root_from_view(
-                ctx,
-                view,
-                pattern,
-                query,
-                root,
-                params,
-                filters,
-                max_results,
-                project_root,
-                order,
-            ) {
-                return answer;
+    let index_status = if root.use_index && !root.ignored_target {
+        match crate::data_layer::text_scope::text_view(ctx) {
+            TextView::Ready(view) => {
+                if let Some(answer) = execute_root_from_view(
+                    ctx,
+                    view,
+                    pattern,
+                    query,
+                    root,
+                    params,
+                    filters,
+                    max_results,
+                    project_root,
+                    order,
+                ) {
+                    return answer;
+                }
+                IndexStatus::Fallback
             }
+            TextView::Building => IndexStatus::Building,
+            TextView::Unavailable => IndexStatus::Fallback,
         }
-    }
+    } else {
+        IndexStatus::Fallback
+    };
 
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
     let snapshot_acquire = snapshot_started.elapsed();
-    let index_lacks_scope = ignored_target;
-
-    // A walk that replaces a ready index reports `Fallback`, so the response
-    // discloses that these results came from the filesystem, not the index.
-    let index_status = if root.use_index && !index_lacks_scope {
-        current_index_status(ctx)
-    } else {
-        IndexStatus::Fallback
-    };
     let mut counts = ScopeFileCounts::default();
     let result = fallback_grep_counted(
         project_root,
@@ -3494,20 +3488,6 @@ pub(crate) fn ripgrep_glob(
     let mut outcome = bounded_fallback_walk_files(search_root, search_root, &filters, "glob");
     outcome.files.truncate(max_results);
     Some(outcome)
-}
-
-/// How the checkout's text index stands for a reply that did not come from
-/// it: `Building` while its first publication is on the way, `Ready` once it
-/// serves (a walk then replaced it for this call), `Fallback` otherwise.
-fn current_index_status(ctx: &impl IndexHost) -> IndexStatus {
-    if ctx.cache_unavailable_reason().is_some() {
-        return IndexStatus::Fallback;
-    }
-    match crate::data_layer::surfaces::report(ctx).map(|report| report.text.status) {
-        Some(crate::data_layer::surfaces::READY) => IndexStatus::Ready,
-        Some(crate::data_layer::surfaces::BUILDING) => IndexStatus::Building,
-        _ => IndexStatus::Fallback,
-    }
 }
 
 pub fn line_starts(content: &str) -> Vec<usize> {

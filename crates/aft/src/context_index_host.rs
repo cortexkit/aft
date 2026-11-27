@@ -1,7 +1,8 @@
 //! Runtime implementations of the index and read-policy interfaces.
 
 use super::*;
-use crate::data_layer::host::IndexHost;
+use crate::data_layer::checkout::PlaneStatus;
+use crate::data_layer::host::{IndexHost, TextView};
 use crate::read_policy::ReadPolicy;
 
 impl IndexHost for AppContext {
@@ -11,8 +12,19 @@ impl IndexHost for AppContext {
     fn data_checkout(&self) -> Option<Arc<crate::data_layer::runtime::DataCheckout>> {
         self.data_checkout()
     }
-    fn data_view(&self) -> Option<crate::data_layer::checkout::CheckoutView> {
-        self.data_view()
+    fn text_view(&self) -> TextView {
+        if self.watcher_gap_pending() {
+            return TextView::Unavailable;
+        }
+        let Some(checkout) = self.data_checkout() else {
+            return TextView::Unavailable;
+        };
+        let (status, view) = checkout.checkout().status_view();
+        match (status.text, view) {
+            (PlaneStatus::Ready, Some(view)) => TextView::Ready(view),
+            (PlaneStatus::Building { .. }, _) => TextView::Building,
+            _ => TextView::Unavailable,
+        }
     }
     fn data_meaning_config(&self) -> Option<crate::config::SemanticBackendConfig> {
         self.data_meaning_config()

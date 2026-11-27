@@ -59,12 +59,15 @@ impl Checkout {
     /// what they could not cover.
     #[must_use]
     pub fn status(&self) -> CheckoutStatus {
+        self.status_view().0
+    }
+
+    /// Read readiness and the corresponding query view under one lock.
+    pub(crate) fn status_view(&self) -> (CheckoutStatus, Option<CheckoutView>) {
         let live = self.live.read().expect("no panics while holding it");
-        self.status_from_view(
-            self.view_from_live(&live).as_ref(),
-            live.building,
-            live.failure.is_some(),
-        )
+        let view = self.view_from_live(&live);
+        let status = self.status_from_view(view.as_ref(), live.building, live.failure.is_some());
+        (status, view)
     }
 
     /// Read status and its view together, without waiting for index publication.

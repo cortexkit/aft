@@ -14,11 +14,18 @@ use crate::semantic_index::SemanticIndex;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+/// The text checkout available to serve a query at the moment it chooses a source.
+pub enum TextView {
+    Ready(CheckoutView),
+    Building,
+    Unavailable,
+}
+
 /// Runtime-owned state, exposed without giving the index an application context.
 pub trait IndexHost: Send + Sync {
     fn probe_data_checkout(&self) -> Option<DataCheckoutProbe>;
     fn data_checkout(&self) -> Option<Arc<DataCheckout>>;
-    fn data_view(&self) -> Option<CheckoutView>;
+    fn text_view(&self) -> TextView;
     fn data_meaning_config(&self) -> Option<SemanticBackendConfig>;
     fn data_layer_withheld(&self) -> Option<Withheld>;
     fn data_layer_serves_meaning(&self) -> bool;
@@ -53,8 +60,8 @@ impl<T: IndexHost + ?Sized> IndexHost for Arc<T> {
     fn data_checkout(&self) -> Option<Arc<DataCheckout>> {
         (**self).data_checkout()
     }
-    fn data_view(&self) -> Option<CheckoutView> {
-        (**self).data_view()
+    fn text_view(&self) -> TextView {
+        (**self).text_view()
     }
     fn data_meaning_config(&self) -> Option<SemanticBackendConfig> {
         (**self).data_meaning_config()
