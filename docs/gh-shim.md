@@ -20,24 +20,34 @@ copy of the list and a pin from AFT. There is no built-in signing key or
 fallback key. The file is owner-only on Unix. On Windows it inherits the state
 directory's ACL, so keep that directory private; there is no worker copy.
 
+The filter prevents accidental writes under the person's GitHub login. It
+doesn't protect against a shell that sets its own environment variables or
+chooses to run the real `gh` directly. The key AFT gives a new shell keeps
+another agent from replacing that shell's trust merely by changing shared
+files. The AFT relay and worker broker still verify policy independently.
+
 A root change makes lists signed by the retired key unusable. The vault must
 publish a newer list signed by the new root before governed writes can resume.
 AFT fetches the current list again when the generation changes. If the daemon
 clears the pin, AFT removes the trust file. If refreshes fail, AFT and the shim
-stop trusting a pin 15 minutes after AFT last read it from the daemon. Start
-a new shell to get the new generation after rotation. A worker shell's copy
+stop trusting a pin 15 minutes after AFT last read it from the daemon. Relaunch
+a shell that started before the first pin arrived or before a rotation to
+get the current key and generation. A worker shell's copy
 of `trust-root.json` is made at launch and does not refresh; start a new
 worker shell when that copy expires.
-A previously provisioned shim, or one with a list or trust file present, refuses
-writes without a verified list rather than using the operator's credentials.
-On a never-provisioned install with no such files, commands pass through only
-when the shim can rule out a write relay, as on a standalone install.
+A shell AFT started with the shim enabled refuses writes without a verified
+list, even before the first pin arrives. A list, a trust file, or a record of
+a previous pin or accepted list also prevents fallback to the person's login.
+With no launch marker or such files, commands pass through only when the
+shim can rule out a write relay, as on a standalone install.
 
 Commit attribution is separate. In `git.co_author: "auto"` mode, the Git
 hook uses the committing agent's GitHub identity from Entorhinal, not the bot
-bound to the repository in the list. For a worker, the daemon must identify
-the head agent it works for, either by name or by linking to a live route for
-that head. Auto attribution requires a shell launched through a route where
+bound to the repository in the list. For a worker, the daemon's parent link
+must identify exactly one active head session that AFT can see. If the daemon
+also names a sponsoring agent for the worker or a program it runs, that name
+must agree with the head's identity. Auto attribution requires a shell launched
+through a route where
 the daemon identifies the agent and that agent has a GitHub identity in
 Entorhinal. It does not require a verified list. A standalone shell, or one
 launched without a daemon-stamped agent identity, gets no automatic trailer.
