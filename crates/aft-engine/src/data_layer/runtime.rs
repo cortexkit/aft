@@ -2839,6 +2839,8 @@ pub(crate) mod tests {
         let mut works = Vec::new();
         for _ in 0..ROOTS {
             let fixture = PublicationFixture::new(QUIET, QUIET);
+            // The first view can be ready before the build resets its retry state.
+            fixture.handle.wait_for_memory_profile_idle_for_test();
             fixture.handle.quiet.changed();
             fixture.handle.work.settle.changed();
             // Keep real retry registrations pending while all roots are bound.
