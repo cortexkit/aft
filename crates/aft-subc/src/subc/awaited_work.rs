@@ -5,7 +5,6 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
@@ -23,6 +22,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const FIRST_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+const FIRST_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const CARD_PREPARATION_LIMIT: Duration = Duration::from_millis(50);
 
 struct RetryLog(Option<tokio::time::Instant>);
@@ -195,7 +196,8 @@ pub(crate) struct Service {
     runtime: tokio::runtime::Handle,
     wire: parking_lot::RwLock<Option<Arc<dyn Wire>>>,
     registrations: tokio::sync::Mutex<()>,
-    terminal: parking_lot::Mutex<HashMap<String, Option<Arc<AtomicBool>>>>,
+    // True for pending cleanups that stay tracked when sync returns unknown.
+    terminal: parking_lot::Mutex<HashMap<String, bool>>,
     cleanup_wake: tokio::sync::watch::Sender<()>,
     progress: parking_lot::Mutex<HashMap<String, CancellationToken>>,
     #[cfg(all(test, unix))]
@@ -249,12 +251,8 @@ impl Service {
         notice: Option<PushFrame>,
         mut persisted: bool,
     ) {
-        if let Event::CleanupOpen {
-            replay,
-            capacity_blocked,
-        } = event
-        {
-            self.submit_cleanup(registry, task, key, replay, capacity_blocked, persisted);
+        if let Event::CleanupOpen { replay } = event {
+            self.submit_cleanup(registry, task, key, replay, persisted);
             return;
         }
         let terminal = !matches!(event, Event::Progress(_));
@@ -267,7 +265,7 @@ impl Service {
                 else {
                     return;
                 };
-                entry.insert(None);
+                entry.insert(false);
             }
             if matches!(event, Event::Cancel) {
                 if let Some(progress) = self.progress.lock().remove(&key) {
@@ -384,17 +382,15 @@ impl Service {
         task: Arc<BgTask>,
         key: String,
         mut replay: Option<OpenReplay>,
-        capacity_blocked: bool,
         mut persisted: bool,
     ) {
-        let blocked = Arc::new(AtomicBool::new(capacity_blocked));
         {
             let mut terminal = self.terminal.lock();
             let std::collections::hash_map::Entry::Vacant(entry) = terminal.entry(key.clone())
             else {
                 return;
             };
-            entry.insert(Some(blocked.clone()));
+            entry.insert(true);
         }
         if let Some(progress) = self.progress.lock().remove(&key) {
             progress.cancel();
@@ -406,54 +402,53 @@ impl Service {
             let cancel = Request::Cancel(CancelParams { instance: service.instance.clone(), key: key.clone() });
             let mut log = RetryLog::new(!persisted);
             let mut delay = FIRST_RETRY_DELAY;
+            let mut capacity_delay = FIRST_CAPACITY_RETRY_DELAY;
             let work = async {
                 loop {
                     if !check_send_state(&registry, &task, &key, &mut persisted, &mut log).await { break; }
                     if persisted {
                         if let Some(open) = &replay {
-                            // Do not send an open concurrently with a sync that
-                            // may omit this key after a capacity refusal.
-                            let registration = service.registrations.lock().await;
-                            if let Some(wire) = service.wire() {
-                                let _ = wake.borrow_and_update();
-                                let (registry_write, task_write) = (registry.clone(), task.clone());
-                                let clear_capacity = tokio::task::spawn_blocking(move || registry_write.mark_cleanup_capacity(&task_write, false)).await;
-                                if !matches!(clear_capacity, Ok(Ok(()))) {
-                                    log.failure(format_args!("could not persist awaited-work open retry for {key}: {clear_capacity:?}"));
-                                } else {
-                                    blocked.store(false, Ordering::Release);
+                            let result = {
+                                let _registration = service.registrations.lock().await;
+                                if let Some(wire) = service.wire() {
+                                    let _ = wake.borrow_and_update();
                                     let body = open.request(&service.instance, &key);
-                                    match Service::call::<ItemReply>(wire.as_ref(), &body, Some(&open.scope)).await {
-                                        Ok(reply) if reply.item.key == key => {
-                                            drop(registration);
-                                            let (registry_write, task_write) = (registry.clone(), task.clone());
-                                            let saved = tokio::task::spawn_blocking(move || registry_write.record_confirmed_cleanup_open(&task_write)).await;
-                                            if !matches!(saved, Ok(Ok(()))) {
-                                                log.failure(format_args!("could not persist confirmation of awaited open for {key}: {saved:?}"));
-                                            }
-                                            // If the write failed, a restart can replay open.
-                                            // The orchestrator refuses an open whose key was cancelled.
-                                            replay = None;
-                                            delay = FIRST_RETRY_DELAY;
-                                            continue;
-                                        }
-                                        Err(Failure::Refused(code)) if matches!(code.as_str(), "key_reused" | "session_ended") => break,
-                                        Err(Failure::Refused(code)) if code == "too_many_open" => {
-                                            blocked.store(true, Ordering::Release);
-                                            let (registry_write, task_write) = (registry.clone(), task.clone());
-                                            let saved = tokio::task::spawn_blocking(move || registry_write.mark_cleanup_capacity(&task_write, true)).await;
-                                            drop(registration);
-                                            if !matches!(saved, Ok(Ok(()))) {
-                                                log.failure(format_args!("could not persist awaited-work capacity wait for {key}: {saved:?}"));
-                                            }
-                                            if wake.changed().await.is_err() { break; }
-                                            delay = FIRST_RETRY_DELAY;
-                                            continue;
-                                        }
-                                        Ok(_) => log.failure(format_args!("awaited open replay returned a different key for {key}")),
-                                        Err(error) => log.failure(format_args!("awaited open replay failed for {key}: {error:?}")),
-                                    }
+                                    Some(Service::call::<ItemReply>(wire.as_ref(), &body, Some(&open.scope)).await)
+                                } else {
+                                    None
                                 }
+                            };
+                            match result {
+                                Some(Ok(reply)) if reply.item.key == key => {
+                                    let (registry_write, task_write) = (registry.clone(), task.clone());
+                                    let saved = tokio::task::spawn_blocking(move || registry_write.record_confirmed_cleanup_open(&task_write)).await;
+                                    if !matches!(saved, Ok(Ok(()))) {
+                                        log.failure(format_args!("could not persist confirmation of awaited open for {key}: {saved:?}"));
+                                    }
+                                    // If the write failed, a restart can replay open.
+                                    // The orchestrator refuses an open whose key was cancelled.
+                                    replay = None;
+                                    delay = FIRST_RETRY_DELAY;
+                                    continue;
+                                }
+                                Some(Err(Failure::Refused(code))) if matches!(code.as_str(), "key_reused" | "session_ended") => break,
+                                Some(Err(Failure::Refused(code))) if code == "too_many_open" => {
+                                    // A slot can also free without an AFT finish or cancel.
+                                    tokio::select! {
+                                        changed = wake.changed() => {
+                                            if changed.is_err() { break; }
+                                            capacity_delay = FIRST_CAPACITY_RETRY_DELAY;
+                                        }
+                                        _ = tokio::time::sleep(capacity_delay) => {
+                                            capacity_delay = (capacity_delay * 2).min(MAX_CAPACITY_RETRY_DELAY);
+                                        }
+                                    }
+                                    delay = FIRST_RETRY_DELAY;
+                                    continue;
+                                }
+                                Some(Ok(_)) => log.failure(format_args!("awaited open replay returned a different key for {key}")),
+                                Some(Err(error)) => log.failure(format_args!("awaited open replay failed for {key}: {error:?}")),
+                                None => {},
                             }
                         } else if let Some(wire) = service.wire() {
                             match Service::call::<ItemReply>(wire.as_ref(), &cancel, None).await {
@@ -471,6 +466,7 @@ impl Service {
                         changed = wake.changed() => {
                             if changed.is_err() { break; }
                             delay = FIRST_RETRY_DELAY;
+                            capacity_delay = FIRST_CAPACITY_RETRY_DELAY;
                         }
                         _ = tokio::time::sleep(delay) => delay = (delay * 2).min(MAX_RETRY_DELAY),
                     }
@@ -677,15 +673,9 @@ async fn stage_notice_record(
 
 #[derive(Clone)]
 pub(crate) enum Event {
-    Finish {
-        outcome: Outcome,
-        summary: String,
-    },
+    Finish { outcome: Outcome, summary: String },
     Cancel,
-    CleanupOpen {
-        replay: Option<OpenReplay>,
-        capacity_blocked: bool,
-    },
+    CleanupOpen { replay: Option<OpenReplay> },
     Progress(String),
 }
 
@@ -1001,27 +991,27 @@ async fn reconcile(
     let _gate = service.registrations.lock().await;
     let listed: ListReply =
         Service::call(wire.as_ref(), &Request::List(ListParams::default()), None).await?;
-    let listed: Arc<HashSet<_>> = Arc::new(listed.items.into_iter().map(|item| item.key).collect());
-    let (executor, listed_for_scan) = (executor.clone(), listed.clone());
+    let executor = executor.clone();
     let (known, registries, mut cleanups) = tokio::task::spawn_blocking(move || {
         let registries: Vec<_> = executor
             .actor_contexts()
             .iter()
             .map(|actor| actor.bash_background().clone())
             .collect();
-        let mut known = listed_for_scan
-            .iter()
-            .filter_map(|key| {
+        let mut known = listed
+            .items
+            .into_iter()
+            .filter_map(|item| {
                 registries
                     .iter()
-                    .find(|registry| registry.knows_awaited_work(key))
-                    .map(|registry| (key.clone(), registry.clone()))
+                    .find(|registry| registry.knows_awaited_work(&item.key))
+                    .map(|registry| (item.key, registry.clone()))
             })
             .collect::<HashMap<_, _>>();
-        let mut cleanups = HashMap::new();
+        let mut cleanups = HashSet::new();
         for registry in &registries {
-            for (key, blocked) in registry.pending_awaited_open_cleanups() {
-                cleanups.insert(key.clone(), blocked);
+            for key in registry.pending_awaited_open_cleanups() {
+                cleanups.insert(key.clone());
                 known.insert(key, registry.clone());
             }
         }
@@ -1032,22 +1022,18 @@ async fn reconcile(
     let mut keep = HashSet::new();
     {
         let terminal = service.terminal.lock();
-        for (key, blocked) in terminal.iter() {
+        for (key, cleanup) in terminal.iter() {
             keep.insert(key.clone());
-            if let Some(blocked) = blocked {
-                cleanups.insert(key.clone(), blocked.load(Ordering::Acquire));
+            if *cleanup {
+                cleanups.insert(key.clone());
             }
         }
     }
+    // Keep every uncertain key, including after a capacity refusal. An earlier
+    // open can commit between list and sync; omission would end it as lost.
+    // Keeping an absent key only returns unknown and does not end its cleanup.
     keep.extend(known.keys().cloned());
-    // A capacity refusal inserts no row. When list also finds no item, omitting
-    // it cannot end any item as lost. The gate prevents a replay from inserting a
-    // row during this sync. Keep any listed key, even one previously refused.
-    let mut open: Vec<_> = keep
-        .iter()
-        .filter(|key| listed.contains(*key) || !cleanups.get(*key).is_some_and(|blocked| *blocked))
-        .cloned()
-        .collect();
+    let mut open: Vec<_> = keep.iter().cloned().collect();
     open.sort_unstable();
     let reply: SyncReply = Service::call(
         wire.as_ref(),
@@ -1059,12 +1045,12 @@ async fn reconcile(
     )
     .await?;
     let unknown: HashSet<_> = reply.unknown.into_iter().collect();
-    keep.retain(|key| !unknown.contains(key) || cleanups.contains_key(key));
+    keep.retain(|key| !unknown.contains(key) || cleanups.contains(key));
     settle_omitted_items(registries, Arc::new(keep)).await;
     let service_for_replay = service.clone();
     let _ = tokio::task::spawn_blocking(move || {
         for (key, registry) in known {
-            if !unknown.contains(&key) || cleanups.contains_key(&key) {
+            if !unknown.contains(&key) || cleanups.contains(&key) {
                 registry.resume_awaited_work(&key, &service_for_replay);
             }
         }

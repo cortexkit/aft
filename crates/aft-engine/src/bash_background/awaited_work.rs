@@ -29,7 +29,6 @@ pub(crate) enum State {
     FallbackCancel,
     FallbackProbe {
         open: OpenReplay,
-        capacity_blocked: bool,
     },
     Settled,
 }
@@ -251,20 +250,20 @@ impl BgTaskRegistry {
         })
     }
 
-    pub(crate) fn pending_awaited_open_cleanups(&self) -> Vec<(String, bool)> {
+    pub(crate) fn pending_awaited_open_cleanups(&self) -> Vec<String> {
         self.task_arcs()
             .into_iter()
             .filter_map(|task| {
                 let state = task.lock_state().ok()?;
-                let blocked = match state.metadata.awaited_work {
-                    Some(State::FallbackProbe {
-                        capacity_blocked, ..
-                    }) => capacity_blocked,
-                    Some(State::FallbackCancel) => false,
-                    Some(State::OpeningAttempt { .. }) if !state.awaited_runtime.opening => false,
-                    _ => return None,
-                };
-                Some((task.task_id.clone(), blocked))
+                match state.metadata.awaited_work {
+                    Some(State::FallbackProbe { .. } | State::FallbackCancel) => {
+                        Some(task.task_id.clone())
+                    }
+                    Some(State::OpeningAttempt { .. }) if !state.awaited_runtime.opening => {
+                        Some(task.task_id.clone())
+                    }
+                    _ => None,
+                }
             })
             .collect()
     }
@@ -383,24 +382,6 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn mark_cleanup_capacity(
-        &self,
-        task: &BgTask,
-        blocked: bool,
-    ) -> std::io::Result<()> {
-        self.save_cleanup_state(task, |state| match state {
-            Some(State::FallbackProbe {
-                open,
-                capacity_blocked,
-            }) if *capacity_blocked != blocked => Some(State::FallbackProbe {
-                open: open.clone(),
-                capacity_blocked: blocked,
-            }),
-            _ => None,
-        })
-        .map(|_| ())
-    }
-
     pub(crate) fn record_confirmed_cleanup_open(&self, task: &BgTask) -> std::io::Result<()> {
         self.save_cleanup_state(task, |state| {
             matches!(state, Some(State::FallbackProbe { .. })).then_some(State::FallbackCancel)
@@ -470,10 +451,7 @@ impl BgTaskRegistry {
                     state.metadata.awaited_work = if let Some(open) = replay {
                         state.metadata.completion_delivered =
                             !state.metadata.notify_on_completion || consumed;
-                        Some(State::FallbackProbe {
-                            open,
-                            capacity_blocked: false,
-                        })
+                        Some(State::FallbackProbe { open })
                     } else if opened {
                         Some(if consumed { State::Cancel } else { State::Open })
                     } else {
@@ -499,17 +477,10 @@ impl BgTaskRegistry {
             self.send_awaited(&task, Event::Cancel, None, persisted);
         } else {
             let cleanup = match &metadata.awaited_work {
-                Some(State::FallbackProbe {
-                    open,
-                    capacity_blocked,
-                }) => Some(Event::CleanupOpen {
+                Some(State::FallbackProbe { open }) => Some(Event::CleanupOpen {
                     replay: Some(open.clone()),
-                    capacity_blocked: *capacity_blocked,
                 }),
-                Some(State::FallbackCancel) => Some(Event::CleanupOpen {
-                    replay: None,
-                    capacity_blocked: false,
-                }),
+                Some(State::FallbackCancel) => Some(Event::CleanupOpen { replay: None }),
                 _ => None,
             };
             if let Some(event) = cleanup {

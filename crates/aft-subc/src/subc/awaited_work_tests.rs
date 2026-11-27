@@ -153,6 +153,7 @@ mod bash_background {
                     reply["unknown"] = json!(unknown);
                     listed.retain(|key| params.open.contains(key));
                     self.lost.lock().extend(lost.iter().cloned());
+                    self.sealed.lock().extend(lost.iter().cloned());
                     reply["lost"] = json!(lost);
                     return Ok(serde_json::to_vec(&reply).unwrap());
                 }
@@ -1433,14 +1434,7 @@ mod bash_background {
         let (Request::Sync(sync), None) = call(&mut calls).await else {
             panic!("missing sync")
         };
-        assert_eq!(
-            sync.open,
-            if listed_at_sync {
-                vec![open.key.clone()]
-            } else {
-                Vec::new()
-            }
-        );
+        assert_eq!(sync.open, [open.key.clone()]);
         assert_eq!(call(&mut calls).await, first);
         if !listed_at_sync {
             no_more(&mut calls).await;
@@ -1475,6 +1469,96 @@ mod bash_background {
     #[tokio::test]
     async fn awaited_capacity_blocked_open_is_kept_if_a_later_list_shows_it() {
         cleanup_replay_capacity(true).await;
+    }
+
+    #[tokio::test]
+    async fn awaited_capacity_refused_key_is_kept_when_the_original_open_commits_during_sync() {
+        let f = Fixture::new();
+        let (service, wire, mut calls) = fake(Answer::LateCommit, Vec::new());
+        *wire.replay_code.lock() = Some("too_many_open");
+        let mut rx = f.start(Some(service.clone()), true);
+        let first = call(&mut calls).await;
+        let Request::Open(open) = &first.0 else {
+            panic!("missing open")
+        };
+        wire.allow_open.notify_one();
+        assert_eq!(call(&mut calls).await, first);
+        no_more(&mut calls).await;
+        f.release();
+        assert_eq!(
+            reply(&mut rx).await.response_for_test().data["status"],
+            "completed"
+        );
+
+        *service.wire.write() = None;
+        // The list is empty; the original request commits just before sync.
+        *wire.commit_on_sync.lock() = Some(open.key.clone());
+        reconcile(&service, wire.clone(), &f.executor)
+            .await
+            .unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [open.key.clone()])
+        );
+        assert_eq!(call(&mut calls).await, first);
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cleanup_to_settle(f.ctx.bash_background(), &open.key),
+        )
+        .await
+        .unwrap();
+        assert!(wire.listed.lock().is_empty());
+        assert!(wire.sealed.lock().contains(&open.key));
+        assert!(wire.lost.lock().is_empty());
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn awaited_capacity_retry_observes_an_externally_freed_slot() {
+        let f = Fixture::new();
+        let (service, wire, mut calls) = fake(Answer::LateCommit, Vec::new());
+        *wire.replay_code.lock() = Some("too_many_open");
+        let mut rx = f.start(Some(service.clone()), true);
+        let first = call(&mut calls).await;
+        let Request::Open(open) = &first.0 else {
+            panic!("missing open")
+        };
+        wire.allow_open.notify_one();
+        assert_eq!(call(&mut calls).await, first);
+        no_more(&mut calls).await;
+        f.release();
+        assert_eq!(
+            reply(&mut rx).await.response_for_test().data["status"],
+            "completed"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(call(&mut calls).await, first);
+        // The provider frees a slot without any AFT finish, cancel, or sync.
+        *wire.replay_code.lock() = None;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(
+            calls.try_recv().is_err(),
+            "the second capacity delay backs off"
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(call(&mut calls).await, first);
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cleanup_to_settle(f.ctx.bash_background(), &open.key),
+        )
+        .await
+        .unwrap();
+        assert!(wire.sealed.lock().contains(&open.key));
+        assert!(wire.lost.lock().is_empty());
+        no_more(&mut calls).await;
     }
 
     #[tokio::test(start_paused = true)]
