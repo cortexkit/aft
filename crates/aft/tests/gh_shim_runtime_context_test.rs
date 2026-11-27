@@ -2109,7 +2109,6 @@ struct SlowDaemonConfig {
     catalog_delay: Duration,
     open_route_delay: Duration,
     request_delay: Duration,
-    remove_during_session_lookup: Option<PathBuf>,
     /// When true, the configured stage delays apply only to the first
     /// accepted connection, so a retried probe (attempt 2) sees a fast
     /// daemon. Used to prove the discovery retry succeeds when the first
@@ -2139,6 +2138,19 @@ impl SlowTestDaemon {
         config: SlowDaemonConfig,
         manifest: Option<PathBuf>,
         offer_write_relay: bool,
+    ) -> Self {
+        Self::spawn_with_removals(config, manifest, offer_write_relay, None)
+    }
+
+    fn spawn_removing_during_session_lookup(manifest: PathBuf) -> Self {
+        Self::spawn_with_removals(SlowDaemonConfig::default(), None, true, Some(manifest))
+    }
+
+    fn spawn_with_removals(
+        config: SlowDaemonConfig,
+        manifest: Option<PathBuf>,
+        offer_write_relay: bool,
+        remove_during_session_lookup: Option<PathBuf>,
     ) -> Self {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test daemon");
         std_listener.set_nonblocking(true).expect("set nonblocking");
@@ -2170,7 +2182,7 @@ impl SlowTestDaemon {
                                 let k = key_clone.clone();
                                 let d = daemon_id_clone;
                                 let manifest = manifest.clone();
-                                let remove_during_session_lookup = config.remove_during_session_lookup.clone();
+                                let remove_during_session_lookup = remove_during_session_lookup.clone();
                                 let catalog_requests = Arc::clone(&catalog_requests_clone);
                                 let first_connection = connection_count == 0;
                                 connection_count += 1;
