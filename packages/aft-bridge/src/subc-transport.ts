@@ -470,6 +470,86 @@ interface HostScopeState {
   retryMs: number;
 }
 
+interface HostScopeServiceOutage {
+  reason: string;
+  retryAt: number;
+  retryMs: number;
+  probing: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  waiters: Map<HostScopeState, () => boolean>;
+}
+
+// A missing service is a process-wide fact, unlike the scope answer for any one session.
+let hostScopeServiceOutage: HostScopeServiceOutage | undefined;
+
+function isHostScopeServiceUnavailable(code: string): boolean {
+  // The daemon reports disabled or not-yet-registered targets as target_unavailable,
+  // and an undeployed module as unknown_module.
+  return code === "unknown_method" || code === "target_unavailable" || code === "unknown_module";
+}
+
+function scheduleHostScopeServiceProbe(outage: HostScopeServiceOutage): void {
+  if (outage.probing || outage.timer || outage.waiters.size === 0) return;
+  outage.timer = setTimeout(
+    () => {
+      outage.timer = undefined;
+      if (Date.now() < outage.retryAt) {
+        scheduleHostScopeServiceProbe(outage);
+        return;
+      }
+      for (const [state, retry] of outage.waiters) {
+        outage.waiters.delete(state);
+        if (retry()) break;
+      }
+    },
+    Math.max(0, outage.retryAt - Date.now()),
+  );
+  outage.timer.unref();
+}
+
+function finishHostScopeServiceLookup(
+  probe: HostScopeServiceOutage | undefined,
+  outcome?: HostScopeResult,
+): void {
+  if (!probe) {
+    // Independent lookups already in flight when the outage started must not extend the backoff.
+    if (
+      outcome?.result === "error" &&
+      isHostScopeServiceUnavailable(outcome.code) &&
+      !hostScopeServiceOutage
+    ) {
+      hostScopeServiceOutage = {
+        reason: `lookup_error code=${outcome.code}`,
+        retryAt: Date.now() + HOST_SCOPE_RETRY_FLOOR_MS,
+        retryMs: HOST_SCOPE_RETRY_FLOOR_MS * 2,
+        probing: false,
+        waiters: new Map(),
+      };
+    }
+    return;
+  }
+  probe.probing = false;
+  if (outcome?.result === "scope" || outcome?.result === "no_scope") {
+    hostScopeServiceOutage = undefined;
+    // The probe only answers for its own session; each other session still needs its own lookup.
+    for (const retry of probe.waiters.values()) retry();
+    probe.waiters.clear();
+    return;
+  }
+  if (outcome) {
+    if (outcome.result === "error" && isHostScopeServiceUnavailable(outcome.code))
+      probe.reason = `lookup_error code=${outcome.code}`;
+    probe.retryAt = Date.now() + probe.retryMs;
+    probe.retryMs = Math.min(probe.retryMs * 2, HOST_SCOPE_RETRY_CAP_MS);
+  }
+  scheduleHostScopeServiceProbe(probe);
+}
+
+export function __resetHostScopeServiceForTests(): void {
+  clearTimeout(hostScopeServiceOutage?.timer);
+  hostScopeServiceOutage = undefined;
+}
+
 /**
  * A run of consecutive per-call failures that got no answer (timeout / route
  * GOODBYE / refusal) on the SAME client raises the suspicion of a dead half-open
@@ -2956,18 +3036,17 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private hostScope(client: SubcClientLike, identity: BindIdentity): Promise<HostScopeDecision> {
-    let lookupReason = "cache_miss";
+    let state = this.hostScopeCache.get(identity.session);
+    let lookupReason = state ? "retry_due" : "cache_miss";
     const refused = this.hostScopeRefusals.get(identity.session);
     if (refused) {
       // A refusal applies to one route-binding attempt, not to the session's future scope.
       // Look up the host scope again on the next bind instead of leaving later routes unscoped.
-      const previous = this.hostScopeCache.get(identity.session);
-      if (previous) this.cancelHostScopeRetry(previous);
-      this.hostScopeCache.delete(identity.session);
+      if (state) this.cancelHostScopeRetry(state);
+      state = undefined;
       this.hostScopeRefusals.delete(identity.session);
       lookupReason = `previous_bind_refusal code=${refused}`;
     }
-    let state = this.hostScopeCache.get(identity.session);
     if (!state) {
       state = { retryAt: 0, retryMs: HOST_SCOPE_RETRY_FLOOR_MS };
       this.hostScopeCache.set(identity.session, state);
@@ -2985,7 +3064,8 @@ export class SubcTransportPool implements AftTransportPool {
         reason,
       });
     }
-    if (state.pending) {
+    const probe = hostScopeServiceOutage;
+    if (state.pending && !probe) {
       log(`subc head scope: session=${identity.session} lookup=skipped reason=inflight_lookup`);
       return state.pending;
     }
@@ -2996,6 +3076,20 @@ export class SubcTransportPool implements AftTransportPool {
       );
       return Promise.resolve({ reason: state.unscopedReason ?? "lookup_backoff" });
     }
+    if (probe) {
+      if (state.pending || probe.probing || Date.now() < probe.retryAt) {
+        log(
+          `subc head scope: session=${identity.session} lookup=skipped reason=scope_service_unavailable`,
+        );
+        state.unscopedReason = probe.reason;
+        this.scheduleHostScopeRetry(identity.session, state);
+        return Promise.resolve({ reason: probe.reason });
+      }
+      probe.probing = true;
+      clearTimeout(probe.timer);
+      probe.timer = undefined;
+      probe.waiters.delete(state);
+    }
     log(`subc head scope: session=${identity.session} lookup=started reason=${lookupReason}`);
     const current = state;
     clearTimeout(current.retryTimer);
@@ -3004,11 +3098,16 @@ export class SubcTransportPool implements AftTransportPool {
     current.lookupAbort = abort;
     const lookup = this.readHostScope(client, identity, abort.signal).then((outcome) => {
       // A scope-close push may invalidate the session while the management request is in flight.
-      if (this.hostScopeCache.get(identity.session) !== current)
+      if (this.hostScopeCache.get(identity.session) !== current) {
+        finishHostScopeServiceLookup(probe);
         return { reason: "lookup_invalidated" };
+      }
       current.pending = undefined;
       current.lookupAbort = undefined;
-      if (abort.signal.aborted) return { reason: "lookup_cancelled" };
+      if (abort.signal.aborted) {
+        finishHostScopeServiceLookup(probe);
+        return { reason: "lookup_cancelled" };
+      }
       this.logHostScopeOutcome(identity.session, outcome);
       const reason =
         outcome.result === "error"
@@ -3025,10 +3124,13 @@ export class SubcTransportPool implements AftTransportPool {
         }
       } else {
         current.unscopedReason = reason;
-        current.retryAt = Date.now() + current.retryMs;
-        current.retryMs = Math.min(current.retryMs * 2, HOST_SCOPE_RETRY_CAP_MS);
-        this.scheduleHostScopeRetry(identity.session, current);
+        if (outcome.result !== "error" || !isHostScopeServiceUnavailable(outcome.code)) {
+          current.retryAt = Date.now() + current.retryMs;
+          current.retryMs = Math.min(current.retryMs * 2, HOST_SCOPE_RETRY_CAP_MS);
+        }
       }
+      finishHostScopeServiceLookup(probe, outcome);
+      if (!current.answer) this.scheduleHostScopeRetry(identity.session, current);
       return {
         scope: outcome.result === "scope" ? outcome.scope : undefined,
         reason,
@@ -3060,6 +3162,11 @@ export class SubcTransportPool implements AftTransportPool {
     clearTimeout(state.retryTimer);
     state.retryTimer = undefined;
     state.lookupAbort?.abort();
+    const outage = hostScopeServiceOutage;
+    if (outage?.waiters.delete(state) && outage.waiters.size === 0) {
+      clearTimeout(outage.timer);
+      outage.timer = undefined;
+    }
   }
 
   private stopUnusedHostScopeRetry(session: string): void {
@@ -3085,6 +3192,22 @@ export class SubcTransportPool implements AftTransportPool {
     )
       return;
     // A head can keep its tool route for its whole life, so recovery cannot rely on another bind.
+    const outage = hostScopeServiceOutage;
+    if (outage && !state.answer && Date.now() >= state.retryAt) {
+      outage.waiters.set(state, () => {
+        const record = this.unscopedHostRecord(session);
+        const client = this.client;
+        if (this.shuttingDown || this.hostScopeCache.get(session) !== state || !record || !client)
+          return false;
+        const retry = this.hostScope(client, record.identity).finally(() => {
+          this.scheduleHostScopeRetry(session, state);
+        });
+        this.reportHostScopeRetryError(session, retry);
+        return true;
+      });
+      scheduleHostScopeServiceProbe(outage);
+      return;
+    }
     state.retryTimer = setTimeout(
       () => {
         state.retryTimer = undefined;
@@ -3111,15 +3234,19 @@ export class SubcTransportPool implements AftTransportPool {
             this.scheduleHostScopeRetry(session, state);
           });
         }
-        void retry.catch((error) => {
-          warn(
-            `subc head scope: session=${session} background retry failed code=${error instanceof Error ? error.name : "Error"}`,
-          );
-        });
+        this.reportHostScopeRetryError(session, retry);
       },
       Math.max(0, state.retryAt - Date.now()),
     );
     state.retryTimer.unref();
+  }
+
+  private reportHostScopeRetryError(session: string, retry: Promise<unknown>): void {
+    void retry.catch((error) => {
+      warn(
+        `subc head scope: session=${session} background retry failed code=${error instanceof Error ? error.name : "Error"}`,
+      );
+    });
   }
 
   private deferHostScopeBind(session: string, state: HostScopeState, code: string): void {
