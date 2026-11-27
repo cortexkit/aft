@@ -106,3 +106,24 @@ fn manifest_state_was_provisioned(root: &Path) -> bool {
         Err(error) => error.kind() != io::ErrorKind::NotFound,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gh_shim_a_list_or_pin_alone_is_provisioning_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().to_owned());
+        assert!(!manifest_state_was_provisioned(temp.path()));
+        for artifact in [&paths.manifest, &paths.trust_root] {
+            std::fs::write(artifact, b"unverified artifact").unwrap();
+            assert!(
+                manifest_state_was_provisioned(temp.path()),
+                "{}",
+                artifact.display()
+            );
+            std::fs::remove_file(artifact).unwrap();
+        }
+    }
+}

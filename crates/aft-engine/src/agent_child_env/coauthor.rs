@@ -180,6 +180,36 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(unix)]
+    #[test]
+    fn git_hook_coauthor_never_uses_the_classic_workers_own_agent_id() {
+        let mut worker = scope_fixture(serde_json::json!({"agent_id":"worker-identity"}));
+        worker.kind = subc_protocol::scope::ScopeKind::Worker;
+        assert_eq!(agent_id(&worker), None);
+    }
+
+    #[test]
+    fn git_hook_coauthor_drops_the_answer_after_one_stale_ttl() {
+        let cache = Cache::new(|_| Err(()));
+        let agent = "agent-refresh-failed";
+        {
+            let mut entries = cache.entries.lock().unwrap();
+            entries.entry(agent.into()).or_default().answer = Some((
+                Instant::now() - TTL,
+                Some("Old Bot <old@example.test>".into()),
+            ));
+        }
+        assert_eq!(
+            cache.line(agent).as_deref(),
+            Some("Old Bot <old@example.test>")
+        );
+        {
+            let mut entries = cache.entries.lock().unwrap();
+            entries.get_mut(agent).unwrap().answer.as_mut().unwrap().0 -= TTL;
+        }
+        assert_eq!(cache.line(agent), None);
+    }
+
     #[test]
     fn git_hook_coauthor_cache_hits_and_refreshes_an_expired_answer_in_background() {
         let reads = Arc::new(AtomicUsize::new(0));

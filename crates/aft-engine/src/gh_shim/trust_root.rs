@@ -94,3 +94,58 @@ pub(super) fn publish(paths: &StatePaths, reply: Reply, now: u64) -> io::Result<
 pub(crate) fn seed_fixture(root: &std::path::Path) {
     super::tests::write_fixture_pin(&StatePaths::from_root(root.to_path_buf()));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gh_shim_does_not_trust_a_root_file_without_the_shell_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(dir.path().to_owned());
+        publish(
+            &paths,
+            Reply::Root {
+                pin: Some(super::super::tests::fixture_pin()),
+                generation: 5,
+            },
+            super::super::unix_seconds(),
+        )
+        .unwrap();
+        assert!(matches!(read(&paths), Err(ManifestProblem::NoTrustRoot)));
+    }
+
+    #[test]
+    fn gh_shim_does_not_replace_persisted_generation_with_an_older_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(dir.path().to_owned());
+        let now = super::super::unix_seconds();
+        let pin = super::super::tests::fixture_pin();
+        publish(
+            &paths,
+            Reply::Root {
+                pin: Some(pin),
+                generation: 8,
+            },
+            now,
+        )
+        .unwrap();
+        assert!(publish(
+            &paths,
+            Reply::Root {
+                pin: None,
+                generation: 7
+            },
+            now
+        )
+        .is_err());
+        assert!(paths.trust_root.exists());
+    }
+
+    #[test]
+    fn gh_shim_rejects_a_pin_whose_id_does_not_match_its_public_key() {
+        let mut pin = super::super::tests::fixture_pin();
+        pin.key_id = "0000000000000000".into();
+        assert!(pin.public_key().is_none());
+    }
+}
