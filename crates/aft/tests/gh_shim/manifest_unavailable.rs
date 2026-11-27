@@ -209,7 +209,14 @@ fn gh_shim_manifest_unavailable_unreadable() {
     // A symlink loop makes the read fail even when the test runner is root.
     std::os::unix::fs::symlink("gh-routing-manifest.json", &manifest).unwrap();
     assert!(fs::read(manifest).is_err());
-    fixture.assert_unavailable();
+    for bypass in [false, true] {
+        fixture.assert_refused(
+            &["issue", "comment", "1", "--body", "offline"],
+            bypass,
+            "gh-shim: gh_shim_manifest_regressed: the manifest artifact fails validation; issue comment is refused until the manifest is repaired\n",
+        );
+        fixture.assert_passthrough(&["pr", "view", "1"], bypass);
+    }
 }
 
 #[test]
@@ -291,25 +298,33 @@ fn gh_shim_manifest_unavailable_uninspectable_provisioning_records() {
 }
 
 #[test]
-fn gh_shim_manifest_unavailable_unprovisioned_passthrough_is_unchanged() {
+fn gh_shim_manifest_unavailable_standalone_passes_writes_only_without_artifacts() {
     let fixture = Fixture::new();
     assert!(!fixture.state.join("trust-root.json").exists());
-    for invalid in [false, true] {
-        if invalid {
-            fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
-        }
+    let write = ["issue", "comment", "1", "--body", "offline"];
+    for bypass in [false, true] {
+        fixture.assert_passthrough(&write, bypass);
+    }
+    for artifact in ["gh-routing-manifest.json", "trust-root.json"] {
+        let artifact = fixture.state.join(artifact);
+        fs::write(&artifact, "{invalid").unwrap();
         for bypass in [false, true] {
-            fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], bypass);
+            // A malformed pin is invalid rather than missing.
+            let refusal = if artifact.ends_with("trust-root.json") {
+                UNAVAILABLE
+            } else {
+                UNPINNED
+            };
+            fixture.assert_refused(&write, bypass, refusal);
             fixture.assert_passthrough(&["pr", "view", "1"], bypass);
         }
+        fs::remove_file(artifact).unwrap();
     }
 }
 
 #[test]
 fn gh_shim_manifest_unavailable_write_relay_does_not_replace_manifest_history() {
     let fixture = Fixture::new();
-    write_fresh_manifest(&fixture.state_home, unix_seconds());
-    fs::remove_file(fixture.state.join("trust-root.json")).unwrap();
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig::default());
     fixture.connect_daemon(&daemon);
 

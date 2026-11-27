@@ -1859,7 +1859,7 @@ fn gh_shim_without_manifest_history_passes_write_when_daemon_is_unreachable() {
 }
 
 #[test]
-fn gh_shim_invalid_manifest_announces_ambient_credential_fallback() {
+fn gh_shim_invalid_manifest_announces_ambient_fallback_for_a_safe_read_only() {
     let temp = tempfile::tempdir().expect("create test root");
     let config_home = temp.path().join("config");
     let state_home = temp.path().join("state");
@@ -1870,7 +1870,7 @@ fn gh_shim_invalid_manifest_announces_ambient_credential_fallback() {
     write_upstream_gh(&upstream_bin);
     write_invalid_manifest(&state_home, unix_seconds());
 
-    let output = shim_command(
+    let refused = shim_command(
         &["issue", "comment", "42", "--body", "hello"],
         &project,
         &config_home,
@@ -1881,7 +1881,23 @@ fn gh_shim_invalid_manifest_announces_ambient_credential_fallback() {
     )
     .output()
     .expect("spawn invalid-manifest gh shim invocation");
+    assert_eq!(refused.status.code(), Some(86));
+    assert!(refused
+        .stderr
+        .starts_with(b"gh-shim: gh_shim_manifest_unavailable: "));
+    assert!(!recorder.exists());
 
+    let output = shim_command(
+        &["issue", "view", "42"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn a safe read with an invalid manifest");
     assert_eq!(output.status.code(), Some(73));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "r2-passthrough\n");
     assert_eq!(
@@ -1890,7 +1906,7 @@ fn gh_shim_invalid_manifest_announces_ambient_credential_fallback() {
     );
     assert_eq!(
         fs::read_to_string(&recorder).expect("read upstream invocation record"),
-        "issue comment 42 --body hello\n"
+        "issue view 42\n"
     );
 }
 
