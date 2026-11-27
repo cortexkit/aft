@@ -823,7 +823,7 @@ fn current_service() -> Option<Arc<Service>> {
 }
 
 pub(super) fn start(path: &Path, executor: Arc<super::Executor>) {
-    if super::registration::module_id().is_none() || SERVICE.read().is_some() {
+    if aft_base::registration::module_id().is_none() || SERVICE.read().is_some() {
         return;
     }
     let service = Arc::new(Service::new(process_instance()));
@@ -1025,7 +1025,7 @@ async fn reconcile(
     let _ = tokio::task::spawn_blocking(move || {
         for (key, registry) in known {
             if !unknown.contains(&key) || cleanups.contains(&key) {
-                registry.resume_awaited_work(&key, service_for_replay);
+                registry.resume_awaited_work(&key, service_for_replay.clone());
             }
         }
     })

@@ -288,7 +288,7 @@ mod bash_background {
     }
 
     fn spawn(req: RawRequest, ctx: &AppContext) -> Response {
-        crate::bash_background::spawn(
+        aft_engine::test_bridge::bash_remote::bash_background::spawn(
             &req.id,
             req.session(),
             req.params["command"].as_str().unwrap(),
@@ -335,6 +335,7 @@ mod bash_background {
 
     impl Fixture {
         fn new() -> Self {
+            crate::subc::lower_hooks::register();
             let (dir, root) = test_support::test_root("awaited-work-shell");
             let ctx = Arc::new(AppContext::from_app(
                 App::default_shared(),
@@ -882,7 +883,7 @@ mod bash_background {
         );
         assert_eq!(
             call(&mut calls).await,
-            (open.request("after-restart", &key), Some(open.scope))
+            (open_request(&open, "after-restart", &key), Some(open.scope))
         );
         assert!(
             matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
@@ -1080,7 +1081,10 @@ mod bash_background {
         );
         assert_eq!(
             call(&mut calls).await,
-            (open.request(&service.instance, &key), Some(open.scope))
+            (
+                open_request(&open, &service.instance, &key),
+                Some(open.scope)
+            )
         );
         assert!(
             matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
@@ -1573,7 +1577,10 @@ mod bash_background {
         wire.replay_offline.store(true, Ordering::SeqCst);
         registry.attach_awaited_for_test(service.clone());
         assert!(!registry.settle_awaited_open(&key, OpenOutcome::Unknown));
-        let expected = (open.request(&service.instance, &key), Some(open.scope));
+        let expected = (
+            open_request(&open, &service.instance, &key),
+            Some(open.scope),
+        );
         assert_eq!(call(&mut calls).await, expected);
         tokio::time::advance(Duration::from_secs(48 * 60 * 60)).await;
         assert_eq!(call(&mut calls).await, expected);
