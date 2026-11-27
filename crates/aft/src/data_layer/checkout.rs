@@ -7501,36 +7501,49 @@ pub fn other() { callee(); }
         let store = tempfile::tempdir().unwrap();
         demo(root.path());
         let layer = Arc::new(DataLayer::new(8 << 20, 2));
-        let idle = std::time::Duration::from_secs(2);
-        layer.set_engine_idle(idle);
+        layer.set_engine_idle(std::time::Duration::from_secs(2));
+        // Run the keeper's scan below instead of letting a worker race the
+        // fixture clock.
+        layer.engines.stop();
         let checkout =
             Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
         checkout.build().unwrap();
-        edit(
-            &checkout,
-            "src/util.rs",
-            "pub fn callee() {}\npub fn other() {}\n",
-        );
-        checkout.refresh_callgraph().unwrap().expect("applied");
-        assert!(checkout.engine_census_bytes().is_some());
-        std::thread::sleep(idle / 2);
-        let edited = Instant::now();
-        edit(
-            &checkout,
-            "src/util.rs",
-            "pub fn callee() {}\npub fn third() {}\n",
-        );
-        std::thread::sleep(idle * 3 / 4);
+        engines::EngineKeeper::with_time_for_test(0, || {
+            edit(
+                &checkout,
+                "src/util.rs",
+                "pub fn callee() {}\npub fn other() {}\n",
+            );
+            checkout.refresh_callgraph().unwrap().expect("applied");
+        });
+        assert_eq!(layer.engines.reap_idle_at_for_test(0), Some(2_000));
+
+        // The idle keeper briefly locks a populated slot while it checks it.
+        // While that lock is held, the memory report for this checkout's
+        // engine comes back empty, which doesn't mean the engine went away.
+        // So check the slot itself.
+        let held = checkout.engine.lock().unwrap();
+        assert!(held.is_some());
+        assert!(checkout.engine_census_bytes().is_none());
+        drop(held);
+        assert!(checkout.engine.lock().unwrap().is_some());
+
+        engines::EngineKeeper::with_time_for_test(1_000, || {
+            edit(
+                &checkout,
+                "src/util.rs",
+                "pub fn callee() {}\npub fn third() {}\n",
+            );
+        });
         // Past the period since the refresh, within it since the edit.
-        assert!(edited.elapsed() < idle, "the test machine is too slow");
+        assert_eq!(layer.engines.reap_idle_at_for_test(2_500), Some(3_000));
         assert!(
-            checkout.engine_census_bytes().is_some(),
-            "the engine went though its checkout was edited within the period"
+            checkout.engine.lock().unwrap().is_some(),
+            "the engine was released before the quiet period since its last edit"
         );
         let epoch = checkout.memory_epoch();
-        // A failed try-lock is not evidence that the slot is empty.
-        wait_until_not(|| checkout.engine.lock().unwrap().is_some());
-        assert!(edited.elapsed() >= idle);
+        assert_eq!(layer.engines.reap_idle_at_for_test(3_000), None);
+        assert!(checkout.engine.lock().unwrap().is_none());
         assert!(checkout.memory_epoch() > epoch, "the census was not told");
         checkout.refresh_callgraph().unwrap().expect("applied");
         assert_eq!(checkout.engine_starts(), 2);

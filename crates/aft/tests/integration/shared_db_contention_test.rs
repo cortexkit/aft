@@ -36,6 +36,21 @@ impl Contended {
     }
 
     fn start_with_retry_gate(gate: Option<&std::path::Path>) -> Self {
+        let gate = gate.map(|path| ("AFT_TEST_MAINTENANCE_RETRY_GATE", path.as_os_str()));
+        let contended = Self::spawn_with_env(gate.as_slice());
+        // Let the child persist its first batch of write-ledger counters so
+        // the fixture tests contention after ledger maintenance has started.
+        contended.wait_for(Duration::from_secs(20), "first write-ledger fold", |c| {
+            c.conn
+                .query_row("SELECT COUNT(*) FROM write_ledger_meta", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .is_ok_and(|rows| rows > 0)
+        });
+        contended
+    }
+
+    fn spawn_with_env(extra_env: &[(&str, &std::ffi::OsStr)]) -> Self {
         let project = tempfile::tempdir().expect("project dir");
         let storage = tempfile::tempdir().expect("storage dir");
         let mut env = vec![
@@ -52,9 +67,7 @@ impl Contended {
             ),
             ("RUST_LOG", std::ffi::OsStr::new("info,aft::db=debug")),
         ];
-        if let Some(gate) = gate {
-            env.push(("AFT_TEST_MAINTENANCE_RETRY_GATE", gate.as_os_str()));
-        }
+        env.extend_from_slice(extra_env);
         let mut aft = AftProcess::spawn_with_env(&env);
         let response = aft.send(
             &json!({
@@ -68,22 +81,12 @@ impl Contended {
         );
         assert_eq!(response["success"], true, "configure failed: {response:?}");
         let conn = aft::db::open(&storage.path().join("aft.db")).expect("open shared aft.db");
-        let contended = Self {
+        Self {
             _project: project,
             storage,
             aft,
             conn,
-        };
-        // Start contending only once the child has committed a fold, so the
-        // folds under test are the ones that meet the held write lock.
-        contended.wait_for(Duration::from_secs(20), "first write-ledger fold", |c| {
-            c.conn
-                .query_row("SELECT COUNT(*) FROM write_ledger_meta", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .is_ok_and(|rows| rows > 0)
-        });
-        contended
+        }
     }
 
     fn log_path(&self) -> PathBuf {
@@ -376,14 +379,49 @@ fn database_reads_are_not_held_behind_maintenance_waiting_on_a_foreign_write_loc
 /// maintenance task and is logged at debug level.
 #[test]
 fn retention_does_not_warn_per_attempt_while_another_process_holds_the_write_lock() {
-    let mut contended = Contended::start();
-    let log_start = contended.hold_write_lock(|_| {});
-    let held_log = contended.log_since(log_start);
-    assert!(
-        held_log.contains("bash task retention"),
-        "retention never ran during the hold; child log:\n{held_log}"
-    );
+    let gate = tempfile::tempdir().expect("retention due probe gate");
+    let mut contended = Contended::spawn_with_env(&[(
+        "AFT_TEST_RETENTION_DUE_PROBE_GATE",
+        gate.path().as_os_str(),
+    )]);
+    contended.wait_for(Duration::from_secs(20), "retention due probe", |_| {
+        gate.path().join("paused").exists()
+    });
 
+    // The child has the read connection but has not queried the index yet.
+    // Commit before BEGIN IMMEDIATE so the row is visible through the WAL.
+    const TASK: &str = "bash-0123456789abcdef";
+    aft::db::compression_events::tests::insert_eligible_retention_task(&contended.conn, TASK);
+    assert!(contended.conn.is_autocommit());
+    let log_path = contended.log_path();
+    let log_start = contended.log_len();
+    contended.with_write_lock(|_, writer| {
+        let held_since = Instant::now();
+        std::fs::write(gate.path().join("release"), b"").expect("release retention due probe");
+        std::thread::sleep(HOLD.saturating_sub(held_since.elapsed()));
+
+        // Read the sweep summary before COMMIT, not after a successful retry
+        // could append to the log. Other maintenance cannot emit this summary.
+        let log = std::fs::read(&log_path).expect("read child log");
+        let held_log = String::from_utf8_lossy(log.get(log_start..).unwrap_or_default());
+        assert!(
+            held_log.contains("bash task retention: initial_eligible=1 removed=0 "),
+            "retention never swept the eligible task during the hold; child log:\n{held_log}"
+        );
+        assert!(aft::db::bash_tasks::bash_task_by_id(writer, TASK)
+            .expect("read held retention row")
+            .is_some());
+    });
+
+    contended.wait_for(
+        Duration::from_secs(10),
+        "retention to remove the task after the lock was released",
+        |c| {
+            aft::db::bash_tasks::bash_task_by_id(&c.conn, TASK)
+                .expect("read retention row after release")
+                .is_none()
+        },
+    );
     let log = contended.finish();
     let warnings = warn_lines(&log, "retention");
     assert!(

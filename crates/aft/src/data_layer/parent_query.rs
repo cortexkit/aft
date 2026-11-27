@@ -299,6 +299,7 @@ pub(crate) fn grep_fan_out(
                 roots: vec![root.clone()],
                 multi_root: false,
                 per_root_max: scope.per_root_max,
+                explicit_single_file: scope.explicit_single_file,
             };
             let (result, root_phases) =
                 crate::grep_executor::execute_profiled_with_filters_in_order(

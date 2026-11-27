@@ -8770,13 +8770,40 @@ mod tests {
         });
         cache.clock_ms.store(1_900, Ordering::Relaxed);
         cache.refresh_for_test(&executor, &app);
-        let report = build_health_report(
-            &cache,
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-        );
+        let fresh = cache.snapshot().0;
+        assert_eq!(fresh.status, HealthStatus::Ok);
+        assert!(!cache.census_contended(&fresh));
+
+        let report = || {
+            build_health_report(
+                &cache,
+                &executor,
+                &HashMap::new(),
+                &DispatchPathMetrics::new(),
+                &app,
+            )
+        };
+        // A pending wake can make the live probe fail even with a fresh census.
+        let (release, held) = crossbeam_channel::bounded(1);
+        let holder = executor.hold_dispatch_loop_for_test(held);
+        let liveness = executor.dispatch_loop_liveness();
+        assert!(liveness.has_pending_work());
+        let contended = report();
+        assert_eq!(contended.status, HealthStatus::Degraded);
+        let metrics = contended.metrics.unwrap();
+        assert_eq!(metrics["generated_at_ms"], 1_900);
+        assert_eq!(metrics["stale_reason"], "executor_contended");
+        drop(release);
+        holder.join().unwrap();
+
+        // Releasing the holder lets the wake run; it does not mean the
+        // scheduler has finished taking the lock to process it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while liveness.has_pending_work() {
+            assert!(Instant::now() < deadline, "scheduler wake did not settle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let report = report();
         assert_eq!(report.status, HealthStatus::Ok);
         let metrics = report.metrics.unwrap();
         assert_eq!(metrics["stale"], false);

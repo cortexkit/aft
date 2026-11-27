@@ -1,0 +1,7 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "note": "Grep reports which source served the reply and the watcher test waits for index readiness, without changing search ranking."
+}

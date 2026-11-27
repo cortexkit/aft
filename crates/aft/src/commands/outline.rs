@@ -6380,12 +6380,15 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         use crate::parser::work_counters::tree_parses;
         let temp = tempfile::tempdir().expect("tempdir");
         let files = small_ts_files(temp.path(), OUTLINE_FILE_WALK_CAP + 5);
+        let request = files_request(&files);
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
+        // Call the inner handler so the request's real I/O deadline cannot
+        // stop a slow filesystem from exercising the file-list cap.
         let before = tree_parses();
-        let response = handle_outline(&files_request(&files), &ctx);
+        let response = handle_outline_inner(&request, &ctx);
         let parses = tree_parses() - before;
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["files_shown"], OUTLINE_FILE_WALK_CAP);
@@ -6398,6 +6401,20 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             "{text}"
         );
         assert_eq!(parses, OUTLINE_FILE_WALK_CAP);
+
+        // When the deadline wins instead, it must be disclosed even though
+        // the same input list also exceeded the cap.
+        let previous = OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.replace(Some(77)));
+        let partial = handle_outline_inner(&request, &ctx);
+        OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(previous));
+        assert!(partial.success, "{partial:?}");
+        assert_eq!(partial.data["files_shown"], 77);
+        assert_eq!(partial.data["complete"], false);
+        assert_eq!(partial.data["deadline_reached"], true);
+        assert_eq!(
+            partial.data["structure_footer"],
+            "shown 77 of ≥205 files (time limit) · narrow: path"
+        );
     }
 
     /// The access probe that runs before the outline handler checks only the

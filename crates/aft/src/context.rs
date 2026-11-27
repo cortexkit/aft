@@ -6867,10 +6867,10 @@ impl AppContext {
         })
     }
 
-    /// The data layer's current view of this root for text queries, when it
-    /// runs, builds the text index and has published; see
-    /// [`Self::data_checkout`]. With the text index switched off, grep and
-    /// glob walk the folder instead.
+    /// The current published text view for tests, even when its text plane is
+    /// not ready to serve queries. A pending watcher gap still withholds it.
+    /// Query paths use [`crate::data_layer::host::IndexHost::text_view`].
+    #[cfg(test)]
     pub(crate) fn data_view(&self) -> Option<crate::data_layer::checkout::CheckoutView> {
         if self.watcher_gap_pending() {
             return None;

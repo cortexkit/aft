@@ -22,8 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aft_store::checkout::{PathKind, PathRecord};
 use aft_store::text::{plan_pattern, Query, Scope};
 
-use crate::data_layer::checkout::{CheckoutView, DataError, PlaneStatus};
-use crate::data_layer::host::IndexHost;
+use crate::data_layer::checkout::{CheckoutView, DataError};
+use crate::data_layer::host::{IndexHost, TextView};
 use crate::pattern_compile::CompiledPattern;
 use crate::search_index::{FileEntry, PathFilters, SearchIndexSnapshot, DEFAULT_MAX_FILE_SIZE};
 
@@ -34,12 +34,18 @@ mod tests;
 /// it: the process runs the data layer, the checkout has published, and its
 /// text plane covers every path.
 pub(crate) fn ready_view(ctx: &(impl IndexHost + ?Sized)) -> Option<CheckoutView> {
+    match text_view(ctx) {
+        TextView::Ready(view) => Some(view),
+        _ => None,
+    }
+}
+
+pub(crate) fn text_view(ctx: &(impl IndexHost + ?Sized)) -> TextView {
     #[cfg(test)]
     if test_hooks::today_only() {
-        return None;
+        return TextView::Unavailable;
     }
-    let view = ctx.data_view()?;
-    (view.status().text == PlaneStatus::Ready).then_some(view)
+    ctx.text_view()
 }
 
 /// One search root inside a view's checkout, and the checkout's files under

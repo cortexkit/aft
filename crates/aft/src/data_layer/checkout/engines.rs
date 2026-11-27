@@ -22,6 +22,11 @@ use std::time::{Duration, Instant};
 
 use super::GraphEngine;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_NOW_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// How long an engine stays after its checkout's last edit or applied
 /// refresh. A coding agent's edits come seconds to minutes apart, and a
 /// checkout publishes its changes two minutes after its last edit; an
@@ -236,7 +241,25 @@ impl EngineKeeper {
     }
 
     fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = TEST_NOW_MS.get() {
+            return now;
+        }
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Timestamp the edit and refresh on the calling test thread, without
+    /// changing the clock on other threads or in other fixtures.
+    #[cfg(test)]
+    pub(super) fn with_time_for_test<T>(now: u64, run: impl FnOnce() -> T) -> T {
+        struct RestoreTime(Option<u64>);
+        impl Drop for RestoreTime {
+            fn drop(&mut self) {
+                TEST_NOW_MS.set(self.0);
+            }
+        }
+        let _restore = RestoreTime(TEST_NOW_MS.replace(Some(now)));
+        run()
     }
 
     /// A new empty slot for the checkout at `root`, whose memory epoch is
@@ -348,6 +371,38 @@ impl EngineKeeper {
         }
     }
 
+    /// Release idle engines and return the earliest next deadline, if any.
+    fn reap_idle(&self, idle: u64, now: u64) -> Option<u64> {
+        let mut next: Option<u64> = None;
+        for slot in self.live_slots() {
+            let (held, busy) = slot.held();
+            if !held {
+                continue;
+            }
+            let due = if busy {
+                now.saturating_add(idle)
+            } else {
+                slot.used_ms.load(Ordering::Acquire).saturating_add(idle)
+            };
+            if due <= now {
+                let why = format!("no edit or refresh for {} s", idle / 1000);
+                if slot.release(Release::Idle, &why) {
+                    continue;
+                }
+                // A refresh took it meanwhile.
+                next = Some(next.map_or(now + idle, |next| next.min(now + idle)));
+                continue;
+            }
+            next = Some(next.map_or(due, |next| next.min(due)));
+        }
+        next
+    }
+
+    #[cfg(test)]
+    pub(super) fn reap_idle_at_for_test(&self, now: u64) -> Option<u64> {
+        self.reap_idle(self.idle_ms.load(Ordering::Acquire), now)
+    }
+
     /// The thread that lets idle engines go: sleeps until the earliest
     /// time an engine falls idle, lets every idle one go, and ends once no
     /// slot holds an engine.
@@ -355,28 +410,7 @@ impl EngineKeeper {
         loop {
             let idle = self.idle_ms.load(Ordering::Acquire);
             let now = self.now_ms();
-            let mut next: Option<u64> = None;
-            for slot in self.live_slots() {
-                let (held, busy) = slot.held();
-                if !held {
-                    continue;
-                }
-                let due = if busy {
-                    now.saturating_add(idle)
-                } else {
-                    slot.used_ms.load(Ordering::Acquire).saturating_add(idle)
-                };
-                if due <= now {
-                    let why = format!("no edit or refresh for {} s", idle / 1000);
-                    if slot.release(Release::Idle, &why) {
-                        continue;
-                    }
-                    // A refresh took it meanwhile.
-                    next = Some(next.map_or(now + idle, |next| next.min(now + idle)));
-                    continue;
-                }
-                next = Some(next.map_or(due, |next| next.min(due)));
-            }
+            let next = self.reap_idle(idle, now);
             let mut state = self.lock();
             if state.stopped {
                 state.reaping = false;

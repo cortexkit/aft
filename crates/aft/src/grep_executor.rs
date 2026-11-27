@@ -23,7 +23,7 @@ use self::multi_path::{
 };
 #[cfg(test)]
 use crate::context::AppContext;
-use crate::data_layer::host::IndexHost;
+use crate::data_layer::host::{IndexHost, TextView};
 use crate::large_read::{MatchVisit, ScanLines};
 use crate::pattern_compile::CompiledPattern;
 use crate::protocol::Response;
@@ -613,6 +613,7 @@ pub struct GrepScope {
     pub roots: Vec<ResolvedRoot>,
     pub multi_root: bool,
     pub per_root_max: usize,
+    pub explicit_single_file: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -685,18 +686,18 @@ pub(crate) fn resolve_grep_scope(
     let project_root = project_root(ctx);
     let search_roots = resolve_roots(paths, &project_root, req_id, session_id, policy)?;
 
-    if let Some(missing_root) = search_roots
-        .iter()
-        .find(|root| crate::bounded_io::metadata(root).is_err())
-    {
-        return Err(Response::error(
-            req_id,
-            "path_not_found",
-            format!(
-                "grep: search path does not exist: {}",
-                missing_root.display()
-            ),
-        ));
+    let mut explicit_single_file = false;
+    for root in &search_roots {
+        let Ok(metadata) = crate::bounded_io::metadata(root) else {
+            return Err(Response::error(
+                req_id,
+                "path_not_found",
+                format!("grep: search path does not exist: {}", root.display()),
+            ));
+        };
+        explicit_single_file = search_roots.len() == 1
+            && paths.is_some_and(|paths| !paths.is_null())
+            && metadata.is_file();
     }
 
     // In a confined call, refuse a search root outside the confined root or
@@ -768,6 +769,7 @@ pub(crate) fn resolve_grep_scope(
         roots,
         multi_root,
         per_root_max,
+        explicit_single_file,
     })
 }
 
@@ -798,6 +800,7 @@ pub(crate) fn grep_root_for_test(
         }],
         multi_root: false,
         per_root_max: 16,
+        explicit_single_file: false,
     };
     let params = GrepParams {
         include: Vec::new(),
@@ -1098,6 +1101,12 @@ fn explicit_file_matches(filter_root: &Path, file: &Path, filters: &PathFilters)
     filters.matches(base, file)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_DIRECTORY_WALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn execute_root_profiled(
     ctx: &impl IndexHost,
     pattern: &CompiledPattern,
@@ -1122,11 +1131,7 @@ fn execute_root_profiled(
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary detection still applies.
     if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-        let index_status = if root.use_index && !crate::data_layer::read_fence::active() {
-            current_index_status(ctx)
-        } else {
-            IndexStatus::Fallback
-        };
+        let index_status = IndexStatus::Fallback;
         let result = if !explicit_file_matches(&root.filter_root, &root.search_root, filters)
             || params
                 .path_exclusion
@@ -1169,37 +1174,39 @@ fn execute_root_profiled(
         );
     }
 
-    if root.use_index && !root.ignored_target {
-        if let Some(view) = crate::data_layer::text_scope::ready_view(ctx) {
-            if let Some(answer) = execute_root_from_view(
-                ctx,
-                view,
-                pattern,
-                query,
-                root,
-                params,
-                filters,
-                max_results,
-                project_root,
-                order,
-            ) {
-                return answer;
+    let index_status = if root.use_index && !root.ignored_target {
+        match crate::data_layer::text_scope::text_view(ctx) {
+            TextView::Ready(view) => {
+                if let Some(answer) = execute_root_from_view(
+                    ctx,
+                    view,
+                    pattern,
+                    query,
+                    root,
+                    params,
+                    filters,
+                    max_results,
+                    project_root,
+                    order,
+                ) {
+                    return answer;
+                }
+                IndexStatus::Fallback
             }
+            TextView::Building => IndexStatus::Building,
+            TextView::Unavailable => IndexStatus::Fallback,
         }
-    }
-
-    let snapshot_started = Instant::now();
-    let ignored_target = root.ignored_target;
-    let snapshot_acquire = snapshot_started.elapsed();
-    let index_lacks_scope = ignored_target;
-
-    // A walk that replaces a ready index reports `Fallback`, so the response
-    // discloses that these results came from the filesystem, not the index.
-    let index_status = if root.use_index && !index_lacks_scope {
-        current_index_status(ctx)
     } else {
         IndexStatus::Fallback
     };
+
+    let snapshot_started = Instant::now();
+    let ignored_target = root.ignored_target;
+    #[cfg(test)]
+    if let Some(before_walk) = BEFORE_DIRECTORY_WALK.with_borrow_mut(Option::take) {
+        before_walk();
+    }
+    let snapshot_acquire = snapshot_started.elapsed();
     let mut counts = ScopeFileCounts::default();
     let result = fallback_grep_counted(
         project_root,
@@ -3496,20 +3503,6 @@ pub(crate) fn ripgrep_glob(
     Some(outcome)
 }
 
-/// How the checkout's text index stands for a reply that did not come from
-/// it: `Building` while its first publication is on the way, `Ready` once it
-/// serves (a walk then replaced it for this call), `Fallback` otherwise.
-fn current_index_status(ctx: &impl IndexHost) -> IndexStatus {
-    if ctx.cache_unavailable_reason().is_some() {
-        return IndexStatus::Fallback;
-    }
-    match crate::data_layer::surfaces::report(ctx).map(|report| report.text.status) {
-        Some(crate::data_layer::surfaces::READY) => IndexStatus::Ready,
-        Some(crate::data_layer::surfaces::BUILDING) => IndexStatus::Building,
-        _ => IndexStatus::Fallback,
-    }
-}
-
 pub fn line_starts(content: &str) -> Vec<usize> {
     let mut starts = vec![0usize];
     for (index, byte) in content.bytes().enumerate() {
@@ -3865,6 +3858,62 @@ mod tests {
         );
         assert_eq!(merged.total_matches, 5);
         assert!(merged.truncated);
+    }
+
+    #[test]
+    fn grep_walk_keeps_its_source_when_the_first_index_publishes() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn publication_needle() {}\n").unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        };
+        config.indexes.callgraph = false;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let checkout = ctx.data_checkout().expect("bound checkout");
+        assert!(checkout.first_text_building(), "the first build is held");
+
+        // Release publication only after grep has missed the view. Wait for
+        // the text index to publish before letting that same request walk.
+        BEFORE_DIRECTORY_WALK.with_borrow_mut(|slot| {
+            *slot = Some(Box::new(move || {
+                let checkout = checkout.checkout();
+                let mut generation = checkout.readiness_generation();
+                drop(hold);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while checkout.view().is_none() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "the text index did not publish");
+                    checkout.wait_for_readiness_change(&mut generation, remaining);
+                }
+            }));
+        });
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "grep-publication-race", "command": "grep",
+            "pattern": "publication_needle", "path": "src",
+        }))
+        .unwrap();
+        let walked = crate::commands::grep::handle_grep(&request, &ctx);
+        assert!(walked.success, "{}", walked.data);
+        assert_eq!(walked.data["total_matches"], 1, "{}", walked.data);
+        assert_eq!(walked.data["complete"], true, "{}", walked.data);
+        assert_eq!(walked.data["files_read_directly"], 1, "{}", walked.data);
+        assert_eq!(walked.data["index_status"], "Building", "{}", walked.data);
+        assert_eq!(walked.data["fallback"], "filesystem", "{}", walked.data);
+
+        let indexed = crate::commands::grep::handle_grep(&request, &ctx);
+        assert!(indexed.success, "{}", indexed.data);
+        assert_eq!(indexed.data["total_matches"], 1, "{}", indexed.data);
+        assert_eq!(indexed.data["complete"], true, "{}", indexed.data);
+        assert_eq!(indexed.data["files_read_directly"], 0, "{}", indexed.data);
+        assert_eq!(indexed.data["index_status"], "Ready", "{}", indexed.data);
+        assert!(indexed.data["fallback"].is_null(), "{}", indexed.data);
     }
 
     /// 100 directories of 100 files, each file holding one `needle`, and a
@@ -4340,6 +4389,7 @@ mod tests {
                 project_root,
                 include: &[],
                 file_roots: &[],
+                single_file_checkout_status: None,
                 offset: 0,
                 explicit_page_rows: None,
                 ignored_scope_note: None,
@@ -4453,6 +4503,7 @@ mod tests {
             }],
             multi_root: false,
             per_root_max: 10,
+            explicit_single_file: false,
         };
         assert!(!scope.multi_root);
         assert_eq!(scope.per_root_max, 10);
@@ -4481,6 +4532,7 @@ mod tests {
             }],
             multi_root: false,
             per_root_max: 10,
+            explicit_single_file: false,
         };
         assert_eq!(scope_ignored_entries(&scope).unwrap().names, [".agents/"]);
         crate::context::confinement::with_root(&ctx, "ignore-disclosure", || {
@@ -4937,6 +4989,7 @@ mod tests {
             }],
             multi_root: false,
             per_root_max: 10,
+            explicit_single_file: false,
         };
         assert_eq!(scope_has_files(&scope, &filters), Some(false));
         // An expired call budget leaves the breakdown unknown instead of
