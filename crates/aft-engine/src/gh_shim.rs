@@ -61,7 +61,6 @@ use api_rules::{api_rule_matches_path, api_tuple, is_api_tuple};
 use captured_dispatch::run_captured_protected;
 #[cfg(test)]
 use captured_dispatch::{captured_plan, captured_rung_refusal};
-use native_guard::delegate;
 use repo_scope::{canonical_repository_key, valid_repository_component};
 
 use prefrontal_route::select_route_holder;
@@ -782,12 +781,37 @@ pub fn run_from_env() -> i32 {
 }
 
 fn run(args: &[OsString]) -> i32 {
-    run_with(args, delegate, worker_reads::identity_for_command)
+    run_with_native(
+        args,
+        native_guard::delegate,
+        worker_reads::identity_for_command,
+    )
 }
 
+#[cfg(test)]
 fn run_with(
     args: &[OsString],
     mut native_delegate: impl FnMut(&[OsString]) -> i32,
+    read_identity: impl FnMut(
+        &[OsString],
+        &Manifest,
+        &StatePaths,
+        &RelayContext,
+    ) -> Result<Option<bool>, String>,
+) -> i32 {
+    run_with_native(
+        args,
+        |guard, args| match guard {
+            Some(guard) => guard.delegate(args, &mut native_delegate),
+            None => native_delegate(args),
+        },
+        read_identity,
+    )
+}
+
+fn run_with_native(
+    args: &[OsString],
+    mut native_dispatch: impl FnMut(Option<&manifest_guard::ManifestGuard<'_>>, &[OsString]) -> i32,
     mut read_identity: impl FnMut(
         &[OsString],
         &Manifest,
@@ -808,12 +832,10 @@ fn run_with(
     }
     // Opting out skips shim governance, not the native-gh restriction on workers.
     if shim_disabled_by_operator() {
-        return native_delegate(args);
+        return native_dispatch(None, args);
     }
     let manifest_guard = manifest_guard::ManifestGuard::new(&paths);
-    // The manifest can disappear after authority and audit checks finish.
-    // Recheck it before calling upstream gh, including audited operator writes.
-    let mut delegate = |args: &[OsString]| manifest_guard.delegate(args, &mut native_delegate);
+    let mut delegate = |args: &[OsString]| native_dispatch(Some(&manifest_guard), args);
     if secret_list::targets(args) {
         return secret_list::dispatch(args, &paths, unix_seconds(), delegate);
     }

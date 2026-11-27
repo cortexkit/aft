@@ -147,26 +147,35 @@ pub(super) fn dispatch(
     dispatch_with(args, relay, signals, relay_client::worker_session, native)
 }
 
-pub(super) fn delegate(args: &[OsString]) -> i32 {
+pub(super) fn delegate(guard: Option<&manifest_guard::ManifestGuard<'_>>, args: &[OsString]) -> i32 {
     dispatch(
         args,
         &RelayContext::from_process(),
         ShellSignals::from_process(),
-        delegate_allowed,
+        |args| delegate_allowed(guard, args),
     )
 }
 
-fn delegate_allowed(args: &[OsString]) -> i32 {
+fn delegate_allowed(guard: Option<&manifest_guard::ManifestGuard<'_>>, args: &[OsString]) -> i32 {
     let Some(real_gh) = resolve_real_gh(&executing_image()) else {
         return refuse(
             RefusalCode::NoRealGh,
             "PATH contains no upstream gh after skipping the executing shim image",
         );
     };
-    if environment_admin::targets_secret(args) {
-        return quiet_secret_gh(real_gh, args);
+    let execute = |args: &[OsString]| {
+        if environment_admin::targets_secret(args) {
+            quiet_secret_gh(real_gh, args)
+        } else {
+            exec_real_gh(real_gh, args)
+        }
+    };
+    // The ticket lookup can wait on the daemon while policy changes.
+    // Recheck the policy state, list digest and pin just before execution.
+    match guard {
+        Some(guard) => guard.delegate(args, execute),
+        None => execute(args),
     }
-    exec_real_gh(real_gh, args)
 }
 
 fn quiet_secret_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
