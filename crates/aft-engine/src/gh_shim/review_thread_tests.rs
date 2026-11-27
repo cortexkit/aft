@@ -47,6 +47,9 @@ fn snapshot(manifest: &Manifest) -> crate::gh_shim_speech::model::PolicySnapshot
 #[test]
 fn a_resolved_repository_frozen_into_a_review_thread_invocation_still_classifies() {
     let _lock = crate::test_env::process_env_lock();
+    let state = tempfile::tempdir().unwrap();
+    super::tests::write_fixture_pin(&StatePaths::from_root(state.path().to_path_buf()));
+    let _state = EnvGuard::set(GH_SHIM_STATE_DIR_ENV, state.path().to_str());
     let manifest = manifest();
     let args = live_resolve_args();
     let (request, invocation) = {

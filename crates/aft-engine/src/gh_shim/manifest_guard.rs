@@ -3,9 +3,10 @@ use std::io;
 use std::path::Path;
 
 use super::{
-    current_platform, delegate_after_invalid_manifest_notice, gh_shim_state_dir_from,
-    is_unbound_safe, refuse, regressed_disposition, resolve_manifest, unix_seconds,
-    ManifestProblem, ManifestResolution, RefusalCode, RegressedDisposition, StatePaths,
+    connection_file_from_config_doc, current_platform, delegate_after_invalid_manifest_notice,
+    gh_shim_state_dir_from, is_unbound_safe, read_user_config_doc, refuse, regressed_disposition,
+    relay_client, resolve_manifest, trust_root, unix_seconds, ManifestProblem, ManifestResolution,
+    RefusalCode, RegressedDisposition, StatePaths, DISCOVERY_BUDGET, NO_TRUST_ROOT_REFUSAL,
 };
 
 pub(super) struct ManifestGuard<'a> {
@@ -43,7 +44,19 @@ impl<'a> ManifestGuard<'a> {
             crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
             crate::environment::non_empty_os_var("HOME").as_deref(),
         );
-        if manifest_state_was_provisioned(&self.paths.root)
+        let local_provisioned = manifest_state_was_provisioned(&self.paths.root);
+        if local_provisioned
+            && matches!(
+                trust_root::read(self.paths),
+                Err(ManifestProblem::NoTrustRoot)
+            )
+        {
+            return Some(refuse(
+                RefusalCode::ManifestUnavailable,
+                NO_TRUST_ROOT_REFUSAL,
+            ));
+        }
+        if local_provisioned
             || manifest_state_was_provisioned(&default_root)
         {
             return Some(refuse(

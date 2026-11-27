@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 
 const UNAVAILABLE: &str = "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.\n";
+const UNPINNED: &str = "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine has no pinned policy root. Ask the operator to run `ck policy-root set` and apply the reviewed change. Reads still work.\n";
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -162,6 +163,7 @@ impl Fixture {
 #[test]
 fn gh_shim_manifest_unavailable_invalid_without_cache() {
     let fixture = Fixture::new();
+    write_fresh_manifest(&fixture.state_home, unix_seconds());
     fixture.high_water();
     fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
     assert!(!fixture.state.join("last-valid-manifest.json").exists());
@@ -172,7 +174,26 @@ fn gh_shim_manifest_unavailable_invalid_without_cache() {
 fn gh_shim_manifest_unavailable_initially_dormant_provisioned() {
     let fixture = Fixture::new();
     fixture.high_water();
-    fixture.assert_unavailable();
+    fixture.assert_refused(
+        &["issue", "comment", "1", "--body", "offline"],
+        false,
+        UNPINNED,
+    );
+}
+
+#[test]
+fn gh_shim_manifest_unavailable_pin_removed_after_acceptance_refuses_writes() {
+    let fixture = Fixture::new();
+    fixture.activate();
+    fs::remove_file(fixture.state.join("trust-root.json")).unwrap();
+    for bypass in [false, true] {
+        fixture.assert_refused(
+            &["issue", "comment", "1", "--body", "offline"],
+            bypass,
+            UNPINNED,
+        );
+        fixture.assert_passthrough(&["pr", "view", "1"], bypass);
+    }
 }
 
 #[test]
@@ -268,6 +289,7 @@ fn gh_shim_manifest_unavailable_uninspectable_provisioning_records() {
 #[test]
 fn gh_shim_manifest_unavailable_unprovisioned_passthrough_is_unchanged() {
     let fixture = Fixture::new();
+    assert!(!fixture.state.join("trust-root.json").exists());
     for invalid in [false, true] {
         if invalid {
             fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
@@ -282,6 +304,8 @@ fn gh_shim_manifest_unavailable_unprovisioned_passthrough_is_unchanged() {
 #[test]
 fn gh_shim_manifest_unavailable_write_relay_does_not_replace_manifest_history() {
     let fixture = Fixture::new();
+    write_fresh_manifest(&fixture.state_home, unix_seconds());
+    fs::remove_file(fixture.state.join("trust-root.json")).unwrap();
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig::default());
     fixture.connect_daemon(&daemon);
 

@@ -260,13 +260,28 @@ async fn until(state: &Mutex<State>, predicate: impl Fn(&State) -> bool) {
     .expect("sync did not reach expected state");
 }
 
+async fn run_fake(paths: StatePaths, connection_file: &Path) {
+    let read: &ReadRoot = &|| {
+        Box::pin(async {
+            Ok(trust_root::Reply::Root {
+                pin: Some(super::super::super::tests::fixture_pin()),
+                generation: 1,
+            })
+        })
+    };
+    run_with(&paths, &RootRefresh::new(read), || {
+        ManagementSession::for_test(connection_file)
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn manifest_sync_watch_seq_gap_epoch_change_and_stream_end_read_latest_again() {
     let vault = Vault::start(State::default());
     let directory = tempfile::tempdir().unwrap();
     let paths = paths(&directory);
     tokio::select! {
-        _ = run_with(paths, || ManagementSession::for_test(&vault.path)) => panic!("sync stopped"),
+        _ = run_fake(paths, &vault.path) => panic!("sync stopped"),
         _ = until(&vault.state, |state| state.watch_rounds == 2) => {}
     }
     let state = vault.state.lock().unwrap();
@@ -291,9 +306,7 @@ async fn manifest_sync_unknown_method_stops_once_without_watch_or_retry_loop() {
     let directory = tempfile::tempdir().unwrap();
     tokio::time::timeout(
         Duration::from_secs(3),
-        run_with(paths(&directory), || {
-            ManagementSession::for_test(&vault.path)
-        }),
+        run_fake(paths(&directory), &vault.path),
     )
     .await
     .expect("unknown method must stop the worker");
@@ -308,7 +321,7 @@ async fn manifest_sync_report_unknown_outcome_retries_the_same_tuple() {
     });
     let directory = tempfile::tempdir().unwrap();
     tokio::select! {
-        _ = run_with(paths(&directory), || ManagementSession::for_test(&vault.path)) => panic!("sync stopped"),
+        _ = run_fake(paths(&directory), &vault.path) => panic!("sync stopped"),
         _ = until(&vault.state, |state| state.watch_rounds >= 1) => {}
     }
     let state = vault.state.lock().unwrap();
@@ -326,7 +339,7 @@ async fn manifest_sync_notice_digest_disagreement_rereads_once_then_reports_inva
     let local = paths(&directory);
     let manifest_path = local.manifest.clone();
     tokio::select! {
-        _ = run_with(local, || ManagementSession::for_test(&vault.path)) => panic!("sync stopped"),
+        _ = run_fake(local, &vault.path) => panic!("sync stopped"),
         _ = until(&vault.state, |state| state.reports.iter().any(|report| report["reason"] == "digest differs from the vault's notice")) => {}
     }
     let state = vault.state.lock().unwrap();

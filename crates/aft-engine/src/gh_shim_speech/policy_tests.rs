@@ -53,8 +53,11 @@ fn comment_input(manifest: &Manifest, body: &Path) -> (Vec<OsString>, AgentBindi
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn frozen_body_is_replayed_under_both_signed_envelopes_without_reopening_the_file() {
+    let _lock = crate::test_env::process_env_lock();
     let manifest = super::tests::fixture_manifest();
     let dir = tempfile::tempdir().unwrap();
+    super::tests::write_fixture_pin(&StatePaths::from_root(dir.path().to_path_buf()));
+    let _state = Env::set(GH_SHIM_STATE_DIR_ENV, Some(dir.path().as_os_str()));
     let file = dir.path().join("body");
     std::fs::write(&file, "original frozen body").unwrap();
     let (args, binding) = comment_input(&manifest, &file);
@@ -94,8 +97,11 @@ fn frozen_body_is_replayed_under_both_signed_envelopes_without_reopening_the_fil
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn a_current_only_classification_cannot_expand_the_start_envelope() {
+    let _lock = crate::test_env::process_env_lock();
     let mut old = super::tests::fixture_manifest();
     let dir = tempfile::tempdir().unwrap();
+    super::tests::write_fixture_pin(&StatePaths::from_root(dir.path().to_path_buf()));
+    let _state = Env::set(GH_SHIM_STATE_DIR_ENV, Some(dir.path().as_os_str()));
     let file = dir.path().join("body");
     std::fs::write(&file, "body").unwrap();
     let (args, binding) = comment_input(&old, &file);
@@ -193,6 +199,7 @@ fn protected_manifest_and_operator_arms_delegate_only_on_operator_disable() {
         Some(view.as_os_str()),
     );
     let paths = StatePaths::from_root(state.clone());
+    super::tests::write_fixture_pin(&paths);
     write_version_high_water(&paths, manifest.manifest_version);
     let repo = manifest.bindings.keys().next().unwrap();
     let args: Vec<OsString> = ["issue", "comment", "7", "--repo", repo, "--body", "body"]

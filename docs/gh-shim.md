@@ -6,10 +6,34 @@ BOTH the signed manifest declares it AND this build's classifier allowlist
 admits it at that manifest version, so a signed artifact alone cannot widen what
 the shim will speak.
 
+## Signing root
+
+The shim verifies lists only against this installation's policy root. The
+operator pins the vault's signing root with `ck policy-root set --vault-key
+<id>` and applies the printed digest with `ck config apply <digest>`. AFT reads
+the pin from its authenticated daemon connection at startup, before activating
+a new list, and every five minutes. It caches the pin beside the list in
+`trust-root.json` with owner-only access, and copies both into a worker shell's
+private state. There is no built-in signing key or fallback key.
+
+A root change makes lists signed by the retired key unusable. The vault must
+publish a newer list signed by the new root before governed writes can resume.
+If the daemon clears the pin, AFT removes the trust file. A previously
+provisioned shim refuses writes without a verified list rather than using the
+operator's credentials. On a never-provisioned install, commands pass through
+only when the shim can rule out a write relay, as on a standalone install.
+
+Commit attribution is separate. In `git.co_author: "auto"` mode, the Git
+hook uses the committing agent's GitHub identity from Entorhinal, not the bot
+bound to the repository in the list. A worker uses the identity of the agent
+it works for. No verified list is needed to add the trailer.
+
 ## Shim status
 
 `gh --status` prints one JSON document from local shim state, including
-`cached_manifest` and `last_rung`. The audit fields are `bypass_audit_count`
+`cached_manifest` and `last_rung`. The manifest status reports the daemon's
+`pinned_trust_root_key_id` and, when verification succeeds, `verified_by_key_id`.
+The audit fields are `bypass_audit_count`
 (the total number of operator-bypass entries) and `bypass_audit_recent`
 (the newest 10 entries, or all entries when fewer exist, with the newest last).
 The summary streams the JSONL file and retains only those 10 entries in memory.

@@ -28,6 +28,30 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+pub fn write_gh_fixture_pin(state: &Path, key: &ring::signature::Ed25519KeyPair, now: u64) {
+    use ring::signature::KeyPair;
+    let public_key_hex: String = key
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    std::fs::create_dir_all(state).unwrap();
+    std::fs::write(
+        state.join("trust-root.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "key_id": "gh-routing-dev-test-key-v1",
+            "public_key_hex": public_key_hex,
+            "retired_key_ids": [],
+            "generation": 1,
+            "read_at_unix_secs": now
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 /// Canonicalize a fixture root for Git path arguments. Git's Windows worktree
 /// creation rejects verbatim local-drive paths, even though Rust accepts them.
 pub fn canonical_git_path(path: &Path) -> PathBuf {

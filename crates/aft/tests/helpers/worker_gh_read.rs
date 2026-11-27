@@ -162,7 +162,7 @@ async fn connection(mut stream: TcpStream, holder: Arc<Mutex<ReadHolder>>) {
 
 pub(super) fn configure(base: &Path, command: &mut Command) {
     use base64::Engine;
-    use ring::signature::Ed25519KeyPair;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     const SEED: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
@@ -188,6 +188,24 @@ pub(super) fn configure(base: &Path, command: &mut Command) {
     manifest["issued_at_unix_secs"] = json!(now);
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let key = Ed25519KeyPair::from_seed_unchecked(&SEED).unwrap();
+    let public_key_hex: String = key
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    std::fs::write(
+        state.join("trust-root.json"),
+        serde_json::to_vec(&json!({
+            "key_id": "gh-routing-dev-test-key-v1",
+            "public_key_hex": public_key_hex,
+            "retired_key_ids": [],
+            "generation": 1,
+            "read_at_unix_secs": now
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let envelope = json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"gh-routing-dev-test-key-v1","fetched_at_unix_secs":now,
         "signature":base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),"manifest_bytes":String::from_utf8(bytes).unwrap()});
     std::fs::write(

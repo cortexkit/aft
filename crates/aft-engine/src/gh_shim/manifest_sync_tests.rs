@@ -2,7 +2,9 @@ use super::super::manifest_wire::Envelope;
 use super::*;
 
 fn paths(directory: &tempfile::TempDir) -> StatePaths {
-    StatePaths::from_root(directory.path().join("gh-shim"))
+    let paths = StatePaths::from_root(directory.path().join("gh-shim"));
+    super::super::tests::write_fixture_pin(&paths);
+    paths
 }
 
 fn candidate(version: u64, now: u64) -> Latest {
@@ -146,6 +148,52 @@ fn manifest_sync_health_remembers_newest_notice_even_when_latest_is_older() {
     health.observe_version(Some(29));
     health.observe_version(None);
     assert_eq!(health.newest_version_seen, Some(30));
+}
+
+#[tokio::test(start_paused = true)]
+async fn manifest_sync_refresh_retires_old_key_and_deletes_a_cleared_pin() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(directory.path().join("gh-shim"));
+    let generation = Arc::new(AtomicU64::new(1));
+    let read = {
+        let generation = generation.clone();
+        move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<trust_root::Reply, ()>> + Send>> {
+            let generation = generation.load(Ordering::Relaxed);
+            Box::pin(async move {
+                let old = super::super::tests::fixture_pin();
+                let pin = match generation {
+                    1 => Some(old),
+                    2 => {
+                        let mut next = super::super::tests::pin_for(&[31; 32], "rotated-synthetic-key");
+                        next.retired_key_ids.push(old.key_id);
+                        Some(next)
+                    }
+                    _ => None,
+                };
+                Ok(trust_root::Reply::Root { pin, generation })
+            })
+        }
+    };
+    let root = RootRefresh::new(&read);
+    let now = unix_seconds();
+    tokio::select! {
+        _ = root.poll(&paths) => panic!("poll stopped"),
+        _ = async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(activate(&paths, &candidate(29, now), now).unwrap().verdict, "valid");
+            generation.store(2, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            assert_eq!(trust_root::read(&paths).unwrap().key_id, "rotated-synthetic-key");
+            assert!(matches!(load_manifest(&paths, now), Err(ManifestProblem::Invalid(reason)) if reason.starts_with("retired manifest key id")));
+            generation.store(3, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            assert!(!paths.trust_root.exists());
+            assert_eq!(version_high_water(&paths), 29);
+        } => {},
+    }
 }
 
 #[cfg(unix)]

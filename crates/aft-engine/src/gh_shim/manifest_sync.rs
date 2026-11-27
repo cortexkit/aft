@@ -7,6 +7,52 @@ use crate::secret::transport::ManagementSession;
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 
+const PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+type ReadRoot = dyn Fn()
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<trust_root::Reply, ()>> + Send>>
+    + Send
+    + Sync;
+
+struct RootRefresh<'a> {
+    read: &'a ReadRoot,
+    // Serialize the read and its publication: a slow older response must not
+    // overwrite a later pin read by the periodic or pre-activation refresh.
+    serial: tokio::sync::Mutex<()>,
+}
+
+impl<'a> RootRefresh<'a> {
+    fn new(read: &'a ReadRoot) -> Self {
+        Self {
+            read,
+            serial: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    async fn refresh(&self, paths: &StatePaths) -> Result<(), Failure> {
+        let _guard = self.serial.lock().await;
+        let reply = tokio::time::timeout(Duration::from_secs(5), (self.read)())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| Failure::new("policy_root_unavailable", true))?;
+        trust_root::publish(paths, reply, unix_seconds())
+            .map_err(|_| Failure::new("store_error", true))
+    }
+
+    async fn poll(&self, paths: &StatePaths) {
+        let mut interval = tokio::time::interval(PIN_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(failure) = self.refresh(paths).await {
+                failure.record();
+            } else {
+                let _ = local_report(paths, unix_seconds());
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default, Serialize)]
 struct Health {
     active_version: Option<u64>,
@@ -52,10 +98,14 @@ fn digest(bytes: &str) -> String {
 fn problem_reason(problem: &ManifestProblem) -> &'static str {
     match problem {
         ManifestProblem::Missing => "manifest missing",
+        ManifestProblem::NoTrustRoot => "no pinned policy root",
         ManifestProblem::RolledBack { .. } => "manifest below high-water version",
         ManifestProblem::BelowFloor { .. } => "manifest below schema floor",
         ManifestProblem::Invalid(reason) if reason.starts_with("untrusted manifest key id") => {
             "untrusted manifest key"
+        }
+        ManifestProblem::Invalid(reason) if reason.starts_with("retired manifest key id") => {
+            "retired manifest key"
         }
         ManifestProblem::Invalid(reason) if reason == "detached signature verification failed" => {
             "detached signature verification failed"
@@ -161,11 +211,10 @@ fn activate(paths: &StatePaths, latest: &Latest, now: u64) -> Option<Report> {
         signature: latest.envelope.signature.clone(),
         manifest_bytes: latest.envelope.manifest_bytes.clone(),
     };
-    let verified =
-        match validate_manifest_candidate(paths, &envelope, now, compiled_manifest_trust_set()) {
-            Ok(verified) => verified,
-            Err(problem) => return Some(candidate_report(latest, problem_reason(&problem))),
-        };
+    let verified = match validate_manifest_candidate(paths, &envelope, now) {
+        Ok(verified) => verified,
+        Err(problem) => return Some(candidate_report(latest, problem_reason(&problem))),
+    };
     if latest.version == 0 || verified.manifest.manifest_version != latest.version {
         return Some(candidate_report(
             latest,
@@ -218,6 +267,7 @@ impl Failure {
             "not_found" => "not_found",
             "home_unavailable" => "home_unavailable",
             "store_error" => "store_error",
+            "policy_root_unavailable" => "policy_root_unavailable",
             "remote_setup_incomplete" => "remote_setup_incomplete",
             "secret_setup_incomplete" => "secret_setup_incomplete",
             "invalid_params" => "invalid_params",
@@ -344,6 +394,7 @@ async fn latest(session: &ManagementSession) -> Result<Latest, Failure> {
 async fn refresh(
     session: &ManagementSession,
     paths: &StatePaths,
+    root: &RootRefresh<'_>,
     cursor: &mut Cursor,
     notice: Option<&Notice>,
 ) -> Result<Option<Report>, Failure> {
@@ -366,16 +417,13 @@ async fn refresh(
             )));
         }
     }
+    root.refresh(paths).await?;
     cursor.read_version = Some(fetched.version);
     cursor.read_sha256 = Some(digest(&fetched.envelope.manifest_bytes));
     Ok(activate(paths, &fetched, unix_seconds()))
 }
 
-async fn run(connection_file: PathBuf, paths: StatePaths) {
-    run_with(paths, || ManagementSession::connect(&connection_file)).await;
-}
-
-async fn run_with<F, Fut>(paths: StatePaths, mut connect: F)
+async fn run_with<F, Fut>(paths: &StatePaths, root: &RootRefresh<'_>, mut connect: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<ManagementSession, ()>>,
@@ -397,10 +445,10 @@ where
                 report(&session, pending).await?;
                 pending_report = None;
             }
-            let first = refresh(&session, &paths, &mut cursor, None).await;
+            let first = refresh(&session, paths, root, &mut cursor, None).await;
             if let Err(failure) = first {
                 if failure.stop() {
-                    if let Some(current) = local_report(&paths, unix_seconds()) {
+                    if let Some(current) = local_report(paths, unix_seconds()) {
                         let _ = report(&session, &current).await;
                     }
                 }
@@ -445,7 +493,8 @@ where
                 let hash_differs = notice.version == cursor.read_version
                     && notice.manifest_sha256 != cursor.read_sha256;
                 if cursor.observe(&notice) || hash_differs {
-                    pending_report = refresh(&session, &paths, &mut cursor, Some(&notice)).await?;
+                    pending_report =
+                        refresh(&session, paths, root, &mut cursor, Some(&notice)).await?;
                     if let Some(pending) = pending_report.as_ref() {
                         report(&session, pending).await?;
                         pending_report = None;
@@ -474,7 +523,14 @@ pub struct Worker {
 
 /// Called only by subc startup after registration, never by a standalone shim.
 #[doc(hidden)]
-pub fn start(connection_file: PathBuf) -> Option<Worker> {
+pub fn start(
+    connection_file: PathBuf,
+    read_root: impl Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<trust_root::Reply, ()>> + Send>,
+        > + Send
+        + Sync
+        + 'static,
+) -> Option<Worker> {
     if !aft_base::registration::module_consumer_allowed()
         || aft_base::registration::module_id().as_deref() != Some("aft")
     {
@@ -492,11 +548,13 @@ pub fn start(connection_file: PathBuf) -> Option<Worker> {
             .build()
         {
             let paths = StatePaths::from_process();
-            let _ = local_report(&paths, unix_seconds());
+            let root = RootRefresh::new(&read_root);
             runtime.block_on(async {
                 tokio::select! {
                     _ = stopped => {},
-                    _ = run(connection_file, paths) => {},
+                    _ = async {
+                        tokio::join!(root.poll(&paths), run_with(&paths, &root, || ManagementSession::connect(&connection_file)));
+                    } => {},
                 }
             });
         }

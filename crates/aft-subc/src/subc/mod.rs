@@ -240,6 +240,8 @@ mod drain;
 mod edge_lifecycle_tests;
 mod flow_read;
 mod fork_call;
+mod gh_shim_session;
+use gh_shim_session::speech_launch_seed;
 mod health;
 mod installed_routes;
 #[cfg(test)]
@@ -1749,61 +1751,6 @@ struct RouteIdentityData {
     /// or the worker's own for a worker run (see `codemode`). Routes in the
     /// route table never carry it.
     run_owner: Option<Arc<codemode::RunOwner>>,
-}
-
-fn speech_launch_seed(
-    identity: &RouteIdentity,
-    route: RouteChannel,
-    control: Option<&Arc<readiness::DaemonControl>>,
-) -> Option<crate::gh_shim_speech::service::LaunchSeed> {
-    use crate::gh_shim_speech::model::{LaunchAuthority, RouteOrigin};
-    let lifecycle = identity.scope.clone()?;
-    let origin = |channel: RouteChannel| {
-        control.and_then(|control| {
-            Some(RouteOrigin {
-                run_nonce: crate::gh_shim_speech::service::run_nonce()?.into(),
-                connection_generation: format!("{:p}", Arc::as_ptr(control)),
-                channel: u32::from(channel.channel),
-                epoch: u64::from(channel.epoch),
-            })
-        })
-    };
-    let launch = if let Some(owner) = &identity.run_owner {
-        if matches!(owner.kind, codemode::RunKind::Worker { .. }) {
-            Err(crate::gh_shim_speech::Refusal::new(
-                crate::gh_shim_speech::Code::AuthorityUnavailable,
-                "owner_unresolved",
-            ))
-        } else {
-            owner
-                .owner_route
-                .scope
-                .clone()
-                .ok_or_else(|| {
-                    crate::gh_shim_speech::Refusal::new(
-                        crate::gh_shim_speech::Code::AuthorityUnavailable,
-                        "owner_unresolved",
-                    )
-                })
-                .and_then(|head| {
-                    LaunchAuthority::codemode(
-                        head,
-                        lifecycle.clone(),
-                        origin(route),
-                        owner.owner_route_channel.and_then(origin),
-                    )
-                })
-        }
-    } else {
-        LaunchAuthority::classic(lifecycle.clone(), origin(route))
-    };
-    Some(crate::gh_shim_speech::service::LaunchSeed {
-        launch,
-        lifecycle: Some(lifecycle),
-        session: identity.session.clone(),
-        harness: identity.harness.clone(),
-        project_root: identity.project_root.display().to_string(),
-    })
 }
 
 impl Deref for RouteIdentity {
@@ -4895,7 +4842,7 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     consent::install_subc_transport(connection_file_path);
     let _expiry = consent::expiry::start(shared_app.clone(), storage_dir.join("aft.db"));
-    let _manifest_sync = crate::gh_shim::manifest_sync::start(connection_file_path.to_path_buf());
+    let _manifest_sync = gh_shim_session::start(connection_file_path, control.clone());
     let bus_worker = task_scope_runtime::start_publication_services(
         connection_file_path,
         &shared_app,

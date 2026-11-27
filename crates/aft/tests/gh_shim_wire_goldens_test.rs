@@ -804,7 +804,7 @@ fn write_signed_manifest(state_dir: &Path, now: u64) {
         "signature": base64::engine::general_purpose::STANDARD.encode(key.sign(&manifest_bytes).as_ref()),
         "manifest_bytes": String::from_utf8(manifest_bytes).expect("manifest is UTF-8"),
     });
-    fs::create_dir_all(state_dir).expect("create shim state directory");
+    crate::test_helpers::write_gh_fixture_pin(state_dir, &key, now);
     fs::write(
         state_dir.join("gh-routing-manifest.json"),
         serde_json::to_vec(&envelope).expect("serialize envelope"),
@@ -1928,7 +1928,7 @@ fn write_signed_manifest_bytes(state_dir: &Path, manifest_bytes: &[u8], now: u64
         "signature": base64::engine::general_purpose::STANDARD.encode(key.sign(manifest_bytes).as_ref()),
         "manifest_bytes": std::str::from_utf8(manifest_bytes).expect("manifest is UTF-8"),
     });
-    fs::create_dir_all(state_dir).expect("create shim state directory");
+    crate::test_helpers::write_gh_fixture_pin(state_dir, &key, now);
     fs::write(
         state_dir.join("gh-routing-manifest.json"),
         serde_json::to_vec(&envelope).expect("serialize envelope"),

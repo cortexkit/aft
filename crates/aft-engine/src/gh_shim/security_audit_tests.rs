@@ -709,7 +709,6 @@ fn stripped_worker_probe_child() {
             |_| panic!("env -i reached native gh"),
         );
         assert_eq!(status, 86);
-        assert!(resolve_and_cache_numeric_id(&StatePaths::from_process(), "test-user").is_none());
         assert!(rename_guard::resolve_preflight_gh().is_none());
         assert_eq!(run(&args(&["api", "repos/cortexkit/aft/issues"])), 86);
     });

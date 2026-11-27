@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aft::config::Config;
 use base64::Engine;
 use ring::signature::Ed25519KeyPair;
 use serde_json::{json, Value};
@@ -53,8 +52,7 @@ fn write_manifest_value(state_home: &Path, now: u64, mut manifest: Value, manife
         "manifest_bytes": String::from_utf8(manifest_bytes).expect("manifest fixture is UTF-8"),
     });
     let manifest_path = state_home.join("cortexkit/aft/gh-shim/gh-routing-manifest.json");
-    fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
-        .expect("create shim state directory");
+    test_helpers::write_gh_fixture_pin(manifest_path.parent().unwrap(), &key, now);
     fs::write(
         manifest_path,
         serde_json::to_vec(&envelope).expect("serialize manifest envelope"),
@@ -323,27 +321,6 @@ fn write_upstream_gh(bin: &Path) {
     .expect("write fake upstream gh");
 }
 
-fn write_upstream_gh_user_api(bin: &Path) {
-    let gh = bin.join("gh");
-    fs::create_dir_all(bin).expect("create fake upstream bin directory");
-    test_helpers::executable_cache::write_executable(
-        &gh,
-        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\n[ \"$1\" = api ] || exit 73\nprintf '289616620\\n'\n",
-    )
-    .expect("write fake upstream gh API");
-}
-
-fn write_numeric_ids(state_home: &Path, ids: Value) {
-    let path = state_home.join("cortexkit/aft/gh-shim/numeric-ids.json");
-    fs::create_dir_all(path.parent().expect("numeric id cache parent"))
-        .expect("create numeric id cache directory");
-    fs::write(
-        path,
-        serde_json::to_vec(&ids).expect("serialize numeric ids"),
-    )
-    .expect("write numeric id cache");
-}
-
 fn write_user_config(config_home: &Path, connection_file: &Path, enabled: Option<bool>) {
     let config_dir = config_home.join("cortexkit");
     fs::create_dir_all(&config_dir).expect("create user config directory");
@@ -435,9 +412,10 @@ fn assert_status_provenance(report: &Value) {
     assert!(report["cached_manifest"]
         .get("verified_by_key_id")
         .is_some());
-    assert!(report["cached_manifest"]["compiled_trust_set_key_ids"]
-        .as_array()
-        .is_some_and(|ids| ids.iter().any(|id| id == "gh-routing-dev-test-key-v1")));
+    assert_eq!(
+        report["cached_manifest"]["pinned_trust_root_key_id"],
+        "gh-routing-dev-test-key-v1"
+    );
 }
 
 const TEST_GH_SHIM_TICKET: &str = "00112233445566778899aabbccddeeff";
@@ -724,7 +702,7 @@ fn gh_shim_s2_one_agent_many_repos_exercises_binding_and_failure_arms() {
     );
     assert_eq!(
         regressed_status["cached_manifest"]["diagnostic_guidance"],
-        "the manifest may be newer than this aft build's trust set - update aft, or install a manifest signed by a trusted key"
+        "ask the operator to install a manifest signed by the daemon's pinned policy root"
     );
     assert!(regressed_status["cached_manifest"]["verified_by_key_id"].is_null());
     assert_status_provenance(&regressed_status);
@@ -812,9 +790,10 @@ fn gh_shim_daemon_probe_from_sync_entry_is_r2_without_a_runtime_panic() {
         report["cached_manifest"]["verified_by_key_id"],
         "gh-routing-dev-test-key-v1"
     );
-    assert!(report["cached_manifest"]["compiled_trust_set_key_ids"]
-        .as_array()
-        .is_some_and(|ids| ids.iter().any(|id| id == "gh-routing-dev-test-key-v1")));
+    assert_eq!(
+        report["cached_manifest"]["pinned_trust_root_key_id"],
+        "gh-routing-dev-test-key-v1"
+    );
 }
 
 #[test]
@@ -1947,90 +1926,6 @@ fn gh_shim_disabled_by_config_overrides_governance_stickiness() {
 }
 
 #[test]
-fn co_author_line_uses_the_cached_manifest_binding_and_numeric_id_offline() {
-    let temp = tempfile::tempdir().expect("create test root");
-    let config_home = temp.path().join("config");
-    let state_home = temp.path().join("state");
-    let home = temp.path().join("home");
-    let project = write_project_repo(temp.path());
-    let connection_file = write_dead_connection_file(temp.path());
-    let upstream_bin = temp.path().join("upstream-bin");
-    let recorder = temp.path().join("upstream-invocations.txt");
-    write_upstream_gh(&upstream_bin);
-    write_fresh_manifest(&state_home, unix_seconds());
-    write_numeric_ids(&state_home, json!({ "alfonso-aft": 289616620 }));
-    write_user_config(&config_home, &connection_file, None);
-
-    let output = shim_command(
-        &["--co-author-line"],
-        &project,
-        &config_home,
-        &state_home,
-        &home,
-        &upstream_bin,
-        &recorder,
-    )
-    .output()
-    .expect("spawn co-author self-report");
-
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>\n"
-    );
-    assert!(output.stderr.is_empty());
-    assert!(
-        !recorder.exists(),
-        "a warm numeric-id cache must stay offline"
-    );
-}
-
-#[test]
-fn co_author_line_resolves_a_missing_numeric_id_once_and_caches_it() {
-    let temp = tempfile::tempdir().expect("create test root");
-    let config_home = temp.path().join("config");
-    let state_home = temp.path().join("state");
-    let home = temp.path().join("home");
-    let project = write_project_repo(temp.path());
-    let connection_file = write_dead_connection_file(temp.path());
-    let upstream_bin = temp.path().join("upstream-bin");
-    let recorder = temp.path().join("upstream-invocations.txt");
-    write_upstream_gh_user_api(&upstream_bin);
-    write_fresh_manifest(&state_home, unix_seconds());
-    write_user_config(&config_home, &connection_file, None);
-
-    for _ in 0..2 {
-        let output = shim_command(
-            &["--co-author-line"],
-            &project,
-            &config_home,
-            &state_home,
-            &home,
-            &upstream_bin,
-            &recorder,
-        )
-        .output()
-        .expect("spawn co-author self-report");
-        assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>\n"
-        );
-    }
-
-    assert_eq!(
-        fs::read_to_string(&recorder).expect("read API invocation record"),
-        "api users/alfonso-aft --jq .id\n"
-    );
-    let ids: Value = serde_json::from_slice(
-        &fs::read(state_home.join("cortexkit/aft/gh-shim/numeric-ids.json"))
-            .expect("read numeric id cache"),
-    )
-    .expect("parse numeric id cache");
-    assert_eq!(ids["alfonso-aft"], 289616620);
-}
-
-#[test]
 fn gh_shim_v11_thread_state_verbs_stay_admin_and_v12_refuses_reason_and_delete_branch() {
     let temp = tempfile::tempdir().expect("create test root");
     let config_home = temp.path().join("config");
@@ -2138,80 +2033,6 @@ fn gh_shim_v11_thread_state_verbs_stay_admin_and_v12_refuses_reason_and_delete_b
 }
 
 #[test]
-fn auto_child_hook_commits_the_cached_bound_identity_exactly_once_on_amend() {
-    let temp = tempfile::tempdir().expect("create test root");
-    let state_home = temp.path().join("state");
-    let config_home = temp.path().join("config");
-    let home = temp.path().join("home");
-    let storage = temp.path().join("storage");
-    let project = write_project_repo(temp.path());
-    write_fresh_manifest(&state_home, unix_seconds());
-    write_numeric_ids(&state_home, json!({ "alfonso-aft": 289616620 }));
-    fs::write(project.join("tracked.txt"), "joint work\n").expect("write tracked file");
-    for args in [
-        &["config", "user.name", "AFT Test"][..],
-        &["config", "user.email", "aft-test@example.test"][..],
-        &["add", "tracked.txt"][..],
-    ] {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(&project)
-            .status()
-            .expect("run git setup command");
-        assert!(status.success(), "git setup failed: {args:?}");
-    }
-
-    let binary = aft_binary();
-    test_helpers::warm_executable(&binary, &["--version"]);
-    let mut config = Config::default();
-    config.github.shim = false;
-    config.gh_shim.binary_path = Some(binary);
-    config.git.co_author = "auto".to_string();
-    let inherited_path = std::env::var_os("PATH").expect("test PATH");
-    let mut environment = std::collections::HashMap::from([
-        (
-            "PATH".to_string(),
-            inherited_path.to_string_lossy().into_owned(),
-        ),
-        (
-            "XDG_STATE_HOME".to_string(),
-            state_home.to_string_lossy().into_owned(),
-        ),
-        (
-            "XDG_CONFIG_HOME".to_string(),
-            config_home.to_string_lossy().into_owned(),
-        ),
-        ("HOME".to_string(), home.to_string_lossy().into_owned()),
-    ]);
-    aft::agent_child_env::inject(&config, &storage, &mut environment, None)
-        .expect("inject child Git environment");
-
-    for args in [
-        &["commit", "--quiet", "-m", "mason: joint work"][..],
-        &["commit", "--quiet", "--amend", "--no-edit"][..],
-    ] {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(&project)
-            .envs(&environment)
-            .status()
-            .expect("run governed commit");
-        assert!(status.success(), "governed commit failed: {args:?}");
-    }
-
-    let output = Command::new("git")
-        .args(["log", "-1", "--format=%B"])
-        .current_dir(&project)
-        .output()
-        .expect("read commit message");
-    assert!(output.status.success());
-    let message = String::from_utf8(output.stdout).expect("commit message UTF-8");
-    assert_eq!(message.matches("Co-authored-by:").count(), 1);
-    assert!(message
-        .contains("Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>"));
-}
-
-#[test]
 fn shim_invoked_as_gh_skips_its_managed_path_entry_and_execs_upstream_once() {
     use std::os::unix::fs::symlink;
 
@@ -2254,32 +2075,6 @@ fn shim_invoked_as_gh_skips_its_managed_path_entry_and_execs_upstream_once() {
         fs::read_to_string(recorder).expect("read upstream invocation record"),
         "issue list\n"
     );
-}
-
-#[test]
-fn co_author_line_is_silently_empty_without_a_cached_manifest_binding() {
-    let temp = tempfile::tempdir().expect("create test root");
-    let project = write_project_repo(temp.path());
-    let upstream = temp.path().join("upstream");
-    let recorder = temp.path().join("upstream-invocations.txt");
-    write_upstream_gh(&upstream);
-
-    let output = shim_command(
-        &["--co-author-line"],
-        &project,
-        &temp.path().join("config"),
-        &temp.path().join("state"),
-        &temp.path().join("home"),
-        &upstream,
-        &recorder,
-    )
-    .output()
-    .expect("spawn inert co-author self-report");
-
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
-    assert!(!recorder.exists());
 }
 
 use std::time::Duration;
