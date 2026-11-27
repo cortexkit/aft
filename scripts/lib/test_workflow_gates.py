@@ -845,7 +845,7 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
             self.assertEqual(cargo_test_execution_lines(command), [], command)
         audit = next(step for step in archive["steps"] if step.get("name") == "Audit native engine compiler inputs (Windows)")
         self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
-        self.assertEqual(audit["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}")
+        self.assertNotIn("CARGO_TARGET_DIR", audit.get("env", {}))
         python = next(i for i, step in enumerate(archive["steps"]) if step.get("uses") == "actions/setup-python@v6")
         tls = next(i for i, step in enumerate(archive["steps"]) if "--probe tls" in step.get("run", ""))
         self.assertEqual(archive["steps"][python]["with"]["python-version"], "3.14")
@@ -1063,7 +1063,8 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         import ast
 
         wanted_functions = {
-            "capture_command", "run_cargo_list", "parse_cargo_list", "suite_name_from_artifact"
+            "resolve_shell_command", "capture_command", "run_cargo_list", "parse_cargo_list",
+            "suite_name_from_artifact",
         }
         nodes = [
             node
@@ -1260,7 +1261,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         audit = next(step for step in job["steps"] if step.get("name") == "Audit native compiler inputs (macOS)")
         self.assertIn(audit["run"], build_steps)
         self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
-        self.assertEqual(audit["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}")
+        self.assertNotIn("CARGO_TARGET_DIR", audit.get("env", {}))
         archive = next(command for command in build_steps if "nextest archive" in command)
         self.assertIn("--timings", archive)
         self.assertIn('/usr/bin/time -l cargo nextest archive', archive)
