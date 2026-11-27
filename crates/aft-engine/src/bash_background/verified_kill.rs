@@ -1192,7 +1192,12 @@ mod tests {
     #[test]
     fn remember_members_drops_a_listing_it_cannot_re_prove() {
         use std::os::unix::process::CommandExt;
-        let mut leader = spawn_session("exec sleep 30");
+        // A group in this session, so another process can join it.
+        let mut leader = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let pgid = leader.id() as i32;
         let member = std::process::Command::new("sleep")
             .arg("30")

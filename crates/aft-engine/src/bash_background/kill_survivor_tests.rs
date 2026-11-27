@@ -1743,7 +1743,7 @@ fn pty_kill_and_timeout_keep_their_outcome_when_the_command_handles_the_signal()
                         .info
                         .status_reason
                         .as_deref()
-                        .is_some_and(|reason| reason.contains("time limit")),
+                        .is_some_and(|reason| reason.contains("(exit 124)")),
                     "{case}: {:?}",
                     snapshot.info.status_reason
                 );
