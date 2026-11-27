@@ -219,7 +219,7 @@ mod tests {
         for pin in [legacy, versioned] {
             assert!(view(pin).is_some());
         }
-        let (_, allocations) = crate::test_allocations::count(|| {
+        let (_, allocations) = aft_base::test_allocations::count(|| {
             for _ in 0..1000 {
                 for pin in [legacy, versioned] {
                     assert!(std::hint::black_box(view(pin)).is_some());
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn pipeline_review_bus_snapshots_do_not_allocate_after_warmup() {
         assert!(!bus_snapshot().is_empty());
-        let (_, allocations) = crate::test_allocations::count(|| {
+        let (_, allocations) = aft_base::test_allocations::count(|| {
             for _ in 0..3 {
                 assert!(!std::hint::black_box(bus_snapshot()).is_empty());
             }
