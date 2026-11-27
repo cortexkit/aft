@@ -21,6 +21,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         None,
         None,
         None,
+        None,
         Vec::new(),
     )
 }

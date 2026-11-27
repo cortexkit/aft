@@ -51,6 +51,9 @@ const INSPECT_TERMINAL_MARGIN: Duration = Duration::from_secs(5);
 // change, rather than making every slow producer also leave freshness unknown.
 const INSPECT_STAT_VERIFICATION_MARGIN: Duration = Duration::from_secs(1);
 
+mod deadline_payload;
+use deadline_payload::{InspectTimeoutPayload, ScopeCompleteness, ScopeInventory};
+
 struct ParsedScope {
     job: JobScope,
     roots: Vec<PathBuf>,
@@ -219,15 +222,16 @@ pub fn deferred_inspect_root_count_for_test(ctx: &AppContext) -> usize {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn wait_at_deferred_inspect_body_gate_for_test(deadline: InspectRequestDeadline, request_id: &str) {
+fn wait_at_deferred_inspect_body_gate_for_test(
+    deadline: InspectRequestDeadline,
+    request_id: &str,
+    require_named_gate: bool,
+) {
     let mut slot = DEFERRED_INSPECT_BODY_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if slot
-        .as_ref()
-        .and_then(|gate| gate.request_id.as_deref())
-        .is_some_and(|expected| expected != request_id)
-    {
+    let expected = slot.as_ref().and_then(|gate| gate.request_id.as_deref());
+    if !expected.map_or(!require_named_gate, |expected| expected == request_id) {
         return;
     }
     let gate = slot.take();
@@ -255,6 +259,7 @@ fn wait_at_deferred_inspect_body_gate_for_test(deadline: InspectRequestDeadline,
 fn wait_at_deferred_inspect_body_gate_for_test(
     _deadline: InspectRequestDeadline,
     _request_id: &str,
+    _require_named_gate: bool,
 ) {
 }
 
@@ -677,6 +682,7 @@ pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Respo
         Some(&phase_log),
         None,
         None,
+        None,
         Vec::new(),
     )
 }
@@ -743,6 +749,7 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
             reports_diagnostics,
             phase_log,
             deadline,
+            None,
         ),
         Err(_) if inspect_cancellation_requested() => {
             build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted)
@@ -783,6 +790,7 @@ fn handle_inspect_payload(
     phase_log: Option<&InspectPhaseLog>,
     request_deadline: Option<InspectRequestDeadline>,
     observed_stats: Option<&InspectRootStatSnapshot>,
+    timeout_payload: Option<&InspectTimeoutPayload>,
     rust_checks: Vec<InspectRustCheck>,
 ) -> Response {
     let _inventory = observed_stats.map(|stats| stats.1.install());
@@ -839,8 +847,17 @@ fn handle_inspect_payload(
             && scope_candidates
                 .as_ref()
                 .is_none_or(|candidates| candidates.walk_complete);
-        (roots, (in_root_count + external_count) as u64, complete)
+        (
+            roots,
+            (in_root_count + external_count) as u64,
+            complete.into(),
+        )
     });
+    if let (Some(timeout), Some(inventory), Some(candidates)) =
+        (timeout_payload, scoped_inventory, &scope_candidates)
+    {
+        timeout.publish_inventory(req, ctx, &snapshot, inventory, &candidates.files);
+    }
     let diagnostics_requested = !scope_was_provided || sections.requests_scoped_diagnostics();
 
     if inspect_cancellation_requested() {
@@ -1017,6 +1034,14 @@ fn handle_inspect_payload(
             // Read the warm LSP store with named gaps for producers whose wait
             // expired. A blocking scoped request first has its started servers
             // analyze the scoped files within the remaining request budget.
+            #[cfg(test)]
+            if let Some(deadline) = request_deadline {
+                wait_at_deferred_inspect_body_gate_for_test(
+                    deadline,
+                    &format!("{}:diagnostics", req.id),
+                    true,
+                );
+            }
             run_diagnostics_category(
                 ctx,
                 &snapshot,
@@ -1189,6 +1214,7 @@ fn handle_inspect_payload(
         offset,
         ctx,
         scoped_inventory,
+        None,
     );
     // A scoped answer carries only the notes of servers for its own files; a
     // TypeScript SDK note from a server started for another request does not
@@ -1426,7 +1452,8 @@ pub(crate) fn handle_inspect_deferred_with_clock(
     // Prepare a fallback without findings counts before producer or graph waits:
     // unfinished analysis must not look like zero findings. Deadline polling
     // must never need the locks held by slow analysis.
-    let timeout_payload = inspect_deadline_payload(req, &ctx, &snapshot, &scope);
+    let timeout_payload = Arc::new(InspectTimeoutPayload::new(req, &ctx, &snapshot, &scope));
+    let worker_timeout_payload = Arc::clone(&timeout_payload);
     let timeout_log = phase_log.clone();
     let timeout_id = request_id.clone();
     let sections = parse_sections(req.params.get("sections"))
@@ -1515,6 +1542,7 @@ pub(crate) fn handle_inspect_deferred_with_clock(
                     reports_diagnostics,
                     phase_log,
                     deadline,
+                    Some(&worker_timeout_payload),
                 ),
                 None if inspect_cancellation_requested() => {
                     build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted)
@@ -1563,7 +1591,7 @@ pub(crate) fn handle_inspect_deferred_with_clock(
                         settled = true;
                         timeout_cancellation.request_cancel();
                         Some(build_inspect_terminal(&timeout_id, &timeout_log,
-                            InspectTerminal::Fresh(timeout_payload.clone(), sections.clone())))
+                            InspectTerminal::Fresh(timeout_payload.get(), sections.clone())))
                     }
                 }
             },
@@ -1574,64 +1602,6 @@ pub(crate) fn handle_inspect_deferred_with_clock(
         .with_cancellation(cancellation)
         .with_shutdown(inspect_shutdown_terminal(request_id, shutdown_log)),
     )
-}
-
-fn inspect_deadline_payload(
-    req: &RawRequest,
-    ctx: &AppContext,
-    snapshot: &InspectSnapshot,
-    scope: &ParsedScope,
-) -> Value {
-    let sections = parse_sections(req.params.get("sections")).expect("validated sections");
-    let scoped = !scope.roots.is_empty();
-    let files = scope
-        .roots
-        .iter()
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
-    let reason = "analysis did not finish within its wait budget";
-    let mut payloads = BTreeMap::new();
-    for category in InspectCategory::active().iter().copied() {
-        let requested = !scoped
-            || if category == InspectCategory::Diagnostics {
-                sections.requests_scoped_diagnostics()
-            } else {
-                sections.detail_categories.is_empty() || sections.includes(category)
-            };
-        let payload = if !requested {
-            serde_json::json!({"status": "not_requested"})
-        } else if category == InspectCategory::Diagnostics {
-            let mut gaps = files.iter().map(|file| serde_json::json!({
-                "kind": "uncovered_file", "file": scope_root_display(&snapshot.project_root, file),
-                "reason": crate::inspect::diagnostics_category::CURRENT_CONTENT_UNVERIFIED_REASON,
-            })).collect::<Vec<_>>();
-            if !scoped || files.len() != scope.roots.len() {
-                gaps.push(serde_json::json!({"kind": "analysis_incomplete", "reason": reason}));
-            }
-            serde_json::json!({"complete": false, "items": [], "gaps": gaps})
-        } else {
-            serde_json::json!({"unavailable": true, "complete": false,
-                "gaps": [{"kind": "analysis_incomplete", "reason": reason}]})
-        };
-        payloads.insert(category, payload);
-    }
-    let mut payload = build_inspect_payload_with_offset(
-        snapshot,
-        &payloads,
-        &sections,
-        parse_top_k(&req.params).expect("validated top_k"),
-        parse_offset(&req.params).expect("validated offset"),
-        ctx,
-        scoped.then_some((
-            scope.roots.as_slice(),
-            files.len() as u64,
-            files.len() == scope.roots.len(),
-        )),
-    );
-    if payload["complete"] == true {
-        payload["gaps"] = serde_json::json!([{"kind": "analysis_incomplete", "reason": reason}]);
-    }
-    payload
 }
 
 fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapshot, Response> {
@@ -1818,6 +1788,7 @@ fn run_blocking_inspect_body(
     reports_diagnostics: bool,
     phase_log: InspectPhaseLog,
     deadline: InspectRequestDeadline,
+    timeout_payload: Option<&InspectTimeoutPayload>,
 ) -> Response {
     let sections = parse_sections(req.params.get("sections"))
         .expect("inspect sections were validated during preflight");
@@ -1880,7 +1851,7 @@ fn run_blocking_inspect_body(
                 );
             }
         };
-    wait_at_deferred_inspect_body_gate_for_test(deadline, &req.id);
+    wait_at_deferred_inspect_body_gate_for_test(deadline, &req.id, false);
     delay_inspect_body_from_env_for_test(deadline);
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
@@ -2056,6 +2027,7 @@ fn run_blocking_inspect_body(
         Some(&phase_log),
         Some(deadline),
         Some(&initial_stats),
+        timeout_payload,
         rust_checks,
     );
     if inspect_cancellation_requested() {
@@ -3340,7 +3312,8 @@ fn build_inspect_payload(
     ctx: &AppContext,
     scope: Option<(&[PathBuf], u64, bool)>,
 ) -> Value {
-    build_inspect_payload_with_offset(snapshot, payloads, sections, top_k, 0, ctx, scope)
+    let scope = scope.map(|(roots, count, complete)| (roots, count, complete.into()));
+    build_inspect_payload_with_offset(snapshot, payloads, sections, top_k, 0, ctx, scope, None)
 }
 
 fn build_inspect_payload_with_offset(
@@ -3350,11 +3323,12 @@ fn build_inspect_payload_with_offset(
     top_k: usize,
     offset: usize,
     ctx: &AppContext,
-    scope: Option<(&[PathBuf], u64, bool)>,
+    scope: Option<ScopeInventory<'_>>,
+    saved_scanner_state: Option<&Value>,
 ) -> Value {
     let scope_roots = scope.map(|(roots, _, _)| roots);
     let scope_files = scope.map(|(_, files, _)| files);
-    let scope_complete = scope.is_none_or(|(_, _, complete)| complete);
+    let scope_complete = scope.is_none_or(|(_, _, completeness)| completeness.is_complete());
     let no_files_matched_scope = scope_files == Some(0) && scope_complete;
     let mut summary = Map::new();
     let mut details = Map::new();
@@ -3578,14 +3552,11 @@ fn build_inspect_payload_with_offset(
     let text = render_inspect_text(
         &summary,
         &details,
-        scope_roots.map(|roots| (roots.len(), scope_files.unwrap_or(0), scope_complete)),
+        scope.map(|(roots, files, completeness)| (roots.len(), files, completeness)),
         sections,
     );
-    let mut payload = serde_json::json!({
-        "summary": Value::Object(summary),
-        "text": text,
-        "complete": complete,
-        "scanner_state": {
+    let scanner_state = saved_scanner_state.cloned().unwrap_or_else(|| {
+        serde_json::json!({
             "tier2_last_run": tier2_last_run(snapshot),
             "tier2_trigger_reason": ctx.tier2_trigger_reason(),
             "disabled_categories": InspectCategory::disabled()
@@ -3593,7 +3564,13 @@ fn build_inspect_payload_with_offset(
                 .chain(InspectCategory::active().iter().filter(|category| !snapshot.config.inspect.category_enabled(**category)))
                 .map(|category| category.as_str())
                 .collect::<Vec<_>>(),
-        }
+        })
+    });
+    let mut payload = serde_json::json!({
+        "summary": Value::Object(summary),
+        "text": text,
+        "complete": complete,
+        "scanner_state": scanner_state,
     });
     if let Some(roots) = scope_roots {
         payload["scope_roots"] = Value::Array(
@@ -3623,15 +3600,12 @@ fn build_inspect_payload_with_offset(
     if !gaps.is_empty() {
         payload["gaps"] = Value::Array(gaps);
     }
-    if !scope_complete {
+    if let Some(gap) = scope.and_then(|(_, _, completeness)| completeness.gap()) {
         payload["scope_files_complete"] = Value::Bool(false);
         if !payload["gaps"].is_array() {
             payload["gaps"] = serde_json::json!([]);
         }
-        payload["gaps"]
-            .as_array_mut()
-            .unwrap()
-            .push(scope_walk_gap());
+        payload["gaps"].as_array_mut().unwrap().push(gap);
         set_inspect_completion(payload.as_object_mut().unwrap(), sections);
     }
     payload
@@ -3641,7 +3615,7 @@ fn build_inspect_payload_with_offset(
 fn render_inspect_text(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
-    scope: Option<(usize, u64, bool)>,
+    scope: Option<(usize, u64, ScopeCompleteness)>,
     sections: &Sections,
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -3650,17 +3624,15 @@ fn render_inspect_text(
         lines.push(format!("PARTIAL — {reason}"));
     }
 
-    if let Some((root_count, file_count, complete)) = scope {
+    if let Some((root_count, file_count, completeness)) = scope {
         let root_label = if root_count == 1 { "root" } else { "roots" };
         let file_label = if file_count == 1 { "file" } else { "files" };
-        let suffix = if !complete {
-            " (file walk incomplete)"
-        } else if file_count == 0 {
-            " (no analyzed files under this scope)"
-        } else {
+        let suffix = completeness.count_suffix(file_count);
+        let qualifier = if completeness.is_complete() {
             ""
+        } else {
+            "at least "
         };
-        let qualifier = if complete { "" } else { "at least " };
         lines.push(format!(
             "scope: {root_count} {root_label}, {qualifier}{file_count} {file_label}{suffix}"
         ));
@@ -3739,7 +3711,7 @@ fn render_inspect_text(
         summary,
         details,
         "duplicates",
-        scope.is_some_and(|(_, files, complete)| files == 0 && complete),
+        scope.is_some_and(|(_, files, completeness)| files == 0 && completeness.is_complete()),
     );
     render_complexity_category(&mut lines, summary, details);
     render_cycles_category(&mut lines, summary, details);
@@ -5829,7 +5801,7 @@ mod render_text_tests {
         let text = render_inspect_text(
             &summary,
             &details,
-            Some((1, 1, true)),
+            Some((1, 1, ScopeCompleteness::Complete)),
             &Sections::summary_only(),
         );
         assert_eq!(text, "PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running (1 file); retry aft_inspect.\nscope: 1 root, 1 file\nAffected files:\n  src/lib.rs\nCyclomatic complexity: 0 functions >= 10");
@@ -5904,7 +5876,7 @@ mod render_text_tests {
                 )
             })
             .collect();
-        assert_eq!(render_inspect_text(&summary, &Map::new(), Some((1, 1, true)), &Sections::summary_only()),
+        assert_eq!(render_inspect_text(&summary, &Map::new(), Some((1, 1, ScopeCompleteness::Complete)), &Sections::summary_only()),
             "scope: 1 root, 1 file\nDuplicates: 0 groups touch the scope\nCyclomatic complexity: 0 functions >= 10\nDead code: 0\nUnused exports: 0");
     }
 
@@ -7028,6 +7000,7 @@ mod fresh_payload_tests {
             2,
             &ctx,
             None,
+            None,
         );
         let details = page["details"].as_object().unwrap();
         let mut lists = 0;
@@ -7905,6 +7878,7 @@ mod inspect_freshness_progress_tests {
                 Some(&phases),
                 Some(deadline),
                 Some(&initial),
+                None,
                 Vec::new(),
             );
             assert!(response.success, "{}", response.data);
@@ -7949,6 +7923,179 @@ mod deferred_terminal_tests {
     use aft_engine::test_bridge::search_misc::inspect::{
         InspectBuilderState, InspectCacheTest as _, InspectManagerTest as _,
     };
+    mod mixed_scope_deadline_tests {
+        use super::*;
+
+        const FILES: [&str; 3] = ["document/first.rs", "document/second.rs", "reader/tests.rs"];
+
+        fn fixture(diagnostics: bool) -> (tempfile::TempDir, Arc<AppContext>, RawRequest) {
+            let root = tempfile::tempdir().unwrap();
+            for file in FILES {
+                let path = root.path().join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "fn sample() {}\n").unwrap();
+            }
+            let mut config = Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            };
+            config.inspect.categories.diagnostics = diagnostics;
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                config,
+            ));
+            ctx.set_harness(crate::harness::Harness::Opencode);
+            let mut req = inspect_request("inspect-timeout-mixed-scope");
+            req.params = serde_json::json!({
+                "scope": ["document", "reader/tests.rs"], "sections": "diagnostics", "topK": 2,
+            });
+            (root, ctx, req)
+        }
+
+        fn cutoff(ctx: Arc<AppContext>, req: &RawRequest, wait_at_diagnostics: bool) -> Value {
+            let _serial = deferred_inspect_test_lock();
+            let gate_id = if wait_at_diagnostics {
+                format!("{}:diagnostics", req.id)
+            } else {
+                req.id.clone()
+            };
+            let (entered, _release) =
+                install_deferred_inspect_body_gate_for_request_for_test(&gate_id);
+            // The real worker stays within budget while the injected reply clock
+            // crosses the cutoff at a known point in the request.
+            let start = Instant::now() + Duration::from_secs(60);
+            let clock = Arc::new(Mutex::new(start));
+            let now = Arc::clone(&clock);
+            let wake = crate::response_finalize::DeferredResponseWake::default();
+            let _wake = wake.install();
+            let DispatchOutcome::Deferred(mut pending) = handle_inspect_deferred_with_clock(
+                req,
+                ctx.clone(),
+                false,
+                Some(start + Duration::from_millis(500)),
+                move || *now.lock().unwrap(),
+            ) else {
+                panic!("inspect must defer");
+            };
+            entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker reached gate");
+            assert!((pending.poll)(&ctx).is_none());
+            *clock.lock().unwrap() = start + Duration::from_millis(250);
+            let response = (pending.poll)(&ctx).expect("reply cutoff must return a payload");
+            assert!(response.success, "{response:?}");
+            assert!((pending.poll)(&ctx).is_none(), "only one terminal reply");
+            let join_deadline = Instant::now() + Duration::from_secs(5);
+            while wake.generation() == 0 {
+                assert!(
+                    Instant::now() < join_deadline,
+                    "inspect ignored cancellation"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            response.data
+        }
+
+        fn assert_timeout(data: &Value, uncovered: &[&str]) {
+            let text = data["text"].as_str().unwrap();
+            let header = text.lines().next().unwrap();
+            assert_eq!(data["inspect_terminal"], "partial", "{data:#}");
+            assert_eq!(data["complete"], false, "{data:#}");
+            assert!(
+                header.contains("analysis did not finish within its wait budget"),
+                "{header}"
+            );
+            assert!(!text.contains("scope_walk_truncated"), "{text}");
+            let gaps = data["summary"]["diagnostics"]["gaps"].as_array().unwrap();
+            let paths = gaps
+                .iter()
+                .filter(|gap| gap["kind"] == "uncovered_file")
+                .map(|gap| gap["file"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(paths, uncovered, "{data:#}");
+        }
+
+        #[test]
+        fn cutoff_before_walk_reports_directory_count_pending() {
+            for diagnostics in [true, false] {
+                let (_root, ctx, req) = fixture(diagnostics);
+                let data = cutoff(ctx, &req, false);
+                if diagnostics {
+                    assert_timeout(&data, &["reader/tests.rs"]);
+                }
+                assert_eq!(data["scope_files"], 1, "{data:#}");
+                assert_eq!(data["scope_files_complete"], false, "{data:#}");
+                assert!(
+                    data["gaps"].as_array().unwrap().iter().any(|gap| {
+                        gap["kind"] == "scope_inventory_pending"
+                            && gap["reason"] == "directory files not yet counted"
+                    }),
+                    "{data:#}"
+                );
+                let text = data["text"].as_str().unwrap();
+                assert!(
+                    text.lines()
+                        .next()
+                        .unwrap()
+                        .contains("analysis did not finish within its wait budget"),
+                    "{text}"
+                );
+                assert!(!text.contains("(file walk incomplete)"), "{text}");
+            }
+        }
+
+        #[test]
+        fn cutoff_after_walk_reports_inventory_and_named_diagnostics_gaps() {
+            let (_root, ctx, req) = fixture(true);
+            let data = cutoff(ctx, &req, true);
+            assert_eq!(data["scope_files"], 3, "{data:#}");
+            assert_timeout(&data, &FILES);
+            assert_ne!(data["scope_files_complete"], false, "{data:#}");
+            assert!(
+                !data["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|gap| { gap["kind"] == "scope_inventory_pending" }),
+                "{data:#}"
+            );
+        }
+
+        #[test]
+        fn walk_with_expired_phase_deadline_reports_real_truncation() {
+            let (_root, ctx, req) = fixture(true);
+            let response = handle_inspect_payload(
+                &req,
+                &ctx,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                None,
+                Some(InspectRequestDeadline::new(Duration::ZERO, Duration::ZERO)),
+                None,
+                None,
+                Vec::new(),
+            );
+            assert!(response.success, "{response:?}");
+            let data = response.data;
+            assert_eq!(data["scope_files_complete"], false, "{data:#}");
+            let text = data["text"].as_str().unwrap();
+            assert!(text.contains("scope_walk_truncated: the scoped file walk reached its entry limit or deadline"), "{text}");
+            assert!(
+                data["summary"]["diagnostics"]["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|gap| { gap["producer"] == "scoped file walk" }),
+                "{data:#}"
+            );
+        }
+    }
+
     mod inspect_request_deadline_tests {
         use super::*;
 
@@ -8331,6 +8478,7 @@ mod deferred_terminal_tests {
                 false,
                 InspectPhaseLog::for_request(name.to_string()),
                 InspectRequestDeadline::new(Duration::from_secs(900), Duration::from_secs(1)),
+                None,
             );
             let measurement = serde_json::json!({
                 "case": name, "ms": started.elapsed().as_secs_f64() * 1000.0,
@@ -9158,6 +9306,7 @@ mod deferred_terminal_tests {
             false,
             Some(&phase_log),
             Some(InspectRequestDeadline::new(Duration::ZERO, Duration::ZERO)),
+            None,
             None,
             Vec::new(),
         );
