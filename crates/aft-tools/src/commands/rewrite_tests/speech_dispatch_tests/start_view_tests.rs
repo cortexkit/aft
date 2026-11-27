@@ -51,6 +51,7 @@ async fn launch(fixture: &Fixture, background: bool, refuse: bool) -> crate::pro
     let root = fixture._dir.path().join("store");
     let state = fixture._dir.path().join("shim");
     let seed = LaunchSeed {
+        coauthor_agent: None,
         launch: Ok(fixture.launch.clone()),
         lifecycle: Some(fixture.head.clone()),
         session: fixture.session.clone(),

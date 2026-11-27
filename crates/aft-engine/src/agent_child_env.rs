@@ -3022,9 +3022,10 @@ mod tests {
         config.git.co_author = "auto".to_string();
         let mut environment = HashMap::new();
         let main = coauthor::scope_fixture(serde_json::json!({"agent_id":"main-agent"}));
-        let worker = coauthor::scope_fixture(
+        let mut worker = coauthor::scope_fixture(
             serde_json::json!({"on_behalf_of_agent":"delegating-agent","run_id":"test-program"}),
         );
+        worker.kind = subc_protocol::scope::ScopeKind::Ephemeral;
         let missing =
             coauthor::scope_fixture(serde_json::json!({"agent_id":"agent-without-github"}));
         coauthor::with_fixture(
@@ -3037,18 +3038,18 @@ mod tests {
                 })
             },
             || {
-                let _main = coauthor::enter(Some(&main));
+                let _main = coauthor::enter(coauthor::agent_id(&main, None));
                 inject(&config, &storage, &mut environment, None).unwrap();
                 assert_eq!(
                     environment[GIT_CO_AUTHOR_LINE_ENV],
                     "Main Bot <main@example.test>"
                 );
                 {
-                    let _missing = coauthor::enter(Some(&missing));
+                    let _missing = coauthor::enter(coauthor::agent_id(&missing, None));
                     inject(&config, &storage, &mut environment, None).unwrap();
                     assert!(!environment.contains_key(GIT_CO_AUTHOR_LINE_ENV));
                 }
-                let _worker = coauthor::enter(Some(&worker));
+                let _worker = coauthor::enter(coauthor::agent_id(&worker, None));
                 inject(&config, &storage, &mut environment, None).unwrap();
                 assert_eq!(
                     environment[GIT_CO_AUTHOR_LINE_ENV],

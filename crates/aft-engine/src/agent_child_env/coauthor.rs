@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use subc_protocol::scope::ScopeStamp;
+use subc_protocol::scope::{ScopeKind, ScopeStamp};
 
 const TTL: Duration = Duration::from_secs(10 * 60);
 const FIRST_SHELL_WAIT: Duration = Duration::from_secs(1);
@@ -125,13 +125,39 @@ pub fn install(connection_file: PathBuf) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cache);
 }
 
-fn agent_id(scope: &ScopeStamp) -> Option<&str> {
-    scope
-        .attributes
-        .on_behalf_of_agent
-        .as_deref()
-        .or(scope.attributes.agent_id.as_deref())
-        .filter(|id| !id.is_empty())
+pub(crate) fn agent_id<'a>(
+    scope: &'a ScopeStamp,
+    parent: Option<&'a ScopeStamp>,
+) -> Option<&'a str> {
+    let present = |value: Option<&'a str>| value.filter(|id| !id.is_empty());
+    if !scope.owner_authorized {
+        return None;
+    }
+    match scope.kind {
+        ScopeKind::Head => present(scope.attributes.agent_id.as_deref()),
+        ScopeKind::Ephemeral if present(scope.attributes.run_id.as_deref()).is_some() => {
+            match (
+                present(scope.attributes.on_behalf_of_agent.as_deref()),
+                present(scope.attributes.agent_id.as_deref()),
+            ) {
+                (Some(agent), None) | (None, Some(agent)) => Some(agent),
+                _ => None,
+            }
+        }
+        ScopeKind::Worker => {
+            present(scope.attributes.on_behalf_of_agent.as_deref()).or_else(|| {
+                let (parent, link) = (parent?, scope.parent.as_ref()?);
+                (parent.owner_authorized
+                    && parent.kind == ScopeKind::Head
+                    && parent.owner == link.owner
+                    && parent.scope_ref == link.scope_ref
+                    && parent.scope_epoch == link.scope_epoch)
+                    .then(|| present(parent.attributes.agent_id.as_deref()))
+                    .flatten()
+            })
+        }
+        _ => None,
+    }
 }
 
 pub(crate) struct ScopeGuard(Option<String>);
@@ -142,8 +168,8 @@ impl Drop for ScopeGuard {
     }
 }
 
-pub(crate) fn enter(scope: Option<&ScopeStamp>) -> ScopeGuard {
-    ScopeGuard(AGENT.with(|agent| agent.replace(scope.and_then(agent_id).map(str::to_owned))))
+pub(crate) fn enter(agent_id: Option<&str>) -> ScopeGuard {
+    ScopeGuard(AGENT.with(|agent| agent.replace(agent_id.map(str::to_owned))))
 }
 
 pub(super) fn line() -> Option<String> {
@@ -180,7 +206,7 @@ pub(super) fn with_fixture<T>(
 pub(super) fn scope_fixture(attributes: serde_json::Value) -> ScopeStamp {
     serde_json::from_value(serde_json::json!({
         "owner": {"kind":"reserved","module_id":"test-module"},
-        "ref":"test-run","scope_epoch":1,"kind":"ephemeral","owner_authorized":true,
+        "ref":"test-run","scope_epoch":1,"kind":"head","owner_authorized":true,
         "attributes": attributes
     }))
     .unwrap()
@@ -196,7 +222,13 @@ mod tests {
     fn git_hook_coauthor_never_uses_the_classic_workers_own_agent_id() {
         let mut worker = scope_fixture(serde_json::json!({"agent_id":"worker-identity"}));
         worker.kind = subc_protocol::scope::ScopeKind::Worker;
-        assert_eq!(agent_id(&worker), None);
+        assert_eq!(agent_id(&worker, None), None);
+        let head = scope_fixture(
+            serde_json::json!({"agent_id":"head-identity", "on_behalf_of_agent":"not-the-head"}),
+        );
+        worker.parent = Some(serde_json::from_value(serde_json::json!({"owner":head.owner,"ref":head.scope_ref,"scope_epoch":head.scope_epoch})).unwrap());
+        assert_eq!(agent_id(&head, None), Some("head-identity"));
+        assert_eq!(agent_id(&worker, Some(&head)), Some("head-identity"));
     }
 
     #[test]

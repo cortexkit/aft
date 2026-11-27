@@ -682,6 +682,7 @@ fn background_ticket(
     )
     .unwrap();
     let seed = crate::gh_shim_speech::service::LaunchSeed {
+        coauthor_agent: None,
         launch: Ok(launch),
         lifecycle: Some(stamp.clone()),
         session: session.into(),

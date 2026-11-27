@@ -27,9 +27,24 @@ pub(super) fn speech_launch_seed(
     identity: &RouteIdentity,
     route: RouteChannel,
     control: Option<&Arc<readiness::DaemonControl>>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
 ) -> Option<crate::gh_shim_speech::service::LaunchSeed> {
     use crate::gh_shim_speech::model::{LaunchAuthority, RouteOrigin};
     let lifecycle = identity.scope.clone()?;
+    let parent = lifecycle.parent.as_ref().and_then(|parent| {
+        routes
+            .values()
+            .filter_map(|route| route.scope.as_ref())
+            .find(|scope| {
+                scope.kind == subc_protocol::scope::ScopeKind::Head
+                    && scope.owner_authorized
+                    && scope.owner == parent.owner
+                    && scope.scope_ref == parent.scope_ref
+                    && scope.scope_epoch == parent.scope_epoch
+            })
+    });
+    let coauthor_agent =
+        crate::agent_child_env::coauthor::agent_id(&lifecycle, parent).map(str::to_owned);
     let origin = |channel: RouteChannel| {
         control.and_then(|control| {
             Some(RouteOrigin {
@@ -72,6 +87,7 @@ pub(super) fn speech_launch_seed(
     Some(crate::gh_shim_speech::service::LaunchSeed {
         launch,
         lifecycle: Some(lifecycle),
+        coauthor_agent,
         session: identity.session.clone(),
         harness: identity.harness.clone(),
         project_root: identity.project_root.display().to_string(),

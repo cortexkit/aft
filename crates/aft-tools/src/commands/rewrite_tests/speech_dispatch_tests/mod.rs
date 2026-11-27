@@ -571,6 +571,7 @@ impl Fixture {
         };
         let session = "dispatch-session".to_string();
         let seed = LaunchSeed {
+            coauthor_agent: None,
             launch: Ok(launch.clone()),
             lifecycle: Some(run.as_ref().unwrap_or(&head).clone()),
             session: session.clone(),

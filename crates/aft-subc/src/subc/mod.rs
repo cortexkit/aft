@@ -10957,7 +10957,7 @@ async fn handle_tool_call_with_capabilities(
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
                 keepalive: progress.clone(),
-                speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
+                speech_seed: speech_launch_seed(&identity, route_id, daemon_control, routes),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
                 late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -11021,7 +11021,7 @@ async fn handle_tool_call_with_capabilities(
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
             keepalive: progress.clone(),
-            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control, routes),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
             late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -11155,7 +11155,7 @@ async fn handle_tool_call_with_capabilities(
         )
         .then(|| PlainToolRun {
             progress: progress.clone(),
-            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control, routes),
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
             format_context: format_context.clone(),
@@ -11598,7 +11598,7 @@ async fn handle_tool_call_with_capabilities(
     phase_trace.mark_executor_submitted();
     let plain_run = PlainToolRun {
         progress,
-        speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
+        speech_seed: speech_launch_seed(&identity, route_id, daemon_control, routes),
         bare_name,
         arguments,
         format_context,

@@ -110,6 +110,7 @@ pub fn run_nonce() -> Option<&'static str> {
 pub struct LaunchSeed {
     pub launch: Result<LaunchAuthority, Refusal>,
     pub lifecycle: Option<ScopeStamp>,
+    pub coauthor_agent: Option<String>,
     pub session: String,
     pub harness: String,
     pub project_root: String,
@@ -127,7 +128,8 @@ pub fn with_launch<T>(
     run: impl FnOnce() -> T,
 ) -> T {
     let _coauthor = crate::agent_child_env::coauthor::enter(
-        seed.as_ref().and_then(|seed| seed.lifecycle.as_ref()),
+        seed.as_ref()
+            .and_then(|seed| seed.coauthor_agent.as_deref()),
     );
     struct Restore(Option<LaunchContext>);
     impl Drop for Restore {
