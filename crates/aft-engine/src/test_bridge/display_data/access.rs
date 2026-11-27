@@ -105,6 +105,10 @@ test_methods! { DataCheckoutTestExt for DataCheckout {
     fn open_planes(root: &Path, storage: &Path, executor: Option<crate::executor::RootMaintenanceExecutor>, planes: crate::data_layer::checkout::Planes) -> Result<Arc<DataCheckout>, DataError>;
 }}
 
+pub fn has_checkout_failure_for_test(checkout: &DataCheckout) -> bool {
+    checkout.last_failure().is_some()
+}
+
 test_methods! { ChildCheckoutsTestExt for crate::data_layer::parent::ChildCheckouts {
     fn insert_for_test(&self, parent: &Path, child: &Path, checkout: Arc<DataCheckout>);
     fn bound_for_test(&self) -> Vec<Arc<DataCheckout>>;

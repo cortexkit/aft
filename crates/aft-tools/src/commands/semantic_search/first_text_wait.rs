@@ -45,7 +45,7 @@ pub(super) fn wait_for_first_text_index(ctx: &AppContext) -> ReadinessWait {
         if !first_text_index_wait_needed(ctx) {
             #[cfg(test)]
             test_signals::signal_exit(|| {
-                if checkout.last_failure().is_some() {
+                if aft_engine::test_bridge::display_data::has_checkout_failure_for_test(&checkout) {
                     test_signals::Exit::Failure
                 } else {
                     test_signals::Exit::Ready
