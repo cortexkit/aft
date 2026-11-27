@@ -12,27 +12,43 @@ The shim verifies lists only against this installation's policy root. The
 operator pins the vault's signing root with `ck policy-root set --vault-key
 <id>` and applies the printed digest with `ck config apply <digest>`. AFT reads
 the pin from its authenticated daemon connection at startup, before activating
-a new list, and every five minutes. It caches the pin beside the list in
-`trust-root.json` with owner-only access, and copies both into a worker shell's
-private state. There is no built-in signing key or fallback key.
+a new list, and every five minutes. The AFT relay, worker broker and speech
+verifier use the pin in memory, never the cached pin on disk. Each new shell
+gets the current key ID, public key and generation from AFT. The shim checks
+them against `trust-root.json` beside the list. A worker shell gets a private
+copy of the list and a pin from AFT. There is no built-in signing key or
+fallback key. The file is owner-only on Unix. On Windows it inherits the state
+directory's ACL, so keep that directory private; there is no worker copy.
 
 A root change makes lists signed by the retired key unusable. The vault must
 publish a newer list signed by the new root before governed writes can resume.
-If the daemon clears the pin, AFT removes the trust file. A previously
-provisioned shim refuses writes without a verified list rather than using the
-operator's credentials. On a never-provisioned install, commands pass through
-only when the shim can rule out a write relay, as on a standalone install.
+AFT fetches the current list again when the generation changes. If the daemon
+clears the pin, AFT removes the trust file. If refreshes fail, AFT and the shim
+stop trusting a pin after 15 minutes without a successful read. A shell
+started before a rotation needs to be restarted to get the new generation.
+A previously provisioned shim, or one with a list or trust file present, refuses
+writes without a verified list rather than using the operator's credentials.
+On a never-provisioned install with no such files, commands pass through only
+when the shim can rule out a write relay, as on a standalone install.
 
 Commit attribution is separate. In `git.co_author: "auto"` mode, the Git
 hook uses the committing agent's GitHub identity from Entorhinal, not the bot
-bound to the repository in the list. A worker uses the identity of the agent
-it works for. No verified list is needed to add the trailer.
+bound to the repository in the list. For a worker, the daemon must identify
+the head agent it works for, either by name or by linking to a live route for
+that head. Auto attribution requires a shell launched through a route where
+the daemon identifies the agent and that agent has a GitHub identity in
+Entorhinal. It does not require a verified list. A standalone shell, or one
+launched without a daemon-stamped agent identity, gets no automatic trailer.
+Start a new shell after upgrading to pick up the new hook environment.
 
 ## Shim status
 
 `gh --status` prints one JSON document from local shim state, including
-`cached_manifest` and `last_rung`. The manifest status reports the daemon's
-`pinned_trust_root_key_id` and, when verification succeeds, `verified_by_key_id`.
+`cached_manifest` and `last_rung`. `cached_manifest.pinned_trust_root_key_id`
+replaces `cached_manifest.compiled_trust_set_key_ids`. It reports the cached
+pin only when it matches the key and generation AFT gave the shell at launch
+and is fresh. `verified_by_key_id`
+is unchanged and reports the key that verified the list.
 The audit fields are `bypass_audit_count`
 (the total number of operator-bypass entries) and `bypass_audit_recent`
 (the newest 10 entries, or all entries when fewer exist, with the newest last).

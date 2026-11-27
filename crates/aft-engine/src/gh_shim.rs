@@ -579,7 +579,7 @@ fn governance_probe_timeout_text(elapsed_ms: u64, stage: ProbeStage) -> String {
 }
 const UNTRUSTED_MANIFEST_KEY_STEERING: &str =
     "ask the operator to install a manifest signed by the daemon's pinned policy root";
-const NO_TRUST_ROOT_REFUSAL: &str = "GitHub writes are refused because this machine has no pinned policy root. Ask the operator to run `ck policy-root set` and apply the reviewed change. Reads still work.";
+const NO_TRUST_ROOT_REFUSAL: &str = "GitHub writes are refused because this shell has no usable pinned policy root. Start a new shell. If the problem persists, ask the operator to check the daemon and run `ck policy-root set` if no root is pinned. Known safe commands still work.";
 const PRE_PROVENANCE_RECORD: &str = "unrecorded (pre-provenance record)";
 const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 

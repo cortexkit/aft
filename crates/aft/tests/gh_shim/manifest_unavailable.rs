@@ -3,7 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 
 const UNAVAILABLE: &str = "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.\n";
-const UNPINNED: &str = "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine has no pinned policy root. Ask the operator to run `ck policy-root set` and apply the reviewed change. Reads still work.\n";
+const UNPINNED: &str = "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this shell has no usable pinned policy root. Start a new shell. If the problem persists, ask the operator to check the daemon and run `ck policy-root set` if no root is pinned. Known safe commands still work.\n";
 
 struct Fixture {
     _root: tempfile::TempDir,

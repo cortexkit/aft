@@ -29,7 +29,8 @@ use crate::gh_shim_relay::{GhRelay, ScopeStamp};
 pub(crate) const SOCKET_ENV: &str = "AFT_GH_READ_SOCKET";
 pub(crate) const CAPABILITY_FILE_ENV: &str = "AFT_GH_READ_CAPABILITY_FILE";
 pub(crate) const STATE_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
-pub(crate) const CHILD_KEYS: [&str; 5] = [
+pub(crate) const CHILD_KEYS: [&str; 6] = [
+    crate::gh_shim::trust_root::ANCHOR_ENV,
     crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
     crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
     SOCKET_ENV,

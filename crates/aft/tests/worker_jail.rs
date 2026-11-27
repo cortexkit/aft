@@ -745,9 +745,15 @@ impl Jail {
         .unwrap();
         let hello = next_frame(&mut stream).await;
         assert_eq!(hello.header.ty, FrameType::Hello);
+        let shim_fixture = base.join("xdg/state/cortexkit/aft/gh-shim");
+        let serve_pin = shim_fixture.join("gh-routing-manifest.json").exists();
         let ack = ModuleHelloAckBody {
             negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: vec![],
+            subc_ops: if serve_pin {
+                vec!["policy_root.get".into()]
+            } else {
+                vec![]
+            },
             subc_capabilities: vec![],
             storage: None,
             machine_id: None,
@@ -766,6 +772,40 @@ impl Jail {
         )
         .await
         .unwrap();
+        if serve_pin {
+            let read = next_frame(&mut stream).await;
+            assert_eq!(read.header.ty, FrameType::Request);
+            assert_eq!(read.header.channel, 0);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&read.body).unwrap(),
+                json!({"op":"policy_root.get"})
+            );
+            let mut pin: Value = serde_json::from_str(test_helpers::gh_fixture_anchor()).unwrap();
+            let generation = pin.as_object_mut().unwrap().remove("generation").unwrap();
+            pin["retired_key_ids"] = json!([]);
+            let reply = json!({"op":"policy_root.get","pin":pin,"generation":generation});
+            write_frame(
+                &mut stream,
+                &Frame::build(
+                    FrameType::Response,
+                    read.header.flags,
+                    0,
+                    0,
+                    read.header.corr,
+                    serde_json::to_vec(&reply).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !shim_fixture.join("trust-root.json").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("AFT did not publish the fixture daemon's pin");
+        }
         let read_holder =
             std::sync::Arc::new(std::sync::Mutex::new(worker_gh_read::ReadHolder::default()));
         let read_router = tokio::spawn(worker_gh_read::serve(listener, read_holder.clone()));
@@ -4840,6 +4880,10 @@ async fn gh_shim_router_host_lookup_transport_failures_record_their_stage() {
             )
             .env("XDG_CONFIG_HOME", jail.base.join("xdg/config"))
             .env("AFT_GH_SHIM_STATE_DIR", &state)
+            .env(
+                "AFT_GH_SHIM_TRUST_ANCHOR",
+                test_helpers::gh_fixture_anchor(),
+            )
             .env("AFT_GH_SHIM_WORKER", "1")
             .env("AFT_GH_READ_CAPABILITY_FILE", &capability);
         if case != "missing" {
