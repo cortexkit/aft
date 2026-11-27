@@ -916,7 +916,9 @@ fn bash_status_cross_session_same_project_finds_task_by_id() {
             Some(project.path().to_path_buf()),
         )
         .unwrap();
-    wait_for_path(&task_file(storage.path(), "session-a", &task_id, "exit"));
+    // The wrapper writes the exit marker before exiting. Wait for the owning
+    // registry to publish completion before the fresh registry reads the task.
+    wait_for_task_metadata(storage.path(), "", &task_id, "completed");
 
     let fresh = registry();
     let snapshot = fresh
