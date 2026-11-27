@@ -409,6 +409,75 @@ describe("OMP internal URL hand-back", () => {
     expect(s.calls).toHaveLength(0);
   });
 
+  test("edit filesystem route drops inert native defaults from an AFT batch", async () => {
+    await withFilesystemTool("edit", async (s) => {
+      const tool = s.tools.get("edit")!;
+      const { prepareArguments } = tool as unknown as {
+        prepareArguments(args: unknown): Record<string, unknown>;
+      };
+      const control = {
+        path: "src/example.ts",
+        edits: [{ oldString: "before", newString: "after" }],
+      };
+      const entry = { ...control.edits[0], op: "update", rename: "", diff: "" };
+      const defaults = { input: "", old_string: "", new_string: "", replace_all: false };
+      const padded = { ...control, edits: [entry], ...defaults };
+      expect(Value.Check(tool.parameters as TSchema, padded)).toBe(true);
+      const prepared = prepareArguments(padded);
+      expect(prepared).toEqual(control);
+      await executeTool(tool, prepared, s.extCtx);
+      await executeTool(tool, padded, s.extCtx);
+      expect(s.calls.map(({ params }) => params.arguments)).toEqual([control, control]);
+
+      const native = { ...padded, path: "local://fixture" };
+      expect(prepareArguments(native)).toBe(native);
+      await executeTool(tool, native, s.extCtx);
+      expect(s.invocations[0]).toBe(native);
+      expect(s.calls).toHaveLength(2);
+
+      const deletion = {
+        ...control,
+        edits: [
+          { oldString: "before", newString: "" },
+          { startLine: 2, endLine: 2, content: "" },
+        ],
+      };
+      await executeTool(
+        tool,
+        { ...deletion, ...defaults, edits: [{ ...entry, newString: "" }, deletion.edits[1]] },
+        s.extCtx,
+      );
+      expect(s.calls[2]?.params.arguments).toEqual(deletion);
+
+      for (const active of [
+        { ...padded, input: "native input" },
+        { ...padded, old_string: "native match", new_string: "" },
+        { ...padded, new_string: "replacement" },
+        { ...padded, replace_all: true },
+        { ...padded, edits: [{ ...entry, rename: "other.ts" }] },
+        { ...padded, edits: [{ ...entry, diff: "patch" }] },
+        { ...padded, edits: [{ ...entry, op: "create" }] },
+        { ...padded, edits: [{ ...entry, op: "delete" }] },
+        { ...padded, appendContent: "append", edits: '[{"oldString":"","op":"delete"}]' },
+        { ...padded, edits: [{ ...entry, oldString: "" }] },
+        { ...padded, edits: [{ ...entry, startLine: 1, endLine: 1, content: "" }] },
+        {
+          ...control,
+          ...defaults,
+          edits: [{ ...control.edits[0], startLine: 1, endLine: 2, content: "" }],
+        },
+        { ...padded, appendContent: "another AFT mode" },
+        { path: control.path, ...defaults },
+      ]) {
+        const refusal = /edit: invalid AFT filesystem arguments: .*only for OMP internal URLs/;
+        expect(() => prepareArguments(active)).toThrow(refusal);
+        await expect(executeTool(tool, active, s.extCtx)).rejects.toThrow(refusal);
+      }
+      expect(s.calls).toHaveLength(3);
+      expect(s.invocations).toHaveLength(1);
+    });
+  });
+
   test("grep filesystem errors name native arguments and the AFT form", async () => {
     const s = setup();
     await expect(

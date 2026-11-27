@@ -233,15 +233,84 @@ function inertBashReady(value: unknown): boolean {
   );
 }
 
+function hasCompetingRange(entry: Record<string, unknown>): boolean {
+  if (typeof entry.content !== "string") return false;
+  try {
+    return (
+      coerceOptionalInt(entry.startLine, "startLine", 1, Number.MAX_SAFE_INTEGER) !== undefined &&
+      coerceOptionalInt(entry.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER) !== undefined
+    );
+  } catch {
+    return false;
+  }
+}
+
+function omitInertEditDefaults(args: Record<string, unknown>): Record<string, unknown> {
+  const normalized = { ...args };
+  let changed = false;
+  for (const key of ["old_string", "new_string", "input", "replace_all"]) {
+    if (args[key] !== (key === "replace_all" ? false : "")) continue;
+    delete normalized[key];
+    changed = true;
+  }
+  if (Array.isArray(args.edits)) {
+    normalized.edits = args.edits.map((value: unknown) => {
+      const entry = asRecord(value);
+      if (
+        entry?.op !== "update" ||
+        typeof entry.oldString !== "string" ||
+        entry.oldString.length === 0 ||
+        (entry.rename !== undefined && entry.rename !== "") ||
+        (entry.diff !== undefined && entry.diff !== "")
+      ) {
+        return value;
+      }
+      const { op: _op, rename: _rename, diff: _diff, ...aftEntry } = entry;
+      changed = true;
+      return aftEntry;
+    });
+  }
+  if (!changed) return args;
+  // A full range with empty content is a deletion, not padding on a find edit.
+  // Leave the native fields in place so the mixed call is refused before prep.
+  for (const value of editEntries(args.edits)) {
+    const entry = asRecord(value);
+    if (
+      entry &&
+      typeof entry.oldString === "string" &&
+      entry.oldString.length > 0 &&
+      hasCompetingRange(entry)
+    ) {
+      return args;
+    }
+  }
+  return normalized;
+}
+
 function normalizeFilesystemArguments(name: string, params: unknown): unknown {
   const args = asRecord(params);
-  if (!args || name !== "bash") return params;
+  if (!args) return params;
+  if (name === "edit") return omitInertEditDefaults(args);
+  if (name !== "bash") return params;
   const normalized = { ...args };
   if (args.cwd === "") delete normalized.cwd;
   if (args.async === false) delete normalized.async;
   if (args.name === "") delete normalized.name;
   if (inertBashReady(args.ready)) delete normalized.ready;
   return normalized;
+}
+
+function editEntries(value: unknown): unknown[] {
+  if (typeof value === "string") {
+    // The filesystem tool also accepts JSON-encoded edits. Inspect them before
+    // its preparation can discard placeholder entries along with native keys.
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  return Array.isArray(value) ? value : [];
 }
 
 function rejectNativeOnlyArguments(name: string, schema: TSchema, params: unknown): void {
@@ -256,8 +325,8 @@ function rejectNativeOnlyArguments(name: string, schema: TSchema, params: unknow
           : [];
   const fields = nativeKeys.filter((key) => args[key] !== undefined);
   if (name === "grep" && Array.isArray(args.path)) fields.push("path");
-  if (name === "edit" && Array.isArray(args.edits)) {
-    args.edits.forEach((entry, index) => {
+  if (name === "edit") {
+    editEntries(args.edits).forEach((entry, index) => {
       for (const key of ["op", "rename", "diff"]) {
         if (asRecord(entry)?.[key] !== undefined) fields.push(`edits[${index}].${key}`);
       }
@@ -313,6 +382,25 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
   if (!router || !["read", "write", "edit", "grep", "bash"].includes(tool.name)) return tool;
   const filesystemSchema = schemaDocument(tool.parameters);
   type PreparedArgs = Parameters<typeof tool.execute>[1];
+  function prepareFilesystem(params: unknown, normalize: boolean): PreparedArgs {
+    const normalized = normalize ? normalizeFilesystemArguments(tool.name, params) : params;
+    try {
+      rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
+      if (tool.prepareArguments) return tool.prepareArguments(normalized);
+      if (tool.name === "edit" && normalized !== params) {
+        // Patch-only editing has no preparation hook to rule out incomplete edits.
+        validateFilesystemArguments(tool.name, filesystemSchema, normalized);
+      }
+      return normalized as PreparedArgs;
+    } catch (error) {
+      // Blank native fields cannot turn an incomplete or conflicting edit into
+      // a valid one. Keep the native-field refusal when the remaining edit fails.
+      if (tool.name === "edit" && normalized !== params) {
+        rejectNativeOnlyArguments(tool.name, filesystemSchema, params);
+      }
+      throw error;
+    }
+  }
   return {
     ...tool,
     ...(tool.name === "bash" ? { readsSkillUris: true } : {}),
@@ -320,9 +408,7 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
     prepareArguments(args) {
       // Native URL inputs must not undergo AFT's path/edit alias normalization.
       if (internalTarget(tool.name, args, router)) return args as PreparedArgs;
-      const normalized = normalizeFilesystemArguments(tool.name, args);
-      rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
-      return tool.prepareArguments ? tool.prepareArguments(normalized) : (normalized as PreparedArgs);
+      return prepareFilesystem(args, true);
     },
     async execute(id, params, signal, onUpdate, context) {
       const native = context as OmpContext;
@@ -340,11 +426,7 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
         });
         return delegatedResult(result, target) as AgentToolResult<TDetails>;
       }
-      const normalized = target ? params : normalizeFilesystemArguments(tool.name, params);
-      rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
-      const prepared = (
-        tool.prepareArguments ? tool.prepareArguments(normalized) : normalized
-      ) as Static<TParams>;
+      const prepared = prepareFilesystem(params, !target);
       // The OMP schema is intentionally wider. Ordinary filesystem calls still
       // obey AFT's original schema and runtime validation (e.g. required content).
       validateFilesystemArguments(tool.name, filesystemSchema, prepared);
