@@ -125,6 +125,7 @@ impl Attach {
                 bind_root_id: root.clone(),
                 inserted_new_actor: false,
                 expected_snapshot_id: None,
+                gh_shim_enabled: false,
                 applied_snapshot_id: None,
                 configure_response: response,
                 diagnostics_on_edit: false,

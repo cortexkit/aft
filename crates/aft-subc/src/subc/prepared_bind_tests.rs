@@ -10,6 +10,7 @@ async fn bind_publication_rejects_missing_or_mismatched_applied_snapshot() {
         let a0 = A0Egress::new(writer.clone(), done);
         let completion = RouteBindCompletion {
             expected_snapshot_id: Some(9),
+            gh_shim_enabled: false,
             applied_snapshot_id: applied,
             route,
             identity: test_support::route_identity(&root, "witness"),

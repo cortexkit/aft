@@ -60,7 +60,7 @@ fn note_list(event: ListEvent) {
     }
 }
 
-pub(crate) fn note_enabled_route() {
+fn note_enabled_route() {
     note_list(ListEvent::EnabledRoute);
 }
 
@@ -616,6 +616,14 @@ where
 #[doc(hidden)]
 pub struct Worker {
     _stop: tokio::sync::oneshot::Sender<()>,
+    ready: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Worker {
+    pub(crate) fn activate(&self) {
+        note_enabled_route();
+        self.ready.notify_one();
+    }
 }
 
 /// Called only by subc startup after registration, never by a standalone shim.
@@ -634,24 +642,29 @@ pub fn start(
         return None;
     }
     let (stop, stopped) = tokio::sync::oneshot::channel();
+    let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+    let bound = ready.clone();
     std::thread::spawn(move || {
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
-            let paths = StatePaths::from_process().for_daemon();
-            let root = RootRefresh::new(&read_root);
             runtime.block_on(async {
                 tokio::select! {
                     _ = stopped => {},
                     _ = async {
+                        // Wait until AFT has bound a route whose resolved
+                        // settings enable the shim.
+                        bound.notified().await;
+                        let paths = StatePaths::from_process().for_daemon();
+                        let root = RootRefresh::new(&read_root);
                         tokio::join!(root.poll(&paths), run_with(&paths, &root, || ManagementSession::connect(&connection_file)));
                     } => {},
                 }
             });
         }
     });
-    Some(Worker { _stop: stop })
+    Some(Worker { _stop: stop, ready })
 }
 
 #[cfg(test)]

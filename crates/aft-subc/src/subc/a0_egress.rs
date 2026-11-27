@@ -247,6 +247,7 @@ pub(super) struct A0Egress {
     slots: Arc<tokio::sync::Semaphore>,
     closing: AtomicBool,
     probe: Option<SubcTestLifecycleProbe>,
+    manifest_sync: Option<crate::gh_shim::manifest_sync::Worker>,
     #[cfg(test)]
     waiter_gate: Option<Arc<WaiterGate>>,
 }
@@ -265,6 +266,7 @@ impl A0Egress {
             slots: Arc::new(tokio::sync::Semaphore::new(WRITER_QUEUE_CAPACITY)),
             closing: AtomicBool::new(false),
             probe: None,
+            manifest_sync: None,
             #[cfg(test)]
             waiter_gate: None,
         }
@@ -272,6 +274,20 @@ impl A0Egress {
     pub(super) fn with_probe(mut self, probe: Option<SubcTestLifecycleProbe>) -> Self {
         self.probe = probe;
         self
+    }
+
+    pub(super) fn with_manifest_sync(
+        mut self,
+        worker: Option<crate::gh_shim::manifest_sync::Worker>,
+    ) -> Self {
+        self.manifest_sync = worker;
+        self
+    }
+
+    pub(super) fn activate_manifest_sync(&self) {
+        if let Some(worker) = &self.manifest_sync {
+            worker.activate();
+        }
     }
     pub(super) fn reserve(
         &self,
@@ -863,6 +879,7 @@ mod fixup_tests {
             );
             ControlCompletion::AckWritten(RouteBindCompletion {
                 expected_snapshot_id: None,
+                gh_shim_enabled: false,
                 applied_snapshot_id: None,
                 route,
                 identity: test_support::route_identity(&root, "receipt"),
@@ -1197,6 +1214,7 @@ mod ordering_tests {
         );
         let completion = RouteBindCompletion {
             expected_snapshot_id: None,
+            gh_shim_enabled: false,
             applied_snapshot_id: None,
             route,
             identity,

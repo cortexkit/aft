@@ -10,9 +10,12 @@ the shim will speak.
 
 The shim verifies lists only against this installation's policy root. The
 operator pins the vault's signing root with `ck policy-root set --vault-key
-<id>` and applies the printed digest with `ck config apply <digest>`. AFT reads
-the pin from its authenticated daemon connection at startup, before activating
-a new list, and every five minutes. The AFT relay, worker broker and speech
+<id>` and applies the printed digest with `ck config apply <digest>`. AFT starts
+fetching policy after a route configured to enable the shim binds. That
+includes per-client overrides such as `harnesses.opencode.github.shim`.
+Until then AFT does not poll the pin or
+create policy state. AFT reads the pin before activating a new list and every
+five minutes. The AFT relay, worker broker and speech
 verifier use the pin in memory, never the cached pin on disk. Each new shell
 gets the current key ID, public key and generation from AFT. The shim checks
 them against `trust-root.json` beside the list. The cached key must also be the

@@ -1613,20 +1613,6 @@ struct PendingBind {
     session: Option<String>,
 }
 
-struct RouteBindCompletion {
-    expected_snapshot_id: Option<u64>,
-    applied_snapshot_id: Option<u64>,
-    route: RouteChannel,
-    identity: RouteIdentity,
-    bind_root_id: ProjectRootId,
-    inserted_new_actor: bool,
-    configure_response: Response,
-    diagnostics_on_edit: bool,
-    ver: u8,
-    corr: u64,
-    flags: Flags,
-}
-
 #[derive(Debug, Clone)]
 struct RouteIdentity(Arc<RouteIdentityData>);
 
@@ -4526,7 +4512,7 @@ async fn connect_and_authenticate_once(
     Ok(stream)
 }
 
-use installed_routes::process_route_bind_completion;
+use installed_routes::{process_route_bind_completion, RouteBindCompletion};
 
 #[allow(clippy::too_many_arguments)]
 async fn drain_pending_route_bind_completions(
@@ -4842,7 +4828,7 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     consent::install_subc_transport(connection_file_path);
     let _expiry = consent::expiry::start(shared_app.clone(), storage_dir.join("aft.db"));
-    let _manifest_sync = gh_shim_session::start(connection_file_path, control.clone());
+    let a0 = gh_shim_session::with_refresh_worker(a0, connection_file_path, control.clone());
     let bus_worker = task_scope_runtime::start_publication_services(
         connection_file_path,
         &shared_app,
@@ -7375,6 +7361,9 @@ async fn handle_route_bind_completion(
         &completion.bind_root_id,
         metrics,
     );
+    if completion.gh_shim_enabled {
+        a0.activate_manifest_sync();
+    }
     live_roots
         .entry(completion.bind_root_id.clone())
         .and_modify(|meta| {
@@ -8254,6 +8243,8 @@ async fn handle_control_request(
             let expected_snapshot_id = prepared_config.as_ref().map(|snapshot| snapshot.id());
             let applied_snapshot = Arc::new(AtomicU64::new(0));
             let job_snapshot = Arc::clone(&applied_snapshot);
+            let applied_gh_shim = Arc::new(AtomicBool::new(false));
+            let job_gh_shim = Arc::clone(&applied_gh_shim);
             installed_route_epochs.insert(route_channel, epoch);
             if let Some(meta) = live_roots.get_mut(&bind_root_id) {
                 meta.maintenance_queued_kinds.clear();
@@ -8285,6 +8276,7 @@ async fn handle_control_request(
                                 None => dispatch(configure_req.clone(), ctx),
                             };
                             if response.success {
+                                job_gh_shim.store(ctx.config().github.shim, Ordering::Release);
                                 output_identity.output_scope.get_or_init(|| {
                                     Arc::new(crate::output_store::OutputScope::new(
                                         ctx,
@@ -8363,6 +8355,7 @@ async fn handle_control_request(
                     bind_root_id: completion_root,
                     inserted_new_actor,
                     configure_response,
+                    gh_shim_enabled: applied_gh_shim.load(Ordering::Acquire),
                     diagnostics_on_edit,
                     ver: completion_ver,
                     corr: completion_corr,
@@ -18606,6 +18599,7 @@ mod tests {
             bind_root_id: root.clone(),
             inserted_new_actor: false,
             expected_snapshot_id: None,
+            gh_shim_enabled: false,
             applied_snapshot_id: None,
             configure_response: Response::success("subc-bind-7", json!({})),
             diagnostics_on_edit: false,
@@ -18746,6 +18740,7 @@ mod tests {
             bind_root_id: root.clone(),
             inserted_new_actor: false,
             expected_snapshot_id: None,
+            gh_shim_enabled: false,
             applied_snapshot_id: None,
             configure_response: Response::success("subc-bind-8", json!({})),
             diagnostics_on_edit: false,

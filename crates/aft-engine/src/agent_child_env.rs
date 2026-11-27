@@ -844,7 +844,6 @@ pub fn inject(
     let gh_enabled = config.github.shim;
     scrub_shim_launch_environment(environment, cfg!(windows));
     if gh_enabled {
-        crate::gh_shim::manifest_sync::note_enabled_route();
         if let Some(value) = crate::gh_shim::trust_root::shell_anchor() {
             environment.insert(crate::gh_shim::trust_root::ANCHOR_ENV.into(), value);
         }

@@ -3,24 +3,28 @@
 use super::*;
 use crate::gh_shim::{manifest_sync, trust_root};
 
-pub(super) fn start(
+pub(super) fn with_refresh_worker(
+    a0: A0Egress,
     connection_file: &Path,
     control: Arc<readiness::DaemonControl>,
-) -> Option<manifest_sync::Worker> {
+) -> A0Egress {
     crate::agent_child_env::coauthor::install(connection_file.to_path_buf());
-    manifest_sync::start(connection_file.to_path_buf(), move || {
-        let control = control.clone();
-        Box::pin(async move {
-            let op = trust_root::GET;
-            if !control.advertises(op) {
-                return Err(());
-            }
-            control
-                .config_request(&json!({"op": op}))
-                .await
-                .map_err(|_| ())
-        })
-    })
+    a0.with_manifest_sync(manifest_sync::start(
+        connection_file.to_path_buf(),
+        move || {
+            let control = control.clone();
+            Box::pin(async move {
+                let op = trust_root::GET;
+                if !control.advertises(op) {
+                    return Err(());
+                }
+                control
+                    .config_request(&json!({"op": op}))
+                    .await
+                    .map_err(|_| ())
+            })
+        },
+    ))
 }
 
 pub(super) fn speech_launch_seed(

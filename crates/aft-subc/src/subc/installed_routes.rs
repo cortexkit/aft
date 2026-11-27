@@ -2,6 +2,21 @@
 use super::*;
 use crate::subc_config::BindConfigCache;
 
+pub(super) struct RouteBindCompletion {
+    pub(super) expected_snapshot_id: Option<u64>,
+    pub(super) applied_snapshot_id: Option<u64>,
+    pub(super) route: RouteChannel,
+    pub(super) identity: RouteIdentity,
+    pub(super) bind_root_id: ProjectRootId,
+    pub(super) inserted_new_actor: bool,
+    pub(super) configure_response: Response,
+    pub(super) diagnostics_on_edit: bool,
+    pub(super) gh_shim_enabled: bool,
+    pub(super) ver: u8,
+    pub(super) corr: u64,
+    pub(super) flags: Flags,
+}
+
 #[derive(Default)]
 pub(super) struct RootChannels {
     pub(super) channels: HashMap<ProjectRootId, HashSet<RouteChannel>>,
