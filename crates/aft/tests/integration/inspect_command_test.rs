@@ -7348,52 +7348,8 @@ fn failed_rust_check_is_never_saved() {
     assert_unsuccessful_rust_check_is_not_persisted("failed");
 }
 
-/// rust-analyzer starts its first `cargo check` just after it reports
-/// quiescence, but a server short of CPU (several of them sharing a CI
-/// runner) can announce that check seconds later. A relay in front of the
-/// real server holds the first check's announcement, and every diagnostics
-/// report, back for three seconds while requests are still answered. The
-/// compiler error (`use of moved value` comes only from the compiler) must be
-/// reported, or the check named as still running; certifying the file from
-/// rust-analyzer's own analysis alone is the stale answer this guards against.
-#[test]
-fn scoped_rust_inspect_waits_for_a_late_first_cargo_check_with_real_rust_analyzer() {
-    if !crate::helpers::real_rust_analyzer_available(
-        "scoped_rust_inspect_waits_for_a_late_first_cargo_check_with_real_rust_analyzer",
-    ) {
-        return;
-    }
-    let (_temp_dir, root, _s) = field_removal_crate();
-    write_file(
-        &root,
-        "src/moves.rs",
-        "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) {\n    (v, v)\n}\n",
-    );
-    write_file(
-        &root,
-        "src/lib.rs",
-        "pub mod moves;\npub mod s;\npub mod user;\n",
-    );
-    let ctx = configured_context(&root);
-    enable_automatic_rust_checks(&ctx);
-    ctx.lsp()
-        .override_binary(ServerKind::Rust, fake_server_path());
-    ctx.lsp()
-        .set_extra_env("AFT_FAKE_LSP_PROXY", "rust-analyzer");
-    ctx.lsp()
-        .set_extra_env("AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS", "3000");
-
-    let response = scoped_diagnostics_inspect(&ctx, "late-first-check", "src");
-    if reported_check_still_running(&response) {
-        return;
-    }
-    assert!(
-        diagnostic_sources_for(&response, "src/moves.rs")
-            .iter()
-            .any(|(_, message)| message.contains("moved value")),
-        "the compiler error of the late check is missing: {response:#}"
-    );
-}
+#[path = "inspect_command_test/rust_readiness.rs"]
+mod rust_readiness;
 
 /// The same late start against the fake, which emulates rust-analyzer's
 /// check on save: it begins its first check three seconds after reporting
