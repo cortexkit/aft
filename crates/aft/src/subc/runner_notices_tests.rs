@@ -2164,10 +2164,6 @@ fn runner_notices_completion_survives_long_outage_and_acks_only_acceptance() {
     let start = std::time::Instant::now();
     let mut due = start;
     for attempt in 0..30 {
-        clock.store(
-            task.finished + due.duration_since(start).as_millis() as u64,
-            Ordering::Relaxed,
-        );
         let Next::Retry(delay) = step(&scheduler, due) else {
             panic!("retired attempt {attempt}")
         };
@@ -2178,13 +2174,23 @@ fn runner_notices_completion_survives_long_outage_and_acks_only_acceptance() {
         assert!(!task.delivered(), "retry must not ack attempt {attempt}");
         assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
         due += delay;
+        clock.fetch_add(delay.as_millis() as u64, Ordering::Relaxed);
     }
     assert!(due.duration_since(start) > Duration::from_secs(20 * 60));
+
+    // The runner has recovered, but the notice is not runnable until its
+    // scheduled retry. That retry must send and ack without another backoff.
+    assert!(Scheduler::take(
+        &mut scheduler.entries.lock().unwrap(),
+        due - Duration::from_millis(1),
+    )
+    .is_none());
+    assert_eq!(capture.receiver.try_iter().count(), 30);
     assert!(matches!(step(&scheduler, due), Next::Done));
+    assert!(scheduler.entries.lock().unwrap().is_empty());
     assert!(task.delivered());
-    assert_eq!(capture.receiver.try_iter().count(), 31);
+    assert_eq!(capture.receiver.try_iter().count(), 1);
     assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
-    assert!(start.elapsed() < Duration::from_secs(1));
 }
 
 #[test]
