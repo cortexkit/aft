@@ -5,7 +5,7 @@ use std::path::Path;
 
 use super::manifest_acceptance::{resolve_with_basis, DecisionBasis};
 use super::{
-    current_platform, delegate_after_invalid_manifest_notice, gh_shim_state_dir_from,
+    current_platform, delegate_after_invalid_manifest_notice, enable_gate, gh_shim_state_dir_from,
     is_unbound_safe, refuse, regressed_disposition, trust_root, unix_seconds, ManifestProblem,
     ManifestResolution, RefusalCode, RegressedDisposition, StatePaths, NO_TRUST_ROOT_REFUSAL,
 };
@@ -69,18 +69,19 @@ impl<'a> ManifestGuard<'a> {
             crate::environment::non_empty_os_var("HOME").as_deref(),
         );
         let local_provisioned = manifest_state_was_provisioned(&self.paths.root);
-        if local_provisioned
-            && matches!(
-                trust_root::read(self.paths),
-                Err(ManifestProblem::NoTrustRoot)
-            )
-        {
-            return Some(refuse(
-                RefusalCode::ManifestUnavailable,
-                NO_TRUST_ROOT_REFUSAL,
-            ));
+        let governed_launch = enable_gate::launched_enabled();
+        if local_provisioned || governed_launch {
+            let pin = trust_root::read(self.paths);
+            if matches!(pin, Err(ManifestProblem::NoTrustRoot)) || (governed_launch && pin.is_err())
+            {
+                return Some(refuse(
+                    RefusalCode::ManifestUnavailable,
+                    NO_TRUST_ROOT_REFUSAL,
+                ));
+            }
         }
-        if local_provisioned
+        if governed_launch
+            || local_provisioned
             || manifest_state_was_provisioned(&default_root)
         {
             return Some(refuse(
