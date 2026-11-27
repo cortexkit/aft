@@ -221,6 +221,7 @@ fn gh_shim_generation_record_alone_blocks_writes() {
 fn gh_shim_final_policy_check_runs_after_the_native_ticket_lookup() {
     let fixture = Fixture::new();
     fixture.activate();
+    fs::remove_file(&fixture.record).unwrap();
     let manifest = fixture.state.join("gh-routing-manifest.json");
     let daemon = SlowTestDaemon::spawn_removing_during_session_lookup(manifest.clone());
     fixture.connect_daemon(&daemon);
