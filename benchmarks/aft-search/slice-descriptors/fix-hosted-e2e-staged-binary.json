@@ -5,5 +5,5 @@
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "CI and test-only change, apart from moving the unchanged first-text-index wait out of the ranking-fenced semantic_search/mod.rs into semantic_search/first_text_wait.rs to keep the file under its size pin; no search, routing or ranking logic changes. End-to-end suites use the aft binary CI staged (AFT_BINARY_PATH) instead of a leftover target build, the Windows native e2e job gets a cold-build budget, the beta-pin gate names the binary it builds, the first-text failure and cancellation tests assert why the wait ended through test-only signals, and one cross-session bash test waits for persisted completion."
+  "note": "CI and test-only change. The one production edit moves an unchanged wait function into its own file under the size pin; no search, routing or ranking logic changes. Details are in the pull request description."
 }
