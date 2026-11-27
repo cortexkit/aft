@@ -1611,6 +1611,10 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                          if command in step.get("run", "")]
                 self.assertEqual(paths, [f"${{{{ env.AFT_CI_JOB_DIR }}}}/{binary}"])
 
+    def test_windows_native_e2e_allows_a_cold_build(self) -> None:
+        job = self.suites[1]["jobs"]["e2e-windows"]
+        self.assertEqual(int(job["timeout-minutes"]), 60)
+
     def test_hosted_native_jobs_prepare_job_local_state_without_machine_cleanup(self) -> None:
         jobs = self.native_jobs()
         self.assertEqual(len(jobs), 20)

@@ -480,7 +480,9 @@ jobs:
     name: E2E (Windows native)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2025
-    timeout-minutes: 30
+    # A cold Cargo build on GitHub's 4-core Windows runner takes 21-25 minutes
+    # on its own. Leave time for runner setup and the native e2e suite as well.
+    timeout-minutes: 60
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
