@@ -7,6 +7,8 @@
  * `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1` or `--use-env-proxy` is active.
  */
 
+import * as http from "node:http";
+
 export interface FormatFetchErrorOptions {
   timedOut?: boolean;
   timeoutMs?: number;
@@ -15,7 +17,18 @@ export interface FormatFetchErrorOptions {
   execArgv?: readonly string[];
 }
 
+export interface EnableNodeEnvProxyOptions {
+  env?: NodeJS.ProcessEnv;
+  isBun?: boolean;
+  execArgv?: readonly string[];
+  setGlobalProxyFromEnv?: ((proxyEnv?: NodeJS.ProcessEnv) => unknown) | null;
+}
+
 const ENV_PROXY_FLAG = "--use-env-proxy";
+
+// Tracks whether enableNodeEnvProxy() turned on Node's environment proxy for
+// the real process env, so formatFetchError() can stop suggesting the flag.
+let processEnvProxyEnabled = false;
 
 function hasProxyEnv(env: NodeJS.ProcessEnv): boolean {
   for (const key of ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"] as const) {
@@ -62,6 +75,38 @@ function causeSummary(error: unknown): string {
   return [...new Set(parts)].join("; ");
 }
 
+/**
+ * Enable Node's built-in env-proxy support (`http.setGlobalProxyFromEnv`)
+ * before the first fetch. No-op on Bun (its fetch already honors
+ * `HTTP(S)_PROXY`) and when no proxy env is configured.
+ *
+ * @returns whether the environment proxy is active after this call.
+ */
+export function enableNodeEnvProxy(opts: EnableNodeEnvProxyOptions = {}): boolean {
+  processEnvProxyEnabled = false;
+  const isBun = opts.isBun ?? Boolean(process.versions.bun);
+  const env = opts.env ?? process.env;
+  const execArgv = opts.execArgv ?? process.execArgv;
+  if (isBun || !hasProxyEnv(env)) return false;
+  if (isEnvProxyActive(env, execArgv)) return true;
+
+  const setProxy =
+    opts.setGlobalProxyFromEnv !== undefined
+      ? opts.setGlobalProxyFromEnv
+      : (http as { setGlobalProxyFromEnv?: (proxyEnv?: NodeJS.ProcessEnv) => unknown })
+          .setGlobalProxyFromEnv;
+  if (typeof setProxy !== "function") return false;
+
+  try {
+    if (opts.env) setProxy(opts.env);
+    else setProxy();
+    processEnvProxyEnabled = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Describe a fetch failure with its timeout, inner cause chain, and Node env-proxy hint. */
 export function formatFetchError(error: unknown, opts: FormatFetchErrorOptions = {}): string {
   const base = error instanceof Error ? error.message : String(error);
@@ -79,7 +124,13 @@ export function formatFetchError(error: unknown, opts: FormatFetchErrorOptions =
     (typeof error === "object" && error !== null && ("cause" in error || "errors" in error)) ||
     /fetch failed/i.test(base);
 
-  if (!isBun && hasProxyEnv(env) && !isEnvProxyActive(env, execArgv) && looksLikeTransportFailure) {
+  if (
+    !isBun &&
+    hasProxyEnv(env) &&
+    !processEnvProxyEnabled &&
+    !isEnvProxyActive(env, execArgv) &&
+    looksLikeTransportFailure
+  ) {
     message +=
       " (HTTP(S)_PROXY is set, but Node.js fetch ignores it unless NODE_USE_ENV_PROXY=1 is set)";
   }

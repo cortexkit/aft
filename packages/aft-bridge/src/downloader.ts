@@ -253,10 +253,9 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     ]);
 
     if (!binaryResponse.ok) {
-      error(
-        `Failed to download AFT binary: HTTP ${binaryResponse.status}: ${binaryResponse.statusText} (${downloadUrl})`,
+      throw new Error(
+        `HTTP ${binaryResponse.status}: ${binaryResponse.statusText} (${downloadUrl})`,
       );
-      return null;
     }
     if (!binaryResponse.body) {
       throw new Error(`Download response for ${assetName} had no body`);

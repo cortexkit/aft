@@ -287,6 +287,13 @@ export {
 } from "./error-contract.js";
 // --- feature-based configuration policy (shared with crates/aft feature_config.rs) ---
 export * from "./feature-config.js";
+// --- fetch transport diagnostics and Node env-proxy ---
+export {
+  type EnableNodeEnvProxyOptions,
+  enableNodeEnvProxy,
+  type FormatFetchErrorOptions,
+  formatFetchError,
+} from "./fetch-proxy.js";
 // --- compact UI formatting ---
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---

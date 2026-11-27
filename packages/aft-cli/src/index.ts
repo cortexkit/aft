@@ -7,6 +7,7 @@
  * `--harness <name>` overrides detection.
  */
 
+import { enableNodeEnvProxy } from "@cortexkit/aft-bridge";
 import { CLI } from "./lib/cli.js";
 
 const command = process.argv[2];
@@ -134,6 +135,9 @@ async function reportFatal(error: unknown): Promise<number> {
   outro(`${CLI} ${command ?? ""} stopped — see the error above.`.replace(/\s+/g, " "));
   return 1;
 }
+
+// Turn on Node's environment proxy support for the CLI process before any command fetches.
+enableNodeEnvProxy();
 
 main()
   .catch(reportFatal)

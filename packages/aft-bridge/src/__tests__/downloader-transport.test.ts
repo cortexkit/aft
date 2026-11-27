@@ -17,7 +17,7 @@ import { join } from "node:path";
 
 import { getActiveLogger } from "../active-logger.js";
 import { isTrustedCachedBinary, readBinaryIdentity } from "../binary-identity.js";
-import { formatFetchError } from "../fetch-proxy.js";
+import { enableNodeEnvProxy, formatFetchError } from "../fetch-proxy.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "../platform.js";
 import { __setOffThreadVersionProbeForTests } from "../version-probe.js";
 import { linkCachedExecutable } from "./test-utils/cached-executable.js";
@@ -402,10 +402,117 @@ describe("downloadBinary hardened transport", () => {
     globalThis.fetch = (async () =>
       new Response("bad", { status: 502, statusText: "Bad Gateway" })) as typeof fetch;
 
-    const lines = await captureBridgeErrors(() => downloadBinary("v9.9.9"));
-    expect(lines.join("\n")).toContain(
-      `Failed to download AFT binary: HTTP 502: Bad Gateway (https://github.com/cortexkit/aft/releases/download/v9.9.9/${assetName})`,
+    // A proxy env var must not turn a plain HTTP status error (which goes
+    // through the shared catch block) into a transport hint. The outer
+    // beforeEach fixture owns the env mutex, so swap this one var manually.
+    const originalHttpsProxy = process.env.https_proxy;
+    process.env.https_proxy = "http://127.0.0.1:7890";
+    try {
+      const lines = await captureBridgeErrors(() => downloadBinary("v9.9.9"));
+      expect(lines.join("\n")).toContain(
+        `Failed to download AFT binary: HTTP 502: Bad Gateway (https://github.com/cortexkit/aft/releases/download/v9.9.9/${assetName})`,
+      );
+      expect(lines.join("\n")).not.toContain("NODE_USE_ENV_PROXY=1");
+    } finally {
+      if (originalHttpsProxy === undefined) delete process.env.https_proxy;
+      else process.env.https_proxy = originalHttpsProxy;
+    }
+  });
+});
+
+describe("enableNodeEnvProxy", () => {
+  const transportError = new TypeError("fetch failed", {
+    cause: Object.assign(new Error("Connect Timeout Error"), {
+      code: "UND_ERR_CONNECT_TIMEOUT",
+    }),
+  });
+  const proxyEnv = { https_proxy: "http://127.0.0.1:7890" };
+
+  afterEach(() => {
+    enableNodeEnvProxy({ env: {} });
+  });
+
+  test("calls setGlobalProxyFromEnv when proxy env is set and suppresses the fallback hint", () => {
+    const seen: Array<NodeJS.ProcessEnv | undefined> = [];
+    const setProxy = (env?: NodeJS.ProcessEnv) => {
+      seen.push(env);
+      return true;
+    };
+
+    expect(
+      enableNodeEnvProxy({
+        env: proxyEnv,
+        isBun: false,
+        execArgv: [],
+        setGlobalProxyFromEnv: setProxy,
+      }),
+    ).toBe(true);
+    expect(seen).toEqual([proxyEnv]);
+
+    expect(
+      formatFetchError(transportError, {
+        env: proxyEnv,
+        isBun: false,
+        execArgv: [],
+      }),
+    ).not.toContain("NODE_USE_ENV_PROXY=1");
+  });
+
+  test("returns false and keeps the fallback hint when setGlobalProxyFromEnv is unavailable", () => {
+    expect(
+      enableNodeEnvProxy({
+        env: proxyEnv,
+        isBun: false,
+        execArgv: [],
+        setGlobalProxyFromEnv: null,
+      }),
+    ).toBe(false);
+    expect(
+      formatFetchError(transportError, {
+        env: proxyEnv,
+        isBun: false,
+        execArgv: [],
+      }),
+    ).toContain(
+      "(HTTP(S)_PROXY is set, but Node.js fetch ignores it unless NODE_USE_ENV_PROXY=1 is set)",
     );
+  });
+
+  test("no-ops on Bun, without proxy env, or when env proxy is already active", () => {
+    const calls: Array<NodeJS.ProcessEnv | undefined> = [];
+    const setProxy = (env?: NodeJS.ProcessEnv) => {
+      calls.push(env);
+      return true;
+    };
+
+    expect(
+      enableNodeEnvProxy({
+        env: proxyEnv,
+        isBun: true,
+        execArgv: [],
+        setGlobalProxyFromEnv: setProxy,
+      }),
+    ).toBe(false);
+    expect(
+      enableNodeEnvProxy({ env: {}, isBun: false, execArgv: [], setGlobalProxyFromEnv: setProxy }),
+    ).toBe(false);
+    expect(
+      enableNodeEnvProxy({
+        env: { ...proxyEnv, NODE_USE_ENV_PROXY: "1" },
+        isBun: false,
+        execArgv: [],
+        setGlobalProxyFromEnv: setProxy,
+      }),
+    ).toBe(true);
+    expect(
+      enableNodeEnvProxy({
+        env: proxyEnv,
+        isBun: false,
+        execArgv: ["--use-env-proxy"],
+        setGlobalProxyFromEnv: setProxy,
+      }),
+    ).toBe(true);
+    expect(calls).toEqual([]);
   });
 });
 
