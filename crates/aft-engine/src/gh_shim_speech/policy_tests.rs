@@ -670,12 +670,17 @@ fn protected_writes_refuse_during_restart_but_operator_disable_passes_through() 
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
     let _lock = crate::test_env::process_env_lock();
-    let manifest: Manifest = serde_json::from_str(include_str!(
+    let mut manifest: Manifest = serde_json::from_str(include_str!(
         "../../../aft/tests/fixtures/gh_shim/v10-manifest.json"
     ))
     .unwrap();
+    manifest.tiers.get_mut(&Tier::Admin).unwrap().push(
+        serde_json::from_value(json!({ "tuple": "run rerun", "platform": ["macos", "linux"] }))
+            .unwrap(),
+    );
     let _fixture = RunWithFixture::new(&manifest);
     let _provisioned = Env::set(
         crate::gh_shim_speech::start_view::PROVISIONED_ENV,
@@ -685,6 +690,10 @@ fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
         .into_iter()
         .map(Into::into)
         .collect();
+    assert!(matches!(
+        classify(&args, &manifest, current_platform()),
+        Classification::Admin { .. }
+    ));
     let (_capture, lines) = capture_refusals_for_test();
     let exit = run_with(
         &args,
@@ -700,27 +709,41 @@ const UNDECLARED_POLICY_REFUSAL: &str = "gh-shim: gh_shim_seam_refusal: task_gh_
 #[test]
 fn captured_policy_undeclared_command_does_not_claim_to_be_a_write() {
     let _lock = crate::test_env::process_env_lock();
-    let manifest = super::tests::fixture_manifest();
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v10-manifest.json"
+    ))
+    .unwrap();
     let _fixture = RunWithFixture::new(&manifest);
     let _provisioned = Env::set(
         crate::gh_shim_speech::start_view::PROVISIONED_ENV,
         Some(OsStr::new("1")),
     );
-    let args = ["variable", "list", "-R", "cortexkit/aft"].map(OsString::from);
-    assert!(matches!(
-        classify(&args, &manifest, current_platform()),
-        Classification::Unclassified
-    ));
-    let (_capture, lines) = capture_refusals_for_test();
-    assert_eq!(
-        run_with(
-            &args,
-            |_| panic!("an undeclared captured invocation must not reach native gh"),
-            |_, _, _, _| panic!("an undeclared captured invocation must not reach the read probe"),
-        ),
-        REFUSAL_EXIT_STATUS,
-    );
-    assert_eq!(*lines.lock().unwrap(), [UNDECLARED_POLICY_REFUSAL]);
+    for raw in [
+        &["variable", "list", "-R", "cortexkit/aft"][..],
+        &["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"][..],
+    ] {
+        let args = raw.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(matches!(
+            classify(&args, &manifest, current_platform()),
+            Classification::Unclassified
+        ));
+        let (_capture, lines) = capture_refusals_for_test();
+        assert_eq!(
+            run_with(
+                &args,
+                |_| panic!("an undeclared captured invocation must not reach native gh"),
+                |_, _, _, _| panic!(
+                    "an undeclared captured invocation must not reach the read probe"
+                ),
+            ),
+            REFUSAL_EXIT_STATUS,
+        );
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [UNDECLARED_POLICY_REFUSAL],
+            "{raw:?}"
+        );
+    }
 }
 
 #[test]
