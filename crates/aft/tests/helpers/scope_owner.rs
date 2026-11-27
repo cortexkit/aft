@@ -8,6 +8,8 @@ use subc_protocol::Principal;
 
 struct ScopeOwner;
 
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+mod basal_flow_read_fixture;
 #[cfg(feature = "test-hooks")]
 mod consumer_identity_fixture;
 mod runner_notice_fixture;
@@ -33,6 +35,11 @@ fn main() {
 }
 
 async fn run() {
+    #[cfg(all(target_os = "linux", feature = "test-hooks"))]
+    if std::env::var_os("AFT_TEST_BASAL_FLOW_READ").is_some() {
+        basal_flow_read_fixture::run().await;
+        return;
+    }
     #[cfg(feature = "test-hooks")]
     if std::env::var_os("AFT_TEST_CONSUMER_IDENTITY").is_some() {
         consumer_identity_fixture::run().await;

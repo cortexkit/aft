@@ -1,0 +1,4 @@
+{
+  "route_open": {"busy_refusals":true,"identity":{"harness":"runner","session":"fixture-session"},"op":"route.open","scope":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"head/fixture","scope_epoch":37},"target":{"kind":"tool_provider","module_id":"aft"}},
+  "request": {"op":"file.read_exact","path":"flows/sample.js"}
+}
