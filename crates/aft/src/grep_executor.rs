@@ -1098,6 +1098,12 @@ fn explicit_file_matches(filter_root: &Path, file: &Path, filters: &PathFilters)
     filters.matches(base, file)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_DIRECTORY_WALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn execute_root_profiled(
     ctx: &impl IndexHost,
     pattern: &CompiledPattern,
@@ -1193,6 +1199,10 @@ fn execute_root_profiled(
 
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
+    #[cfg(test)]
+    if let Some(before_walk) = BEFORE_DIRECTORY_WALK.with_borrow_mut(Option::take) {
+        before_walk();
+    }
     let snapshot_acquire = snapshot_started.elapsed();
     let mut counts = ScopeFileCounts::default();
     let result = fallback_grep_counted(
@@ -3845,6 +3855,62 @@ mod tests {
         );
         assert_eq!(merged.total_matches, 5);
         assert!(merged.truncated);
+    }
+
+    #[test]
+    fn grep_walk_keeps_its_source_when_the_first_index_publishes() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn publication_needle() {}\n").unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        };
+        config.indexes.callgraph = false;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let checkout = ctx.data_checkout().expect("bound checkout");
+        assert!(checkout.first_text_building(), "the first build is held");
+
+        // Release publication only after grep has missed the view. Wait for
+        // the text index to publish before letting that same request walk.
+        BEFORE_DIRECTORY_WALK.with_borrow_mut(|slot| {
+            *slot = Some(Box::new(move || {
+                let checkout = checkout.checkout();
+                let mut generation = checkout.readiness_generation();
+                drop(hold);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while checkout.view().is_none() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "the text index did not publish");
+                    checkout.wait_for_readiness_change(&mut generation, remaining);
+                }
+            }));
+        });
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "grep-publication-race", "command": "grep",
+            "pattern": "publication_needle", "path": "src",
+        }))
+        .unwrap();
+        let walked = crate::commands::grep::handle_grep(&request, &ctx);
+        assert!(walked.success, "{}", walked.data);
+        assert_eq!(walked.data["total_matches"], 1, "{}", walked.data);
+        assert_eq!(walked.data["complete"], true, "{}", walked.data);
+        assert_eq!(walked.data["files_read_directly"], 1, "{}", walked.data);
+        assert_eq!(walked.data["index_status"], "Building", "{}", walked.data);
+        assert_eq!(walked.data["fallback"], "filesystem", "{}", walked.data);
+
+        let indexed = crate::commands::grep::handle_grep(&request, &ctx);
+        assert!(indexed.success, "{}", indexed.data);
+        assert_eq!(indexed.data["total_matches"], 1, "{}", indexed.data);
+        assert_eq!(indexed.data["complete"], true, "{}", indexed.data);
+        assert_eq!(indexed.data["files_read_directly"], 0, "{}", indexed.data);
+        assert_eq!(indexed.data["index_status"], "Ready", "{}", indexed.data);
+        assert!(indexed.data["fallback"].is_null(), "{}", indexed.data);
     }
 
     /// 100 directories of 100 files, each file holding one `needle`, and a
