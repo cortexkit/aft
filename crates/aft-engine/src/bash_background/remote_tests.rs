@@ -909,7 +909,7 @@ fn exec_remote_bash_unknown_reply_without_job_omits_status_hint() {
 #[test]
 fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
     let mut remote = RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         explicit_runon: false,
@@ -2826,7 +2826,7 @@ async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: keyed.then(|| KeyedSubmission {
             key: format!("aft:{task_id}"),
             created_at_ms: unix_millis(),
@@ -5191,7 +5191,7 @@ fn unreported_git_untracked_and_ignored_reports_stay_silent() {
 #[test]
 fn remote_phase_comes_from_runner_evidence() {
     let mut remote = RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -5342,7 +5342,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
     metadata.status = BgTaskStatus::Running;
     metadata.started_at = 1_000_000;
     metadata.remote = Some(RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -5600,7 +5600,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
     // Submitted first nine minutes ago; the runner drained until now.
     metadata.started_at = now - 9 * MINUTE_MS;
     metadata.remote = Some(RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -8781,7 +8781,7 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         explicit_runon: true,

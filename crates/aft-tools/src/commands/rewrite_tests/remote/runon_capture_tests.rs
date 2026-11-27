@@ -1,8 +1,8 @@
 use super::*;
-use aft_engine::test_bridge::bash_remote::{remote_wire::Daemon, set_test_cap};
+use aft_engine::test_bridge::bash_remote::{remote_wire::Daemon, set_test_cap, BgTaskRegistryTestExt as _};
 
-const COPY_WARNING: &str = "Copied while another command in this checkout was still running; its changes may be missing from the job.";
 const EDIT: &str = "until test -e .release-editor; do sleep 0.02; done; printf 'edited before capture\n' > tracked.txt";
+const HOLD: &str = "until test -e .release-editor; do sleep 0.02; done";
 
 fn local_command(
     ctx: &crate::context::AppContext,
@@ -46,11 +46,25 @@ fn start_remote_editor(
     daemon: &Daemon,
     workdir: &Path,
 ) -> String {
+    start_foreground_remote(
+        ctx,
+        launch(daemon.connection().clone()),
+        workdir,
+        &format!("touch .editor-started; {EDIT}"),
+    )
+}
+
+fn start_foreground_remote(
+    ctx: &crate::context::AppContext,
+    launch: crate::bash_background::RemoteLaunch,
+    workdir: &Path,
+    command: &str,
+) -> String {
     ctx.bash_background()
         .spawn_remote(
-            launch(daemon.connection().clone()),
+            launch,
             SpawnPlan::Unsandboxed,
-            &format!("touch .editor-started; {EDIT}"),
+            command,
             resolve_posix_shell(),
             "session".into(),
             workdir.into(),
@@ -75,7 +89,7 @@ fn start_log_capture(root: &Path) -> Arc<Mutex<Vec<String>>> {
     capture
 }
 
-fn assert_warning(snapshot: &BgTaskSnapshot, expected: bool) {
+fn assert_warning(snapshot: &BgTaskSnapshot, expected: Option<&str>) {
     assert_eq!(
         snapshot.info.status,
         BgTaskStatus::Completed,
@@ -85,11 +99,31 @@ fn assert_warning(snapshot: &BgTaskSnapshot, expected: bool) {
         snapshot
             .output_preview
             .lines()
-            .filter(|line| *line == COPY_WARNING)
-            .count(),
-        usize::from(expected),
+            .filter(|line| line.starts_with("Copied while another command in this checkout"))
+            .collect::<Vec<_>>(),
+        expected.into_iter().collect::<Vec<_>>(),
         "{}",
         snapshot.output_preview,
+    );
+}
+
+fn assert_saved_overlaps(registry: &BgTaskRegistry, job: &str, overlaps: &[(&str, &str)]) {
+    let path = registry.task_json_path(job, "session").unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let remote = &saved["remote"];
+    // The old reader knows only this boolean and ignores additional fields.
+    #[derive(serde::Deserialize)]
+    struct OldRemote {
+        copy_warning: bool,
+    }
+    assert!(
+        serde_json::from_value::<OldRemote>(remote.clone())
+            .unwrap()
+            .copy_warning
+    );
+    assert_eq!(
+        remote["copy_warning_commands"],
+        serde_json::json!(overlaps.iter().copied().collect::<BTreeMap<_, _>>()),
     );
 }
 
@@ -124,7 +158,7 @@ async fn runon_capture_waits_for_foreground_edit_in_a_checkout_subdirectory() {
         done.output_preview.contains("edited before capture"),
         "{done:?}"
     );
-    assert_warning(&done, false);
+    assert_warning(&done, None);
     let logs = logs.lock().unwrap();
     let wait = logs
         .iter()
@@ -174,7 +208,7 @@ async fn runon_capture_waits_for_foreground_local_fallback() {
         done.output_preview.contains("edited before capture"),
         "{done:?}"
     );
-    assert_warning(&done, false);
+    assert_warning(&done, None);
     assert!(logs.lock().unwrap().iter().any(|line| {
         line.contains("runon: foreground capture wait ")
             && line.contains(&job)
@@ -216,7 +250,7 @@ async fn runon_capture_does_not_wait_or_warn_after_fallback_spawn_failure() {
     let logs = start_log_capture(&root);
     let _cap = set_test_cap(&root, Duration::from_millis(100));
     let job = start_runon(&ctx, &capture);
-    assert_warning(&terminal(ctx.bash_background(), &job).await, false);
+    assert_warning(&terminal(ctx.bash_background(), &job).await, None);
     assert!(!logs
         .lock()
         .unwrap()
@@ -232,7 +266,7 @@ async fn runon_capture_submits_after_cap_and_warns_once() {
     let ctx = remote_test_context(dir.path());
     let root = dir.path().canonicalize().unwrap();
     let _cap = set_test_cap(&root, Duration::from_millis(100));
-    let local = local_command(&ctx, &root, "session", Foreground, EDIT);
+    let local = local_command(&ctx, &root, "session", Foreground, HOLD);
     let logs = start_log_capture(&root);
     let job = start_runon(&ctx, &daemon);
     let done = terminal(ctx.bash_background(), &job).await;
@@ -240,7 +274,8 @@ async fn runon_capture_submits_after_cap_and_warns_once() {
         done.output_preview.lines().any(|line| line == "fixture"),
         "{done:?}"
     );
-    assert_warning(&done, true);
+    assert_warning(&done, Some("Copied while another command in this checkout was still running (`until test -e .release-editor; do sleep 0.02; done`); its changes may be missing from the job."));
+    assert_saved_overlaps(ctx.bash_background(), &job, &[(&local, HOLD)]);
     assert!(logs
         .lock()
         .unwrap()
@@ -262,15 +297,14 @@ async fn runon_capture_ignores_background_promoted_other_checkout_and_other_sess
     let ctx = remote_test_context(&root);
     let root = root.canonicalize().unwrap();
     let _cap = set_test_cap(&root, Duration::from_millis(100));
-    let wait = "until test -e .release-editor; do sleep 0.02; done";
-    let background = local_command(&ctx, &root, "session", Background { max: 8 }, wait);
-    let promoted = local_command(&ctx, &root, "session", Foreground, wait);
+    let background = local_command(&ctx, &root, "session", Background { max: 8 }, HOLD);
+    let promoted = local_command(&ctx, &root, "session", Foreground, HOLD);
     ctx.bash_background().promote(&promoted, "session").unwrap();
-    let outside = local_command(&ctx, &other, "session", Foreground, wait);
-    let other_session = local_command(&ctx, &root, "other-session", Foreground, wait);
+    let outside = local_command(&ctx, &other, "session", Foreground, HOLD);
+    let other_session = local_command(&ctx, &root, "other-session", Foreground, HOLD);
     let logs = start_log_capture(&root);
     let job = start_runon(&ctx, &daemon);
-    assert_warning(&terminal(ctx.bash_background(), &job).await, false);
+    assert_warning(&terminal(ctx.bash_background(), &job).await, None);
     assert!(!logs
         .lock()
         .unwrap()
@@ -308,7 +342,103 @@ async fn runon_capture_warns_if_foreground_command_starts_and_finishes_during_co
     terminal(ctx.bash_background(), &local).await;
     daemon.acceptance_gate().notify_one();
     let done = terminal(ctx.bash_background(), &job).await;
-    assert_warning(&done, true);
+    assert_warning(&done, Some("Copied while another command in this checkout was still running (`printf 'edited during copy`); its changes may be missing from the job."));
+    assert_saved_overlaps(
+        ctx.bash_background(),
+        &job,
+        &[(&local, "printf 'edited during copy")],
+    );
+}
+
+#[tokio::test]
+async fn runon_capture_warns_with_one_name_and_counts_other_overlapping_tasks() {
+    use crate::bash_background::TaskSlot::Foreground;
+    let daemon = daemon(Script::CaptureCheckout { gated: true }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let root = dir.path().canonicalize().unwrap();
+    let _cap = set_test_cap(&root, Duration::from_millis(100));
+    let first = local_command(&ctx, &root, "session", Foreground, HOLD);
+    let job = start_runon(&ctx, &daemon);
+    daemon.wait_for_requests("exec.run", 1).await;
+    let second = local_command(&ctx, &root, "session", Foreground, "printf second");
+    terminal(ctx.bash_background(), &second).await;
+    daemon.acceptance_gate().notify_one();
+
+    let shown = if first < second {
+        HOLD
+    } else {
+        "printf second"
+    };
+    let done = terminal(ctx.bash_background(), &job).await;
+    assert_warning(&done, Some(&format!("Copied while another command in this checkout was still running (`{shown}` and 1 more); its changes may be missing from the job.")));
+    assert_saved_overlaps(
+        ctx.bash_background(),
+        &job,
+        &[(&first, HOLD), (&second, "printf second")],
+    );
+    fs::write(root.join(".release-editor"), "").unwrap();
+    terminal(ctx.bash_background(), &first).await;
+}
+
+#[tokio::test]
+async fn runon_capture_shortens_a_long_command_on_a_character_boundary() {
+    use crate::bash_background::TaskSlot::Foreground;
+    let daemon = daemon(Script::CaptureCheckout { gated: true }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let job = start_runon(&ctx, &daemon);
+    daemon.wait_for_requests("exec.run", 1).await;
+    let command = format!("printf '%s' '{}'\nprintf second-line", "é".repeat(100));
+    let local = local_command(&ctx, dir.path(), "session", Foreground, &command);
+    terminal(ctx.bash_background(), &local).await;
+    daemon.acceptance_gate().notify_one();
+
+    let done = terminal(ctx.bash_background(), &job).await;
+    let shown = format!("printf '%s' '{}…", "é".repeat(67));
+    assert_warning(&done, Some(&format!("Copied while another command in this checkout was still running (`{shown}`); its changes may be missing from the job.")));
+    assert_saved_overlaps(ctx.bash_background(), &job, &[(&local, &shown)]);
+}
+
+#[test]
+fn runon_capture_renders_the_old_warning_from_a_record_without_command_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_registry, _task, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("unused-connection"),
+        "printf capture",
+    );
+    let mut old: serde_json::Value =
+        serde_json::from_slice(&fs::read(&paths.json).unwrap()).unwrap();
+    let remote = old["remote"].as_object_mut().unwrap();
+    assert!(!remote.contains_key("copy_warning_commands"));
+    assert_eq!(remote.insert("copy_warning".into(), true.into()), None);
+    let metadata: PersistedTask = serde_json::from_value(old).unwrap();
+    let note = completion_preview::rendered_execution_note(&metadata).unwrap();
+    assert_eq!(note.lines().last(), Some("Copied while another command in this checkout was still running; its changes may be missing from the job."));
+}
+
+#[tokio::test]
+async fn runon_capture_does_not_warn_about_another_runon_in_the_same_checkout() {
+    let first = daemon(Script::CaptureCheckout { gated: true }, "exec-remote/v1").await;
+    let second = daemon(Script::CaptureCheckout { gated: false }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let _cap = set_test_cap(dir.path(), Duration::from_millis(100));
+    let remote = start_foreground_remote(
+        &ctx,
+        crate::bash_background::RemoteLaunch {
+            explicit_runon: true,
+            ..launch(first.connection().clone())
+        },
+        dir.path(),
+        "printf first remote",
+    );
+    first.wait_for_requests("exec.run", 1).await;
+    let job = start_runon(&ctx, &second);
+    assert_warning(&terminal(ctx.bash_background(), &job).await, None);
+    first.acceptance_gate().notify_one();
+    assert_warning(&terminal(ctx.bash_background(), &remote).await, None);
 }
 
 #[tokio::test]

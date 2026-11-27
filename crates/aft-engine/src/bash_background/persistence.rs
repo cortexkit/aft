@@ -9,6 +9,7 @@ pub(crate) use scope_records::{
 pub use scope_records::{read_task_at, write_task};
 
 use crate::bash_background::TaskIdentityAuth;
+use std::collections::BTreeMap;
 #[cfg(all(test, unix))]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
@@ -359,6 +360,18 @@ pub struct PersistedCompletionPreview {
     pub output_preview: String,
     pub output_truncated: bool,
     pub bash_output_list_envelope: Option<crate::list_envelope::ListEnvelope>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(super) struct RemoteCopyWarning {
+    #[serde(rename = "copy_warning", default, skip_serializing_if = "is_false")]
+    pub(super) active: bool,
+    #[serde(
+        rename = "copy_warning_commands",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub(super) commands: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

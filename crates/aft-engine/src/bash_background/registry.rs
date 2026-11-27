@@ -5836,7 +5836,7 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             local_capture_command: Default::default(),
             #[cfg(unix)]
-            runon_copy_warning: AtomicBool::new(false),
+            runon_copy_overlaps: Mutex::default(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -5927,8 +5927,7 @@ impl BgTaskRegistry {
             } else if let TaskRuntime::Piped(Some(child)) = &mut state.runtime {
                 if let Some(mut release) = child.stdin.take() {
                     if !task.holds_background_slot.load(Ordering::Acquire) {
-                        task.local_capture_command
-                            .get_or_init(|| runon_capture::LocalCommand::start(&task, &workdir));
+                        runon_capture::track_local(&task, &workdir, command);
                     }
                     if let Err(error) = release.write_all(b"run\n") {
                         crate::slog_warn!(
@@ -6303,7 +6302,7 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             local_capture_command: Default::default(),
             #[cfg(unix)]
-            runon_copy_warning: AtomicBool::new(false),
+            runon_copy_overlaps: Mutex::default(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -6691,7 +6690,7 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             local_capture_command: Default::default(),
             #[cfg(unix)]
-            runon_copy_warning: AtomicBool::new(false),
+            runon_copy_overlaps: Mutex::default(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -13527,7 +13526,7 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             local_capture_command: Default::default(),
             #[cfg(unix)]
-            runon_copy_warning: AtomicBool::new(false),
+            runon_copy_overlaps: Mutex::default(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]

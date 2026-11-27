@@ -138,7 +138,7 @@ impl BgTaskRegistry {
         let start_capture = || {
             (!task.holds_background_slot.load(Ordering::Acquire)
                 && task.local_capture_command.get().is_none())
-            .then(|| runon_capture::LocalCommand::start(task, &metadata.workdir))
+            .then(|| runon_capture::LocalCommand::start(task, &metadata.workdir, &metadata.command))
         };
         // An ungated child can edit the checkout as soon as it spawns. Keep
         // the guard here until launch succeeds so setup errors unregister it.

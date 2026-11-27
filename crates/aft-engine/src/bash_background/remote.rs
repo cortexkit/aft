@@ -879,8 +879,8 @@ impl RemotePreStartRefusal {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemoteTask {
-    #[serde(default, skip_serializing_if = "super::is_false")]
-    pub(super) copy_warning: bool,
+    #[serde(flatten)]
+    pub(super) copy_warning: super::super::persistence::RemoteCopyWarning,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<KeyedSubmission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1975,7 +1975,7 @@ impl OutputSink for TaskSink {
         r.job_id = Some(accepted.job_id);
         r.queue_position = Some(accepted.queue_position);
         r.accepted = true;
-        r.copy_warning |= self.task.runon_copy_warning.load(Ordering::Acquire);
+        runon_capture::store_warning(&self.task, r);
         r.accepted_platform = accepted.platform.clone();
         r.granted_network = accepted.network == Some(Network::Outbound);
         if accepted.env_not_forwarded.is_some() {
@@ -2168,9 +2168,9 @@ impl OutputSink for TaskSink {
                     .map(|mut returns| returns.without_manifest())
             })
             .flatten();
-        let copy_warning = self.task.runon_copy_warning.load(Ordering::Acquire);
+        let task = Arc::clone(&self.task);
         self.commit(|r| {
-            r.copy_warning |= copy_warning;
+            runon_capture::store_warning(&task, r);
             let resubmit_refusal = r.submission.as_ref().is_some_and(|s| s.resuming)
                 && matches!(verdict, Verdict::RunLocally { .. });
             // A keyed refusal belongs to this call, not to the existing job.
@@ -2792,7 +2792,7 @@ impl BgTaskRegistry {
         metadata.status = BgTaskStatus::Running;
         metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
-            copy_warning: false,
+            copy_warning: Default::default(),
             submission: None,
             requested_platform: launch.requested_platform.clone(),
             accepted_platform: None,
@@ -4631,7 +4631,7 @@ impl BgTaskRegistry {
                 return;
             }
             if let Some(remote) = state.metadata.remote.as_mut() {
-                remote.copy_warning |= task.runon_copy_warning.load(Ordering::Acquire);
+                runon_capture::store_warning(task, remote);
             }
             reason = remote_oom_kill(&state.metadata)
                 .map(|oom| oom.message())
