@@ -261,6 +261,9 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         path_exclusion: None,
     };
+    let single_file_checkout_status = scope
+        .explicit_single_file
+        .then(|| checkout_status_for_named_file(ctx, &scope));
     // Past the store cap, which lines are kept must not depend on how
     // parallel workers are scheduled, or two requests over unchanged files
     // could store different lines and their pages would overlap or skip rows.
@@ -335,6 +338,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             project_root: &project_root,
             include: &params.include,
             file_roots: &file_roots,
+            single_file_checkout_status,
             offset,
             explicit_page_rows,
             ignored_scope_note: ignored_scope_note.as_deref(),
@@ -541,6 +545,27 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     response
 }
 
+fn checkout_status_for_named_file(
+    ctx: &AppContext,
+    scope: &grep_executor::GrepScope,
+) -> IndexStatus {
+    use crate::data_layer::surfaces::{self, BUILDING, READY};
+
+    // A named file is always read directly. The count line can read checkout
+    // readiness separately because its label does not describe the source.
+    if !matches!(scope.roots.as_slice(), [root] if root.use_index)
+        || crate::data_layer::read_fence::active()
+        || ctx.cache_unavailable_reason().is_some()
+    {
+        return IndexStatus::Fallback;
+    }
+    match surfaces::report(ctx).map(|report| report.text.status) {
+        Some(READY) => IndexStatus::Ready,
+        Some(BUILDING) => IndexStatus::Building,
+        _ => IndexStatus::Fallback,
+    }
+}
+
 /// `{"trigram": {status, reason}}` for grep/glob responses, from the shared
 /// engine observation. Reading it never starts a build.
 pub(crate) fn trigram_index_disclosure(ctx: &AppContext) -> serde_json::Value {
@@ -647,21 +672,18 @@ pub(crate) fn grep_footer_tags(result: &GrepResult) -> String {
     }
 }
 
-/// The footer the grep tool prints. An index answer gets the plain footer.
-/// Any other answer came from reading files directly (a fallback walk or a
-/// named file), so its index label also says how much of the scope that read
-/// covered: a zero next to "[index: building]" alone could mean either "no
-/// match anywhere" or "the walk never got there", and the reader cannot tell
-/// which without re-checking.
-fn grep_tool_footer(result: &GrepResult) -> String {
+/// The footer the grep tool prints. A fallback directory walk says how much
+/// it covered: a zero next to "[index: building]" alone could mean either
+/// "no match anywhere" or "the walk never got there".
+fn grep_tool_footer(result: &GrepResult, display_status: IndexStatus) -> String {
     let found = found_matches_phrase(result.total_matches, result.files_with_matches);
     let cap_note = if result.truncated { " (capped)" } else { "" };
-    if result.index_status == IndexStatus::Ready {
+    if display_status == IndexStatus::Ready {
         return format!("{found}{cap_note}");
     }
     format!(
         "{found}{cap_note} [index: {}; {}]",
-        index_status_label(result.index_status),
+        index_status_label(display_status),
         direct_read_coverage(result)
     )
 }
@@ -809,6 +831,7 @@ pub(crate) struct GrepPageRequest<'a> {
     /// Search roots that are files: naming a file as `path` prints its lines
     /// whatever its kind.
     pub file_roots: &'a [PathBuf],
+    pub single_file_checkout_status: Option<IndexStatus>,
     pub offset: usize,
     /// `max_results` when the caller set it: every page then holds that many
     /// rows, with no first-page summary sizing.
@@ -958,9 +981,13 @@ pub(crate) fn grep_page_output<'a>(
     };
     // Reserve the existing summaries and footer inside the page's one byte
     // budget. The transport budget also needs room for finalization notices.
+    let display_status = request
+        .single_file_checkout_status
+        .unwrap_or(result.index_status);
+    let footer = grep_tool_footer(result, display_status);
     let metadata_bytes = counted_text.as_ref().map_or(0, String::len)
         + only_counted_note.as_ref().map_or(0, String::len)
-        + grep_tool_footer(result).len()
+        + footer.len()
         + request.ignored_scope_note.map_or(0, str::len)
         + if first {
             files_first_summary(&shown, &files, DEFAULT_MAX_RESULTS).len()
@@ -1006,7 +1033,7 @@ pub(crate) fn grep_page_output<'a>(
     if let Some(block) = counted_text {
         sections.push(block);
     }
-    sections.push(grep_tool_footer(result));
+    sections.push(footer);
     if let Some(note) = request.ignored_scope_note {
         sections.push(note.to_string());
     }
@@ -2000,6 +2027,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grep_explicit_single_file_keeps_the_checkout_label_in_its_text_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn publication_needle() {}\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let assert_rendering = |status, suffix| {
+            for path in [
+                serde_json::json!("src/lib.rs"),
+                serde_json::json!([root.join("src/lib.rs")]),
+            ] {
+                let request = serde_json::from_value(serde_json::json!({
+                    "id": "grep-explicit-file", "command": "grep",
+                    "path": path, "pattern": "publication_needle",
+                }))
+                .unwrap();
+                let response = handle_grep(&request, &ctx);
+                assert!(response.success, "{}", response.data);
+                let display_path = Path::new("src").join("lib.rs");
+                let expected = format!(
+                    "{}\n1: fn publication_needle() {{}}\n\nFound 1 match in 1 file{suffix}",
+                    display_path.display()
+                );
+                assert_eq!(response.data["text"], expected);
+                assert_eq!(
+                    crate::subc_format::format_response_unbounded(
+                        "grep",
+                        &response,
+                        &Default::default()
+                    ),
+                    expected
+                );
+                assert_eq!(response.data["index"]["trigram"]["status"], status);
+                assert_eq!(response.data["index_status"], "Fallback");
+                assert_eq!(response.data["fallback"], "filesystem");
+                assert_eq!(response.data["files_read_directly"], 1);
+            }
+        };
+        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        assert_rendering("building", " [index: building; searched 1 file directly]");
+        drop(hold);
+        crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
+        assert_rendering("ready", "");
+    }
+
     fn grep_match(file: &str, line: u32, line_text: &str) -> GrepMatch {
         GrepMatch {
             file: PathBuf::from(file),
@@ -2055,6 +2135,7 @@ mod tests {
                 project_root: &root,
                 include: &[],
                 file_roots: &[],
+                single_file_checkout_status: None,
                 offset: 0,
                 explicit_page_rows: Some(1000),
                 ignored_scope_note: None,
@@ -2473,12 +2554,12 @@ mod tests {
         );
         one.files_read_directly = 1;
         assert_eq!(
-            grep_tool_footer(&one),
+            grep_tool_footer(&one, one.index_status),
             "Found 1 match in 1 file [index: fallback; searched 1 file directly]"
         );
         one.walk_bound = Some(WalkBound::FileLimit(1));
         assert_eq!(
-            grep_tool_footer(&one),
+            grep_tool_footer(&one, one.index_status),
             "Found 1 match in 1 file [index: fallback; incomplete: checked 1 file before the walk's 1-file limit]"
         );
         one.walk_bound = Some(WalkBound::TimeBudget);

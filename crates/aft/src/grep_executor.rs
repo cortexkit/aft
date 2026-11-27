@@ -613,6 +613,7 @@ pub struct GrepScope {
     pub roots: Vec<ResolvedRoot>,
     pub multi_root: bool,
     pub per_root_max: usize,
+    pub explicit_single_file: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -685,18 +686,18 @@ pub(crate) fn resolve_grep_scope(
     let project_root = project_root(ctx);
     let search_roots = resolve_roots(paths, &project_root, req_id, session_id, policy)?;
 
-    if let Some(missing_root) = search_roots
-        .iter()
-        .find(|root| crate::bounded_io::metadata(root).is_err())
-    {
-        return Err(Response::error(
-            req_id,
-            "path_not_found",
-            format!(
-                "grep: search path does not exist: {}",
-                missing_root.display()
-            ),
-        ));
+    let mut explicit_single_file = false;
+    for root in &search_roots {
+        let Ok(metadata) = crate::bounded_io::metadata(root) else {
+            return Err(Response::error(
+                req_id,
+                "path_not_found",
+                format!("grep: search path does not exist: {}", root.display()),
+            ));
+        };
+        explicit_single_file = search_roots.len() == 1
+            && paths.is_some_and(|paths| !paths.is_null())
+            && metadata.is_file();
     }
 
     // In a confined call, refuse a search root outside the confined root or
@@ -768,6 +769,7 @@ pub(crate) fn resolve_grep_scope(
         roots,
         multi_root,
         per_root_max,
+        explicit_single_file,
     })
 }
 
@@ -798,6 +800,7 @@ pub(crate) fn grep_root_for_test(
         }],
         multi_root: false,
         per_root_max: 16,
+        explicit_single_file: false,
     };
     let params = GrepParams {
         include: Vec::new(),
@@ -4386,6 +4389,7 @@ mod tests {
                 project_root,
                 include: &[],
                 file_roots: &[],
+                single_file_checkout_status: None,
                 offset: 0,
                 explicit_page_rows: None,
                 ignored_scope_note: None,
@@ -4499,6 +4503,7 @@ mod tests {
             }],
             multi_root: false,
             per_root_max: 10,
+            explicit_single_file: false,
         };
         assert!(!scope.multi_root);
         assert_eq!(scope.per_root_max, 10);
@@ -4527,6 +4532,7 @@ mod tests {
             }],
             multi_root: false,
             per_root_max: 10,
+            explicit_single_file: false,
         };
         assert_eq!(scope_ignored_entries(&scope).unwrap().names, [".agents/"]);
         crate::context::confinement::with_root(&ctx, "ignore-disclosure", || {
@@ -4983,6 +4989,7 @@ mod tests {
             }],
             multi_root: false,
             per_root_max: 10,
+            explicit_single_file: false,
         };
         assert_eq!(scope_has_files(&scope, &filters), Some(false));
         // An expired call budget leaves the breakdown unknown instead of
