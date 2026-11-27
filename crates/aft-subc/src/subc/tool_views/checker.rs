@@ -140,16 +140,12 @@ fn bash_samples(input_schema: &Value, has_tail: bool) -> Vec<Value> {
     }
     if requires_bash_description(input_schema) {
         for sample in &mut samples {
-            sample["input"]
-                .as_object_mut()
-                .unwrap()
-                .entry("description")
-                .or_insert(json!("Print the requested test output"));
+            if !sample["input"]["description"].is_string() {
+                sample["input"]["description"] = json!("Print the requested test output");
+            }
         }
     }
-    samples.extend(bash_row_samples().into_iter().filter(|sample| {
-        !requires_bash_description(input_schema) || sample["input"]["description"].is_string()
-    }));
+    samples.extend(bash_row_samples_for(input_schema));
     samples
 }
 
@@ -159,16 +155,19 @@ fn requires_bash_description(input_schema: &Value) -> bool {
         .is_some_and(|fields| fields.iter().any(|field| field == "description"))
 }
 
+fn bash_row_samples_for(input_schema: &Value) -> impl Iterator<Item = Value> {
+    let required = requires_bash_description(input_schema);
+    bash_row_samples()
+        .into_iter()
+        .filter(move |sample| !required || sample["input"]["description"].is_string())
+}
+
 fn bash_row_samples() -> Vec<Value> {
-    serde_json::from_str(include_str!(
-        "../../../tests/fixtures/tool_views/bash-row-samples.json"
-    ))
-    .unwrap()
+    fixture_json("tool_views/bash-row-samples.json")
 }
 
 #[test]
 fn bash_rows_keep_both_ends_and_prefer_the_description() {
-    let samples = bash_row_samples();
     for pin in VERSIONED_VIEW_PINS
         .iter()
         .filter(|pin| pin.starts_with("tp2:bash:"))
@@ -186,13 +185,9 @@ fn bash_rows_keep_both_ends_and_prefer_the_description() {
                 report.diagnostics
             );
         }
+        let samples: Vec<_> = bash_row_samples_for(input_schema).collect();
+        assert!(!samples.is_empty(), "{pin}: no valid row samples");
         for sample in &samples {
-            // Only historical schemas can project a call made without a description.
-            if requires_bash_description(input_schema)
-                && !sample["input"]["description"].is_string()
-            {
-                continue;
-            }
             let heights = registry::row_heights(
                 &manifest.template["row"],
                 schema,
