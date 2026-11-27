@@ -46,6 +46,11 @@ impl History {
         self.current_key_id.is_some() || !self.previous_key_ids.is_empty()
     }
 
+    pub(super) fn permits_cached_key(&self, key: &str) -> bool {
+        self.current_key_id.as_deref() == Some(key)
+            && !self.previous_key_ids.iter().any(|previous| previous == key)
+    }
+
     pub(super) fn merge(&mut self, disk: &Self) {
         if self == disk {
             return;

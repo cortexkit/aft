@@ -14853,10 +14853,14 @@ INHERITED FLAGS
         // verification without looking at retirement would make this go green.
         let mut retired = rotated;
         retired.retired_key_ids.push(rotated_id.clone());
-        publish_pin(&paths, Some(retired));
         assert!(
-            matches!(load_manifest(&paths, TEST_NOW), Err(ManifestProblem::Invalid(reason)) if reason == format!("retired manifest key id {rotated_id}"))
+            matches!(verify_manifest_envelope(&envelope, &retired), Err(ManifestProblem::Invalid(reason)) if reason == format!("retired manifest key id {rotated_id}"))
         );
+        publish_pin(&paths, Some(retired));
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::NoTrustRoot)
+        ));
     }
 
     #[cfg(unix)]

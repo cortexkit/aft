@@ -155,16 +155,28 @@ fn read_file(
         return Err(ManifestProblem::NoTrustRoot);
     }
     root.pin.public_key().ok_or_else(invalid)?;
+    let marker = fs::read(paths.root.join(HIGH_WATER)).map_err(|_| ManifestProblem::NoTrustRoot)?;
+    let history: History =
+        serde_json::from_slice(&marker).map_err(|_| ManifestProblem::NoTrustRoot)?;
+    // The record is published before the pin file. A leftover pin cannot undo
+    // a recorded rotation or clear, even in a shell launched under that pin.
+    if !history.valid() || !history.permits_cached_key(&root.pin.key_id) {
+        return Err(ManifestProblem::NoTrustRoot);
+    }
     Ok(root)
 }
 
-fn daemon_root(paths: &StatePaths) -> Option<StoredRoot> {
+fn with_fresh_daemon<T>(paths: &StatePaths, read: impl FnOnce(&DaemonState) -> T) -> T {
     daemon_state(paths, |state| {
         if state.read_at.is_some_and(|at| at.elapsed() >= MAX_AGE) {
             state.root = None;
         }
-        state.root.clone()
+        read(state)
     })
+}
+
+fn daemon_root(paths: &StatePaths) -> Option<StoredRoot> {
+    with_fresh_daemon(paths, |state| state.root.clone())
 }
 
 pub(super) fn read_daemon(paths: &StatePaths) -> Result<Pin, ManifestProblem> {
@@ -184,7 +196,13 @@ pub(crate) fn shell_anchor() -> Option<String> {
 
 #[cfg(unix)]
 pub(super) fn seed_worker(paths: &StatePaths, destination: &std::path::Path) -> io::Result<()> {
-    if let Some(root) = daemon_root(paths) {
+    let snapshot = with_fresh_daemon(paths, |state| state.root.clone().zip(state.history.clone()));
+    if let Some((root, history)) = snapshot {
+        atomic_write(
+            &destination.join(HIGH_WATER),
+            &serde_json::to_vec(&history)?,
+            AtomicWriteDurability::None,
+        )?;
         atomic_write(
             &destination.join(FILE_NAME),
             &serde_json::to_vec(&root)?,
@@ -310,6 +328,9 @@ mod tests {
         publish_pin(Some(current.clone()), 7).unwrap();
         assert_eq!(read_daemon(&paths).unwrap(), current);
         assert_eq!(floor(), 9);
+        let shell = read_snapshot(&paths).unwrap();
+        assert_eq!(shell.generation, 7);
+        assert_eq!(shell.pin, current);
         publish_pin(None, 6).unwrap();
         assert_eq!(floor(), 9);
         assert!(matches!(

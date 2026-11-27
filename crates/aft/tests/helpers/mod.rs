@@ -39,6 +39,11 @@ pub fn write_gh_fixture_pin(state: &Path, key: &ring::signature::Ed25519KeyPair,
         .collect();
     std::fs::create_dir_all(state).unwrap();
     std::fs::write(
+        state.join("trust-root-generation.json"),
+        br#"{"generation":1,"current_key_id":"21fe31dfa154a261","previous_key_ids":[]}"#,
+    )
+    .unwrap();
+    std::fs::write(
         state.join("trust-root.json"),
         serde_json::to_vec(&serde_json::json!({
             "key_id": "21fe31dfa154a261",

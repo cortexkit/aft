@@ -15,8 +15,11 @@ the pin from its authenticated daemon connection at startup, before activating
 a new list, and every five minutes. The AFT relay, worker broker and speech
 verifier use the pin in memory, never the cached pin on disk. Each new shell
 gets the current key ID, public key and generation from AFT. The shim checks
-them against `trust-root.json` beside the list. A worker shell gets a private
-copy of the list and a pin from AFT. There is no built-in signing key or
+them against `trust-root.json` beside the list. The cached key must also be the
+current key in `trust-root-generation.json`, and must not be superseded or
+retired there. This closes trust on a recorded rotation or clear even if the
+old pin file is left behind. A worker shell gets a private copy of the list,
+pin and generation record from AFT. There is no built-in signing key or
 fallback key. The file is owner-only on Unix. On Windows it inherits the state
 directory's ACL, so keep that directory private; there is no worker copy.
 

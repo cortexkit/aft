@@ -314,6 +314,11 @@ fn gh_shim_recorded_clear_refuses_an_old_anchor_after_partial_publication() {
 }
 
 #[test]
+fn gh_shim_recorded_retirement_refuses_an_old_anchor_even_if_current_key_matches() {
+    assert_old_anchor_after_recorded_transition(Some("21fe31dfa154a261"));
+}
+
+#[test]
 fn gh_shim_manifest_unavailable_pin_removed_after_acceptance_refuses_writes() {
     let fixture = Fixture::new();
     fixture.activate();
