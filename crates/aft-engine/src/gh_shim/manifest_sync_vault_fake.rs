@@ -14,6 +14,8 @@ struct State {
     unknown_method: bool,
     report_unknown_once: bool,
     digest_mismatch: bool,
+    latest_reply: Option<Value>,
+    keep_watch_open: bool,
 }
 
 struct Vault {
@@ -183,7 +185,11 @@ async fn serve(
                             assert_eq!(value["params"], json!({}));
                             vec![response(
                                 FrameType::Response,
-                                samples["latest.reply"].clone(),
+                                state
+                                    .latest_reply
+                                    .as_ref()
+                                    .unwrap_or(&samples["latest.reply"])
+                                    .clone(),
                             )]
                         }
                         "manifest.report_active" => {
@@ -207,11 +213,20 @@ async fn serve(
                             assert_eq!(value["params"], json!({}));
                             state.watch_rounds += 1;
                             let mut notice = samples["watch.stored"].clone();
+                            if let Some(reply) = &state.latest_reply {
+                                let body = reply["result"]["envelope"]["manifest_bytes"]
+                                    .as_str()
+                                    .unwrap();
+                                notice["manifest_sha256"] = json!(digest(body));
+                            }
                             if state.digest_mismatch {
                                 notice["manifest_sha256"] = json!("0".repeat(64));
                             }
                             let mut replies = vec![response(FrameType::StreamData, notice.clone())];
-                            if state.watch_rounds == 1 && !state.digest_mismatch {
+                            if state.watch_rounds == 1
+                                && !state.digest_mismatch
+                                && !state.keep_watch_open
+                            {
                                 notice["seq"] = json!(3);
                                 replies.push(response(FrameType::StreamData, notice.clone()));
                                 notice["seq"] = json!(4);
@@ -275,6 +290,23 @@ async fn run_fake(paths: StatePaths, connection_file: &Path) {
     .await;
 }
 
+fn signed_latest(seed: Option<&[u8; 32]>) -> Value {
+    let mut manifest = super::super::super::tests::fixture_manifest();
+    manifest.manifest_version = 29;
+    let envelope = match seed {
+        Some(seed) => {
+            let pin = super::super::super::tests::pin_for(seed);
+            super::super::super::tests::signed_with(&manifest, unix_seconds(), seed, &pin.key_id)
+        }
+        None => super::super::super::tests::signed(&manifest, unix_seconds()),
+    };
+    json!({"result":{"version":29,"envelope":{
+        "key_id": envelope.key_id,
+        "signature": envelope.signature,
+        "manifest_bytes": envelope.manifest_bytes,
+    }}})
+}
+
 #[tokio::test]
 async fn manifest_sync_does_not_advance_the_cursor_for_a_rejected_candidate() {
     let vault = Vault::start(State::default());
@@ -300,7 +332,10 @@ async fn manifest_sync_does_not_advance_the_cursor_for_a_rejected_candidate() {
 
 #[tokio::test]
 async fn manifest_sync_watch_seq_gap_epoch_change_and_stream_end_read_latest_again() {
-    let vault = Vault::start(State::default());
+    let vault = Vault::start(State {
+        latest_reply: Some(signed_latest(None)),
+        ..State::default()
+    });
     let directory = tempfile::tempdir().unwrap();
     let paths = paths(&directory);
     tokio::select! {
@@ -318,6 +353,39 @@ async fn manifest_sync_watch_seq_gap_epoch_change_and_stream_end_read_latest_aga
     );
     assert_eq!(state.watch_rounds, 2);
     assert!(!state.reports.is_empty());
+}
+
+#[tokio::test]
+async fn manifest_sync_rotation_refetches_and_activates_without_a_vault_notice() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let seed = [31; 32];
+    let vault = Vault::start(State {
+        latest_reply: Some(signed_latest(Some(&seed))),
+        keep_watch_open: true,
+        ..State::default()
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let paths = paths(&directory).for_daemon();
+    let generation = AtomicU64::new(1);
+    let read = || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<trust_root::Reply, ()>> + Send>> {
+        let generation = generation.load(Ordering::Relaxed);
+        Box::pin(async move {
+            let pin = if generation == 1 { super::super::super::tests::fixture_pin() } else { super::super::super::tests::pin_for(&seed) };
+            Ok(trust_root::Reply::Root { pin: Some(pin), generation })
+        })
+    };
+    let root = RootRefresh::new(&read);
+    tokio::select! {
+        _ = run_with(&paths, &root, || ManagementSession::for_test(&vault.path)) => panic!("sync stopped"),
+        _ = async {
+            until(&vault.state, |state| state.watch_rounds == 1 && state.reports.len() >= 2).await;
+            assert!(!paths.manifest.exists());
+            generation.store(2, Ordering::Relaxed);
+            root.refresh(&paths).await.unwrap();
+            until(&vault.state, |state| state.reports.iter().any(|report| report["verdict"] == "valid")).await;
+            assert_eq!(load_manifest(&paths, unix_seconds()).unwrap().manifest_version, 29);
+        } => {},
+    }
 }
 
 #[tokio::test]

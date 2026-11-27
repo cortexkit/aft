@@ -15,6 +15,7 @@ type ReadRoot = dyn Fn()
 
 struct RootRefresh<'a> {
     read: &'a ReadRoot,
+    generation: tokio::sync::watch::Sender<Option<u64>>,
     // Serialize the read and its publication: a slow older response must not
     // overwrite a later pin read by the periodic or pre-activation refresh.
     serial: tokio::sync::Mutex<()>,
@@ -24,19 +25,30 @@ impl<'a> RootRefresh<'a> {
     fn new(read: &'a ReadRoot) -> Self {
         Self {
             read,
+            generation: tokio::sync::watch::Sender::new(None),
             serial: tokio::sync::Mutex::new(()),
         }
     }
 
-    async fn refresh(&self, paths: &StatePaths) -> Result<(), Failure> {
+    async fn refresh(&self, paths: &StatePaths) -> Result<u64, Failure> {
         let _guard = self.serial.lock().await;
         let reply = tokio::time::timeout(Duration::from_secs(5), (self.read)())
             .await
             .ok()
             .and_then(Result::ok)
             .ok_or_else(|| Failure::new("policy_root_unavailable", true))?;
+        let trust_root::Reply::Root { generation, .. } = &reply;
+        let generation = *generation;
         trust_root::publish(paths, reply, unix_seconds())
-            .map_err(|_| Failure::new("store_error", true))
+            .map_err(|_| Failure::new("store_error", true))?;
+        self.generation.send_if_modified(|seen| {
+            if *seen == Some(generation) {
+                return false;
+            }
+            *seen = Some(generation);
+            true
+        });
+        Ok(generation)
     }
 
     async fn poll(&self, paths: &StatePaths) {
@@ -200,9 +212,6 @@ fn activate(paths: &StatePaths, latest: &Latest, now: u64) -> Option<Report> {
             ))
         }
     };
-    if latest.version <= version_high_water(paths) {
-        return current;
-    }
     let envelope = SignedManifest {
         artifact_id: MANIFEST_ARTIFACT_ID.into(),
         envelope_version: ENVELOPE_VERSION,
@@ -239,6 +248,7 @@ struct Cursor {
     seq: u64,
     read_version: Option<u64>,
     read_sha256: Option<String>,
+    pin_generation: Option<u64>,
 }
 
 impl Cursor {
@@ -411,18 +421,25 @@ async fn refresh(
     if disagrees(&fetched) {
         fetched = latest(session).await?;
         if disagrees(&fetched) {
-            cursor.read_version = Some(fetched.version);
-            cursor.read_sha256 = Some(digest(&fetched.envelope.manifest_bytes));
             return Ok(Some(candidate_report(
                 &fetched,
                 "digest differs from the vault's notice",
             )));
         }
     }
-    root.refresh(paths).await?;
-    cursor.read_version = Some(fetched.version);
-    cursor.read_sha256 = Some(digest(&fetched.envelope.manifest_bytes));
-    Ok(activate(paths, &fetched, unix_seconds()))
+    let generation = root.refresh(paths).await?;
+    cursor.pin_generation = Some(generation);
+    let activated = activate(paths, &fetched, unix_seconds());
+    let digest = digest(&fetched.envelope.manifest_bytes);
+    if activated.as_ref().is_some_and(|report| {
+        report.verdict == "valid"
+            && report.version == fetched.version
+            && report.payload_sha256 == digest
+    }) {
+        cursor.read_version = Some(fetched.version);
+        cursor.read_sha256 = Some(digest);
+    }
+    Ok(activated)
 }
 
 async fn run_with<F, Fut>(paths: &StatePaths, root: &RootRefresh<'_>, mut connect: F)
@@ -442,6 +459,7 @@ where
             }
         };
         let mut cursor = Cursor::default();
+        let mut generations = root.generation.subscribe();
         let result: Result<(), Failure> = async {
             if let Some(pending) = pending_report.as_ref() {
                 report(&session, pending).await?;
@@ -466,7 +484,22 @@ where
                 .await
                 .map_err(Failure::transport)?;
             loop {
-                let Some(bytes) = subscription.events().recv().await else {
+                let event = tokio::select! {
+                    event = subscription.events().recv() => event,
+                    changed = generations.changed() => {
+                        changed.map_err(|_| Failure::new("policy_root_unavailable", true))?;
+                        let generation = *generations.borrow_and_update();
+                        if generation != cursor.pin_generation {
+                            pending_report = refresh(&session, paths, root, &mut cursor, None).await?;
+                            if let Some(pending) = pending_report.as_ref() {
+                                report(&session, pending).await?;
+                                pending_report = None;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let Some(bytes) = event else {
                     // The SDK closes this receiver after a normal STREAM_END
                     // frame or a lost watch. Reconnect always reads latest anew.
                     return match subscription.closed().await {
