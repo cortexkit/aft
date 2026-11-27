@@ -11,7 +11,7 @@ use std::{fs, io};
 pub(super) const FILE_NAME: &str = "trust-root.json";
 pub const GET: &str = "policy_root.get";
 pub(crate) const ANCHOR_ENV: &str = "AFT_GH_SHIM_TRUST_ANCHOR";
-const HIGH_WATER: &str = "trust-root-generation.json";
+pub(super) const HIGH_WATER: &str = "trust-root-generation.json";
 const MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Default)]
