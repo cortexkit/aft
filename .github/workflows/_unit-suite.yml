@@ -49,7 +49,10 @@ jobs:
     name: Cargo test archive (Linux)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    # Warm builds from main's cache take 16-19 minutes. A run whose crate
+    # layout or manifests differ from main's cache key compiles cold and needs
+    # about 26-30 minutes on this runner, so the budget covers a cold build.
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
