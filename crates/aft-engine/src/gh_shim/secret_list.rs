@@ -165,16 +165,7 @@ impl ListArgs {
     }
 
     fn repository(&self, cwd: &Path) -> Option<String> {
-        if let Some(repo) = &self.repo {
-            let (owner, name) = repo.split_once('/')?;
-            return (valid_repository_component(owner) && valid_repository_component(name))
-                .then(|| repo.to_ascii_lowercase());
-        }
-        TargetRepository {
-            gh_repo: gh_repo_env(),
-            ..TargetRepository::default()
-        }
-        .repository_key(cwd)
+        repo_scope::explicit_or_current_repository(self.repo.as_deref(), cwd)
     }
 
     fn argv(&self, repository: &str) -> Vec<OsString> {

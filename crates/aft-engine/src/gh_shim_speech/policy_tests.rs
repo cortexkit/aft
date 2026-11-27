@@ -719,7 +719,7 @@ fn captured_policy_undeclared_command_does_not_claim_to_be_a_write() {
         Some(OsStr::new("1")),
     );
     for raw in [
-        &["variable", "list", "-R", "cortexkit/aft"][..],
+        &["variable", "get", "REQUIRES_CORE", "-R", "cortexkit/aft"][..],
         &["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"][..],
     ] {
         let args = raw.iter().map(OsString::from).collect::<Vec<_>>();

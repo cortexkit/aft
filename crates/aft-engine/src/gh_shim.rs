@@ -44,10 +44,12 @@ mod numeric_id_cache;
 mod prefrontal_route;
 pub(crate) mod read_contract;
 mod rename_guard;
+mod repo_scope;
 mod secret_list;
 mod ticket_repository;
 mod v22_rows;
 mod v23_queue;
+mod variable_rows;
 mod worker_reads;
 mod workflow_approval;
 
@@ -56,6 +58,7 @@ use captured_dispatch::run_captured_protected;
 #[cfg(test)]
 use captured_dispatch::{captured_plan, captured_rung_refusal};
 use native_guard::delegate;
+use repo_scope::{canonical_repository_key, valid_repository_component};
 
 use prefrontal_route::select_route_holder;
 
@@ -384,7 +387,6 @@ const UNBOUND_SAFE_COMMANDS: &[&str] = &[
     "org list",
     "gist list",
     "gist view",
-    "variable list",
     "variable get",
     "ruleset list",
     "ruleset view",
@@ -815,6 +817,9 @@ fn run_with(
     let mut delegate = |args: &[OsString]| manifest_guard.delegate(args, &mut native_delegate);
     if secret_list::targets(args) {
         return secret_list::dispatch(args, &paths, unix_seconds(), delegate);
+    }
+    if let Some(status) = variable_rows::dispatch(args, &paths, &mut delegate) {
+        return status;
     }
     if crate::environment::non_empty_var(crate::gh_shim_speech::start_view::WORKER_POLICY_ENV)
         .as_deref()
@@ -3623,51 +3628,6 @@ fn origin_remote(cwd: &Path) -> Option<String> {
         .filter(|remote| !remote.is_empty())
 }
 
-fn canonical_repository_key(value: &str) -> Option<String> {
-    let remote = value.trim().trim_end_matches('/');
-    let path = if let Some(path) = [
-        "https://github.com/",
-        "http://github.com/",
-        "ssh://git@github.com/",
-        "git://github.com/",
-        "git@github.com:",
-        "github.com/",
-    ]
-    .iter()
-    .find_map(|prefix| remote.strip_prefix(prefix))
-    {
-        path
-    } else if remote.contains("://") || remote.contains('@') || remote.contains(':') {
-        // Repository bindings identify GitHub repositories. A foreign remote is
-        // intentionally unmapped rather than treated as an owner/name string.
-        return None;
-    } else {
-        remote
-    }
-    .trim_end_matches(".git")
-    .trim_matches('/');
-    let mut parts = path.split('/');
-    let owner = parts.next()?;
-    let repository = parts.next()?;
-    (valid_repository_component(owner)
-        && valid_repository_component(repository)
-        && parts.next().is_none())
-    .then(|| {
-        format!(
-            "{}/{}",
-            owner.to_ascii_lowercase(),
-            repository.to_ascii_lowercase()
-        )
-    })
-}
-
-fn valid_repository_component(value: &str) -> bool {
-    !matches!(value, "" | "." | "..")
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
 fn gh_session_id(agent_id: &str) -> String {
     format!("gh-shim:{agent_id}")
 }
@@ -4932,6 +4892,9 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
     }
     if tuple == environment_admin::SECRET_SET {
         return environment_admin::classify_secret(args, manifest, platform);
+    }
+    if let Some(classification) = variable_rows::classify(&tuple, args, manifest, platform) {
+        return classification;
     }
     // Only a signed queue declaration may reinterpret the queue-shaped merge
     // invocation. Direct merges and disabling auto-merge retain their admin row.

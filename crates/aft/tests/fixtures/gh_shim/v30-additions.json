@@ -9,6 +9,16 @@
       {
         "tuple": "secret set",
         "platform": ["macos", "linux"]
+      },
+      {
+        "tuple": "variable set",
+        "platform": ["macos", "linux"]
+      }
+    ],
+    "mechanical": [
+      {
+        "tuple": "variable list",
+        "platform": ["macos", "linux"]
       }
     ]
   },

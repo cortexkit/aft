@@ -1,3 +1,4 @@
+use super::repo_scope::valid_environment;
 use super::*;
 
 mod api;
@@ -21,7 +22,7 @@ pub(super) fn dispatch(
             paths,
             cwd,
             now,
-            secret::stdin_ready,
+            repo_scope::redirected_stdin,
             delegate,
         ));
     }
@@ -78,14 +79,6 @@ fn operator_allowed(manifest: &Manifest, tuple: &str) -> Result<(), i32> {
     }
     native_guard::permission_from_process()
         .map_err(|text| refuse(RefusalCode::WorkerNativeGh, &text))
-}
-
-fn valid_environment(name: &str) -> bool {
-    // Keep the encoded name in one literal URL segment, with no gh placeholders.
-    !name.trim().is_empty()
-        && !matches!(name, "." | "..")
-        && !name.contains(['/', '\\', '%', '?', '#', '{', '}'])
-        && !name.chars().any(char::is_control)
 }
 
 #[cfg(test)]

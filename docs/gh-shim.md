@@ -82,8 +82,8 @@ unapproved:
 
 - reads: `issue`/`pr`/`release`/`repo`/`run`/`workflow`/`label`/`cache`
   views, lists and downloads, `search` `issues`/`prs`/`repos`/`code`/`commits`,
-  `status`, `org list`, `gist` `list`/`view`, `variable`
-  `list`/`get`, `ruleset` `list`/`view`/`check`, `project`
+  `status`, `org list`, `gist` `list`/`view`, `variable get`,
+  `ruleset` `list`/`view`/`check`, `project`
   `list`/`view`/`field-list`/`item-list`, `ssh-key list`, `gpg-key list`,
   `codespace list`, `release verify`/`verify-asset`, `attestation verify`,
   `extension list`/`search`, and the `list`/`view` actions of
@@ -195,6 +195,8 @@ The **Since** column names the minimum signed manifest version unless noted.
 | `api` PUT `/repos/*/*/environments/*` | ADMINISTRATION | v30 |
 | `api` POST `/repos/*/*/environments/*/deployment-branch-policies` | ADMINISTRATION | v30 |
 | `secret set NAME --env ENV` (repository scope, value from stdin) | ADMINISTRATION | v30 |
+| `variable set NAME` (repository or repository environment scope) | ADMINISTRATION | v30 |
+| `variable list` (repository or repository environment scope) | MECHANICAL | v30 |
 | `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
 | `repo rename`, `repo create` | ADMINISTRATION-AS-OPERATOR | v19 |
 | `workflow disable`, `workflow enable` | ADMINISTRATION-AS-OPERATOR | v19 |
@@ -264,6 +266,16 @@ interactive input, `--body`/`-b`, `--env-file`, and other scopes and options
 are refused. The shim sends stdin directly to upstream gh and suppresses its
 output; the exit status still reports success or failure. The audit identifies
 the repository, environment, and secret name, not the value.
+
+`variable set NAME` is an audited operator action. Supply a nonempty `--body`
+or `-b` value, or pass the value on stdin from a pipe or file. `variable list`
+is a read and does not need the operator bypass or add an audit line. Both
+require a signed v30 or newer manifest, a GitHub repository (use `-R OWNER/REPO`
+or the current repository), and may use `--env ENV`. Organization and user
+scopes, bulk files, and `variable delete` are not admitted by these rows.
+The `variable set` audit records the repository, optional environment, and
+variable name, not the value. These commands are available in the main session,
+not in shells launched for delegated workers.
 
 Every row is declared for `macos` and `linux`: the schema requires a non-empty
 `platform` list on tuples and API rules alike, so no row is OS-neutral.

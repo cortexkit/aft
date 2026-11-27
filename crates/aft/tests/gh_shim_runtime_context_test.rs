@@ -497,6 +497,9 @@ mod manifest_unavailable;
 #[path = "gh_shim/environment_secret_stdin.rs"]
 mod environment_secret_stdin;
 
+#[path = "gh_shim/variable_stdin.rs"]
+mod variable_stdin;
+
 #[test]
 fn gh_shim_child_override_leaves_operator_state_canary_untouched() {
     let temp = tempfile::tempdir().expect("create test root");

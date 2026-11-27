@@ -5,26 +5,6 @@ const SECRET_ARGS: &str = "use gh secret set NAME --env ENV [-R OWNER/REPO] with
 const NEEDS_REPO: &str = "environment secret set requires a github.com repository; use -R OWNER/REPO or run from a checkout with a github.com origin";
 const NEEDS_STDIN: &str = "environment secret set requires stdin from a pipe or file; terminal or missing input is not supported";
 
-#[cfg(unix)]
-pub(super) fn stdin_ready() -> bool {
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // fstat inspects stdin without reading the value or changing the file offset.
-    if unsafe { libc::fstat(libc::STDIN_FILENO, metadata.as_mut_ptr()) } != 0 {
-        return false;
-    }
-    // SAFETY: successful fstat initialized the result.
-    matches!(
-        unsafe { metadata.assume_init() }.st_mode & libc::S_IFMT,
-        libc::S_IFIFO | libc::S_IFREG
-    )
-}
-
-#[cfg(not(unix))]
-pub(super) fn stdin_ready() -> bool {
-    // The signed row is supported on macOS and Linux only.
-    false
-}
-
 pub(in crate::gh_shim) fn targets_secret(args: &[OsString]) -> bool {
     command_head(args).is_some_and(|(verb, subcommand, _)| {
         verb == "secret" && subcommand.as_deref() == Some("set")
@@ -171,16 +151,7 @@ impl SecretArgs {
     }
 
     fn repository(&self, cwd: &Path) -> Option<String> {
-        if let Some(repo) = &self.repo {
-            let (owner, name) = repo.split_once('/')?;
-            return (valid_repository_component(owner) && valid_repository_component(name))
-                .then(|| repo.to_ascii_lowercase());
-        }
-        TargetRepository {
-            gh_repo: gh_repo_env(),
-            ..TargetRepository::default()
-        }
-        .repository_key(cwd)
+        repo_scope::explicit_or_current_repository(self.repo.as_deref(), cwd)
     }
 
     fn argv(&self, repository: &str) -> Vec<OsString> {
