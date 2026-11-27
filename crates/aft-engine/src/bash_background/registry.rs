@@ -363,42 +363,6 @@ enum KillSignalPlan {
     },
 }
 
-pub(super) fn log_bash_kill(task_id: &str, pid: Option<u32>, pgid: Option<i32>, reason: &str) {
-    let target = pid.or_else(|| pgid.and_then(|pgid| u32::try_from(pgid).ok()));
-    match target {
-        Some(pid) => {
-            crate::slog_info!("bash kill task={task_id} pid={pid} pgid={pgid:?} reason={reason:?}")
-        }
-        None => crate::slog_info!(
-            "bash kill task={task_id} pid=unknown pgid={pgid:?} reason={reason:?}"
-        ),
-    }
-}
-
-/// Stop independent commands concurrently so a batch shares one grace window.
-/// Callers collect targets before entering here, without registry/task locks.
-pub fn stop_tasks_in_parallel<T: Send, R: Send>(
-    tasks: impl IntoIterator<Item = T>,
-    stop: impl Fn(T) -> R + Sync,
-) -> Vec<R> {
-    #[cfg(unix)]
-    {
-        std::thread::scope(|scope| {
-            let stop = &stop;
-            let workers: Vec<_> = tasks
-                .into_iter()
-                .map(|task| scope.spawn(move || stop(task)))
-                .collect();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().expect("command stop worker panicked"))
-                .collect()
-        })
-    }
-    #[cfg(not(unix))]
-    tasks.into_iter().map(stop).collect()
-}
-
 /// Longest a completion notice waits for a process-group check another caller
 /// has started. The check is one listing of the group, normally milliseconds.
 const FIRST_GROUP_SAMPLE_WAIT: Duration = Duration::from_secs(2);
@@ -454,20 +418,6 @@ impl KillSettlementTestSamples {
             self.pgid, self.count, self.recent
         )
     }
-}
-
-/// Close a PTY's pseudoterminal so its reader reaches end-of-file and
-/// the task can finalize. On Windows, ConPTY's reader sees end-of-file only
-/// once the pseudoconsole is closed, and closing it can wait for conhost to
-/// flush; it runs on its own thread so no caller (or lock) waits on that.
-fn close_pty_master(master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
-    let Some(master) = master else {
-        return;
-    };
-    #[cfg(windows)]
-    close_pty_master_off_thread(Some(master));
-    #[cfg(not(windows))]
-    drop(master);
 }
 
 #[cfg(any(windows, test, feature = "test-support"))]
@@ -11024,7 +10974,7 @@ impl BgTaskRegistry {
             };
             // Pruning the record ends the scratch's retention too: without the
             // record nothing could find and delete the directory later.
-            let ready = delivered_terminal && expired && {
+            let ready = delivered_terminal && expired && self.reap_terminal_child(&task) && {
                 self.release_task_scratch(&task, false);
                 self.cleanup_terminal_task_temp(&task).unwrap_or(false)
             };
@@ -11919,7 +11869,11 @@ impl BgTaskRegistry {
         if let Ok(state) = task.lock_state() {
             // A PTY kill in flight decides the outcome (it may not be
             // confirmed); finalization waits for it.
-            if cfg!(unix) && state.kill_in_flight && matches!(state.runtime, TaskRuntime::Pty(_)) {
+            if cfg!(unix)
+                && state.kill_in_flight
+                && matches!(state.runtime, TaskRuntime::Pty(_))
+                && !verified_kill::polling_as_kill()
+            {
                 return Ok(());
             }
             if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
@@ -13887,12 +13841,14 @@ impl BgTaskRegistry {
                         unreachable!()
                     }
                 } else {
-                    // A repeated kill can observe the first kill's committed waiter result.
-                    let committed_piped_override = if state.metadata.mode == BgMode::Pipes {
-                        state.pending_terminal_override.clone()
-                    } else {
-                        None
-                    };
+                    // A repeated kill can observe the first kill's committed
+                    // waiter result; a PTY's `killed` marker keeps its outcome.
+                    let committed_piped_override =
+                        if state.metadata.mode == BgMode::Pipes || marker == ExitMarker::Killed {
+                            state.pending_terminal_override.clone()
+                        } else {
+                            None
+                        };
                     let terminal_reason = if marker == ExitMarker::Killed || resource_kill {
                         reason.clone()
                     } else if committed_piped_override.is_some() {
@@ -13996,11 +13952,15 @@ impl BgTaskRegistry {
                         child: child_slot.take(),
                     },
                     TaskRuntime::Pty(Some(pty)) => {
+                        // ConPTY has no signals to commit at; the kill owns the exit.
+                        #[cfg(windows)]
                         pty.was_killed.store(true, Ordering::SeqCst);
                         // Hang up only a leader still proven to be the task's:
-                        // its pid is otherwise free for reuse.
+                        // its pid is otherwise free for reuse. The hangup is
+                        // the kill's commit point (see `was_killed`).
                         #[cfg(not(windows))]
                         if pty_evidence.as_ref().is_some_and(|e| e.leader_running()) {
+                            pty.was_killed.store(true, Ordering::SeqCst);
                             log_bash_kill(task_id, pty.child_pid, pgid, kill_reason);
                             if let Err(error) = pty.killer.kill() {
                                 crate::slog_warn!(
@@ -14022,6 +13982,13 @@ impl BgTaskRegistry {
                 plan
             }
         };
+        let mut in_flight = verified_kill::KillInFlight::new(
+            &task,
+            matches!(
+                plan,
+                KillSignalPlan::Piped { .. } | KillSignalPlan::Pty { .. }
+            ),
+        );
 
         let mut scope_kill_attempted = false;
         let mut coverage_note = None;
@@ -14035,7 +14002,11 @@ impl BgTaskRegistry {
                     close_pty_master(runtime.master.take());
                 }
             }
-            KillSignalPlan::AwaitOtherKill => self.await_kill_in_flight(&task),
+            KillSignalPlan::AwaitOtherKill => {
+                // The kill in flight owns the scope too.
+                self.await_kill_in_flight(&task);
+                scope_kill_attempted = true;
+            }
             KillSignalPlan::TerminalSurvivors { pgid, live_count } => {
                 kill_reached = live_count;
                 log_bash_kill(task_id, None, Some(pgid), kill_reason);
@@ -14254,17 +14225,20 @@ impl BgTaskRegistry {
                     unconfirmed.clone(),
                     &mut saves,
                 )?;
-                // A leader that outlived every signal is never seen to exit.
+                // Wait, bounded, for the leader's exit; one that outlived
+                // every signal of an unconfirmed kill is never seen to exit.
                 #[cfg(unix)]
-                if unconfirmed.is_some() && !terminalized {
-                    terminalized = self.settle_unconfirmed_pty_kill(&task, &mut saves)?;
+                if !terminalized {
+                    terminalized =
+                        self.settle_pty_kill(&task, unconfirmed.is_some(), &mut saves)?;
                 }
                 // Finalization waited for this kill's outcome; publish it now if
                 // the command has already exited.
                 #[cfg(unix)]
-                let _ = self.poll_task(&task);
+                verified_kill::poll_as_kill(self, &task);
             }
         }
+        in_flight.finish();
 
         if !scope_kill_attempted {
             if let Err(error) = self.kill_task_scope_with_reason(&task.task_id, kill_reason) {
@@ -17943,8 +17917,11 @@ mod watch_scan;
 
 #[path = "verified_kill.rs"]
 mod verified_kill;
+pub(super) use verified_kill::log_bash_kill;
+pub use verified_kill::stop_tasks_in_parallel;
 use verified_kill::{
-    finished_group_is_still_the_tasks, record_group_check, settle_killed_process_group,
+    close_pty_master, finished_group_is_still_the_tasks, record_group_check,
+    settle_killed_process_group,
 };
 
 #[path = "pty_input_write.rs"]

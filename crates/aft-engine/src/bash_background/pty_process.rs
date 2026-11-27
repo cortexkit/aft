@@ -960,12 +960,10 @@ pub(crate) fn spawn_waiter(
         let marker = loop {
             match crate::agent_commands::wait_pty(child.as_mut(), root) {
                 Ok(status) => {
-                    // A leader that exited with a code of its own ended
-                    // naturally even if a kill was under way: that exit wins.
-                    // Only a death by signal is the kill's (Unix); ConPTY
-                    // reports no signals.
-                    let killed_by_signal = cfg!(windows) || status.signal().is_some();
-                    if was_killed.load(Ordering::SeqCst) && killed_by_signal {
+                    // `was_killed` is set when a kill commits, right before
+                    // its first signal; any exit observed after that, even
+                    // with a code of the command's own, is the kill's.
+                    if was_killed.load(Ordering::SeqCst) {
                         break ExitMarker::Killed;
                     }
                     let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
@@ -1132,71 +1130,6 @@ mod tests {
         }
         wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(fs::read_to_string(exit_path).unwrap(), "0");
-    }
-
-    #[derive(Debug)]
-    struct ExitsWith(ExitStatus);
-
-    impl ChildKiller for ExitsWith {
-        fn kill(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-            Box::new(FakeKiller)
-        }
-    }
-
-    impl Child for ExitsWith {
-        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-            Ok(None)
-        }
-
-        fn wait(&mut self) -> io::Result<ExitStatus> {
-            Ok(self.0.clone())
-        }
-
-        fn process_id(&self) -> Option<u32> {
-            None
-        }
-
-        #[cfg(windows)]
-        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-            None
-        }
-    }
-
-    /// A leader that exits with a code of its own during a kill ended
-    /// naturally: its code is recorded, not `killed`. Only a death by signal
-    /// is the kill's.
-    #[cfg(unix)]
-    #[test]
-    fn pty_waiter_keeps_a_natural_exit_code_during_a_kill() {
-        for (status, expected) in [
-            (ExitStatus::with_exit_code(3), "3"),
-            (ExitStatus::with_signal("Hangup"), "killed"),
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let exit_path = temp.path().join("task.exit");
-            let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
-            let coordinator = Arc::new(CompletionCoordinator::new(
-                "task".to_string(),
-                "session".to_string(),
-                wake_tx,
-            ));
-            spawn_waiter(
-                Box::new(ExitsWith(status)),
-                File::create(&exit_path).unwrap(),
-                Arc::new(AtomicBool::new(true)),
-                Arc::new(AtomicBool::new(false)),
-                Arc::clone(&coordinator),
-                None,
-            )
-            .unwrap();
-            coordinator.signal_one_done();
-            wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert_eq!(fs::read_to_string(exit_path).unwrap(), expected);
-        }
     }
 
     #[test]

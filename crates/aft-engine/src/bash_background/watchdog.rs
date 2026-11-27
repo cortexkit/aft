@@ -669,6 +669,11 @@ fn retire_terminal_task(
     pass_cause: WatchdogPassCause,
     awaiting_reader: &mut HashMap<String, Instant>,
 ) {
+    // A kill can hand back a wrapper that had not exited yet; the task stays
+    // watched until it is reaped, so it never lingers as a zombie.
+    if !registry.reap_terminal_child(task) {
+        return;
+    }
     if registry.retry_terminal_persist(task).is_err() {
         return;
     }

@@ -1668,3 +1668,110 @@ fn a_natural_exit_wins_over_a_kill_that_sent_nothing() {
         BgTaskStatus::Completed
     );
 }
+
+/// Wait for a PTY task to publish its outcome.
+fn wait_for_terminal(registry: &BgTaskRegistry, task_id: &str) -> BgTaskSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let snapshot = registry.status(task_id, SESSION, None, None, 0).unwrap();
+        if snapshot.info.status.is_terminal() {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the task never finished: {:?}",
+            snapshot.info.status
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn spawn_pty_for_kill(registry: &BgTaskRegistry, dir: &Path, command: &str) -> String {
+    registry
+        .spawn_pty(
+            SpawnPlan::Unsandboxed,
+            command,
+            SESSION.to_string(),
+            dir.to_path_buf(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.to_path_buf(),
+            10,
+            true,
+            false,
+            Some(dir.to_path_buf()),
+            24,
+            80,
+        )
+        .unwrap()
+}
+
+/// A command that handles SIGHUP and SIGTERM by exiting with a code is
+/// still stopped by the kill: once the kill has signalled it, the exit it
+/// reports is the kill's. A kill stays killed and a timeout stays timed out,
+/// with its reason, whatever code the command chose.
+#[test]
+fn pty_kill_and_timeout_keep_their_outcome_when_the_command_handles_the_signal() {
+    for exit in [0, 143] {
+        for timeout in [false, true] {
+            let registry = registry();
+            let dir = tempfile::tempdir().unwrap();
+            let task_id = spawn_pty_for_kill(
+                &registry,
+                dir.path(),
+                &format!("trap 'exit {exit}' HUP TERM; touch ready; while :; do sleep 0.1; done"),
+            );
+            wait_for_file(&dir.path().join("ready"), "the command did not start");
+            let _reap = ReapGroup(task_pgid(&registry, &task_id));
+            if timeout {
+                registry.kill_for_timeout(&task_id, SESSION).unwrap();
+            } else {
+                registry.kill(&task_id, SESSION).unwrap();
+            }
+            let snapshot = wait_for_terminal(&registry, &task_id);
+            let expected = if timeout {
+                BgTaskStatus::TimedOut
+            } else {
+                BgTaskStatus::Killed
+            };
+            let case = format!("exit {exit} timeout={timeout}");
+            assert_eq!(snapshot.info.status, expected, "{case}");
+            if timeout {
+                assert!(
+                    snapshot
+                        .info
+                        .status_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("time limit")),
+                    "{case}: {:?}",
+                    snapshot.info.status_reason
+                );
+            }
+            assert_eq!(
+                completion_for(&registry, &task_id).status,
+                expected,
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A command that exits on its own before the kill sends anything keeps its
+/// own exit code.
+#[test]
+fn pty_command_that_exits_before_any_signal_keeps_its_code() {
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_pty_for_kill(&registry, dir.path(), "exit 3");
+    let exit = registry.task_for_test(&task_id).unwrap().paths.exit.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&exit).unwrap_or_default() != "3" {
+        assert!(Instant::now() < deadline, "the command never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    registry.kill(&task_id, SESSION).unwrap();
+    let snapshot = wait_for_terminal(&registry, &task_id);
+    assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
+    assert_eq!(snapshot.exit_code, Some(3));
+}

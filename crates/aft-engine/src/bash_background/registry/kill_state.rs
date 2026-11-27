@@ -45,14 +45,16 @@ impl BgTaskRegistry {
         pty.coordinator.observed_exit.get().cloned()
     }
 
-    /// A PTY kill whose outcome is unknown may leave its leader running, and
-    /// then no exit is ever observed. After the termination grace period, if
-    /// the leader has still not exited, publish the unknown outcome here so
-    /// the task never stays `killing`. Returns whether this call published it.
+    /// Wait, at most the termination grace period, for a killed PTY's leader
+    /// to be seen exiting. A kill whose outcome is unknown (`unconfirmed`)
+    /// may leave the leader running, and then no exit is ever observed: its
+    /// unknown outcome is published here so the task never stays `killing`.
+    /// Returns whether this call published it.
     #[cfg(unix)]
-    pub(super) fn settle_unconfirmed_pty_kill(
+    pub(super) fn settle_pty_kill(
         &self,
         task: &Arc<BgTask>,
+        unconfirmed: bool,
         saves: &mut KillStateSave,
     ) -> Result<bool, String> {
         let exited = |state: &BgTaskState| {
@@ -75,6 +77,9 @@ impl BgTaskRegistry {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+        if !unconfirmed {
+            return Ok(false);
         }
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task
@@ -149,8 +154,13 @@ impl BgTaskRegistry {
         let mut state = task
             .lock_state()
             .map_err(|_| "background task lock poisoned".to_string())?;
-        state.kill_in_flight = false;
-        task.kill_settled.notify_all();
+        // On Unix the kill keeps `kill_in_flight` until it has published its
+        // outcome (see `KillInFlight`); ConPTY's outcome is published here.
+        #[cfg(windows)]
+        {
+            state.kill_in_flight = false;
+            task.kill_settled.notify_all();
+        }
         // The waiter's exit marker is published after this, with this outcome.
         #[cfg(not(windows))]
         if let Some(unconfirmed) = unconfirmed.clone() {

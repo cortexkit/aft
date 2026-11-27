@@ -2419,3 +2419,119 @@ fn scoped_pty_that_outlives_its_kill_still_ends_and_posts_one_completion() {
         .count();
     assert_eq!(completions, 1);
 }
+
+/// A second kill during the first kill's wait for an unconfirmed PTY's exit
+/// waits for that kill, even when a `killed` marker appears meanwhile, so the
+/// unknown outcome and its reason are what get published.
+#[test]
+fn second_pty_kill_during_the_settle_wait_keeps_fate_unknown() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    r.inner.shutdown.store(true, Ordering::SeqCst);
+    let id = r
+        .spawn_pty(
+            SpawnPlan::Unsandboxed,
+            "trap '' HUP TERM; echo ready; while :; do sleep 1; done",
+            "settle-gap".into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.path().into(),
+            8,
+            true,
+            false,
+            Some(root.path().into()),
+            24,
+            80,
+        )
+        .unwrap();
+    let task = r.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.pty)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+    super::super::process::test_hooks::deny_sigkill(pgid);
+    let cgroup = root.path().join("broken-scope");
+    std::fs::create_dir_all(cgroup.join("cgroup.kill")).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), format!("{pgid}\n")).unwrap();
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(&id, cgroup));
+    let first = {
+        let (r, id) = (r.clone(), id.clone());
+        std::thread::spawn(move || {
+            super::super::task_scope::with_pidfds_unavailable_for_test(|| r.kill(&id, "settle-gap"))
+        })
+    };
+    // The first kill has recorded its unknown outcome and waits for an exit.
+    until(|| {
+        let state = task.lock_state().unwrap();
+        state.metadata.status == BgTaskStatus::Killing
+            && state
+                .metadata
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("Task outcome is unknown"))
+    });
+    std::fs::write(&task.paths.exit, "killed").unwrap();
+    let second = r.kill(&id, "settle-gap");
+    let first = first.join().unwrap();
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(second.info.status, BgTaskStatus::FateUnknown);
+    let completions: Vec<_> = r
+        .pending_completions_for_session("settle-gap")
+        .into_iter()
+        .filter(|completion| completion.task_id == id)
+        .collect();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].status, BgTaskStatus::FateUnknown);
+    assert!(completions[0]
+        .status_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("Task outcome is unknown")));
+}
+
+/// A kill hands back a wrapper that has not exited within its reap wait.
+/// The watchdog keeps the finished task until it has reaped that wrapper,
+/// so it never lingers as a zombie.
+#[test]
+fn handed_back_wrapper_is_reaped_by_the_watchdog() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    let (id, pgid) = fake_scoped_command(&r, root.path(), "hand-back", false, true);
+    let faults = super::super::task_scope::ListingFaults {
+        pidfd_errno: Some(libc::EMFILE),
+        ..Default::default()
+    };
+    super::super::task_scope::with_listing_faults_for_test(faults, || {
+        r.kill(&id, "hand-back").unwrap()
+    });
+    let task = r.task(&id).unwrap();
+    let handed_back = matches!(
+        task.lock_state().unwrap().runtime,
+        TaskRuntime::Piped(Some(_))
+    );
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    assert!(
+        handed_back,
+        "precondition: the running wrapper was handed back"
+    );
+    until(|| {
+        super::super::watchdog::run_pass(&r, WatchdogPassCause::Tick, &mut HashMap::new());
+        matches!(task.lock_state().unwrap().runtime, TaskRuntime::Piped(None))
+    });
+    assert_eq!(
+        unsafe { libc::waitpid(pgid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1,
+        "the wrapper was left unreaped"
+    );
+}

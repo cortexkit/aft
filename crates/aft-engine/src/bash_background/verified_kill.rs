@@ -108,20 +108,35 @@ impl GroupEvidence {
     }
 
     /// Record who is in the group now, if the group is proven before the
-    /// listing. The members are kept even if the leader exits while the group
-    /// is listed: a recorded member still running in the group proves it
-    /// later, because a group number cannot be reused while the group has
-    /// members. The listing reads only identities, never account names,
-    /// which can stall on a slow directory service. Returns whether the group
-    /// was proven.
+    /// listing and still the task's after it. A recorded member still running
+    /// in the group proves it later, because a group number cannot be reused
+    /// while the group has members. The listing reads only identities, never
+    /// account names, which can stall on a slow directory service. Returns
+    /// whether the group was proven.
     #[cfg(unix)]
     pub(super) fn remember_members(&mut self) -> bool {
         if !self.proven() {
             return false;
         }
-        if let Ok(identities) = super::super::process::process_group_identities(self.pgid) {
-            self.identities.extend(identities);
+        let Ok(listed) = super::super::process::process_group_identities(self.pgid) else {
+            return true;
+        };
+        // The listing describes the task's group only if the group is still
+        // proven after it was taken: its number could otherwise have been
+        // freed and reused while it was listed.
+        if self.proven() {
+            self.identities.extend(listed);
+            return true;
         }
+        // The earlier proof is gone, typically because the leader exited
+        // during the listing. A reused number is held by a newer process
+        // leading a new group; while no process holds it, the members listed
+        // are what is left of the task's group and still prove it.
+        let number_held = u32::try_from(self.pgid).is_ok_and(is_process_alive);
+        if number_held || listed.is_empty() {
+            return false;
+        }
+        self.identities.extend(listed);
         true
     }
 
@@ -228,17 +243,19 @@ pub(super) fn terminate_pty_task(
     metadata: &PersistedTask,
     pid: u32,
     #[cfg_attr(windows, allow(unused_variables))] evidence: Option<GroupEvidence>,
+    before_first_signal: &mut dyn FnMut(),
 ) -> Option<String> {
     #[cfg(unix)]
     {
         let pgid = i32::try_from(pid).ok()?;
         evidence
             .unwrap_or_else(|| GroupEvidence::for_task(metadata, pgid, None))
-            .terminate()
+            .terminate_with(before_first_signal)
     }
     #[cfg(windows)]
     {
         let _ = metadata;
+        before_first_signal();
         terminate_pid(pid);
         None
     }
@@ -462,7 +479,7 @@ impl BgTaskRegistry {
                         None,
                         &mut || {},
                     ),
-                    BgMode::Pty => terminate_pty_task(metadata, pid, None),
+                    BgMode::Pty => terminate_pty_task(metadata, pid, None, &mut || {}),
                 };
                 if note.as_deref() == Some(NOTHING_SENT_NOTE) {
                     // The process stopped matching between the check and the
@@ -628,12 +645,92 @@ impl BgTaskRegistry {
         evidence: Option<GroupEvidence>,
     ) -> Option<String> {
         let metadata = task.lock_state().ok()?.metadata.clone();
+        // The kill commits when its first signal is sent: from then on an exit
+        // the PTY waiter observes is the kill's, whatever its code.
+        let mut commit = || {
+            if let Ok(state) = task.lock_state() {
+                if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
+                    pty.was_killed.store(true, Ordering::SeqCst);
+                }
+            }
+        };
         #[cfg(target_os = "linux")]
         if let Ok(Some(scope)) = self.kill_scope_handle(&metadata) {
-            return terminate_scope_or_group(&scope, || evidence, &mut || {}, || {});
+            return terminate_scope_or_group(&scope, || evidence, &mut commit, || {});
         }
-        terminate_pty_task(&metadata, pid, evidence)
+        terminate_pty_task(&metadata, pid, evidence, &mut commit)
     }
+
+    /// Reap a terminal task's own wrapper if a kill handed it back still
+    /// running. Returns whether the child slot is now empty; until then the
+    /// task's files must stay (on Windows the child keeps their handles open).
+    pub(crate) fn reap_terminal_child(&self, task: &BgTask) -> bool {
+        let Ok(mut state) = task.lock_state() else {
+            return false;
+        };
+        if !state.metadata.status.is_terminal() {
+            return true;
+        }
+        let TaskRuntime::Piped(slot) = &mut state.runtime else {
+            return true;
+        };
+        let reaped = match slot.as_mut().map(|child| child.try_wait()) {
+            None => return true,
+            Some(Ok(None)) => return false,
+            Some(Ok(Some(_))) => true,
+            Some(Err(_)) => false,
+        };
+        *slot = None;
+        state.child_exit_observed |= reaped;
+        true
+    }
+}
+
+/// Keeps a kill's `kill_in_flight` claim until the kill has published its
+/// outcome, and releases it on every exit, early returns and panics included,
+/// so no task is left `killing` with nothing to finish it.
+pub(super) struct KillInFlight<'a>(Option<&'a BgTask>);
+
+impl<'a> KillInFlight<'a> {
+    /// A claim for `task`, if this kill set its `kill_in_flight`.
+    pub(super) fn new(task: &'a BgTask, claimed: bool) -> Self {
+        Self(claimed.then_some(task))
+    }
+
+    /// Release the claim now, waking callers waiting for this kill.
+    pub(super) fn finish(&mut self) {
+        if let Some(task) = self.0.take() {
+            if let Ok(mut state) = task.lock_state() {
+                state.kill_in_flight = false;
+            }
+            task.kill_settled.notify_all();
+        }
+    }
+}
+
+impl Drop for KillInFlight<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+thread_local! {
+    static POLLING_AS_KILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Poll a PTY task on behalf of the kill that owns it, so the kill can
+/// publish its own outcome while it still holds `kill_in_flight` (other
+/// pollers wait for it).
+#[cfg(unix)]
+pub(super) fn poll_as_kill(registry: &BgTaskRegistry, task: &Arc<BgTask>) {
+    POLLING_AS_KILL.with(|flag| flag.set(true));
+    let _ = registry.poll_task(task);
+    POLLING_AS_KILL.with(|flag| flag.set(false));
+}
+
+/// Whether this thread is polling on behalf of the kill in flight.
+pub(super) fn polling_as_kill() -> bool {
+    POLLING_AS_KILL.with(std::cell::Cell::get)
 }
 
 /// The evidence a PTY kill needs, gathered before its leader is hung up and
@@ -795,6 +892,61 @@ pub(super) fn record_group_check(
             metadata.live_descendants_unavailable = Some(*reason);
         }
     }
+}
+
+pub(in crate::bash_background) fn log_bash_kill(
+    task_id: &str,
+    pid: Option<u32>,
+    pgid: Option<i32>,
+    reason: &str,
+) {
+    let target = pid.or_else(|| pgid.and_then(|pgid| u32::try_from(pgid).ok()));
+    match target {
+        Some(pid) => {
+            crate::slog_info!("bash kill task={task_id} pid={pid} pgid={pgid:?} reason={reason:?}")
+        }
+        None => crate::slog_info!(
+            "bash kill task={task_id} pid=unknown pgid={pgid:?} reason={reason:?}"
+        ),
+    }
+}
+
+/// Stop independent commands concurrently so a batch shares one grace window.
+/// Callers collect targets before entering here, without registry/task locks.
+pub fn stop_tasks_in_parallel<T: Send, R: Send>(
+    tasks: impl IntoIterator<Item = T>,
+    stop: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    #[cfg(unix)]
+    {
+        std::thread::scope(|scope| {
+            let stop = &stop;
+            let workers: Vec<_> = tasks
+                .into_iter()
+                .map(|task| scope.spawn(move || stop(task)))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("command stop worker panicked"))
+                .collect()
+        })
+    }
+    #[cfg(not(unix))]
+    tasks.into_iter().map(stop).collect()
+}
+
+/// Close a PTY's pseudoterminal so its reader reaches end-of-file and
+/// the task can finalize. On Windows, ConPTY's reader sees end-of-file only
+/// once the pseudoconsole is closed, and closing it can wait for conhost to
+/// flush; it runs on its own thread so no caller (or lock) waits on that.
+pub(super) fn close_pty_master(master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
+    let Some(master) = master else {
+        return;
+    };
+    #[cfg(windows)]
+    close_pty_master_off_thread(Some(master));
+    #[cfg(not(windows))]
+    drop(master);
 }
 
 #[cfg(test)]
@@ -1029,6 +1181,85 @@ mod tests {
             persisted.status_reason,
             Some(restart_fate_unknown_reason(&persisted, &paths))
         );
+    }
+
+    /// The members listed while the group was proven are kept only if the
+    /// group is still the task's after the listing. Here the member that
+    /// proved it exits during the listing while another process holds the
+    /// group number with a start the task never recorded: the listing could
+    /// describe a reused group, so it proves nothing.
+    #[cfg(unix)]
+    #[test]
+    fn remember_members_drops_a_listing_it_cannot_re_prove() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = spawn_session("exec sleep 30");
+        let pgid = leader.id() as i32;
+        let member = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(pgid)
+            .spawn()
+            .unwrap();
+        let member_pid = member.id();
+        let mut evidence = GroupEvidence {
+            pgid,
+            owned_leader: None,
+            identities: vec![
+                ProcessIdentity::from_epoch(leader.id(), 1),
+                ProcessIdentity::of(member_pid).unwrap(),
+            ],
+        };
+        let member = std::cell::RefCell::new(Some(member));
+        let proven = super::super::super::process::test_hooks::with_listing_observer(
+            move || {
+                if let Some(mut member) = member.borrow_mut().take() {
+                    let _ = member.kill();
+                    let _ = member.wait();
+                }
+            },
+            || evidence.remember_members(),
+        );
+        let _ = leader.kill();
+        let _ = leader.wait();
+        assert!(!proven, "a listing that could not be re-proven was kept");
+        assert!(!evidence
+            .identities
+            .iter()
+            .any(|identity| identity.pid == pgid as u32 && identity.started_at_ms != 1));
+    }
+
+    /// A kill's claim on `kill_in_flight` is released even when the kill
+    /// thread panics, so the task can still be finished.
+    #[cfg(unix)]
+    #[test]
+    fn kill_in_flight_is_released_when_the_kill_thread_panics() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "sleep 30",
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(std::time::Duration::from_secs(30)),
+                None,
+                dir.path().into(),
+                8,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        let task = registry.task(&task_id).unwrap();
+        task.lock_state().unwrap().kill_in_flight = true;
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _claim = KillInFlight::new(&task, true);
+            panic!("kill thread failed");
+        }));
+        let released = !task.lock_state().unwrap().kill_in_flight;
+        let _ = registry.kill(&task_id, "session");
+        assert!(panicked.is_err());
+        assert!(released, "a dead kill left the task claimed");
     }
 
     /// A group number is checked again right before SIGKILL; a group no longer

@@ -219,15 +219,14 @@ pub(super) fn terminate_members(
         return false;
     }
     before();
-    // A failed listing is settled by the caller writing to `cgroup.kill` and
-    // checking that the scope is empty.
-    if signal_members(cgroup, libc::SIGTERM).is_err() {
-        return true;
-    }
+    // A listing that fails or never settles may still hide members, so the
+    // full grace period runs unless a listing shows none left running. The
+    // caller then writes `cgroup.kill` and checks that the scope is empty.
+    let _ = signal_members(cgroup, libc::SIGTERM);
     let started = Instant::now();
     while started.elapsed() < super::super::process::TERMINATE_GRACE {
         reap();
-        if signal_members(cgroup, 0).map_or(true, |live| live.is_empty()) {
+        if signal_members(cgroup, 0).is_ok_and(|live| live.is_empty()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -414,5 +413,43 @@ mod membership_tests {
         }
         let _ = (first.kill(), late.kill(), first.wait(), late.wait());
         assert_eq!(stopped, (true, true), "a member was left unsignalled");
+    }
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+
+    /// After SIGTERM, listings that never settle may hide members, so the
+    /// full grace period runs before the caller's `cgroup.kill`.
+    #[test]
+    fn task_scope_term_keeps_its_grace_when_listings_never_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sleepers: Vec<_> = (0..2)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let (a, b) = (sleepers[0].id(), sleepers[1].id());
+        let faults = ListingFaults {
+            listings: (0..4_000)
+                .map(|round| if round % 2 == 0 { vec![a] } else { vec![b] })
+                .collect(),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        with_listing_faults_for_test(faults, || terminate_members(dir.path(), || {}, || {}));
+        let elapsed = started.elapsed();
+        for sleeper in &mut sleepers {
+            let _ = sleeper.kill();
+            let _ = sleeper.wait();
+        }
+        assert!(
+            elapsed >= super::super::super::process::TERMINATE_GRACE,
+            "the grace period was cut short: {elapsed:?}"
+        );
     }
 }
