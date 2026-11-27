@@ -769,6 +769,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "transport admission and allocation bounds, not result-list cuts; oversized frames and excess held requests receive explicit errors, retained input keeps its budget charge across queue moves",
     },
     ExclusionEntry {
+        file: "subc/wire.rs",
+        enclosing_item: "prepare_client_delivery, build_legacy_tool_response_frame",
+        location_or_primitive: "CLIENT_REPLY_BODY_LIMIT",
+        reason: "bounds encoded reply bytes, not a particular result list; oversized replies keep existing status and recovery fields in a transport fallback",
+    },
+    ExclusionEntry {
         file: "cli/sandbox_launch/landlock_backend.rs",
         enclosing_item: "session_task_read_paths",
         location_or_primitive: "tasks.truncate(MAX_SESSION_READ_TASKS)",

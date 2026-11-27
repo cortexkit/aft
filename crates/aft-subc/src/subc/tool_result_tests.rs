@@ -87,6 +87,144 @@ fn project_frame(mut outgoing: wire::WriterFrame) -> Frame {
     outgoing.frame
 }
 
+#[tokio::test]
+async fn delivered_frame_limit_keeps_bash_status_and_capture_pointer() {
+    let metrics = Arc::new(DispatchPathMetrics::new());
+    let (writer, receiver) = mpsc::channel(1);
+    let (pong, pong_receiver) = mpsc::channel(1);
+    let (mut daemon, module) = tokio::io::duplex(8 * 1024);
+    let output = spawn_writer_task(module, receiver, pong_receiver, metrics.clone());
+    let limit = subc_protocol::MAX_DELIVERED_FRAME_LEN as usize;
+    for oversized in [false, true] {
+        let data = json!({
+            "task_id": "bash-0000000000000001", "status": "failed", "exit_code": 1,
+            "output_path": "/capture/stdout", "stderr_path": "/capture/stderr",
+            "pty_raw": if oversized { "x".repeat(limit) } else { "short".into() },
+        });
+        let result = ToolCallResult {
+            text: "task failed".into(),
+            response: Response::success("request-id", data.clone()),
+        };
+        // Queue an already encoded reply to exercise the final writer, not just
+        // the early sizing check in the tool response builder.
+        let body = wire::tests::legacy_tool_response_body(&result, true);
+        let frame =
+            Frame::build(FrameType::Response, control_flags(), 7, 2, 11, body.clone()).unwrap();
+        send_reliable_writer_frame(&writer, &metrics, frame, "delivered frame test")
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut daemon))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert_eq!(
+            (reply.header.channel, reply.header.epoch, reply.header.corr),
+            (7, 2, 11)
+        );
+        if oversized {
+            assert!(
+                reply.body.len() + subc_protocol::HEADER_LEN <= limit,
+                "delivered {} body bytes",
+                reply.body.len()
+            );
+            let value: Value = serde_json::from_slice(&reply.body).unwrap();
+            let payload = &value["structuredContent"];
+            for field in [
+                "task_id",
+                "status",
+                "exit_code",
+                "output_path",
+                "stderr_path",
+            ] {
+                assert_eq!(payload[field], data[field], "{field}");
+            }
+            assert_eq!(payload["code"], "response_too_large");
+            assert_eq!(payload["truncation_reason"], "transport_frame_limit");
+            assert!(payload.get("pty_raw").is_none());
+        } else {
+            assert_eq!(reply.body, body);
+        }
+    }
+    drop(writer);
+    drop(pong);
+    output.await.unwrap().unwrap();
+}
+
+#[test]
+fn delivered_frame_limit_uses_actual_body_plus_header_at_boundary() {
+    let limit = subc_protocol::MAX_DELIVERED_FRAME_LEN as usize - subc_protocol::HEADER_LEN;
+    for ty in [
+        FrameType::Response,
+        FrameType::Error,
+        FrameType::StreamData,
+        FrameType::StreamEnd,
+    ] {
+        for excess in [0, 1] {
+            let body = format!("\"{}\"", "x".repeat(limit + excess - 2)).into_bytes();
+            let frame = Frame::build(ty, control_flags(), 7, 2, 11, body.clone()).unwrap();
+            let mut outgoing = wire::WriterFrame::plain(frame);
+            outgoing.prepare_client_delivery().unwrap();
+            let reply = outgoing.frame();
+            assert_eq!(
+                (reply.header.channel, reply.header.epoch, reply.header.corr),
+                (7, 2, 11)
+            );
+            if excess == 0 {
+                assert_eq!(reply.header.ty, ty);
+                assert_eq!(reply.body, body);
+            } else {
+                assert_eq!(reply.header.ty, FrameType::Error);
+                assert!(reply.body.len() < limit);
+                let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(error.code, "response_too_large");
+            }
+        }
+    }
+}
+
+#[test]
+fn delivered_frame_limit_preserves_bash_fields_in_early_fallbacks() {
+    let data = json!({
+        "task_id": "bash-0000000000000001", "status": "failed", "exit_code": 1,
+        "output_path": "/capture/stdout",
+        "bg_completions": ["x".repeat(subc_protocol::MAX_DELIVERED_FRAME_LEN as usize)],
+    });
+    let result = ToolCallResult {
+        text: "task failed".into(),
+        response: Response::success("request-id", data.clone()),
+    };
+    for tool_result in [false, true] {
+        let mut policy = opted_in(BindTrust::FirstParty);
+        policy.tool_result_body = tool_result;
+        let mut outgoing = wire::build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(7, 2),
+            11,
+            control_flags(),
+            &result,
+            policy,
+        )
+        .unwrap();
+        if !tool_result {
+            assert!(outgoing.body().len() < wire::CLIENT_REPLY_BODY_LIMIT);
+        }
+        outgoing.prepare_client_delivery().unwrap();
+        let payload: Value = serde_json::from_slice(outgoing.body()).unwrap();
+        let fields = &payload["structuredContent"];
+        for field in ["task_id", "status", "exit_code", "output_path"] {
+            assert_eq!(fields[field], data[field], "{field}");
+        }
+        assert_eq!(fields["code"], "response_too_large");
+        assert_eq!(fields["truncation_reason"], "transport_frame_limit");
+        assert!(fields.get("bg_completions").is_none());
+        if tool_result {
+            validate(&serde_json::from_slice::<ToolResult>(outgoing.body()).unwrap()).unwrap();
+        }
+    }
+}
+
 #[test]
 fn tool_result_error_code_normalization_and_success_omission() {
     for (raw, expected) in [
@@ -2051,11 +2189,17 @@ fn record(tool: &str, shape: &str, result: &ToolCallResult) {
         )
         .unwrap();
         let frame = project_frame(frame);
-        assert_eq!(
-            frame.body,
-            wire::tests::legacy_tool_response_body(result, trust != BindTrust::Untrusted),
-            "legacy bytes: {tool}/{shape}/{label}"
-        );
+        let legacy = wire::tests::legacy_tool_response_body(result, trust != BindTrust::Untrusted);
+        if legacy.len() > wire::CLIENT_REPLY_BODY_LIMIT {
+            let fallback: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert!(frame.body.len() < wire::CLIENT_REPLY_BODY_LIMIT);
+            assert_eq!(fallback["isError"], true, "{tool}/{shape}/{label}");
+            if trust != BindTrust::Untrusted {
+                assert_eq!(fallback["structuredContent"]["code"], "response_too_large");
+            }
+        } else {
+            assert!(frame.body == legacy, "legacy bytes: {tool}/{shape}/{label}");
+        }
         let frame = wire::build_tool_response_frame(
             PROTOCOL_VERSION,
             route_key(2, 1),
@@ -2217,7 +2361,7 @@ fn tool_result_real_reply_validation_report() {
     #[cfg(unix)]
     assert_eq!(REPLIES.get(), 264, "the real-reply corpus must not shrink");
     println!(
-        "Validated {} opted-in replies and {} byte-identical legacy replies; machine codes: {:?}",
+        "Validated {} opted-in replies and {} legacy replies (byte-identical when deliverable); machine codes: {:?}",
         REPLIES.get(),
         REPLIES.get(),
         CODES.with_borrow(|codes| codes.clone())

@@ -13,7 +13,9 @@ use super::{
 use crate::logging::ToolCallCaller;
 use crate::run_tool_call::{PhaseTrace, ToolCallEgressTiming, ToolCallPhaseDurations};
 use std::borrow::Cow;
-use subc_protocol::{FrameBuildError, MAX_FRAME_BODY_LEN};
+use subc_protocol::{HEADER_LEN, MAX_DELIVERED_FRAME_LEN, MAX_FRAME_BODY_LEN};
+
+pub(super) const CLIENT_REPLY_BODY_LIMIT: usize = MAX_DELIVERED_FRAME_LEN as usize - HEADER_LEN;
 
 pub(super) type WriterSender = mpsc::Sender<WriterFrame>;
 
@@ -345,7 +347,7 @@ impl WriterFrame {
             } else {
                 None
             };
-            outgoing.result_projection = Some((policy, MAX_FRAME_BODY_LEN as usize, source));
+            outgoing.result_projection = Some((policy, CLIENT_REPLY_BODY_LIMIT, source));
         } else if policy.model_only && outgoing.header.ty == FrameType::Response {
             outgoing.prepared_projection = Some(Arc::new(
                 model_only_body(&outgoing.frame.body).unwrap_or_else(|_| {
@@ -527,6 +529,38 @@ impl WriterFrame {
             body,
         )
         .map_err(SubcError::FrameBuild)?;
+        Ok(())
+    }
+
+    /// Check the bytes the daemon will deliver, after any recipient projection.
+    pub(super) fn prepare_client_delivery(&mut self) -> Result<(), SubcError> {
+        self.project_tool_result()?;
+        let body = self.body();
+        if body.len() <= CLIENT_REPLY_BODY_LIMIT {
+            return Ok(());
+        }
+        let header = &self.frame.header;
+        match header.ty {
+            FrameType::Push | FrameType::Request => {
+                log::warn!(
+                    "oversized subc {:?}: operation={:?} encoded_bytes={}",
+                    header.ty,
+                    frame_operation(body),
+                    body.len() + HEADER_LEN,
+                );
+            }
+            FrameType::Response
+            | FrameType::Error
+            | FrameType::StreamData
+            | FrameType::StreamEnd => {
+                let tool_result_body = self
+                    .response_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.tool_result_body);
+                self.frame = oversized_client_reply(&self.frame, body, tool_result_body)?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -959,6 +993,7 @@ fn truncate_rendered_text(text: &str, limit: usize) -> Cow<'_, str> {
     Cow::Owned(truncated)
 }
 
+#[cfg(test)]
 fn serialize_tool_response_body(
     result: &ToolCallResult,
     include_structured: bool,
@@ -1118,6 +1153,58 @@ fn serialize_tool_response_body_with_text(
     Ok(body)
 }
 
+fn frame_operation(body: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    struct Operation {
+        op: Option<String>,
+        name: Option<String>,
+        #[serde(alias = "method")]
+        command: Option<String>,
+        #[serde(rename = "type")]
+        frame_type: Option<String>,
+    }
+    serde_json::from_slice::<Operation>(body)
+        .ok()
+        .and_then(|op| op.op.or(op.command).or(op.name).or(op.frame_type))
+        .filter(|op| op.len() <= 128)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn transport_limit_message(body_len: usize, max_body_len: usize) -> String {
+    format!(
+        "tool response serialized to {body_len} bytes, exceeding the daemon transport limit of {max_body_len} bytes; re-run with a narrower range, a smaller limit, or offset+limit paging; output over {} MiB cannot cross the daemon transport",
+        transport_limit_mib(max_body_len)
+    )
+}
+
+const RECOVERY_FIELD_MAX_BYTES: usize = 4 * 1024;
+
+fn truncation_data(source: &Value) -> Value {
+    let mut data = serde_json::json!({
+        "complete": false,
+        "truncated": true,
+        "truncation_reason": TRANSPORT_TRUNCATION_REASON,
+    });
+    // Keep wire status and capture pointers, never arbitrary payloads or IDs.
+    for key in [
+        "task_id",
+        "status",
+        "exit_code",
+        "output_path",
+        "stderr_path",
+    ] {
+        if let Some(value) = source.get(key).filter(|value| match value {
+            Value::String(text) => text.len() <= RECOVERY_FIELD_MAX_BYTES,
+            Value::Number(_) | Value::Bool(_) | Value::Null => true,
+            _ => false,
+        }) {
+            data[key] = value.clone();
+        }
+    }
+    data
+}
+
+#[allow(clippy::too_many_arguments)]
 fn response_too_large_frame(
     ver: u8,
     route: RouteChannel,
@@ -1126,29 +1213,47 @@ fn response_too_large_frame(
     body_len: usize,
     max_body_len: usize,
     include_structured: bool,
+    tool_result_body: bool,
+    source: &Value,
 ) -> Frame {
-    let message = format!(
-        "tool response serialized to {body_len} bytes, exceeding the daemon transport limit of {max_body_len} bytes; re-run with a narrower range, a smaller limit, or offset+limit paging; output over {} MiB cannot cross the daemon transport",
-        transport_limit_mib(max_body_len)
-    );
-    // Never copy the original response id or data into this backstop. Its bounded
-    // fields make the fallback frame independent of the oversized source payload.
+    let message = transport_limit_message(body_len, max_body_len);
     let response = Response::error_with_data(
         format!("subc-{}-{corr}", route.channel),
         RESPONSE_TOO_LARGE_CODE,
         message.clone(),
-        serde_json::json!({
-            "complete": false,
-            "truncated": true,
-            "truncation_reason": TRANSPORT_TRUNCATION_REASON,
-        }),
+        truncation_data(source),
     );
     let result = ToolCallResult {
         text: message,
         response,
     };
-    let body = serialize_tool_response_body(&result, include_structured)
-        .expect("fixed response_too_large envelope must serialize");
+    let mut body = serialize_tool_response_body_with_text(
+        &result,
+        include_structured,
+        &result.text,
+        false,
+        tool_result_body,
+    )
+    .expect("fixed response_too_large envelope must serialize");
+    // Small caller-configured test limits need not fit every capture path.
+    if body.len() > max_body_len {
+        let mut minimal = result;
+        minimal.response.data = Response::error_with_data(
+            &minimal.response.id,
+            RESPONSE_TOO_LARGE_CODE,
+            &minimal.text,
+            truncation_data(&Value::Null),
+        )
+        .data;
+        body = serialize_tool_response_body_with_text(
+            &minimal,
+            include_structured,
+            &minimal.text,
+            false,
+            tool_result_body,
+        )
+        .expect("minimal response_too_large envelope must serialize");
+    }
     debug_assert!(
         body.len() <= max_body_len,
         "fixed response_too_large envelope must fit the effective body limit"
@@ -1163,6 +1268,88 @@ fn response_too_large_frame(
         body,
     )
     .expect("fixed response_too_large envelope must fit the protocol frame limit")
+}
+
+fn oversized_client_reply(
+    frame: &Frame,
+    body: &[u8],
+    tool_result_body: bool,
+) -> Result<Frame, SubcError> {
+    // Skip the potentially huge content parts rather than allocating a second
+    // copy of the returned output just to find the status fields.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ToolEnvelope<'a> {
+        #[serde(borrow)]
+        structured_content: Option<Recovery<'a>>,
+        #[serde(rename = "isError")]
+        _is_error: bool,
+        #[serde(rename = "content")]
+        _content: serde::de::IgnoredAny,
+        error_code: Option<serde::de::IgnoredAny>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Recovery<'a> {
+        #[serde(borrow)]
+        task_id: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        status: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        exit_code: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        output_path: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        stderr_path: Option<&'a serde_json::value::RawValue>,
+    }
+    let header = &frame.header;
+    if header.ty == FrameType::Response {
+        if let Ok(envelope) = serde_json::from_slice::<ToolEnvelope>(body) {
+            let include_structured = envelope.structured_content.is_some();
+            let source = envelope
+                .structured_content
+                .map(|data| {
+                    let map = [
+                        ("task_id", data.task_id),
+                        ("status", data.status),
+                        ("exit_code", data.exit_code),
+                        ("output_path", data.output_path),
+                        ("stderr_path", data.stderr_path),
+                    ]
+                    .into_iter()
+                    .filter_map(|(key, raw)| {
+                        let raw = raw?.get();
+                        if raw.len() > RECOVERY_FIELD_MAX_BYTES * 6 + 2 {
+                            return None;
+                        }
+                        let value = serde_json::from_str(raw).ok()?;
+                        Some((key.to_owned(), value))
+                    })
+                    .collect();
+                    Value::Object(map)
+                })
+                .unwrap_or(Value::Null);
+            return Ok(response_too_large_frame(
+                header.ver,
+                super::route_key(header.channel, header.epoch),
+                header.corr,
+                header.flags,
+                body.len(),
+                CLIENT_REPLY_BODY_LIMIT,
+                include_structured,
+                tool_result_body || envelope.error_code.is_some(),
+                &source,
+            ));
+        }
+    }
+    build_error_frame(
+        header.ver,
+        header.channel,
+        header.epoch,
+        header.corr,
+        header.flags,
+        RESPONSE_TOO_LARGE_CODE,
+        &transport_limit_message(body.len(), CLIENT_REPLY_BODY_LIMIT),
+    )
 }
 
 // LLM runners show the model only an ordinary call's text, so their replies
@@ -1277,7 +1464,7 @@ pub(super) fn build_tool_response_frame(
         flags,
         result,
         policy,
-        MAX_FRAME_BODY_LEN as usize,
+        CLIENT_REPLY_BODY_LIMIT,
     )
 }
 
@@ -1359,8 +1546,13 @@ pub(super) fn build_tool_response_frame_with_limit(
     };
     let trust = policy.trust;
     if !policy.tool_result_body {
+        let legacy_limit = if policy.model_only {
+            MAX_FRAME_BODY_LEN as usize
+        } else {
+            max_body_len
+        };
         let frame =
-            build_legacy_tool_response_frame(ver, route, corr, flags, result, trust, max_body_len)?;
+            build_legacy_tool_response_frame(ver, route, corr, flags, result, trust, legacy_limit)?;
         // The ledger retains the full legacy frame. Only the final writer sees
         // the runner's projection, just as it does for tool-result/v1 replies.
         let projection = policy
@@ -1397,8 +1589,17 @@ pub(super) fn build_tool_response_frame_with_limit(
                 .collect()
         })
         .unwrap_or_default();
-    let frame =
-        build_legacy_tool_response_frame(ver, route, corr, flags, &source, trust, max_body_len)?;
+    // This legacy copy is for the ledger, not the client. The projected result
+    // has its own limit and is checked again at the writer.
+    let frame = build_legacy_tool_response_frame(
+        ver,
+        route,
+        corr,
+        flags,
+        &source,
+        trust,
+        MAX_FRAME_BODY_LEN as usize,
+    )?;
     if let Some(parts) = source
         .response
         .data
@@ -1456,7 +1657,7 @@ fn build_legacy_tool_response_frame(
     )
     .map_err(SubcError::Json)?;
 
-    if effective_max_body_len < MAX_FRAME_BODY_LEN as usize && body.len() > effective_max_body_len {
+    if body.len() > effective_max_body_len {
         return Ok(response_too_large_frame(
             ver,
             route,
@@ -1465,10 +1666,12 @@ fn build_legacy_tool_response_frame(
             body.len(),
             effective_max_body_len,
             include_structured,
+            false,
+            &result.response.data,
         ));
     }
 
-    match Frame::build_with_version(
+    Frame::build_with_version(
         ver,
         FrameType::Response,
         flags,
@@ -1476,27 +1679,8 @@ fn build_legacy_tool_response_frame(
         route.epoch,
         corr,
         body,
-    ) {
-        Ok(frame) => Ok(frame),
-        Err(FrameBuildError::BodyExceedsMax { body_len, max }) => Ok(response_too_large_frame(
-            ver,
-            route,
-            corr,
-            flags,
-            body_len,
-            max as usize,
-            include_structured,
-        )),
-        Err(FrameBuildError::BodyTooLarge { body_len }) => Ok(response_too_large_frame(
-            ver,
-            route,
-            corr,
-            flags,
-            body_len,
-            MAX_FRAME_BODY_LEN as usize,
-            include_structured,
-        )),
-    }
+    )
+    .map_err(SubcError::FrameBuild)
 }
 
 fn retained_tool_result(body: &[u8]) -> Result<ToolCallResult, SubcError> {
@@ -1610,11 +1794,19 @@ fn build_result_body_frame(
     .map_err(SubcError::Json)?;
     // The result contract is strictly below 3 MiB, independently of the transport cap.
     if body.len() >= super::result_body::MAX_RESULT_BYTES || body.len() > max_body_len {
-        let response = super::result_body::too_large(
+        let mut response = super::result_body::too_large(
             "response_too_large",
             body.len(),
             "narrow the call with paths, pattern, or offset/limit",
         );
+        if result.response.data["task_id"].is_string() {
+            if let (Value::Object(fields), Some(data)) = (
+                truncation_data(&result.response.data),
+                response.data.as_object_mut(),
+            ) {
+                data.extend(fields);
+            }
+        }
         result = ToolCallResult {
             text: response.data["message"].as_str().unwrap().into(),
             response,

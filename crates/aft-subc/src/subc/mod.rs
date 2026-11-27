@@ -6768,7 +6768,7 @@ where
             if !queued.begin_ack_write() {
                 continue;
             }
-            queued.project_tool_result().map_err(|error| {
+            queued.prepare_client_delivery().map_err(|error| {
                 metrics.close_shell_reply_connection(true);
                 subc_transport::FrameIoError::Io(io::Error::other(error.to_string()))
             })?;

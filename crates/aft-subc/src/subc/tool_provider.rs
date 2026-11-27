@@ -1989,7 +1989,7 @@ fn custody_operation(name: &str) -> bool {
 
 /// The largest body a role reply may carry: one subc frame. Withdraw answers
 /// and late-results pages are bounded by it, never by the tool-response limit.
-pub(super) const ROLE_REPLY_BODY_LIMIT: usize = subc_protocol::MAX_FRAME_BODY_LEN as usize;
+pub(super) const ROLE_REPLY_BODY_LIMIT: usize = super::wire::CLIENT_REPLY_BODY_LIMIT;
 
 /// A custody request whose caller checks passed and that now needs the ledger.
 enum Custody {
