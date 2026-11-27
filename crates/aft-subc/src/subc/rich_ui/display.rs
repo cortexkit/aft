@@ -33,6 +33,15 @@ struct Writer {
     store: store::Store,
 }
 static SENDER: OnceLock<Writer> = OnceLock::new();
+
+#[cfg(test)]
+static EMPTY_OUTBOX_SCANNED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[cfg(test)]
+pub(crate) async fn wait_for_empty_outbox_scan_for_test() {
+    EMPTY_OUTBOX_SCANNED.notified().await;
+}
+
 type Captures = Mutex<HashMap<String, Arc<Mutex<Capture>>>>;
 static CALLS: LazyLock<Captures> = LazyLock::new(Default::default);
 thread_local! { static ACTIVE: RefCell<Option<Arc<Mutex<Capture>>>> = const { RefCell::new(None) }; }
@@ -998,6 +1007,12 @@ async fn next_display_entry(
                 return None;
             }
         };
+        // The guard from the empty scan is no longer held. The isolated
+        // startup fixture can admit its own record before the sender wakes.
+        #[cfg(test)]
+        if next.is_none() {
+            EMPTY_OUTBOX_SCANNED.notify_one();
+        }
         // Adding entries to the outbox signals the channel even during the
         // scan above. One wake is enough to drain all currently due entries.
         let wake = match next {

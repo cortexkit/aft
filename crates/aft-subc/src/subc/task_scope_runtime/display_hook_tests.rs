@@ -193,6 +193,9 @@ async fn assert_publications(storage: &Path) {
     use crate::db::display_records;
     use rich_ui::outbox::{ceilings, Identity};
 
+    // The fixture admits directly without waking the sender. Wait for its
+    // startup scan so the real publisher below controls the only outbox use.
+    rich_ui::display::wait_for_empty_outbox_scan_for_test().await;
     let pin = tool_views::SHIPPED.first_key_value().unwrap().0;
     let (id, expected) = rich_ui::display::with_outbox(|outbox| {
         let now = Instant::now();
@@ -218,6 +221,27 @@ async fn assert_publications(storage: &Path) {
 
     let hooks = late_result_bus::hooks().expect("daemon startup registered the hooks");
     let ready = ReadyEvents::default();
+    let (held, locked) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        rich_ui::display::with_outbox(|_| {
+            held.send(()).unwrap();
+            released
+                .recv_timeout(Duration::from_secs(5))
+                .expect("publish_one must not wait for the outbox");
+        })
+        .expect("the startup scan has released the outbox");
+    });
+    locked.await.unwrap();
+    display::publish_one(&ready, Some(hooks)).await;
+    assert!(ready.0.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(
+        (hooks.take_due_read)(),
+        Some((id.clone(), expected.clone()))
+    );
+
     display::publish_one(&ready, Some(hooks)).await;
     let body = display::body(&id).unwrap();
     assert_ne!(id.as_bytes(), body);
