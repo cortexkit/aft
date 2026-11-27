@@ -17885,6 +17885,8 @@ mod watch_scan;
 
 #[path = "verified_kill.rs"]
 mod verified_kill;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use verified_kill::install_kill_signal_gate_for_test;
 pub(super) use verified_kill::log_bash_kill;
 pub use verified_kill::stop_tasks_in_parallel;
 #[cfg(any(test, feature = "test-support"))]
@@ -17893,10 +17895,6 @@ use verified_kill::{
     close_pty_master, finished_group_is_still_the_tasks, record_group_check,
     settle_killed_process_group,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use verified_kill::install_kill_signal_gate_for_test;
-#[cfg(test)]
-pub(crate) use verified_kill::KILL_PANICS;
 
 #[path = "pty_input_write.rs"]
 mod pty_input_write;

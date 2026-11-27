@@ -98,12 +98,17 @@ impl GroupEvidence {
     }
 
     /// Whether the task's recorded leader (the process whose pid is the group
-    /// number) is still running in the group with its saved start.
+    /// number) is still running in the group with its saved start. Unlike
+    /// group proof, an exited leader that is not reaped yet (a zombie) counts
+    /// as gone here: it still pins the group number, so it proves the group,
+    /// but it can no longer act on a hangup, and a kill that hangs it up would
+    /// claim an exit the command made on its own.
     #[cfg(unix)]
     pub(super) fn leader_running(&self) -> bool {
         self.identities.iter().any(|identity| {
             i32::try_from(identity.pid) == Ok(self.pgid)
                 && super::super::process::is_running_in_group(identity, self.pgid)
+                && !super::super::process::has_exited(identity.pid)
         })
     }
 
@@ -1330,10 +1335,7 @@ mod tests {
             .unwrap();
         let task = registry.task(&task_id).unwrap();
         let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
-        super::super::KILL_PANICS
-            .lock()
-            .unwrap()
-            .insert(task_id.clone());
+        KILL_PANICS.lock().unwrap().insert(task_id.clone());
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             registry.kill(&task_id, "session")
         }));
@@ -1367,9 +1369,8 @@ mod tests {
         false
     }
 
-    /// A leader that has exited but is not reaped yet (a zombie) is not
-    /// running: it neither proves its group as a running leader nor gets
-    /// hung up.
+    /// A leader that has exited but is not reaped yet (a zombie) is not a
+    /// running leader, so the kill neither commits for it nor hangs it up.
     #[cfg(unix)]
     #[test]
     fn a_zombie_leader_is_not_running() {
@@ -1398,10 +1399,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let running = evidence.leader_running();
-        let in_group = super::super::super::process::is_running_in_group(&identity, pid as i32);
+        // Unreaped, it still pins the group number, so it still proves it.
+        let proven = evidence.proven();
         let _ = leader.wait();
         assert!(!running, "a zombie leader was taken as running");
-        assert!(!in_group, "a zombie was taken as running in its group");
+        #[cfg(target_os = "linux")]
+        assert!(proven, "an unreaped leader stopped proving its group");
+        let _ = proven;
     }
 
     /// The mark that lets a kill's own poll past the in-flight deferral is
