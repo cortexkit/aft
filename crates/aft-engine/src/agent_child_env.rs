@@ -807,9 +807,13 @@ pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
     }
 }
 
-fn scrub_shim_launch_environment(environment: &mut HashMap<String, String>, _windows: bool) {
+fn scrub_shim_launch_environment(environment: &mut HashMap<String, String>, windows: bool) {
     for key in crate::gh_shim_worker_broker::CHILD_KEYS {
         environment.remove(key);
+    }
+    if windows {
+        environment
+            .retain(|key, _| !key.eq_ignore_ascii_case(crate::gh_shim::trust_root::ANCHOR_ENV));
     }
 }
 
