@@ -1618,6 +1618,168 @@ fn read_worker_stamp() -> ScopeStamp {
     scope
 }
 
+fn codemode_run_stamp(
+    parent: &ScopeStamp,
+    attributes: subc_protocol::scope::ScopeAttributes,
+) -> ScopeStamp {
+    use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent};
+    ScopeStamp::new(
+        parent.owner.clone(),
+        "codemode-run",
+        3,
+        ScopeKind::Ephemeral,
+    )
+    .with_parent(Some(ScopeParent::new(
+        parent.owner.clone(),
+        parent.scope_ref.clone(),
+        parent.scope_epoch,
+    )))
+    .with_parent_state(Some(ParentState::Linked))
+    .with_attributes(attributes.with_run_id(Some("program-a".into())))
+    .with_owner_authorized(true)
+    .with_expires_at_ms(Some(crate::db::call_ledger::now_ms() as u64 + 60_000))
+}
+
+fn issue_comment_params(ticket: &str) -> Value {
+    let mut params = bot_params(ticket, "codemode-issue-comment");
+    params["request"]["action"] = json!("issue comment");
+    params["request"]["body"] = json!({"body":"fixture comment"});
+    params["request"]["repository"] = json!("cortexkit/aft");
+    params
+}
+
+#[test]
+fn codemode_gh_head_read_delegates_in_either_order_with_bot_comment() {
+    use crate::gh_shim_speech::{model::LaunchAuthority, service};
+    use subc_protocol::scope::ScopeAttributes;
+    let root = tempfile::tempdir().unwrap();
+    let session = "codemode-head-read-comment";
+    let head = delegating_stamp();
+    let run = codemode_run_stamp(
+        &head,
+        ScopeAttributes::new().with_agent_id(head.attributes.agent_id.clone()),
+    );
+    let mut routes = scopes_for(session, Some(head.clone()));
+    let head_origin = launch_origin();
+    let run_origin = crate::gh_shim_speech::model::RouteOrigin {
+        channel: 2,
+        ..head_origin.clone()
+    };
+    routes.push_origin(head_origin.clone(), Some(head.clone()));
+    routes.push_origin(run_origin.clone(), Some(run.clone()));
+    let launch = LaunchAuthority::codemode(
+        head.clone(),
+        run.clone(),
+        Some(run_origin),
+        Some(head_origin),
+    )
+    .unwrap();
+    for operations in [
+        [SESSION_CONTEXT_OPERATION, BOT_REQUEST_OPERATION],
+        [BOT_REQUEST_OPERATION, SESSION_CONTEXT_OPERATION],
+    ] {
+        let seed = service::LaunchSeed {
+            launch: Ok(launch.clone()),
+            lifecycle: Some(run.clone()),
+            session: session.into(),
+            harness: "pi".into(),
+            project_root: "/project".into(),
+        };
+        let ticket = service::with_launch(Some(seed), root.path(), || {
+            crate::gh_shim_ticket::ScopedTicket::issue(session, "call", "/project")
+        });
+        let value = ticket.value().unwrap();
+        let transport = FakeTransport::scoped();
+        for operation in operations {
+            let params = if operation == SESSION_CONTEXT_OPERATION {
+                json!({"ticket":value})
+            } else {
+                issue_comment_params(value)
+            };
+            let (reply, _) = run_with_scopes(&transport, operation, params, &routes);
+            assert!(reply.ok, "{operation}: {:?}", reply.data);
+            if operation == SESSION_CONTEXT_OPERATION {
+                // The shim delegates to native gh for a head instead of issuing read_request.
+                assert_eq!(reply.data["head"], true, "{operations:?}");
+                assert_eq!(reply.data["worker"], false, "{operations:?}");
+            }
+        }
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].2["arguments"]["request"]["action"],
+            "issue comment"
+        );
+        assert_eq!(transport.plexus_scopes(), vec![Some(scope_selector(&head))]);
+    }
+}
+
+#[test]
+fn codemode_gh_worker_run_keeps_scoped_reads_and_refuses_bot_comment() {
+    use subc_protocol::scope::ScopeAttributes;
+    let session = "codemode-worker-read-comment";
+    let worker = read_worker_stamp();
+    let run = codemode_run_stamp(
+        &worker,
+        ScopeAttributes::new().with_on_behalf_of_agent(Some("agent-fixture".into())),
+    );
+    let ticket = crate::bash_background::registry::with_scope_spawn(Some(run), || {
+        crate::gh_shim_ticket::ScopedTicket::issue(session, "call", "/project")
+    });
+    let value = ticket.value().unwrap();
+    let routes = scopes_for(session, Some(worker.clone()));
+    let transport = FakeTransport::scoped();
+    let (context, _) = run_with_scopes(
+        &transport,
+        SESSION_CONTEXT_OPERATION,
+        json!({"ticket":value}),
+        &routes,
+    );
+    assert!(context.ok, "{:?}", context.data);
+    assert_eq!(context.data["worker"], true);
+    assert_eq!(context.data["head"], false);
+    let (refusal, _) = run_with_scopes(
+        &transport,
+        BOT_REQUEST_OPERATION,
+        issue_comment_params(value),
+        &routes,
+    );
+    assert!(!refusal.ok);
+    assert_eq!(
+        refusal.data["refusal_code"],
+        crate::gh_shim_speech::WORKER_WRITE_CODE
+    );
+
+    let head_routes = scopes_for(session, Some(delegating_stamp()));
+    let (context, _) = run_with_scopes(
+        &transport,
+        SESSION_CONTEXT_OPERATION,
+        json!({"ticket":value}),
+        &head_routes,
+    );
+    assert_eq!(context.data["worker"], true);
+    let (refusal, _) = run_with_scopes(
+        &transport,
+        READ_REQUEST_OPERATION,
+        read_params(value),
+        &head_routes,
+    );
+    assert_eq!(refusal.data["refusal_code"], "agent_identity_required");
+    assert!(transport.calls().is_empty());
+
+    let (read, _) = run_with_scopes(
+        &transport,
+        READ_REQUEST_OPERATION,
+        read_params(value),
+        &routes,
+    );
+    assert!(read.ok, "{:?}", read.data);
+    assert_eq!(
+        transport.plexus_scopes(),
+        vec![Some(scope_selector(&worker))]
+    );
+}
+
 #[tokio::test]
 async fn read_bulk_selection_follows_each_routes_live_advertisement() {
     let description = Arc::new(Mutex::new(json!({})));
@@ -2134,22 +2296,11 @@ async fn worker_and_parented_ephemeral_writes_have_the_same_specific_refusal() {
 
 #[tokio::test]
 async fn validated_head_codemode_is_not_a_worker_write_but_invalid_head_is() {
-    use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent};
     let head = delegating_stamp();
-    let run = ScopeStamp::new(head.owner.clone(), "codemode-run", 3, ScopeKind::Ephemeral)
-        .with_parent(Some(ScopeParent::new(
-            head.owner.clone(),
-            head.scope_ref.clone(),
-            head.scope_epoch,
-        )))
-        .with_parent_state(Some(ParentState::Linked))
-        .with_attributes(
-            subc_protocol::scope::ScopeAttributes::new()
-                .with_agent_id(Some("agent-fixture".into()))
-                .with_run_id(Some("program-a".into())),
-        )
-        .with_owner_authorized(true)
-        .with_expires_at_ms(Some(crate::db::call_ledger::now_ms() as u64 + 60_000));
+    let run = codemode_run_stamp(
+        &head,
+        subc_protocol::scope::ScopeAttributes::new().with_agent_id(Some("agent-fixture".into())),
+    );
     let launch = crate::gh_shim_speech::model::LaunchAuthority::codemode(
         head.clone(),
         run.clone(),

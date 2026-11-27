@@ -566,13 +566,10 @@ async fn relay_inner<T: RelayTransport>(
                 path = taken;
                 reply
             }
-            SESSION_CONTEXT_OPERATION => session_context(
-                &redeemed,
-                redeemed
-                    .lifecycle_scope
-                    .as_ref()
-                    .or_else(|| call.route_scopes.for_session(&redeemed.session_id)),
-            ),
+            SESSION_CONTEXT_OPERATION => {
+                let stamp = command_session_scope(&redeemed, call.route_scopes);
+                session_context(&redeemed, stamp)
+            }
             BINDINGS_READ_OPERATION => {
                 path = PATH_UNSCOPED;
                 bindings_read(transport, &redeemed).await
@@ -687,6 +684,25 @@ fn head_scope(stamp: &ScopeStamp) -> bool {
         && crate::access_policy::prefrontal::is_principal(&stamp.owner)
         && stamp.parent.is_none()
         && matches!(stamp.kind, ScopeKind::Head | ScopeKind::Ephemeral)
+}
+
+fn command_session_scope<'a>(
+    ticket: &'a crate::gh_shim_ticket::Redeemed,
+    routes: &'a RouteScopes,
+) -> Option<&'a ScopeStamp> {
+    // The run is linked to the head's scope so it ends when the head does.
+    // That link does not make the head's program a worker.
+    // Only the validated head launch of this exact run can override its lifetime stamp.
+    let head_launch = ticket.launch.as_ref().filter(|launch| {
+        launch.run.is_some()
+            && launch.run == ticket.lifecycle_scope
+            && head_scope(&launch.authority)
+            && launch.validate().is_ok()
+    });
+    head_launch
+        .map(|launch| &launch.authority)
+        .or(ticket.lifecycle_scope.as_ref())
+        .or_else(|| routes.for_session(&ticket.session_id))
 }
 
 pub(crate) fn session_context(
