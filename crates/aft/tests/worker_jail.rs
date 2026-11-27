@@ -122,6 +122,7 @@ struct Jail {
     stream: TcpStream,
     next_corr: u64,
     pending_frames: std::collections::VecDeque<Frame>,
+    policy_root: gh_shim_attached::PolicyRootPeer,
     read_holder: std::sync::Arc<std::sync::Mutex<worker_gh_read::ReadHolder>>,
     read_router: tokio::task::JoinHandle<()>,
 }
@@ -747,16 +748,10 @@ impl Jail {
         .unwrap();
         let hello = next_frame(&mut stream).await;
         assert_eq!(hello.header.ty, FrameType::Hello);
-        let shim_fixture = base.join("xdg/state/cortexkit/aft/gh-shim");
-        let serve_pin = shim_fixture.join("gh-routing-manifest.json").exists();
-        let advertise_pin = serve_pin || base.join("hold-policy-root").exists();
+        let policy_root = gh_shim_attached::PolicyRootPeer::new(&base);
         let ack = ModuleHelloAckBody {
             negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: if advertise_pin {
-                vec!["policy_root.get".into()]
-            } else {
-                vec![]
-            },
+            subc_ops: policy_root.advertised_ops(),
             subc_capabilities: vec![],
             storage: None,
             machine_id: None,
@@ -775,37 +770,6 @@ impl Jail {
         )
         .await
         .unwrap();
-        if serve_pin {
-            let read = next_frame(&mut stream).await;
-            assert_eq!(read.header.ty, FrameType::Request);
-            assert_eq!(read.header.channel, 0);
-            assert_eq!(
-                serde_json::from_slice::<Value>(&read.body).unwrap(),
-                json!({"op":"policy_root.get"})
-            );
-            let reply = worker_gh_read::policy_root_reply();
-            write_frame(
-                &mut stream,
-                &Frame::build(
-                    FrameType::Response,
-                    read.header.flags,
-                    0,
-                    0,
-                    read.header.corr,
-                    serde_json::to_vec(&reply).unwrap(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !shim_fixture.join("trust-root.json").exists() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("AFT did not publish the fixture daemon's pin");
-        }
         let read_holder =
             std::sync::Arc::new(std::sync::Mutex::new(worker_gh_read::ReadHolder::default()));
         let read_router = tokio::spawn(worker_gh_read::serve(listener, read_holder.clone()));
@@ -824,10 +788,14 @@ impl Jail {
             stream,
             next_corr: 100,
             pending_frames: std::collections::VecDeque::new(),
+            policy_root,
             read_holder,
             read_router,
         };
         jail.bind_worker().await;
+        if jail.policy_root.expects_pin_after_worker_bind() {
+            jail.wait_for_fixture_pin().await;
+        }
         jail
     }
 
@@ -975,7 +943,7 @@ impl Jail {
             return self.pending_frames.remove(index).unwrap();
         }
         loop {
-            let frame = next_frame(&mut self.stream).await;
+            let frame = self.next_non_policy_frame().await;
             if frame.header.channel == channel && frame.header.corr == corr {
                 return frame;
             }

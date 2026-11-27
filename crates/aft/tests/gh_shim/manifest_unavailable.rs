@@ -252,6 +252,67 @@ fn gh_shim_final_policy_check_runs_after_the_native_ticket_lookup() {
     assert!(!fixture.record.exists());
 }
 
+fn assert_old_anchor_after_recorded_transition(current: Option<&str>) {
+    let fixture = Fixture::new();
+    fixture.activate();
+    let policy_marker = fixture.state.join("trust-root-generation.json");
+    let old_key = "21fe31dfa154a261";
+    let args = [
+        "issue",
+        "comment",
+        "1",
+        "--body",
+        "not native",
+        "-R",
+        "outside/unbound",
+    ];
+    let run = || {
+        fixture
+            .command(&args, true)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .output()
+            .unwrap()
+    };
+    // The cached trust file and the shell anchor both carry generation 1.
+    // A benign rollback of the daemon generation does not retire its key.
+    fs::write(
+        &policy_marker,
+        serde_json::to_vec(
+            &json!({"generation": 2, "current_key_id": old_key, "previous_key_ids": []}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let allowed = run();
+    assert_eq!(allowed.status.code(), Some(73), "{allowed:?}");
+    fs::remove_file(&fixture.record).unwrap();
+
+    // Model a durable history update followed by a failed root-file update.
+    fs::write(
+        &policy_marker,
+        serde_json::to_vec(
+            &json!({"generation": 2, "current_key_id": current, "previous_key_ids": [old_key]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run();
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    assert_eq!(output.stderr, UNPINNED.as_bytes());
+    assert!(!fixture.record.exists());
+}
+
+#[test]
+fn gh_shim_recorded_rotation_refuses_an_old_anchor_after_partial_publication() {
+    assert_old_anchor_after_recorded_transition(Some("0123456789abcdef"));
+}
+
+#[test]
+fn gh_shim_recorded_clear_refuses_an_old_anchor_after_partial_publication() {
+    assert_old_anchor_after_recorded_transition(None);
+}
+
 #[test]
 fn gh_shim_manifest_unavailable_pin_removed_after_acceptance_refuses_writes() {
     let fixture = Fixture::new();

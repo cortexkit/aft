@@ -108,6 +108,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gh_shim_bulk_retirements_cannot_evict_the_just_superseded_key() {
+        let mut history = History::default();
+        let old = crate::gh_shim::tests::pin_for(&[42; 32]);
+        let mut new = crate::gh_shim::tests::pin_for(&[43; 32]);
+        new.retired_key_ids = (0..PAST_KEYS).map(|id| format!("{id:016x}")).collect();
+        history.advance(Some(&old), 12).unwrap();
+        history.advance(Some(&new), 13).unwrap();
+        assert_eq!(history.previous_key_ids.len(), PAST_KEYS);
+        assert!(history.advance(Some(&old), 12).is_err());
+    }
+
+    #[test]
     fn gh_shim_keys_evicted_from_bounded_history_count_as_never_seen() {
         let mut history = History::default();
         let pins: Vec<_> = (0..=PAST_KEYS + 1)

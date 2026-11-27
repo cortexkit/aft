@@ -12,6 +12,7 @@ pub(super) struct ReadHolder {
     pub binds: HashMap<String, ScopeStamp>,
     pub calls: Vec<Value>,
     pub dials: Vec<Value>,
+    pub manifest_dials: usize,
     pub hold_reads: Option<Arc<tokio::sync::Notify>>,
     pub results: VecDeque<Value>,
 }
@@ -73,6 +74,11 @@ async fn connection(mut stream: TcpStream, holder: Arc<Mutex<ReadHolder>>) {
             FrameType::Request => {
                 let body: Value = serde_json::from_slice(&frame.body).unwrap();
                 if header.channel == 0 && body["op"] == "route.open" {
+                    if body["target"]
+                        == json!({"kind":"management_surface","module_id":"claustrum"})
+                    {
+                        holder.lock().unwrap().manifest_dials += 1;
+                    }
                     let selector = &body["scope"];
                     let plexus = body["target"]
                         == serde_json::to_value(RouteTarget::ToolProvider {
