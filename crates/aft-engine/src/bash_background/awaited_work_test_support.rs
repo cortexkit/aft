@@ -56,6 +56,19 @@ impl BgTaskRegistry {
         self.set_awaited_marker_for_test(key, State::FallbackCancel);
     }
 
+    pub(crate) fn set_awaited_notice_owner_for_test(&self, key: &str) {
+        let task = self.task(key).unwrap();
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task.lock_state().unwrap();
+        state.metadata.launching_identity = Some(crate::bash_background::TaskIdentity {
+            principal: Some("reserved:broca".into()),
+            harness: "runner".into(),
+            session: task.session_id.clone(),
+        });
+        self.persist_task_locked(&task, &state.metadata, &mut db)
+            .unwrap();
+    }
+
     pub(crate) fn set_awaited_cleanup_age_and_scope_for_test(
         &self,
         key: &str,

@@ -120,12 +120,6 @@ pub(crate) fn state_for_spawn() -> Option<State> {
 }
 
 impl BgTaskRegistry {
-    pub(crate) fn awaited_cleanup_age(&self, task: &BgTask) -> Duration {
-        task.lock_state().map_or(Duration::MAX, |state| {
-            Duration::from_millis(unix_millis().saturating_sub(state.metadata.started_at))
-        })
-    }
-
     pub(crate) fn watch_awaited_scope_ends(&self) -> tokio::sync::watch::Receiver<()> {
         self.inner.awaited_scope_ends.subscribe()
     }
@@ -297,11 +291,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) async fn settle_missing_awaited(
-        &self,
-        listed: Arc<HashSet<String>>,
-        service: Arc<Service>,
-    ) {
+    pub(crate) async fn settle_missing_awaited(&self, listed: Arc<HashSet<String>>) {
         let registry = self.clone();
         let Ok(tasks) = tokio::task::spawn_blocking(move || registry.task_arcs()).await else {
             return;
@@ -312,7 +302,7 @@ impl BgTaskRegistry {
             if batch.is_empty() {
                 break;
             }
-            let (registry, listed, service) = (self.clone(), listed.clone(), service.clone());
+            let (registry, listed) = (self.clone(), listed.clone());
             let _ = tokio::task::spawn_blocking(move || {
                 for task in batch {
                     if listed.contains(&task.task_id) {
@@ -322,12 +312,6 @@ impl BgTaskRegistry {
                     let Ok(mut state) = task.lock_state() else {
                         continue;
                     };
-                    if state.metadata.has_pending_fallback_cancel() {
-                        drop(state);
-                        registry.attach_awaited_work(&service);
-                        registry.send_awaited(&task, Event::CleanupOpen, None, true);
-                        continue;
-                    }
                     if !state.awaited_runtime.opening
                         && state.metadata.awaited_work.is_some()
                         && !matches!(state.metadata.awaited_work, Some(State::Settled))
@@ -398,7 +382,12 @@ impl BgTaskRegistry {
         if matches!(metadata.awaited_work, Some(State::Cancel)) {
             self.send_awaited(&task, Event::Cancel, None, persisted);
         } else if metadata.has_pending_fallback_cancel() {
-            self.send_awaited(&task, Event::CleanupOpen, None, persisted);
+            self.send_awaited(
+                &task,
+                Event::CleanupOpen { listed: recovering },
+                None,
+                persisted,
+            );
         }
         if metadata.status.is_terminal() && !matches!(metadata.awaited_work, Some(State::Cancel)) {
             if let Some(service) = self.inner.awaited_work.lock().upgrade() {

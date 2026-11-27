@@ -76,6 +76,18 @@ impl Store {
         .await
     }
 
+    pub(super) async fn commit_awaited_notice(&self, id: String) -> Result<bool, &'static str> {
+        self.run(move |conn| {
+            display_records::commit_awaited_notice(conn, &id, display_records::now_ms())
+        })
+        .await
+    }
+
+    pub(super) async fn discard_unlinked_notice(&self, id: String) -> Result<(), &'static str> {
+        self.run(move |conn| display_records::discard_unlinked_notice(conn, &id))
+            .await
+    }
+
     pub(super) async fn restore_awaited_count(&self) -> Result<usize, &'static str> {
         let pending = self.pending_awaited.clone();
         self.run(move |conn| {

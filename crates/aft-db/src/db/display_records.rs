@@ -208,15 +208,40 @@ pub fn prepare_awaited_notice(
     persist_awaited_notice(conn, &format!("draft:{id}"), bytes, now_ms)
 }
 
+pub fn commit_awaited_notice(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<bool> {
+    if !available(conn)? {
+        return Ok(false);
+    }
+    if read(conn, id, now_ms)?.is_some() {
+        return Ok(true);
+    }
+    // A zero announcement timestamp marks a readable card that does not yet
+    // have a pointer in an orchestrator request. It is not a pending wake.
+    Ok(conn.execute(
+        &format!(
+            "UPDATE display_records SET record_id=?1, announced_at_ms=0, wake_acked_at_ms=?3
+            WHERE record_id=?2 AND {EXPIRY} >= ?3
+              AND NOT EXISTS (SELECT 1 FROM display_records WHERE record_id=?1)"
+        ),
+        params![id, format!("draft:{id}"), now_ms],
+    )? == 1)
+}
+
 pub fn activate_awaited_notice(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<()> {
     if available(conn)? {
         conn.execute(
-            &format!(
-                "UPDATE display_records SET record_id=?1 WHERE record_id=?2 AND {EXPIRY} >= ?3
-             AND NOT EXISTS (SELECT 1 FROM display_records WHERE record_id=?1)"
-            ),
-            params![id, format!("draft:{id}"), now_ms],
+            "UPDATE display_records SET announced_at_ms=?2, wake_acked_at_ms=NULL
+            WHERE record_id=?1 AND announced_at_ms=0",
+            params![id, now_ms],
         )?;
+    }
+    Ok(())
+}
+
+pub fn discard_unlinked_notice(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    if available(conn)? {
+        conn.execute("DELETE FROM display_records WHERE record_id=?1 OR (record_id=?2 AND announced_at_ms=0)",
+            params![format!("draft:{id}"), id])?;
     }
     Ok(())
 }

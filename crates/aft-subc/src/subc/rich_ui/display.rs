@@ -25,9 +25,9 @@ mod notice_pull;
 mod store;
 use counters::{count, Counter::*};
 pub(crate) use notice_pull::publish_awaited_notice;
-pub(in crate::subc) use notice_pull::{
-    activate_awaited_notice, prepare_awaited_notice, stage_notice,
-};
+#[cfg(all(test, unix))]
+pub(in crate::subc) use notice_pull::TestAwaitedCards;
+pub(in crate::subc) use notice_pull::{stage_notice, AwaitedCards};
 
 struct Writer {
     outbox: Mutex<Outbox>,

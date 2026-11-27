@@ -102,7 +102,9 @@ mod bash_background {
             let (key, label, index) = match req {
                 Request::List(_) => {
                     if self.warming.load(Ordering::SeqCst) {
-                        return Err(Failure::Refused("module_warming".into()));
+                        return Err(Failure::Refused(
+                            subc_protocol::error_codes::BIND_BUSY.into(),
+                        ));
                     }
                     let mut listing = examples["list"][0].clone();
                     let item = listing["items"][0].clone();
@@ -129,10 +131,15 @@ mod bash_background {
                         .filter(|key| !params.open.contains(key))
                         .cloned()
                         .collect();
+                    let unknown: Vec<_> = params
+                        .open
+                        .iter()
+                        .filter(|key| !listed.contains(key))
+                        .collect();
+                    reply["unknown"] = json!(unknown);
                     listed.retain(|key| params.open.contains(key));
                     self.lost.lock().extend(lost.iter().cloned());
                     reply["lost"] = json!(lost);
-                    reply["unknown"] = json!([]);
                     return Ok(serde_json::to_vec(&reply).unwrap());
                 }
                 Request::Open(open) => {
@@ -899,10 +906,14 @@ mod bash_background {
         let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
         wire.warming.store(true, Ordering::SeqCst);
         *service.wire.write() = None;
-        let failure = reconcile(&service, wire.clone(), &executor)
-            .await
-            .unwrap_err();
-        assert!(failure.retry_discovery());
+        let mut observed = None;
+        let first = discover_catalog(&mut observed, "same catalog", async {
+            reconcile(&service, wire.clone(), &executor)
+                .await
+                .map(|()| true)
+        })
+        .await;
+        assert_eq!(first, None);
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
         assert!(
             !restarted
@@ -913,7 +924,13 @@ mod bash_background {
         );
         assert!(calls.try_recv().is_err());
         wire.warming.store(false, Ordering::SeqCst);
-        reconcile(&service, wire, &executor).await.unwrap();
+        let again = discover_catalog(&mut observed, "same catalog", async {
+            reconcile(&service, wire.clone(), &executor)
+                .await
+                .map(|()| true)
+        })
+        .await;
+        assert_eq!(again, Some(true));
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
         assert!(
             matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open.is_empty())
@@ -938,24 +955,35 @@ mod bash_background {
     }
 
     #[tokio::test]
-    async fn awaited_unknown_key_cleanup_expires_using_its_saved_age() {
+    async fn an_old_listed_awaited_cleanup_survives_an_offline_cancel_route() {
         let f = Fixture::new();
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
         registry.seed_awaited_fallback_for_test(&key);
         registry.set_awaited_cleanup_age_and_scope_for_test(
             &key,
-            CLEANUP_LIFETIME - Duration::from_secs(2),
+            CLEANUP_LIFETIME + Duration::from_secs(60),
             call_scope(true),
         );
         let (executor, restarted) = restored(&f);
-        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
-        wire.cancel_unknown.store(true, Ordering::SeqCst);
-        reconcile(&service, wire, &executor).await.unwrap();
+        let (service, wire, mut calls) = fake(Answer::Open, vec![key.clone()]);
+        wire.cancel_offline.store(true, Ordering::SeqCst);
+        *service.wire.write() = None;
+        reconcile(&service, wire.clone(), &executor).await.unwrap();
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
         assert!(
             matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [key.clone()])
         );
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
+        );
+        assert!(wire.listed.lock().contains(&key));
+        assert!(restarted
+            .bash_background()
+            .notice_metadata(&key)
+            .unwrap()
+            .has_pending_fallback_cancel());
+        wire.cancel_offline.store(false, Ordering::SeqCst);
         assert!(
             matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
         );
@@ -965,7 +993,29 @@ mod bash_background {
         )
         .await
         .unwrap();
-        while calls.try_recv().is_ok() {}
+        assert!(!wire.listed.lock().contains(&key));
+        assert!(wire.lost.lock().is_empty());
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn sync_unknown_settles_awaited_cleanup_without_sending_cancel() {
+        let f = Fixture::new();
+        let registry = f.ctx.bash_background();
+        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        registry.seed_awaited_fallback_for_test(&key);
+        let (executor, restarted) = restored(&f);
+        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        reconcile(&service, wire, &executor).await.unwrap();
+        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+        assert!(
+            matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [key.clone()])
+        );
+        assert!(!restarted
+            .bash_background()
+            .notice_metadata(&key)
+            .unwrap()
+            .has_pending_fallback_cancel());
         no_more(&mut calls).await;
     }
 
@@ -976,7 +1026,7 @@ mod bash_background {
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
         registry.seed_awaited_fallback_for_test(&key);
         registry.set_awaited_cleanup_age_and_scope_for_test(&key, Duration::ZERO, call_scope(true));
-        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        let (service, wire, mut calls) = fake(Answer::Open, vec![key.clone()]);
         wire.cancel_unknown.store(true, Ordering::SeqCst);
         reconcile(&service, wire, &f.executor).await.unwrap();
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
@@ -992,6 +1042,68 @@ mod bash_background {
         .await
         .unwrap();
         no_more(&mut calls).await;
+    }
+
+    async fn finish_with_gated_card_rename(miss_deadline: bool) {
+        let f = Fixture::new();
+        let registry = f.ctx.bash_background();
+        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        registry.set_awaited_notice_owner_for_test(&key);
+        let cards = Arc::new(crate::subc::rich_ui::display::TestAwaitedCards::new(
+            f.dir.path().join("cards.db"),
+        ));
+        assert!(cards.read("unwritten".into()).await.is_none());
+        cards.pause_rename.store(true, Ordering::Release);
+        let (mut service, _fake, mut calls) = fake(Answer::Open, Vec::new());
+        Arc::get_mut(&mut service).unwrap().cards = AwaitedCards::Test(cards.clone());
+        registry.attach_awaited_for_test(&service);
+        registry.publish_awaited_for_test(&key);
+        tokio::time::timeout(Duration::from_secs(5), cards.rename_pending.notified())
+            .await
+            .unwrap();
+        let id = cards.staged_id.lock().clone().unwrap();
+        assert!(
+            calls.try_recv().is_err(),
+            "the draft must not be sent as a pointer"
+        );
+        if miss_deadline {
+            tokio::time::advance(CARD_PREPARATION_LIMIT + Duration::from_millis(1)).await;
+        } else {
+            cards.allow_rename.notify_one();
+        }
+        let (Request::Finish(finish), None) = call(&mut calls).await else {
+            panic!("missing finish")
+        };
+        if miss_deadline {
+            assert!(finish.notice_record.is_none());
+            assert!(cards.read(format!("draft:{id}")).await.is_some());
+            cards.allow_rename.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), cards.discarded.notified())
+                .await
+                .unwrap();
+            assert!(cards.read(format!("draft:{id}")).await.is_none());
+            assert!(
+                cards.read(id).await.is_none(),
+                "the unlinked real row must also be deleted"
+            );
+        } else {
+            assert_eq!(finish.notice_record.unwrap().id, id);
+            assert!(
+                cards.read(id).await.is_some(),
+                "the pointed-to bytes must already be committed"
+            );
+        }
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn awaited_finish_waits_for_a_committed_notice_record_before_sending_its_pointer() {
+        finish_with_gated_card_rename(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn awaited_finish_omits_a_slow_notice_record_and_cleans_up_its_late_write() {
+        finish_with_gated_card_rename(true).await;
     }
 }
 
@@ -1010,7 +1122,11 @@ fn awaited_retry_failures_log_at_most_once_per_minute() {
 #[tokio::test(start_paused = true)]
 async fn an_awaited_finish_can_be_built_when_the_card_store_never_answers() {
     let start = tokio::time::Instant::now();
-    let id = card_before_deadline(std::future::pending::<Option<String>>()).await;
+    let id = card_before_deadline(
+        AwaitedCards::Module,
+        std::future::pending::<Option<String>>(),
+    )
+    .await;
     assert!(start.elapsed() <= CARD_PREPARATION_LIMIT + Duration::from_millis(1));
     let service = Service::new("instance");
     let request = service.request_body(
@@ -1022,5 +1138,17 @@ async fn an_awaited_finish_can_be_built_when_the_card_store_never_answers() {
         id,
     );
     assert!(matches!(&request, Request::Finish(params) if params.notice_record.is_none()));
-    assert!(activate_linked_card(&request).is_none());
+    assert!(activate_linked_card(AwaitedCards::Module, &request).is_none());
+}
+
+#[test]
+fn awaited_cleanup_credits_only_intervals_between_unknown_key_replies() {
+    let mut window = UnknownWindow::default();
+    let start = tokio::time::Instant::now();
+    assert!(!window.unknown(start));
+    assert!(!window.unknown(start + CLEANUP_LIFETIME / 2));
+    window.interrupted();
+    let reconnect = start + CLEANUP_LIFETIME * 3;
+    assert!(!window.unknown(reconnect));
+    assert!(window.unknown(reconnect + CLEANUP_LIFETIME / 2));
 }

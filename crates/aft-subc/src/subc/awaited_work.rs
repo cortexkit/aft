@@ -12,6 +12,7 @@ use subc_protocol::scope::{ScopeKind, ScopeSelector, ScopeStamp};
 use subc_protocol::{BindIdentity, RouteTarget};
 use tokio_util::sync::CancellationToken;
 
+use super::rich_ui::display::AwaitedCards;
 use crate::bash_background::registry::{BgCompletion, BgTask};
 use crate::bash_background::{BgTaskRegistry, OpenOutcome};
 use crate::protocol::PushFrame;
@@ -23,6 +24,32 @@ const FIRST_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const CARD_PREPARATION_LIMIT: Duration = Duration::from_millis(50);
 const CLEANUP_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupObservation {
+    Unconfirmed,
+    Open,
+    Ended,
+}
+
+#[derive(Default)]
+struct UnknownWindow {
+    elapsed: Duration,
+    previous: Option<tokio::time::Instant>,
+}
+
+impl UnknownWindow {
+    fn unknown(&mut self, now: tokio::time::Instant) -> bool {
+        if let Some(previous) = self.previous.replace(now) {
+            self.elapsed += now.saturating_duration_since(previous);
+        }
+        self.elapsed >= CLEANUP_LIFETIME
+    }
+
+    fn interrupted(&mut self) {
+        self.previous = None;
+    }
+}
 
 struct RetryLog(Option<tokio::time::Instant>);
 
@@ -62,9 +89,7 @@ enum Failure {
 impl Failure {
     fn retry_discovery(&self) -> bool {
         match self {
-            Self::Refused(code) => {
-                matches!(code.as_str(), "module_warming" | "route_busy" | "busy")
-            }
+            Self::Refused(code) => subc_protocol::error_codes::is_retryable_route_open(code),
             Self::Transport(_) | Self::Unknown(_) => true,
         }
     }
@@ -173,8 +198,11 @@ pub(crate) struct Service {
     runtime: tokio::runtime::Handle,
     wire: parking_lot::RwLock<Option<Arc<dyn Wire>>>,
     registrations: tokio::sync::Mutex<()>,
-    terminal: parking_lot::Mutex<HashSet<String>>,
+    terminal:
+        parking_lot::Mutex<HashMap<String, Option<tokio::sync::watch::Sender<CleanupObservation>>>>,
     progress: parking_lot::Mutex<HashMap<String, CancellationToken>>,
+    #[cfg(all(test, unix))]
+    cards: AwaitedCards,
 }
 
 impl Service {
@@ -186,11 +214,20 @@ impl Service {
             registrations: Default::default(),
             terminal: Default::default(),
             progress: Default::default(),
+            #[cfg(all(test, unix))]
+            cards: Default::default(),
         }
     }
 
     fn wire(&self) -> Option<Arc<dyn Wire>> {
         self.wire.read().clone()
+    }
+
+    fn cards(&self) -> AwaitedCards {
+        #[cfg(all(test, unix))]
+        return self.cards.clone();
+        #[cfg(not(all(test, unix)))]
+        AwaitedCards::Module
     }
 
     async fn call<T: DeserializeOwned>(
@@ -215,15 +252,37 @@ impl Service {
         mut persisted: bool,
     ) {
         let terminal = !matches!(event, Event::Progress(_));
-        let cleanup = matches!(event, Event::CleanupOpen);
+        let cleanup = matches!(event, Event::CleanupOpen { .. });
         let scope_ends = cleanup.then(|| registry.watch_awaited_scope_ends());
+        let (signal, mut observations) = match &event {
+            Event::CleanupOpen { listed } => {
+                let (tx, rx) = tokio::sync::watch::channel(if *listed {
+                    CleanupObservation::Open
+                } else {
+                    CleanupObservation::Unconfirmed
+                });
+                (Some(tx), Some(rx))
+            }
+            _ => (None, None),
+        };
+        let until_ended = observations.clone();
         let token = CancellationToken::new();
         let mut pending_progress = None;
         if terminal {
-            if !self.terminal.lock().insert(key.clone()) {
-                return;
+            match self.terminal.lock().entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(signal);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    if matches!(event, Event::CleanupOpen { listed: true }) {
+                        if let Some(signal) = entry.get() {
+                            signal.send_replace(CleanupObservation::Open);
+                        }
+                    }
+                    return;
+                }
             }
-            if matches!(event, Event::Cancel | Event::CleanupOpen) {
+            if matches!(event, Event::Cancel | Event::CleanupOpen { .. }) {
                 if let Some(progress) = self.progress.lock().remove(&key) {
                     progress.cancel();
                 }
@@ -243,7 +302,9 @@ impl Service {
             let mut delay = FIRST_RETRY_DELAY;
             let mut retry_log = RetryLog::new(!persisted);
             let mut request = None;
+            let mut card_choice = None;
             let mut activation = None;
+            let mut unknown = UnknownWindow::default();
             let sending = async {
             loop {
                 let guard = registry.clone();
@@ -273,11 +334,11 @@ impl Service {
                 let wire = service.wire().filter(|_| persisted);
                 if wire.is_some() && request.is_none() {
                     match service
-                        .request_for(&registry, &task, &key, event.clone(), notice.clone())
+                         .request_for(&registry, &task, &key, event.clone(), notice.clone(), &mut card_choice)
                         .await
                     {
                         Ok(prepared) => {
-                            activation = activate_linked_card(&prepared);
+                             activation = activate_linked_card(service.cards(), &prepared);
                             request = Some(prepared);
                         }
                         Err(error) => retry_log.failure(format_args!(
@@ -292,48 +353,63 @@ impl Service {
                     };
                     match result {
                         Ok(_) => break,
-                        Err(Failure::Refused(code)) if cleanup && code == "unknown_key" => {
+                         Err(Failure::Refused(code)) if cleanup && code == "unknown_key" => {
                             // On another route the timed-out open can still be
                             // committing while its cleanup arrives first.
-                            retry_log.failure(format_args!(
+                             retry_log.failure(format_args!(
                                 "{} waiting for uncertain open of {key}: {code}",
                                 req.method()
-                            ));
+                             ));
+                             let may_expire = observations.as_ref().is_some_and(|rx| *rx.borrow() == CleanupObservation::Unconfirmed);
+                             if may_expire && unknown.unknown(tokio::time::Instant::now()) {
+                                  // Reconciliation may have found that the
+                                  // orchestrator still holds the item. Wait for
+                                  // that observation before expiring its cancel.
+                                 let fence = service.registrations.lock().await;
+                                 if observations.as_ref().is_some_and(|rx| *rx.borrow() == CleanupObservation::Unconfirmed) {
+                                     log::warn!("abandoning uncertain awaited open cleanup for {key}: unknown-key retry window expired");
+                                     return Some(fence);
+                                 }
+                             }
                         }
                         Err(Failure::Refused(code)) => {
                             log::warn!("{} refused for {key}: {code}", req.method());
                             break;
                         }
-                        Err(Failure::Transport(error) | Failure::Unknown(error)) => retry_log
-                            .failure(format_args!(
-                                "{} transport failed for {key}: {error}",
-                                req.method()
-                            )),
+                         Err(Failure::Transport(error) | Failure::Unknown(error)) => {
+                             unknown.interrupted();
+                             retry_log.failure(format_args!(
+                                 "{} transport failed for {key}: {error}",
+                                 req.method()
+                             ));
+                         }
                     }
-                } else if persisted && service.wire().is_none() {
+                 } else if persisted && service.wire().is_none() {
+                     unknown.interrupted();
                     retry_log.failure(format_args!("awaited-work transport unavailable for {key}"));
                 }
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    _ = tokio::time::sleep(delay) => {},
+                 tokio::select! {
+                     _ = token.cancelled() => break,
+                     _ = wait_for_cleanup_change(observations.as_mut()), if cleanup => {
+                         unknown = UnknownWindow::default();
+                         delay = FIRST_RETRY_DELAY;
+                         continue;
+                     }
+                     _ = tokio::time::sleep(delay) => {},
                 }
                 delay = (delay * 2).min(MAX_RETRY_DELAY);
-            }};
-            if let Some(scope_ends) = scope_ends {
-                let (guard, retained) = (registry.clone(), task.clone());
-                let age = tokio::task::spawn_blocking(move || guard.awaited_cleanup_age(&retained))
-                    .await.unwrap_or(CLEANUP_LIFETIME);
+            }
+            None };
+            let _expiry_fence = if let Some(scope_ends) = scope_ends {
                 tokio::select! {
                     biased;
-                    _ = tokio::time::sleep(CLEANUP_LIFETIME.saturating_sub(age)) => {
-                        log::warn!("abandoning uncertain awaited open cleanup for {key}: retry lifetime expired");
-                    }
-                    _ = wait_for_revocation(&registry, &task, scope_ends) => {},
-                    _ = sending => {},
+                    _ = wait_for_cleanup_end(until_ended.expect("cleanup observation")) => None,
+                    _ = wait_for_revocation(&registry, &task, scope_ends) => None,
+                    expiry_fence = sending => expiry_fence,
                 }
             } else {
-                sending.await;
-            }
+                sending.await
+            };
             if terminal {
                 // A confirmed link may be announced after finish. Its storage
                 // never delays the orchestrator's release of the worker.
@@ -358,6 +434,7 @@ impl Service {
         key: &str,
         event: Event,
         notice: Option<PushFrame>,
+        card_choice: &mut Option<Option<String>>,
     ) -> std::io::Result<Request> {
         let is_finish = matches!(event, Event::Finish { .. });
         let saved = if is_finish {
@@ -371,11 +448,20 @@ impl Service {
         let id = if let Some(id) = saved {
             id
         } else {
-            let id = if let Some(frame) = notice {
-                card_before_deadline(stage_notice_record(registry.clone(), key.into(), frame)).await
-            } else {
-                None
-            };
+            if card_choice.is_none() {
+                let id = if let Some(frame) = notice {
+                    let cards = self.cards();
+                    card_before_deadline(
+                        cards.clone(),
+                        stage_notice_record(cards, registry.clone(), key.into(), frame),
+                    )
+                    .await
+                } else {
+                    None
+                };
+                *card_choice = Some(id);
+            }
+            let id = card_choice.clone().flatten();
             if is_finish {
                 // A restart must replay the same pointer, even when there was
                 // no room for a card on the original attempt.
@@ -406,7 +492,7 @@ impl Service {
                 more: Some(format!("full output: bash_status({{ taskId: \"{key}\" }})")),
                 notice_record,
             }),
-            Event::Cancel | Event::CleanupOpen => Request::Cancel(CancelParams {
+            Event::Cancel | Event::CleanupOpen { .. } => Request::Cancel(CancelParams {
                 instance: self.instance.clone(),
                 key: key.into(),
             }),
@@ -421,6 +507,24 @@ impl Service {
 
     pub(crate) fn replay_terminal(&self, run: impl FnOnce() + Send + 'static) {
         self.runtime.spawn_blocking(run);
+    }
+}
+
+async fn wait_for_cleanup_change(
+    changes: Option<&mut tokio::sync::watch::Receiver<CleanupObservation>>,
+) {
+    if let Some(changes) = changes {
+        let _ = changes.changed().await;
+    }
+}
+
+async fn wait_for_cleanup_end(mut changes: tokio::sync::watch::Receiver<CleanupObservation>) {
+    loop {
+        if *changes.borrow_and_update() == CleanupObservation::Ended
+            || changes.changed().await.is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -440,27 +544,40 @@ async fn wait_for_revocation(
     }
 }
 
-async fn card_before_deadline<T>(
-    prepare: impl std::future::Future<Output = Option<T>>,
-) -> Option<T> {
-    tokio::time::timeout(CARD_PREPARATION_LIMIT, prepare)
-        .await
-        .ok()
-        .flatten()
+async fn card_before_deadline(
+    cards: AwaitedCards,
+    prepare: impl std::future::Future<Output = Option<String>> + Send + 'static,
+) -> Option<String> {
+    let mut job = tokio::spawn(prepare);
+    match tokio::time::timeout(CARD_PREPARATION_LIMIT, &mut job).await {
+        Ok(result) => result.ok().flatten(),
+        Err(_) => {
+            // SQLite can finish a blocking write after the deadline. The
+            // caller has chosen no pointer; discard any card the job returns.
+            tokio::spawn(async move {
+                if let Ok(Some(id)) = job.await {
+                    cards.discard(id).await;
+                }
+            });
+            None
+        }
+    }
 }
 
-fn activate_linked_card(request: &Request) -> Option<tokio::task::JoinHandle<()>> {
+fn activate_linked_card(
+    cards: AwaitedCards,
+    request: &Request,
+) -> Option<tokio::task::JoinHandle<()>> {
     let pointer = match request {
         Request::Finish(params) => params.notice_record.as_ref(),
         Request::Progress(params) => params.notice_record.as_ref(),
         _ => None,
     }?;
-    Some(super::rich_ui::display::activate_awaited_notice(
-        pointer.id.clone(),
-    ))
+    Some(cards.announce(pointer.id.clone()))
 }
 
 async fn stage_notice_record(
+    cards: AwaitedCards,
     registry: BgTaskRegistry,
     key: String,
     frame: PushFrame,
@@ -476,14 +593,14 @@ async fn stage_notice_record(
     })
     .await
     .ok()??;
-    super::rich_ui::display::prepare_awaited_notice(record).await
+    cards.commit(record).await
 }
 
 #[derive(Clone)]
 pub(crate) enum Event {
     Finish { outcome: Outcome, summary: String },
     Cancel,
-    CleanupOpen,
+    CleanupOpen { listed: bool },
     Progress(String),
 }
 
@@ -699,21 +816,14 @@ async fn discover(path: PathBuf, executor: Arc<super::Executor>, service: Weak<S
                 }
                 if generation.is_none() {
                     observed = Some(catalog);
-                } else if observed.as_ref() != Some(&catalog) {
-                    match refresh(connection, &current, &executor, generation == active).await {
-                        Ok(supported) => {
-                            active = if supported { generation } else { None };
-                            observed = Some(catalog);
-                        }
-                        Err(error) => {
-                            if error.retry_discovery() {
-                                log::debug!("awaited-work discovery will retry: {error:?}");
-                            } else {
-                                log::warn!("awaited-work discovery refused: {error:?}");
-                                observed = Some(catalog);
-                            }
-                        }
-                    }
+                } else if let Some(supported) = discover_catalog(
+                    &mut observed,
+                    catalog,
+                    refresh(connection, &current, &executor, generation == active),
+                )
+                .await
+                {
+                    active = if supported { generation } else { None };
                 }
             } else {
                 consumer = None;
@@ -724,6 +834,31 @@ async fn discover(path: PathBuf, executor: Arc<super::Executor>, service: Weak<S
         }
         drop(current);
         tokio::time::sleep(DISCOVERY_INTERVAL).await;
+    }
+}
+
+async fn discover_catalog<C: PartialEq>(
+    observed: &mut Option<C>,
+    catalog: C,
+    refresh: impl std::future::Future<Output = Result<bool, Failure>>,
+) -> Option<bool> {
+    if observed.as_ref() == Some(&catalog) {
+        return None;
+    }
+    match refresh.await {
+        Ok(supported) => {
+            *observed = Some(catalog);
+            Some(supported)
+        }
+        Err(error) if error.retry_discovery() => {
+            log::debug!("awaited-work discovery will retry: {error:?}");
+            None
+        }
+        Err(error) => {
+            log::warn!("awaited-work discovery refused: {error:?}");
+            *observed = Some(catalog);
+            None
+        }
     }
 }
 
@@ -769,6 +904,14 @@ async fn reconcile(
     let _gate = service.registrations.lock().await;
     let listed: ListReply =
         Service::call(wire.as_ref(), &Request::List(ListParams::default()), None).await?;
+    {
+        let terminal = service.terminal.lock();
+        for item in &listed.items {
+            if let Some(Some(observation)) = terminal.get(&item.key) {
+                observation.send_replace(CleanupObservation::Open);
+            }
+        }
+    }
     let executor = executor.clone();
     let (known, registries) = tokio::task::spawn_blocking(move || {
         let registries: Vec<_> = executor
@@ -800,7 +943,7 @@ async fn reconcile(
     .map_err(|error| Failure::Transport(error.to_string()))?;
     // Terminal retries own their decisions even after removal from the task
     // index. Keep them, and keep uncertain opens that have not appeared in list.
-    let mut keep = service.terminal.lock().clone();
+    let mut keep: HashSet<_> = service.terminal.lock().keys().cloned().collect();
     keep.extend(known.keys().cloned());
     let mut open: Vec<_> = keep.iter().cloned().collect();
     open.sort_unstable();
@@ -814,8 +957,20 @@ async fn reconcile(
     )
     .await?;
     let unknown: HashSet<_> = reply.unknown.into_iter().collect();
+    {
+        let terminal = service.terminal.lock();
+        for key in &keep {
+            if let Some(Some(observation)) = terminal.get(key) {
+                observation.send_replace(if unknown.contains(key) {
+                    CleanupObservation::Ended
+                } else {
+                    CleanupObservation::Open
+                });
+            }
+        }
+    }
     keep.retain(|key| !unknown.contains(key));
-    settle_omitted_items(service, registries, Arc::new(keep)).await;
+    settle_omitted_items(registries, Arc::new(keep)).await;
     let service_for_replay = service.clone();
     let _ = tokio::task::spawn_blocking(move || {
         for (key, registry) in known {
@@ -833,15 +988,9 @@ async fn reconcile(
 // open, and refuses as busy until its store is ready after restart. After both
 // list and sync have succeeded, an omitted item has already ended (or its open
 // never committed); settling locally must not send another notice.
-async fn settle_omitted_items(
-    service: &Arc<Service>,
-    registries: Vec<BgTaskRegistry>,
-    retained: Arc<HashSet<String>>,
-) {
+async fn settle_omitted_items(registries: Vec<BgTaskRegistry>, retained: Arc<HashSet<String>>) {
     for registry in registries {
-        registry
-            .settle_missing_awaited(retained.clone(), service.clone())
-            .await;
+        registry.settle_missing_awaited(retained.clone()).await;
     }
 }
 
