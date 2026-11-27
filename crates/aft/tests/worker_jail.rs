@@ -780,10 +780,7 @@ impl Jail {
                 serde_json::from_slice::<Value>(&read.body).unwrap(),
                 json!({"op":"policy_root.get"})
             );
-            let mut pin: Value = serde_json::from_str(test_helpers::gh_fixture_anchor()).unwrap();
-            let generation = pin.as_object_mut().unwrap().remove("generation").unwrap();
-            pin["retired_key_ids"] = json!([]);
-            let reply = json!({"op":"policy_root.get","pin":pin,"generation":generation});
+            let reply = worker_gh_read::policy_root_reply();
             write_frame(
                 &mut stream,
                 &Frame::build(
@@ -4880,10 +4877,7 @@ async fn gh_shim_router_host_lookup_transport_failures_record_their_stage() {
             )
             .env("XDG_CONFIG_HOME", jail.base.join("xdg/config"))
             .env("AFT_GH_SHIM_STATE_DIR", &state)
-            .env(
-                "AFT_GH_SHIM_TRUST_ANCHOR",
-                test_helpers::gh_fixture_anchor(),
-            )
+            .env("AFT_GH_SHIM_TRUST_ANCHOR", worker_gh_read::TRUST_ANCHOR)
             .env("AFT_GH_SHIM_WORKER", "1")
             .env("AFT_GH_READ_CAPABILITY_FILE", &capability);
         if case != "missing" {

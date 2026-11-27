@@ -160,6 +160,15 @@ async fn connection(mut stream: TcpStream, holder: Arc<Mutex<ReadHolder>>) {
     }
 }
 
+pub(super) const TRUST_ANCHOR: &str = r#"{"key_id":"21fe31dfa154a261","public_key_hex":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","generation":1}"#;
+
+pub(super) fn policy_root_reply() -> Value {
+    let mut pin: Value = serde_json::from_str(TRUST_ANCHOR).unwrap();
+    let generation = pin.as_object_mut().unwrap().remove("generation").unwrap();
+    pin["retired_key_ids"] = json!([]);
+    json!({"op":"policy_root.get","pin":pin,"generation":generation})
+}
+
 pub(super) fn configure(base: &Path, command: &mut Command) {
     use base64::Engine;
     use ring::signature::Ed25519KeyPair;
