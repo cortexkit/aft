@@ -1,6 +1,21 @@
 use super::super::manifest_wire::Envelope;
 use super::*;
 
+#[test]
+fn gh_shim_manifest_sync_notes_missing_vault_list_once_per_log_level() {
+    let mut notice = MissingListNotice::default();
+    assert_eq!(notice.observe(ListEvent::Missing), (true, false));
+    assert_eq!(notice.observe(ListEvent::Missing), (false, false));
+    assert_eq!(notice.observe(ListEvent::EnabledRoute), (false, true));
+    assert_eq!(notice.observe(ListEvent::Missing), (false, false));
+    assert_eq!(notice.observe(ListEvent::EnabledRoute), (false, false));
+
+    let mut recovered = MissingListNotice::default();
+    assert_eq!(recovered.observe(ListEvent::Missing), (true, false));
+    assert_eq!(recovered.observe(ListEvent::Available), (false, false));
+    assert_eq!(recovered.observe(ListEvent::EnabledRoute), (false, false));
+}
+
 fn paths(directory: &tempfile::TempDir) -> StatePaths {
     let paths = StatePaths::from_root(directory.path().join("gh-shim"));
     super::super::tests::write_fixture_pin(&paths);

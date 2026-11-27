@@ -13,6 +13,57 @@ type ReadRoot = dyn Fn()
     + Send
     + Sync;
 
+#[derive(Default)]
+struct MissingListNotice {
+    seen: bool,
+    missing: bool,
+    enabled_route: bool,
+    warned: bool,
+}
+
+enum ListEvent {
+    Missing,
+    Available,
+    EnabledRoute,
+}
+
+impl MissingListNotice {
+    fn observe(&mut self, event: ListEvent) -> (bool, bool) {
+        let first_missing = matches!(event, ListEvent::Missing) && !self.seen;
+        match event {
+            ListEvent::Missing => {
+                self.seen = true;
+                self.missing = true;
+            }
+            ListEvent::Available => self.missing = false,
+            ListEvent::EnabledRoute => self.enabled_route = true,
+        }
+        let warn = self.enabled_route && self.missing && !self.warned;
+        self.warned |= warn;
+        (first_missing, warn)
+    }
+}
+
+static LIST_NOTICE: std::sync::LazyLock<Mutex<MissingListNotice>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+fn note_list(event: ListEvent) {
+    let (debug, warn) = LIST_NOTICE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .observe(event);
+    if debug {
+        log::debug!("The vault has no GitHub routing list available to this installation");
+    }
+    if warn {
+        log::warn!("An enabled GitHub shim cannot fetch its routing list from the vault");
+    }
+}
+
+pub(crate) fn note_enabled_route() {
+    note_list(ListEvent::EnabledRoute);
+}
+
 struct RootRefresh<'a> {
     read: &'a ReadRoot,
     generation: tokio::sync::watch::Sender<Option<u64>>,
@@ -297,7 +348,7 @@ impl Failure {
     }
 
     fn stop(self) -> bool {
-        matches!(self.code, "unknown_method" | "not_found")
+        self.code == "unknown_method"
     }
 
     fn record(self) {
@@ -396,6 +447,7 @@ async fn latest(session: &ManagementSession) -> Result<Latest, Failure> {
     if latest.version == 0 {
         return Err(Failure::new("transport_unavailable", true));
     }
+    note_list(ListEvent::Available);
     let mut health = HEALTH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -541,6 +593,16 @@ where
         session.close().await;
         if let Err(failure) = result {
             failure.record();
+            if failure.code == "not_found" {
+                note_list(ListEvent::Missing);
+                pending_report = None;
+                let mut generations = root.generation.subscribe();
+                tokio::select! {
+                    _ = tokio::time::sleep(PIN_REFRESH_INTERVAL) => {},
+                    _ = generations.changed() => {},
+                }
+                continue;
+            }
             if failure.stop() {
                 log::info!("manifest sync stopped: {}", failure.code);
                 return;
@@ -573,11 +635,6 @@ pub fn start(
     }
     let (stop, stopped) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        if enable_gate::gh_shim_enabled_from_config_doc(&read_user_config_doc().unwrap_or_default())
-            == Some(false)
-        {
-            return;
-        }
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
