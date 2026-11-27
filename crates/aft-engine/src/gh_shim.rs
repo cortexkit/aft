@@ -985,7 +985,7 @@ fn run_with(
     }
     let determination = determine_rung(&paths, &target, &cwd, now);
     if determination.record.rung != Rung::R3 {
-        let disposition = match resolve_manifest(&paths, now) {
+        let disposition = match manifest_guard.observe(now) {
             ManifestResolution::Active(manifest) => non_r3_governance_disposition(
                 &cwd,
                 &target,
@@ -1049,7 +1049,7 @@ fn run_with(
     // A valid manifest gates R3 both during fresh discovery and when a cached
     // R3 determination is reused. If it disappears or fails validation between
     // those two moments, use the same unavailable-manifest gate as below R3.
-    let manifest = match resolve_manifest(&paths, now) {
+    let manifest = match manifest_guard.observe(now) {
         ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed { manifest, problem } => {
             if let Some(status) = captured_now() {

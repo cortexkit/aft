@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -13,6 +14,7 @@ pub(super) struct ManifestGuard<'a> {
     paths: &'a StatePaths,
     initial: ManifestResolution,
     basis: DecisionBasis,
+    basis_changed: Cell<bool>,
 }
 
 impl<'a> ManifestGuard<'a> {
@@ -22,11 +24,22 @@ impl<'a> ManifestGuard<'a> {
             paths,
             initial,
             basis,
+            basis_changed: Cell::new(false),
         }
     }
 
     pub(super) fn initial(&self) -> &ManifestResolution {
         &self.initial
+    }
+
+    pub(super) fn observe(&self, now: u64) -> ManifestResolution {
+        let (current, basis) = resolve_with_basis(self.paths, now);
+        if self.basis != basis
+            || std::mem::discriminant(&self.initial) != std::mem::discriminant(&current)
+        {
+            self.basis_changed.set(true);
+        }
+        current
     }
 
     pub(super) fn dispatch_without_valid_manifest(
@@ -83,10 +96,8 @@ impl<'a> ManifestGuard<'a> {
         args: &[OsString],
         delegate: impl FnOnce(&[OsString]) -> i32,
     ) -> i32 {
-        let (current, basis) = resolve_with_basis(self.paths, unix_seconds());
-        if self.basis != basis
-            || std::mem::discriminant(&self.initial) != std::mem::discriminant(&current)
-        {
+        let current = self.observe(unix_seconds());
+        if self.basis_changed.get() {
             return refuse(
                 RefusalCode::ManifestUnavailable,
                 "GitHub routing policy changed before the command could run. Start the command again.",
@@ -147,5 +158,29 @@ mod tests {
             );
             std::fs::remove_file(artifact).unwrap();
         }
+    }
+
+    #[test]
+    fn gh_shim_refuses_an_active_basis_change_even_if_the_first_list_returns() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().to_owned());
+        let now = unix_seconds();
+        let mut list = super::super::tests::fixture_manifest();
+        super::super::tests::write_signed_manifest(&paths, list.clone(), now);
+        let original = std::fs::read(&paths.manifest).unwrap();
+        let guard = ManifestGuard::new(&paths);
+        assert!(matches!(guard.initial(), ManifestResolution::Active(_)));
+        list.issued_at_unix_secs = now;
+        super::super::tests::write_signed_manifest(&paths, list, now);
+        assert_ne!(std::fs::read(&paths.manifest).unwrap(), original);
+        assert!(matches!(guard.observe(now), ManifestResolution::Active(_)));
+        std::fs::write(&paths.manifest, original).unwrap();
+        let args = [OsString::from("issue"), OsString::from("list")];
+        assert_eq!(
+            guard.delegate(&args, |_| panic!(
+                "the command used a different signed list"
+            )),
+            86
+        );
     }
 }
