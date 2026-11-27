@@ -11,7 +11,7 @@ mod fake_lsp;
 #[test]
 fn lsp_inspect_keeps_push_only_document_open_to_certify_a_later_push() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = crate::path_identity::canonicalize_normalized(dir.path());
     let file = root.join("src").join("lib.rs");
     std::fs::create_dir(root.join("src")).unwrap();
     std::fs::write(&file, "pub fn f() {}\n").unwrap();

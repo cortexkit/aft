@@ -436,7 +436,7 @@ struct PreparedWatcher {
 #[test]
 fn watcher_preparation_does_not_hold_admission_or_publish_into_a_closed_generation() {
     let root = tempfile::tempdir().unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         Config {
             project_root: Some(root.path().to_path_buf()),

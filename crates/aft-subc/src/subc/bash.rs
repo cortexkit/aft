@@ -5006,6 +5006,41 @@ mod grant_path_tests {
     #[tokio::test]
     async fn bash_progress_reaches_subc_origin_before_command_finishes() {
         use super::*;
+        const CHILD: &str = "AFT_TEST_BASH_PROGRESS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // This case tests progress delivery, not masking of the runner's
+            // ambient credentials. Run the test subprocess with a clean environment.
+            let isolated = tempfile::tempdir().unwrap();
+            let home = isolated.path().join("home");
+            let temp = isolated.path().join("tmp");
+            for path in [&home, &temp] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let test = concat!(
+                module_path!(),
+                "::bash_progress_reaches_subc_origin_before_command_finishes"
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test.split_once("::").unwrap().1, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("HOME", &home)
+                .env("TMPDIR", &temp)
+                .env("SHELL", "/bin/bash")
+                .env(CHILD, "1")
+                .current_dir(&home)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let (dir, root) = super::super::test_support::test_root("bash-progress");
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| {

@@ -25,7 +25,7 @@ async fn assert_idle_flycheck_persistence(overflow: bool) {
     )
     .unwrap();
     std::fs::write(root.as_path().join("lib.rs"), "pub fn ready() {}\n").unwrap();
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         crate::context::default_language_provider_factory(),
         crate::config::Config::default(),
     ));

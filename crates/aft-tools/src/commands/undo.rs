@@ -9,10 +9,12 @@ mod audit_regressions {
 
     #[test]
     fn edit_review_opus_9_undo_preview_probes_without_backup_mutex() {
+        use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
+
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("file.txt");
         std::fs::write(&file, b"original").unwrap();
-        let ctx = std::sync::Arc::new(AppContext::new(
+        let ctx = std::sync::Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         ));
@@ -23,10 +25,12 @@ mod audit_regressions {
             "id": "preview-lock", "command": "undo_preview", "file": file,
         }))
         .unwrap();
-        ctx.backup()
-            .lock()
-            .snapshot(req.session(), &file, "original")
-            .unwrap();
+        {
+            let mut backup = ctx.backup().lock();
+            backup.permit_temp_path_snapshots_for_test();
+            backup.snapshot(req.session(), &file, "original").unwrap();
+            assert_eq!(backup.history(req.session(), &file).len(), 1);
+        }
         let checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _hook = install_authorization_hook_for_test(&req.id, {
             let ctx = ctx.clone();

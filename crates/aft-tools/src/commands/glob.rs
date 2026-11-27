@@ -1189,7 +1189,7 @@ mod tests {
         for index in 0..=DEFAULT_MAX_RESULTS {
             std::fs::write(project.join(format!("file-{index:03}.txt")), "text").unwrap();
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config {
                 project_root: Some(project),

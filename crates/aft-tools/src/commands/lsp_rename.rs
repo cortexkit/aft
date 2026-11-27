@@ -746,7 +746,7 @@ mod rollback_tests {
             storage_dir: Some(root.join("storage")),
             ..Default::default()
         };
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
             enabled: false,
             ..Default::default()

@@ -285,6 +285,12 @@ pub fn drain_flycheck_end_for_maintenance_test(
         },
     )
     .unwrap();
+    #[cfg(all(not(test), feature = "test-support"))]
+    let cache = {
+        let mut cache = cache;
+        cache.wait_for_persistence_for_test();
+        cache
+    };
     client.completed_rust_check = Some(cache);
     manager.clients.insert(key.clone(), client);
     finish_flycheck_for_maintenance_test(manager, &key, 1);

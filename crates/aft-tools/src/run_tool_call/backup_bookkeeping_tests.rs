@@ -158,6 +158,8 @@ fn backup_bookkeeping_read_only_calls_do_not_wait_for_store_owner() {
 
 #[test]
 fn backup_bookkeeping_keeps_undo_entry_but_does_not_infer_skipped_reason() {
+    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
+
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("small.rs");
     let original = "pub fn small() {}\n";
@@ -169,6 +171,7 @@ fn backup_bookkeeping_keeps_undo_entry_but_does_not_infer_skipped_reason() {
             ..Default::default()
         },
     );
+    ctx.backup().lock().permit_temp_path_snapshots_for_test();
     let args = json!({"path": "small.rs", "content": "pub fn changed() {}\n"});
     let format = crate::subc_format::FormatContext::from_tool_call("write", &args, root.path());
     let tool_ctx = ToolCallContext {
@@ -218,7 +221,7 @@ fn backup_bookkeeping_does_not_attach_a_concurrent_calls_skip() {
         storage_dir: Some(path.join("storage")),
         ..Default::default()
     };
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
         enabled: false,
         ..Default::default()
@@ -317,7 +320,7 @@ fn import_and_refactor_handlers_report_their_own_backup_skips() {
             storage_dir: Some(root.join("storage")),
             ..Default::default()
         };
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
             enabled: false,
             ..Default::default()

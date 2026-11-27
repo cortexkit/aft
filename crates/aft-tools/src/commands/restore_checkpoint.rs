@@ -226,7 +226,7 @@ mod tests {
     fn edit_review_opus_9_checkpoint_restore_probes_without_checkpoint_mutex() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("original.txt");
-        let ctx = std::sync::Arc::new(AppContext::new(
+        let ctx = std::sync::Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         ));

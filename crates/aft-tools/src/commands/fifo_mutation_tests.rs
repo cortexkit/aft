@@ -1,4 +1,4 @@
-use crate::{config::Config, context::AppContext, protocol::RawRequest};
+use crate::{config::Config, protocol::RawRequest};
 use serde_json::json;
 use std::os::unix::fs::FileTypeExt;
 use std::process::Command;
@@ -13,7 +13,7 @@ fn fifo_mutations_refuse_without_a_writer() {
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: c_path is a valid NUL-terminated pathname.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config {
                 project_root: Some(temp.path().to_path_buf()),

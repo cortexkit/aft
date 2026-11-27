@@ -108,10 +108,9 @@ mod tests {
         ] {
             fs::write(&path, prior).unwrap();
             if req.id == "undo" {
-                ctx.backup()
-                    .lock()
-                    .snapshot(req.session(), &path, "tracked")
-                    .unwrap();
+                let mut backup = ctx.backup().lock();
+                backup.permit_temp_path_snapshots_for_test();
+                backup.snapshot(req.session(), &path, "tracked").unwrap();
             }
             fs::write(&path, b"after").unwrap();
             ctx.backup().lock().record_post_mutation_states();
@@ -130,7 +129,7 @@ mod tests {
     }
 
     fn test_context(root: &std::path::Path) -> AppContext {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.to_path_buf()),
@@ -218,10 +217,17 @@ mod tests {
         }))
         .unwrap();
         std::fs::write(&path, b"original").unwrap();
-        ctx.backup()
-            .lock()
-            .snapshot(request.session(), &path, "tracked")
-            .unwrap();
+        {
+            let mut backup = ctx.backup().lock();
+            backup.permit_temp_path_snapshots_for_test();
+            backup
+                .snapshot(request.session(), &path, "tracked")
+                .unwrap();
+            assert_eq!(
+                backup.try_tracked_files(request.session()).unwrap().len(),
+                1
+            );
+        }
         std::fs::remove_file(&path).unwrap();
 
         let explicit: RawRequest = serde_json::from_value(serde_json::json!({

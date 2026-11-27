@@ -286,7 +286,7 @@ mod audit_regressions {
         let invalid = "const value = {;\n";
         let later = "const value = 2;\n";
         std::fs::write(&path, "const value = 1;\n").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),
@@ -321,7 +321,7 @@ mod audit_regressions {
         let root = dir.path().canonicalize().unwrap();
         let path = root.join("example.ts");
         std::fs::write(&path, "const value = 0;\n").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),

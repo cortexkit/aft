@@ -1316,6 +1316,8 @@ mod tests {
 
     #[test]
     fn edit_review_opus_1_undo_skips_failed_append_open() {
+        use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
+
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("a.txt");
         let ctx = crate::test_context(Box::new(StubProvider), Config::default());
@@ -1327,10 +1329,13 @@ mod tests {
         }))
         .unwrap();
         fs::write(&file, b"before").unwrap();
-        ctx.backup()
-            .lock()
-            .snapshot_with_op(req.session(), &file, "original", Some("previous"))
-            .unwrap();
+        {
+            let mut backup = ctx.backup().lock();
+            backup.permit_temp_path_snapshots_for_test();
+            backup
+                .snapshot_with_op(req.session(), &file, "original", Some("previous"))
+                .unwrap();
+        }
         fs::write(&file, b"current").unwrap();
         ctx.backup().lock().record_post_mutation_states();
 

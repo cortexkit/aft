@@ -1245,6 +1245,8 @@ pub(crate) struct CompletedRustCheck {
     checkout: PathBuf,
     path: PathBuf,
     persistence_enabled: bool,
+    #[cfg(all(not(test), unix, feature = "test-support"))]
+    wait_for_persistence: bool,
     runtime: Runtime,
     saved: Option<Arc<SavedCheck>>,
     validation: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<Option<SavedCheck>>>>,
@@ -1271,6 +1273,8 @@ impl CompletedRustCheck {
             // No disk operation uses the empty path while persistence is disabled.
             path: PathBuf::new(),
             persistence_enabled: false,
+            #[cfg(all(not(test), unix, feature = "test-support"))]
+            wait_for_persistence: false,
             saved: None,
             validation: parking_lot::Mutex::new(None),
             pending: None,
@@ -1530,6 +1534,8 @@ impl CompletedRustCheck {
             checkout,
             path,
             persistence_enabled: true,
+            #[cfg(all(not(test), unix, feature = "test-support"))]
+            wait_for_persistence: false,
             runtime,
             saved,
             validation: parking_lot::Mutex::new(None),
@@ -1541,6 +1547,11 @@ impl CompletedRustCheck {
             #[cfg(not(unix))]
             pre_spawn,
         })
+    }
+
+    #[cfg(all(not(test), unix, feature = "test-support"))]
+    pub(crate) fn wait_for_persistence_for_test(&mut self) {
+        self.wait_for_persistence = true;
     }
 
     pub(crate) fn begin(&mut self, began: SystemTime) {
@@ -1698,7 +1709,11 @@ impl CompletedRustCheck {
             self.saved = Some(Arc::new(record.clone()));
             #[cfg(test)]
             worker.join().unwrap();
-            #[cfg(not(test))]
+            #[cfg(all(not(test), unix, feature = "test-support"))]
+            if self.wait_for_persistence {
+                worker.join().unwrap();
+            }
+            #[cfg(not(any(test, all(unix, feature = "test-support"))))]
             drop(worker);
             return Some(record);
         }

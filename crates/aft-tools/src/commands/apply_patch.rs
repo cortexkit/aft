@@ -1523,7 +1523,7 @@ mod tests {
     #[ignore = "requires rustfmt; run explicitly to measure batch lock retention"]
     fn measure_formatter_backed_patch_admission_extension() {
         let temp = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(temp.path().to_path_buf()),
@@ -1583,7 +1583,7 @@ mod tests {
             if with_move {
                 fs::write(&destination, "const previous = 0;\n").unwrap();
             }
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     project_root: Some(temp.path().to_path_buf()),
@@ -1649,7 +1649,7 @@ mod tests {
             assert!(std::env::var_os("AFT_REQUIRE_CASE_INSENSITIVE_TEST_VOLUME").is_none());
             return;
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),

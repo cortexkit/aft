@@ -1280,9 +1280,9 @@ impl BackupStore {
         self.discovery_deadline_override = Some(Instant::now());
     }
 
-    #[cfg(test)]
-    fn enforce_temp_path_policy_for_tests(&mut self) {
-        self.enforce_temp_path_policy = true;
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_temp_path_policy_for_tests(&mut self, enforce: bool) {
+        self.enforce_temp_path_policy = enforce;
     }
 
     pub(crate) fn uses_db_pool(&self, conn: &Arc<Mutex<TrackedConnection>>) -> bool {
@@ -12085,7 +12085,7 @@ mod tests {
 
         let before_temp = backup_skipped_totals().1;
         let mut store = BackupStore::new();
-        store.enforce_temp_path_policy_for_tests();
+        store.set_temp_path_policy_for_tests(true);
         assert!(store
             .snapshot_with_op(DEFAULT_SESSION_ID, &path, "temp", Some("temp-op"))
             .unwrap()

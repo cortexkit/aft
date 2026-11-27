@@ -1497,7 +1497,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = crate::path_identity::canonicalize_normalized(temp.path());
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -1554,7 +1554,7 @@ mod tests {
             let storage = tempfile::tempdir().unwrap();
             let root = crate::path_identity::canonicalize_normalized(temp.path());
             let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
-            let ctx = std::sync::Arc::new(AppContext::new(
+            let ctx = std::sync::Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     project_root: Some(root.clone()),

@@ -16,7 +16,7 @@ fn tool_relative_missing_path_uses_native_separators() {
 }
 
 fn call(root: &Path, name: &str, args: Value) -> ToolCallResult {
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.to_owned()),

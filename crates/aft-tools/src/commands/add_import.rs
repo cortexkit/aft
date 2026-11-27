@@ -894,19 +894,22 @@ mod tests {
     #[test]
     fn edit_review_opus_1_undo_skips_rolled_back_import() {
         use super::*;
+        use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
 
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("a.ts");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.path().to_path_buf()),
                 ..Default::default()
             },
         );
-        ctx.backup()
-            .lock()
-            .set_storage_dir(root.path().join("backup"), 72);
+        {
+            let mut backup = ctx.backup().lock();
+            backup.set_storage_dir(root.path().join("backup"), 72);
+            backup.permit_temp_path_snapshots_for_test();
+        }
         ctx.checkpoint().lock().set_storage_dir_for_harness(
             root.path().join("checkpoints"),
             crate::harness::Harness::Opencode,

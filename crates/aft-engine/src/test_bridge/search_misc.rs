@@ -345,6 +345,7 @@ pub fn session_call_counts(
 }
 
 pub trait BackupStoreTest {
+    fn permit_temp_path_snapshots_for_test(&mut self);
     fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf);
     fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf);
     fn expire_discovery_for_tests(&mut self);
@@ -363,6 +364,10 @@ pub trait BackupStoreTest {
 }
 
 impl BackupStoreTest for crate::backup::BackupStore {
+    fn permit_temp_path_snapshots_for_test(&mut self) {
+        self.set_temp_path_policy_for_tests(false);
+    }
+
     fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf) {
         self.add_created_dir_for_test(session, key, dir);
     }
