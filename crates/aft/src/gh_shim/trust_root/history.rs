@@ -1,5 +1,6 @@
 use super::Pin;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::io;
 
@@ -18,6 +19,8 @@ pub(super) struct History {
     pub(super) generation: u64,
     current_key_id: Option<String>,
     previous_key_ids: VecDeque<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retirement_digest: Option<[u8; 32]>,
 }
 
 impl History {
@@ -91,18 +94,30 @@ impl History {
         if !lower || reset {
             self.generation = generation;
         }
-        if key != self.current_key_id.as_deref() {
-            if let Some(previous) = self.current_key_id.take() {
-                self.remember(previous);
-            }
-            self.current_key_id = key.map(str::to_owned);
-        }
-        if let Some(pin) = pin {
-            for id in &pin.retired_key_ids {
-                if valid_id(id) {
-                    self.remember(id.clone());
+        let outgoing = if key != self.current_key_id.as_deref() {
+            std::mem::replace(&mut self.current_key_id, key.map(str::to_owned))
+        } else {
+            None
+        };
+        let retirement_digest = pin
+            .map(|pin| {
+                serde_json::to_vec(&pin.retired_key_ids).map(|bytes| Sha256::digest(bytes).into())
+            })
+            .transpose()?;
+        // A poll repeating the same retirement list must not make its old
+        // entries newer than a key AFT actually saw superseded.
+        if retirement_digest != self.retirement_digest {
+            if let Some(pin) = pin {
+                for id in &pin.retired_key_ids {
+                    if valid_id(id) {
+                        self.remember(id.clone());
+                    }
                 }
             }
+            self.retirement_digest = retirement_digest;
+        }
+        if let Some(outgoing) = outgoing {
+            self.remember(outgoing);
         }
         Ok(reset)
     }
@@ -122,6 +137,13 @@ mod tests {
         history.advance(Some(&new), 13).unwrap();
         assert_eq!(history.previous_key_ids.len(), PAST_KEYS);
         assert!(history.advance(Some(&old), 12).is_err());
+        let stored = serde_json::to_vec(&history).unwrap();
+        let mut restarted: History = serde_json::from_slice(&stored).unwrap();
+        for _ in 0..3 {
+            assert!(!restarted.advance(Some(&new), 13).unwrap());
+            assert_eq!(serde_json::to_vec(&restarted).unwrap(), stored);
+        }
+        assert!(restarted.advance(Some(&old), 12).is_err());
     }
 
     #[test]
