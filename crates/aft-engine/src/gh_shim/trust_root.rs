@@ -8,6 +8,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
+mod history;
+use history::History;
+
 pub(super) const FILE_NAME: &str = "trust-root.json";
 pub const GET: &str = "policy_root.get";
 pub(crate) const ANCHOR_ENV: &str = "AFT_GH_SHIM_TRUST_ANCHOR";
@@ -16,14 +19,14 @@ const MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Default)]
 struct DaemonState {
-    generation: u64,
+    history: Option<History>,
     read_at: Option<Instant>,
     root: Option<StoredRoot>,
 }
 
 #[cfg(not(test))]
 static DAEMON: Mutex<DaemonState> = Mutex::new(DaemonState {
-    generation: 0,
+    history: None,
     read_at: None,
     root: None,
 });
@@ -202,9 +205,12 @@ pub(super) fn publish(paths: &StatePaths, reply: Reply, now: u64) -> io::Result<
     // A publisher cannot change trust while another process is accepting a list.
     let _lock = manifest_acceptance_lock(paths)?;
     let marker = paths.root.join(HIGH_WATER);
-    let persisted = match fs::read(&marker) {
-        Ok(bytes) => serde_json::from_slice::<u64>(&bytes)?,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+    let (persisted, corrupt) = match fs::read(&marker) {
+        Ok(bytes) => match serde_json::from_slice::<History>(&bytes) {
+            Ok(history) if history.valid() => (Some(history), false),
+            _ => (None, true),
+        },
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (None, false),
         Err(err) => return Err(err),
     };
     let root = pin.map(|pin| StoredRoot {
@@ -213,18 +219,23 @@ pub(super) fn publish(paths: &StatePaths, reply: Reply, now: u64) -> io::Result<
         read_at_unix_secs: now,
     });
     daemon_state(paths, |state| -> io::Result<()> {
-        let floor = persisted.max(state.generation);
-        if generation < floor {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "policy root generation regressed",
-            ));
+        let mut history = state
+            .history
+            .clone()
+            .or_else(|| persisted.clone())
+            .unwrap_or_default();
+        if let Some(disk) = &persisted {
+            history.merge(disk);
         }
-        state.generation = generation;
-        if generation > persisted {
+        let reset = history.advance(root.as_ref().map(|root| &root.pin), generation)?;
+        // With no observed pin, a null reply's generation is only a daemon
+        // settings version, not evidence that a root key was provisioned.
+        let write_marker = corrupt
+            || (persisted.as_ref() != Some(&history) && (persisted.is_some() || history.had_pin()));
+        if write_marker {
             if let Err(error) = atomic_write(
                 &marker,
-                &serde_json::to_vec(&generation)?,
+                &serde_json::to_vec(&history)?,
                 AtomicWriteDurability::FileAndDirectory,
             ) {
                 // A newer reply invalidates the old pin, but the new pin
@@ -232,7 +243,14 @@ pub(super) fn publish(paths: &StatePaths, reply: Reply, now: u64) -> io::Result<
                 state.root = None;
                 return Err(error);
             }
+            if corrupt {
+                log::warn!("GitHub policy root generation record was corrupt; rebuilt it from the daemon reply");
+            }
+            if reset {
+                log::warn!("The daemon returned a new GitHub policy root at a lower generation; reset the generation floor");
+            }
         }
+        state.history = Some(history);
         state.read_at = Some(Instant::now());
         state.root = root.clone();
         match &root {
@@ -277,6 +295,11 @@ mod tests {
         let retired = super::super::tests::pin_for(&[32; 32]);
         current.retired_key_ids.push(retired.key_id.clone());
         let fresh = super::super::tests::pin_for(&[33; 32]);
+        let floor = || {
+            serde_json::from_slice::<History>(&fs::read(paths.root.join(HIGH_WATER)).unwrap())
+                .unwrap()
+                .generation
+        };
         let publish_pin =
             |pin, generation| publish(&paths, Reply::Root { pin, generation }, unix_seconds());
         publish_pin(Some(old.clone()), 8).unwrap();
@@ -286,7 +309,9 @@ mod tests {
         assert!(publish_pin(Some(retired), 8).is_err());
         publish_pin(Some(current.clone()), 7).unwrap();
         assert_eq!(read_daemon(&paths).unwrap(), current);
+        assert_eq!(floor(), 9);
         publish_pin(None, 6).unwrap();
+        assert_eq!(floor(), 9);
         assert!(matches!(
             read_daemon(&paths),
             Err(ManifestProblem::NoTrustRoot)
@@ -294,6 +319,7 @@ mod tests {
         assert!(publish_pin(Some(current), 8).is_err());
         publish_pin(Some(fresh.clone()), 3).unwrap();
         assert_eq!(read_daemon(&paths).unwrap(), fresh);
+        assert_eq!(floor(), 3);
     }
 
     #[test]
@@ -421,47 +447,39 @@ mod tests {
     }
 
     #[test]
-    fn gh_shim_does_not_replace_persisted_generation_with_an_older_reply() {
+    fn gh_shim_null_pin_does_not_create_evidence_until_a_pin_has_been_seen() {
         let dir = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(dir.path().to_owned());
         let now = super::super::unix_seconds();
+        let reply = |pin, generation| Reply::Root { pin, generation };
+        let marker = paths.root.join(HIGH_WATER);
+        publish(&paths, reply(None, 7), now).unwrap();
+        assert!(!paths.trust_root.exists());
+        assert!(
+            !marker.exists(),
+            "overall settings generation does not provision the shim"
+        );
         let pin = super::super::tests::fixture_pin();
         publish(
             &paths,
             Reply::Root {
-                pin: Some(pin),
+                pin: Some(pin.clone()),
                 generation: 8,
             },
             now,
         )
         .unwrap();
         daemon_state(&paths, |state| *state = DaemonState::default());
-        assert!(publish(
-            &paths,
-            Reply::Root {
-                pin: None,
-                generation: 7
-            },
-            now
-        )
-        .is_err());
-        assert!(paths.trust_root.exists());
-        publish(
-            &paths,
-            Reply::Root {
-                pin: None,
-                generation: 9,
-            },
-            now,
-        )
-        .unwrap();
+        publish(&paths, reply(None, 7), now).unwrap();
         assert!(!paths.trust_root.exists());
+        let history: History = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
+        assert_eq!(history.generation, 8);
         daemon_state(&paths, |state| *state = DaemonState::default());
         assert!(publish(
             &paths,
             Reply::Root {
-                pin: Some(super::super::tests::fixture_pin()),
-                generation: 8
+                pin: Some(pin),
+                generation: 7
             },
             now
         )
