@@ -211,7 +211,7 @@ fn activate(paths: &StatePaths, latest: &Latest, now: u64) -> Option<Report> {
         signature: latest.envelope.signature.clone(),
         manifest_bytes: latest.envelope.manifest_bytes.clone(),
     };
-    let verified = match trust_root::read(paths)
+    let verified = match trust_root::read_daemon(paths)
         .and_then(|pin| validate_manifest_candidate(paths, &envelope, now, &pin))
     {
         Ok(verified) => verified,
@@ -549,7 +549,7 @@ pub fn start(
             .enable_all()
             .build()
         {
-            let paths = StatePaths::from_process();
+            let paths = StatePaths::from_process().for_daemon();
             let root = RootRefresh::new(&read_root);
             runtime.block_on(async {
                 tokio::select! {

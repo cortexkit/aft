@@ -37,6 +37,8 @@ mod captured_dispatch;
 mod enable_gate;
 mod environment_admin;
 mod manifest_guard;
+mod state_paths;
+use state_paths::StatePaths;
 pub mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
@@ -2515,48 +2517,6 @@ struct LastProbeReport {
     outcome: String,
 }
 
-#[derive(Clone, Debug)]
-struct StatePaths {
-    root: PathBuf,
-    manifest: PathBuf,
-    trust_root: PathBuf,
-    rung: PathBuf,
-    bypass_audit: PathBuf,
-    unexpected_gh_route_advertisers: PathBuf,
-    seam_state: PathBuf,
-    last_valid_manifest: PathBuf,
-    version_high_water: PathBuf,
-    manifests_dir: PathBuf,
-    last_probe: PathBuf,
-}
-
-impl StatePaths {
-    fn from_process() -> Self {
-        Self::from_root(gh_shim_state_dir_from(
-            crate::environment::non_empty_os_var(GH_SHIM_STATE_DIR_ENV).as_deref(),
-            crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
-            crate::environment::non_empty_os_var("HOME").as_deref(),
-        ))
-    }
-
-    fn from_root(root: PathBuf) -> Self {
-        crate::private_storage::tighten_root(&root);
-        Self {
-            manifest: root.join("gh-routing-manifest.json"),
-            trust_root: root.join(trust_root::FILE_NAME),
-            rung: root.join("rung-cache.json"),
-            bypass_audit: root.join("operator-bypass.jsonl"),
-            unexpected_gh_route_advertisers: root.join("unexpected-gh-route-advertisers.json"),
-            seam_state: root.join("seam-state.json"),
-            last_valid_manifest: root.join("last-valid-manifest.json"),
-            version_high_water: root.join("manifest-version-high-water.json"),
-            manifests_dir: root.join("manifests"),
-            last_probe: root.join("last-probe.json"),
-            root,
-        }
-    }
-}
-
 /// The gh-shim state files this process's environment resolves to, for the
 /// test-gate check that none of them lands in the operator's real state home.
 #[cfg(test)]
@@ -3444,7 +3404,7 @@ fn checkout_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBindin
 pub(crate) fn verified_worker_read_repository(
     repository_at_mint: Option<&str>,
 ) -> Result<String, String> {
-    let paths = StatePaths::from_process();
+    let paths = StatePaths::from_process().for_daemon();
     let ManifestResolution::Active(manifest) = resolve_manifest(&paths, unix_seconds()) else {
         return Err("worker read relay requires a verified active manifest".into());
     };
@@ -3476,16 +3436,7 @@ pub(crate) fn seed_worker_state(root: &Path) -> Result<(), String> {
             return Ok(());
         }
         let _lock = manifest_acceptance_lock(&paths).map_err(|error| error.to_string())?;
-        match std::fs::read(&paths.trust_root) {
-            Ok(bytes) => aft_base::durability::atomic_write(
-                &root.join(trust_root::FILE_NAME),
-                &bytes,
-                aft_base::durability::AtomicWriteDurability::None,
-            )
-            .map_err(|error| error.to_string())?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.to_string()),
-        }
+        trust_root::seed_worker(&paths, root).map_err(|error| error.to_string())?;
         let source = match std::fs::File::open(&paths.manifest) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -5121,17 +5072,22 @@ fn attach_invocation(
     Ok(request)
 }
 
-pub(crate) fn capture_speech_policy() -> Result<
-    Option<(
-        crate::gh_shim_speech::model::PolicySnapshot,
-        BTreeMap<String, String>,
-        u64,
-    )>,
-    crate::gh_shim_speech::Refusal,
-> {
+type CapturedSpeechPolicy = (
+    crate::gh_shim_speech::model::PolicySnapshot,
+    BTreeMap<String, String>,
+    u64,
+);
+
+pub(crate) fn capture_speech_policy(
+) -> Result<Option<CapturedSpeechPolicy>, crate::gh_shim_speech::Refusal> {
+    capture_speech_policy_at(&StatePaths::from_process().for_daemon())
+}
+
+fn capture_speech_policy_at(
+    paths: &StatePaths,
+) -> Result<Option<CapturedSpeechPolicy>, crate::gh_shim_speech::Refusal> {
     use crate::gh_shim_speech::{Code, Refusal};
     use sha2::Digest;
-    let paths = StatePaths::from_process();
     if !paths.manifest.exists()
         && !paths.last_valid_manifest.exists()
         && !paths.version_high_water.exists()
@@ -5150,7 +5106,7 @@ pub(crate) fn capture_speech_policy() -> Result<
     let bytes = accepted.signed_envelope;
     let current = fs::read(&paths.manifest)
         .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let manifest = verified_speech_manifest(&bytes)
+    let manifest = verified_speech_manifest_at(&bytes, paths)
         .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     if manifest.manifest_version != high.newest_accepted_version {
         return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
@@ -5175,7 +5131,10 @@ pub(crate) fn capture_speech_policy() -> Result<
     )))
 }
 
-fn verified_speech_manifest(bytes: &[u8]) -> Result<Manifest, crate::gh_shim_speech::Refusal> {
+fn verified_speech_manifest_at(
+    bytes: &[u8],
+    paths: &StatePaths,
+) -> Result<Manifest, crate::gh_shim_speech::Refusal> {
     let invalid = |check| {
         crate::gh_shim_speech::snapshot_invalid(
             "gh_shim::verified_speech_manifest",
@@ -5191,8 +5150,7 @@ fn verified_speech_manifest(bytes: &[u8]) -> Result<Manifest, crate::gh_shim_spe
     if envelope.envelope_version != ENVELOPE_VERSION {
         return Err(invalid("envelope_version"));
     }
-    let pin = trust_root::read(&StatePaths::from_process())
-        .map_err(|_| invalid("envelope_verification"))?;
+    let pin = trust_root::read(paths).map_err(|_| invalid("envelope_verification"))?;
     let verified =
         verify_manifest_envelope(&envelope, &pin).map_err(|_| invalid("envelope_verification"))?;
     let manifest = verified.manifest;
@@ -5213,7 +5171,8 @@ pub(crate) fn speech_start_classification(
     args: &[OsString],
 ) -> Result<bool, crate::gh_shim_speech::Refusal> {
     use sha2::Digest;
-    let manifest = verified_speech_manifest(&snapshot.signed_envelope)?;
+    let manifest =
+        verified_speech_manifest_at(&snapshot.signed_envelope, &StatePaths::from_process())?;
     if snapshot.version != manifest.manifest_version
         || snapshot.artifact_id != manifest.artifact_id
         || snapshot.digest.as_slice() != sha2::Sha256::digest(&snapshot.signed_envelope).as_slice()
@@ -5326,6 +5285,7 @@ pub(crate) fn validate_speech_policy(
 ) -> Result<(), crate::gh_shim_speech::Refusal> {
     use crate::gh_shim_speech::{Code, Refusal};
     use sha2::Digest;
+    let paths = StatePaths::from_process().for_daemon();
     invocation.validate()?;
     let actual = wire_mutation_semantics(request)
         .ok_or_else(|| Refusal::new(Code::PolicyDenied, "payload_denied"))?;
@@ -5336,7 +5296,7 @@ pub(crate) fn validate_speech_policy(
         {
             return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
         }
-        let manifest = verified_speech_manifest(&snapshot.signed_envelope)?;
+        let manifest = verified_speech_manifest_at(&snapshot.signed_envelope, &paths)?;
         if manifest.manifest_version != snapshot.version
             || manifest.artifact_id != snapshot.artifact_id
             || current.version < start.version
@@ -8332,7 +8292,7 @@ pub(crate) mod tests {
         serde_json::from_str(&json).expect("producer edit-last vectors fixture")
     }
 
-    fn signed_with(
+    pub(super) fn signed_with(
         manifest: &Manifest,
         fetched_at_unix_secs: u64,
         seed: &[u8; 32],
@@ -8374,7 +8334,7 @@ pub(crate) mod tests {
         trust_root::publish(
             paths,
             trust_root::Reply::Root { pin, generation: 1 },
-            TEST_NOW,
+            unix_seconds(),
         )
         .unwrap();
     }
@@ -14938,6 +14898,8 @@ INHERITED FLAGS
         write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
         let worker = StatePaths::from_root(directory.path().join("worker"));
 
+        let anchor = trust_root::shell_anchor().unwrap();
+        let _anchor = ScopedTestEnvVar::set(trust_root::ANCHOR_ENV, Some(&anchor));
         seed_worker_state(&worker.root).unwrap();
         assert_eq!(
             fs::read(&worker.trust_root).unwrap(),

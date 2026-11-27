@@ -56,6 +56,10 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_STATE_HOME", &self.state_home)
             .env("AFT_GH_SHIM_STATE_DIR", &self.state)
+            .env(
+                "AFT_GH_SHIM_TRUST_ANCHOR",
+                crate::test_helpers::gh_fixture_anchor(),
+            )
             .env("AFT_STORAGE_DIR", self._root.path().join("storage"))
             .env("PATH", &self.bin)
             .env("GH_REPO", "cortexkit/aft")

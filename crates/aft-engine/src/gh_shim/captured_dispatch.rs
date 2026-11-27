@@ -118,9 +118,9 @@ pub(super) fn captured_plan(
     }
     load_manifest(paths, now)
         .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let (snapshot, _, _) = capture_speech_policy()?
+    let (snapshot, _, _) = capture_speech_policy_at(paths)?
         .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let manifest = verified_speech_manifest(&snapshot.signed_envelope)
+    let manifest = verified_speech_manifest_at(&snapshot.signed_envelope, paths)
         .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     let classification = classify(args, &manifest, current_platform());
     match classification {

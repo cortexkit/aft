@@ -441,6 +441,7 @@ fn shim_command(
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", state_home)
         .env("AFT_GH_SHIM_STATE_DIR", state_home.join("cortexkit/aft/gh-shim"))
+        .env("AFT_GH_SHIM_TRUST_ANCHOR", crate::test_helpers::gh_fixture_anchor())
         .env("HOME", home)
         // Direct shim invocations bypass the shared AftProcess helper. Give each
         // fixture its own root so an unexpected future configure path cannot

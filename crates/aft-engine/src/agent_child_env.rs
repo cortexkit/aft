@@ -701,6 +701,7 @@ pub fn scrub_inherited_process_markers() {
     std::env::remove_var(GIT_CO_AUTHOR_ENV);
     std::env::remove_var(GIT_CO_AUTHOR_LINE_ENV);
     std::env::remove_var(GH_SHIM_BINARY_ENV);
+    std::env::remove_var(crate::gh_shim::trust_root::ANCHOR_ENV);
     std::env::remove_var(crate::gh_shim_paths::GH_SHIM_ENABLED_ENV);
     let original: HashMap<String, OsString> = std::env::vars_os()
         .filter_map(|(key, value)| {
@@ -746,6 +747,7 @@ pub(crate) fn is_subc_credential_env_key(key: &str) -> bool {
 /// both the inherited process environment and explicit command overrides.
 #[doc(hidden)]
 pub fn apply_to_command(command: &mut Command, environment: &HashMap<String, String>) {
+    command.env_remove(crate::gh_shim::trust_root::ANCHOR_ENV);
     // A ticket in this process's own environment belongs to whatever command
     // started this process, never to the child. The child gets a ticket only
     // when its request environment carries one issued for it.
@@ -786,6 +788,7 @@ pub fn apply_to_command(command: &mut Command, environment: &HashMap<String, Str
 /// CommandBuilder materializes the process environment when it is constructed,
 /// so filtering the builder covers Unix exec and Windows CreateProcess alike.
 pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
+    command.env_remove(crate::gh_shim::trust_root::ANCHOR_ENV);
     command.env_remove(crate::privacy_spawn::CONTROL_ENV);
     for key in crate::gh_shim_worker_broker::CHILD_KEYS {
         command.env_remove(key);
@@ -831,6 +834,13 @@ pub fn inject(
     }
 
     let gh_enabled = config.github.shim;
+    let anchor = crate::gh_shim::trust_root::ANCHOR_ENV;
+    environment.remove(anchor);
+    if gh_enabled {
+        if let Some(value) = crate::gh_shim::trust_root::shell_anchor() {
+            environment.insert(anchor.into(), value);
+        }
+    }
     for key in crate::gh_shim_worker_broker::CHILD_KEYS {
         environment.remove(key);
     }

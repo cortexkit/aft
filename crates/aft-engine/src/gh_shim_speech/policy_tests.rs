@@ -3,8 +3,9 @@ use sha2::Digest;
 
 #[test]
 fn invalid_signed_speech_manifest_warns_without_envelope_contents() {
+    let paths = StatePaths::from_process();
     crate::gh_shim_speech::tests::assert_snapshot_warning(
-        || verified_speech_manifest(b"secret-invalid-envelope").unwrap_err(),
+        || verified_speech_manifest_at(b"secret-invalid-envelope", &paths).unwrap_err(),
         "gh_shim::verified_speech_manifest",
         "envelope_json",
         json!({"envelope_bytes": 23}),
@@ -13,7 +14,7 @@ fn invalid_signed_speech_manifest_warns_without_envelope_contents() {
     envelope.envelope_version += 1;
     let bytes = serde_json::to_vec(&envelope).unwrap();
     crate::gh_shim_speech::tests::assert_snapshot_warning(
-        || verified_speech_manifest(&bytes).unwrap_err(),
+        || verified_speech_manifest_at(&bytes, &paths).unwrap_err(),
         "gh_shim::verified_speech_manifest",
         "envelope_version",
         json!({"envelope_bytes": bytes.len()}),

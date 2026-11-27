@@ -933,6 +933,7 @@ fn run_shim(verb: &Verb, reply: &HolderReply) -> Run {
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("AFT_GH_SHIM_STATE_DIR", &state_dir)
+        .env("AFT_GH_SHIM_TRUST_ANCHOR", crate::test_helpers::gh_fixture_anchor())
         .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)
@@ -1305,6 +1306,7 @@ fn run_targeting(
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("AFT_GH_SHIM_STATE_DIR", &state_dir)
+        .env("AFT_GH_SHIM_TRUST_ANCHOR", crate::test_helpers::gh_fixture_anchor())
         .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)
@@ -2078,6 +2080,10 @@ fn run_row_with_options(
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("AFT_GH_SHIM_STATE_DIR", &state_dir)
+        .env(
+            "AFT_GH_SHIM_TRUST_ANCHOR",
+            crate::test_helpers::gh_fixture_anchor(),
+        )
         .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)

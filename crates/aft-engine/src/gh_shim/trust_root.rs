@@ -1,18 +1,57 @@
 //! The daemon's policy root, cached beside the signed manifest for child shims.
 
-use super::{manifest_acceptance_lock, ManifestProblem, StatePaths};
+use super::{manifest_acceptance_lock, unix_seconds, ManifestProblem, StatePaths};
+use aft_base::durability::{atomic_write, sync_dir, AtomicWriteDurability};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use std::{fs, io};
 
 pub(super) const FILE_NAME: &str = "trust-root.json";
 pub const GET: &str = "policy_root.get";
+pub(crate) const ANCHOR_ENV: &str = "AFT_GH_SHIM_TRUST_ANCHOR";
+const HIGH_WATER: &str = "trust-root-generation.json";
+const MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+struct DaemonState {
+    generation: u64,
+    read_at: Option<Instant>,
+    root: Option<StoredRoot>,
+}
+
+#[cfg(not(test))]
+static DAEMON: Mutex<DaemonState> = Mutex::new(DaemonState {
+    generation: 0,
+    read_at: None,
+    root: None,
+});
+
+#[cfg(test)]
+static DAEMON: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, DaemonState>>,
+> = std::sync::LazyLock::new(Mutex::default);
+
+fn daemon_state<T>(_paths: &StatePaths, f: impl FnOnce(&mut DaemonState) -> T) -> T {
+    let mut daemon = DAEMON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(not(test))]
+    return f(&mut daemon);
+    #[cfg(test)]
+    f(daemon.entry(_paths.root.clone()).or_default())
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "op")]
 pub enum Reply {
     #[serde(rename = "policy_root.get")]
-    Root { pin: Option<Pin>, generation: u64 },
+    Root {
+        #[serde(deserialize_with = "Option::deserialize")]
+        pin: Option<Pin>,
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -22,12 +61,29 @@ pub struct Pin {
     pub(super) retired_key_ids: Vec<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct StoredRoot {
     #[serde(flatten)]
     pin: Pin,
     generation: u64,
     read_at_unix_secs: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+struct Anchor {
+    key_id: String,
+    public_key_hex: String,
+    generation: u64,
+}
+
+impl StoredRoot {
+    fn anchor(&self) -> Anchor {
+        Anchor {
+            key_id: self.pin.key_id.clone(),
+            public_key_hex: self.pin.public_key_hex.clone(),
+            generation: self.generation,
+        }
+    }
 }
 
 impl Pin {
@@ -58,6 +114,23 @@ pub(super) fn key_id(public_key: &[u8]) -> String {
 }
 
 pub(super) fn read(paths: &StatePaths) -> Result<Pin, ManifestProblem> {
+    if paths.daemon_trust {
+        return read_daemon(paths);
+    }
+    let anchor = std::env::var(ANCHOR_ENV)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    #[cfg(test)]
+    let anchor = test_anchor(paths).or(anchor);
+    read_file(paths, anchor.as_ref(), unix_seconds())
+}
+
+fn read_file(
+    paths: &StatePaths,
+    anchor: Option<&Anchor>,
+    now: u64,
+) -> Result<Pin, ManifestProblem> {
+    let anchor = anchor.ok_or(ManifestProblem::NoTrustRoot)?;
     let invalid = || ManifestProblem::Invalid("invalid daemon signing root".into());
     let bytes = match fs::read(&paths.trust_root) {
         Ok(bytes) => bytes,
@@ -67,36 +140,114 @@ pub(super) fn read(paths: &StatePaths) -> Result<Pin, ManifestProblem> {
         Err(_) => return Err(invalid()),
     };
     let root: StoredRoot = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if root.anchor() != *anchor
+        || !now
+            .checked_sub(root.read_at_unix_secs)
+            .is_some_and(|age| age < MAX_AGE.as_secs())
+    {
+        return Err(ManifestProblem::NoTrustRoot);
+    }
     root.pin.public_key().ok_or_else(invalid)?;
     Ok(root.pin)
 }
 
+fn daemon_root(paths: &StatePaths) -> Option<StoredRoot> {
+    daemon_state(paths, |state| {
+        if state.read_at.is_some_and(|at| at.elapsed() >= MAX_AGE) {
+            state.root = None;
+        }
+        state.root.clone()
+    })
+}
+
+pub(super) fn read_daemon(paths: &StatePaths) -> Result<Pin, ManifestProblem> {
+    daemon_root(paths)
+        .map(|root| root.pin)
+        .ok_or(ManifestProblem::NoTrustRoot)
+}
+
+pub(crate) fn shell_anchor() -> Option<String> {
+    let root = daemon_root(&StatePaths::from_process())?;
+    // Do not give the shell an anchor for a key the daemon lists as retired.
+    if root.pin.retired_key_ids.contains(&root.pin.key_id) {
+        return None;
+    }
+    serde_json::to_string(&root.anchor()).ok()
+}
+
+#[cfg(unix)]
+pub(super) fn seed_worker(paths: &StatePaths, destination: &std::path::Path) -> io::Result<()> {
+    if let Some(root) = daemon_root(paths) {
+        atomic_write(
+            &destination.join(FILE_NAME),
+            &serde_json::to_vec(&root)?,
+            AtomicWriteDurability::None,
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn publish(paths: &StatePaths, reply: Reply, now: u64) -> io::Result<()> {
     let Reply::Root { pin, generation } = reply;
-    if pin.is_none() && !paths.root.exists() {
-        return Ok(());
+    if pin.as_ref().is_some_and(|pin| pin.public_key().is_none()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid policy root key",
+        ));
     }
     // A publisher cannot change trust while another process is accepting a list.
     let _lock = manifest_acceptance_lock(paths)?;
-    match pin {
-        None => match fs::remove_file(&paths.trust_root) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        },
-        Some(pin) => {
-            let bytes = serde_json::to_vec(&StoredRoot {
-                pin,
-                generation,
-                read_at_unix_secs: now,
-            })?;
-            aft_base::durability::atomic_write(
-                &paths.trust_root,
-                &bytes,
-                aft_base::durability::AtomicWriteDurability::FileAndDirectory,
-            )
+    let marker = paths.root.join(HIGH_WATER);
+    let persisted = match fs::read(&marker) {
+        Ok(bytes) => serde_json::from_slice::<u64>(&bytes)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err),
+    };
+    let root = pin.map(|pin| StoredRoot {
+        pin,
+        generation,
+        read_at_unix_secs: now,
+    });
+    daemon_state(paths, |state| -> io::Result<()> {
+        let floor = persisted.max(state.generation);
+        if generation < floor {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "policy root generation regressed",
+            ));
         }
+        state.generation = generation;
+        state.read_at = Some(Instant::now());
+        state.root = root.clone();
+        if generation > persisted {
+            atomic_write(
+                &marker,
+                &serde_json::to_vec(&generation)?,
+                AtomicWriteDurability::FileAndDirectory,
+            )?;
+        }
+        match &root {
+            None => unlink(paths),
+            Some(root) => atomic_write(
+                &paths.trust_root,
+                &serde_json::to_vec(root)?,
+                AtomicWriteDurability::FileAndDirectory,
+            ),
+        }
+    })
+}
+
+fn unlink(paths: &StatePaths) -> io::Result<()> {
+    match fs::remove_file(&paths.trust_root) {
+        Ok(()) => sync_dir(&paths.root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
+}
+
+#[cfg(test)]
+fn test_anchor(paths: &StatePaths) -> Option<Anchor> {
+    daemon_root(paths).map(|root| root.anchor())
 }
 
 #[cfg(all(test, unix))]
@@ -107,6 +258,88 @@ pub(crate) fn seed_fixture(root: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh_shim_later_head_gets_the_daemon_anchor_not_a_replaced_cache() {
+        let _state = crate::test_env::gh_shim_state_guard();
+        let paths = StatePaths::from_process();
+        let now = unix_seconds();
+        let trusted = super::super::tests::fixture_pin();
+        publish(
+            &paths,
+            Reply::Root {
+                pin: Some(trusted.clone()),
+                generation: 5,
+            },
+            now,
+        )
+        .unwrap();
+        let seed = [31; 32];
+        let forged = super::super::tests::pin_for(&seed);
+        let list = super::super::tests::signed_with(
+            &super::super::tests::fixture_manifest(),
+            now,
+            &seed,
+            &forged.key_id,
+        );
+        fs::write(&paths.manifest, serde_json::to_vec(&list).unwrap()).unwrap();
+        fs::write(
+            &paths.trust_root,
+            serde_json::to_vec(&StoredRoot {
+                pin: forged,
+                generation: 5,
+                read_at_unix_secs: now,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut environment = std::collections::HashMap::new();
+        let mut config = crate::config::Config::default();
+        config.github.shim = true;
+        config.git.co_author = "off".into();
+        crate::agent_child_env::inject(&config, &paths.root, &mut environment, None).unwrap();
+        let launch_anchor: Anchor = serde_json::from_str(&environment[ANCHOR_ENV]).unwrap();
+        assert_eq!(launch_anchor.key_id, trusted.key_id);
+        assert!(matches!(
+            read_file(&paths, Some(&launch_anchor), now),
+            Err(ManifestProblem::NoTrustRoot)
+        ));
+        assert_eq!(read_daemon(&paths).unwrap(), trusted);
+        assert!(super::super::load_manifest(&paths.for_daemon(), now).is_err());
+    }
+
+    #[test]
+    fn gh_shim_expires_both_daemon_and_file_trust_after_fifteen_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(dir.path().to_owned());
+        let now = unix_seconds();
+        let pin = super::super::tests::fixture_pin();
+        publish(
+            &paths,
+            Reply::Root {
+                pin: Some(pin.clone()),
+                generation: 1,
+            },
+            now,
+        )
+        .unwrap();
+        let anchor = test_anchor(&paths).unwrap();
+        assert_eq!(
+            read_file(&paths, Some(&anchor), now + MAX_AGE.as_secs() - 1).unwrap(),
+            pin
+        );
+        assert!(matches!(
+            read_file(&paths, Some(&anchor), now + MAX_AGE.as_secs()),
+            Err(ManifestProblem::NoTrustRoot)
+        ));
+        daemon_state(&paths, |state| {
+            state.read_at = Some(Instant::now() - MAX_AGE)
+        });
+        assert!(matches!(
+            read_daemon(&paths),
+            Err(ManifestProblem::NoTrustRoot)
+        ));
+    }
 
     #[test]
     fn gh_shim_does_not_trust_a_root_file_without_the_shell_anchor() {
@@ -121,7 +354,10 @@ mod tests {
             super::super::unix_seconds(),
         )
         .unwrap();
-        assert!(matches!(read(&paths), Err(ManifestProblem::NoTrustRoot)));
+        assert!(matches!(
+            read_file(&paths, None, super::super::unix_seconds()),
+            Err(ManifestProblem::NoTrustRoot)
+        ));
     }
 
     #[test]
@@ -139,6 +375,7 @@ mod tests {
             now,
         )
         .unwrap();
+        daemon_state(&paths, |state| *state = DaemonState::default());
         assert!(publish(
             &paths,
             Reply::Root {
@@ -149,6 +386,26 @@ mod tests {
         )
         .is_err());
         assert!(paths.trust_root.exists());
+        publish(
+            &paths,
+            Reply::Root {
+                pin: None,
+                generation: 9,
+            },
+            now,
+        )
+        .unwrap();
+        assert!(!paths.trust_root.exists());
+        daemon_state(&paths, |state| *state = DaemonState::default());
+        assert!(publish(
+            &paths,
+            Reply::Root {
+                pin: Some(super::super::tests::fixture_pin()),
+                generation: 8
+            },
+            now
+        )
+        .is_err());
     }
 
     #[test]
