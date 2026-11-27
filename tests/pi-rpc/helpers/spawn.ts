@@ -15,6 +15,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { cachedExecutableBytes } from "../../../packages/aft-bridge/src/__tests__/test-utils/cached-executable.js";
+import { stagedE2eBinary } from "../../helpers/e2e-binary.js";
 import { hermeticGitChildEnv } from "../../helpers/git-env.js";
 import { createRpcClient, type RpcClient } from "./rpc-client";
 
@@ -76,7 +77,7 @@ export interface PiSpawnOptions {
   restrictToProjectRoot?: boolean;
 }
 
-function childEnv(configDir: string): Record<string, string> {
+function childEnv(configDir: string, stagedBinary: string | null): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined || key === "NODE_ENV") continue;
@@ -90,27 +91,14 @@ function childEnv(configDir: string): Record<string, string> {
   result.OPENAI_API_KEY = "sk-mock";
   result.PI_OFFLINE = "1";
   result.PI_SKIP_VERSION_CHECK = "1";
-  // Prepend BOTH target/release and target/debug to PATH so the Pi RPC
-  // tests find the aft binary regardless of which build the surrounding
-  // CI job produced:
-  //   - dedicated `pi-rpc-e2e` job:        cargo build --release  → target/release/aft
-  //   - workspace `Test` / `Test (macOS)`: cargo test --workspace → target/debug/aft
-  //
-  // Locally either may exist; release takes precedence to match the
-  // dedicated CI job's behavior. Mirrors the same fallback pattern used by
-  // packages/opencode-plugin/src/__tests__/e2e/helpers.ts and
-  // packages/pi-plugin/src/__tests__/e2e/helpers.ts (TARGET_DEBUG_BINARY).
+  // The child runs from a fixture project, so pass an absolute override.
+  if (stagedBinary) result.AFT_BINARY_PATH = stagedBinary;
+  // Local runs without a staged binary can still use workspace builds.
   const sep = process.platform === "win32" ? ";" : ":";
-  const explicitBinaryDir = process.env.AFT_BINARY_PATH
-    ? [dirname(process.env.AFT_BINARY_PATH)]
-    : [];
-  result.PATH = [
-    ...explicitBinaryDir,
-    join(REPO_ROOT, "target", "release"),
-    join(REPO_ROOT, "target", "stage"),
-    join(REPO_ROOT, "target", "debug"),
-    result.PATH ?? "",
-  ].join(sep);
+  const binaryDirs = stagedBinary
+    ? [dirname(stagedBinary)]
+    : ["release", "stage", "debug"].map((profile) => join(REPO_ROOT, "target", profile));
+  result.PATH = [...binaryDirs, result.PATH ?? ""].join(sep);
   // Store-backed callgraph ops (e.g. trace_to_symbol) build the persisted store
   // in the background and return `callgraph_building` until it lands. Tests
   // assert the real JSON result, so block the op until the store is ready
@@ -138,19 +126,19 @@ function childEnv(configDir: string): Record<string, string> {
  * why this never reproduced locally). Production is unaffected: real installs
  * have no source build, so the npm platform package is the correct source there.
  */
-function seedBinaryCache(configDir: string): void {
+function seedBinaryCache(configDir: string, stagedBinary: string | null): void {
   const ext = process.platform === "win32" ? ".exe" : "";
   // AFT_BINARY_PATH (set by CI) pins the exact build under test. Without it,
   // pick the NEWEST existing build across profiles: any fixed precedence
   // order lets a stale binary from an earlier build of another profile
   // shadow the one just built (the classic target/release-shadows-debug
   // trap, and its stage-profile sibling).
-  const builtBinary = process.env.AFT_BINARY_PATH
-    ? process.env.AFT_BINARY_PATH
-    : ["release", "stage", "debug"]
-        .map((profile) => join(REPO_ROOT, "target", profile, `aft${ext}`))
-        .filter((candidate) => existsSync(candidate))
-        .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
+  const builtBinary =
+    stagedBinary ??
+    ["release", "stage", "debug"]
+      .map((profile) => join(REPO_ROOT, "target", profile, `aft${ext}`))
+      .filter((candidate) => existsSync(candidate))
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
   if (builtBinary === undefined || !existsSync(builtBinary)) {
     throw new Error(
       `No built aft binary (checked AFT_BINARY_PATH and target/{release,stage,debug}/aft${ext}). ` +
@@ -190,7 +178,7 @@ function seedBinaryCache(configDir: string): void {
   else symlinkSync(cachedBinary, dest);
 }
 
-function writeConfigs(opts: PiSpawnOptions): string {
+function writeConfigs(opts: PiSpawnOptions, stagedBinary: string | null): string {
   const agentDir = join(opts.configDir, ".pi", "agent");
   const extensionsDir = join(agentDir, "extensions");
   mkdirSync(extensionsDir, { recursive: true });
@@ -198,7 +186,7 @@ function writeConfigs(opts: PiSpawnOptions): string {
   mkdirSync(join(opts.configDir, "data"), { recursive: true });
   mkdirSync(join(opts.configDir, "cache"), { recursive: true });
   // Resolve to the build under test, not the lockfile's published platform pkg.
-  seedBinaryCache(opts.configDir);
+  seedBinaryCache(opts.configDir, stagedBinary);
 
   const distEntry = join(opts.aftPluginDir, "dist", "index.js");
   if (!existsSync(distEntry)) {
@@ -248,7 +236,8 @@ function writeConfigs(opts: PiSpawnOptions): string {
 }
 
 export function spawnPiRpc(opts: PiSpawnOptions): { child: ChildProcess; client: RpcClient } {
-  const agentDir = writeConfigs(opts);
+  const stagedBinary = stagedE2eBinary(process.env);
+  const agentDir = writeConfigs(opts, stagedBinary);
   const child = spawn(
     "node",
     [
@@ -266,7 +255,7 @@ export function spawnPiRpc(opts: PiSpawnOptions): { child: ChildProcess; client:
     ],
     {
       cwd: opts.workdir,
-      env: { ...childEnv(opts.configDir), PI_CODING_AGENT_DIR: agentDir },
+      env: { ...childEnv(opts.configDir, stagedBinary), PI_CODING_AGENT_DIR: agentDir },
       stdio: ["pipe", "pipe", "pipe"],
     },
   );

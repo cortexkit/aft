@@ -10,6 +10,7 @@ pub mod extensions;
 pub(crate) mod external_disk_check;
 mod external_exact;
 mod external_pattern;
+mod first_text_wait;
 pub use crate::search_state::generation_token;
 pub mod lexical_lane;
 pub use crate::search_state::memo;
@@ -140,6 +141,8 @@ use crate::semantic_index::{
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
 use checkout_gaps::CheckoutSemanticGaps;
+pub(crate) use first_text_wait::first_text_index_wait_needed;
+use first_text_wait::wait_for_first_text_index;
 
 const DEFAULT_TOP_K: usize = 10;
 
@@ -377,60 +380,6 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
         wait_for_first_text_index(self.ctx)
     }
-}
-
-const FIRST_TEXT_INDEX_WAIT: Duration = Duration::from_secs(8);
-
-/// Admission uses the same predicate as the wait, so only cold searches leave
-/// the executor. A semantic lane that can already answer needs no text wait.
-pub(crate) fn first_text_index_wait_needed(ctx: &AppContext) -> bool {
-    let lanes = SearchLaneStatus::observe_current(ctx);
-    lanes.trigram.effective == IndexEffective::Building
-        && ctx
-            .data_checkout()
-            .is_some_and(|checkout| checkout.first_text_building())
-        && !lanes.semantic.is_ready()
-}
-
-fn wait_for_first_text_index(ctx: &AppContext) -> extensions::ReadinessWait {
-    // Tool-provider admission hands cold searches to a continuation. A direct
-    // executor caller must not park a worker that the index builder may need.
-    if crate::executor::current_thread_is_executor_worker() {
-        return extensions::ReadinessWait::Completed;
-    }
-    let Some(checkout) = ctx.data_checkout() else {
-        return extensions::ReadinessWait::Completed;
-    };
-    let deadline = Instant::now() + FIRST_TEXT_INDEX_WAIT;
-    let deadline =
-        crate::bounded_io::current().map_or(deadline, |budget| deadline.min(budget.deadline));
-    let mut generation = checkout.checkout().readiness_generation();
-    waits::timed(waits::SearchWait::Readiness, || loop {
-        if search_cancellation_requested() {
-            return extensions::ReadinessWait::Cancelled;
-        }
-        if Instant::now() >= deadline || !first_text_index_wait_needed(ctx) {
-            return extensions::ReadinessWait::Completed;
-        }
-        // Publication wakes this condition variable immediately. The short
-        // cap only observes the job token's cancellation checks (including a
-        // project root deleted or no longer used), which have a separate wake.
-        // Readiness itself is sampled again only when the store signals it.
-        let observed = generation;
-        while generation == observed && Instant::now() < deadline {
-            #[cfg(test)]
-            tests::signal_first_text_wait();
-            checkout.checkout().wait_for_readiness_change(
-                &mut generation,
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(25)),
-            );
-            if search_cancellation_requested() {
-                return extensions::ReadinessWait::Cancelled;
-            }
-        }
-    })
 }
 
 /// The cold-search continuation uses the existing pending-response transport,
@@ -10587,10 +10536,13 @@ fn degraded_warning(ctx: &AppContext) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::first_text_wait::test_signals::{Exit as FirstTextWaitExit, EXITED, STARTED};
     use super::*;
 
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
+    use crate::data_layer::runtime::DataCheckout;
+    use crate::executor::JobCancellation;
     use crate::parser::TreeSitterProvider;
     use crate::semantic_index::{
         with_query_budget_for_test, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex,
@@ -10610,14 +10562,6 @@ mod tests {
         /// Lets a test publish a trigram index while the search sees it as still loading.
         static SEARCH_INDEX_LOAD_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
             const { std::cell::RefCell::new(None) };
-        static FIRST_TEXT_WAIT_STARTED: std::cell::Cell<Option<std::sync::mpsc::Sender<()>>> =
-            const { std::cell::Cell::new(None) };
-    }
-
-    pub(super) fn signal_first_text_wait() {
-        if let Some(started) = FIRST_TEXT_WAIT_STARTED.take() {
-            started.send(()).expect("publication test is listening");
-        }
     }
 
     fn semantic_request(query: &str, top_k: usize) -> RawRequest {
@@ -10701,7 +10645,7 @@ mod tests {
         let (started, waiting) = std::sync::mpsc::channel();
         let worker_ctx = Arc::clone(&ctx);
         let worker = thread::spawn(move || {
-            FIRST_TEXT_WAIT_STARTED.set(Some(started));
+            STARTED.set(Some(started));
             handle_semantic_search(&semantic_request("first_index_needle", 5), &worker_ctx)
         });
         // Wait until the search has sampled the building state and captured the
@@ -10777,50 +10721,80 @@ mod tests {
     }
 
     #[test]
-    fn first_text_index_search_stops_waiting_on_failure_or_cancellation() {
-        for cancel in [false, true] {
-            let (_dir, root, ctx) = first_text_index_fixture();
-            let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-            crate::data_layer::surfaces::bind_for_test(&ctx);
-            let token = crate::executor::JobCancellation::new();
-            let worker_token = token.clone();
-            let worker_ctx = Arc::clone(&ctx);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let worker = thread::spawn(move || {
-                let _cancel = crate::executor::install_job_cancellation(worker_token);
-                tx.send(handle_semantic_search(
-                    &semantic_request("first_index_needle", 5),
-                    &worker_ctx,
-                ))
-                .unwrap();
-            });
-            assert!(matches!(
-                rx.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ));
-            if cancel {
-                token.request_cancel();
-            } else {
-                ctx.data_checkout().unwrap().note_outcome_for_test::<()>(
+    fn first_text_index_search_wakes_on_build_failure() {
+        assert_first_text_wait_exit(
+            FirstTextWaitExit::Failure,
+            "search_lanes_unavailable",
+            |checkout, _| {
+                checkout.note_outcome_for_test::<()>(
                     "build",
                     &Err(crate::data_layer::checkout::DataError::Store(
                         "test build failed".into(),
                     )),
                 );
-            }
-            let response = rx
-                .recv_timeout(Duration::from_millis(500))
-                .expect("failure or cancellation stops the wait");
-            assert_eq!(
-                response.data["code"],
-                if cancel {
-                    "request_cancelled"
-                } else {
-                    "search_lanes_unavailable"
-                }
-            );
-            worker.join().unwrap();
-        }
+            },
+        );
+    }
+
+    #[test]
+    fn first_text_index_search_observes_cancellation_on_poll() {
+        assert_first_text_wait_exit(
+            FirstTextWaitExit::Cancelled,
+            "request_cancelled",
+            |_, token| token.request_cancel(),
+        );
+    }
+
+    fn assert_first_text_wait_exit(
+        expected: FirstTextWaitExit,
+        code: &str,
+        trigger: impl FnOnce(&DataCheckout, &JobCancellation),
+    ) {
+        let (_dir, root, ctx) = first_text_index_fixture();
+        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let checkout = ctx.data_checkout().unwrap();
+        let token = JobCancellation::new();
+        let worker_token = token.clone();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (exited, exit) = std::sync::mpsc::channel();
+        let (replied, reply) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _cancel = crate::executor::install_job_cancellation(worker_token);
+            STARTED.set(Some(started));
+            EXITED.set(Some(exited));
+            let response = handle_semantic_search(&semantic_request("first_index_needle", 5), &ctx);
+            replied.send((response, Instant::now())).unwrap();
+        });
+
+        // The worker has captured its readiness generation. A build failure
+        // changes that generation; cancellation leaves it unchanged.
+        let hang_catch = Duration::from_secs(5);
+        waiting
+            .recv_timeout(hang_catch)
+            .expect("search entered the first-text wait");
+        let generation = checkout.checkout().readiness_generation();
+        let triggered_at = Instant::now();
+        trigger(&checkout, &token);
+        let (reason, exited_at) = exit
+            .recv_timeout(hang_catch)
+            .expect("first-text wait exited");
+        eprintln!(
+            "first-text {reason:?}: trigger to wait exit {:?}",
+            exited_at.duration_since(triggered_at)
+        );
+        assert_eq!(reason, expected);
+        assert_eq!(
+            checkout.checkout().readiness_generation() != generation,
+            expected == FirstTextWaitExit::Failure
+        );
+        let (response, replied_at) = reply.recv_timeout(hang_catch).expect("search replied");
+        eprintln!(
+            "first-text {reason:?}: wait exit to response {:?}",
+            replied_at.duration_since(exited_at)
+        );
+        assert_eq!(response.data["code"], code);
+        worker.join().unwrap();
     }
 
     #[test]

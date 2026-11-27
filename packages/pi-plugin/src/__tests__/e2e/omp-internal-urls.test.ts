@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { stagedE2eBinary } from "../../../../../tests/helpers/e2e-binary.js";
 
 const host = process.env.AFT_OMP_HOST;
 if (!host)
@@ -26,13 +27,15 @@ async function runHeadless(extensionEntry?: string): Promise<void> {
       AFT_STORAGE_DIR: join(home, "data", "cortexkit", "aft"),
       AFT_CACHE_DIR: join(home, "cache", "aft"),
       AFT_OMP_HOST: resolve(host!),
-      // Use the same local binary as the other Pi e2e tests, not first-run
-      // downloads into this intentionally empty HOME. Delegated startup keeps
-      // the bridge and index installers lazy until an AFT filesystem call.
-      AFT_BINARY_PATH: resolve(
-        import.meta.dir,
-        `../../../../../target/debug/aft${process.platform === "win32" ? ".exe" : ""}`,
-      ),
+      // Use the build under test, not first-run downloads into this empty HOME.
+      // A delegated child (MAGIC_CONTEXT_PI_SUBAGENT below) skips eager startup,
+      // so the installers stay lazy until an AFT filesystem call.
+      AFT_BINARY_PATH:
+        stagedE2eBinary(process.env) ??
+        resolve(
+          import.meta.dir,
+          `../../../../../target/debug/aft${process.platform === "win32" ? ".exe" : ""}`,
+        ),
       MAGIC_CONTEXT_PI_SUBAGENT: "1",
       AFT_LOG_STDERR: "1",
       ...(extensionEntry ? { AFT_OMP_EXTENSION_ENTRY: extensionEntry } : {}),

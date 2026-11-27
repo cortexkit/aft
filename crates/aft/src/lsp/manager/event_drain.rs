@@ -270,7 +270,8 @@ impl LspManager {
     fn ingress_ready(&self, key: &ServerKey, id: ServerInstanceId) -> bool {
         self.clients.get(key).is_some_and(|client| {
             client.instance == id
-                && (!client.uses_analysis_progress() || !self.starting.contains_key(key))
+                && (!(client.uses_analysis_progress() || key.kind == ServerKind::Rust)
+                    || !self.starting.contains_key(key))
         })
     }
 
@@ -310,6 +311,19 @@ impl LspManager {
                 receipt.receive_order,
                 self.diagnostics.current_epoch(),
             );
+        }
+    }
+
+    pub(super) fn handle_rust_status(&mut self, receipt: &ReceivedLspEvent) {
+        if let LspEvent::Notification {
+            server_kind: ServerKind::Rust,
+            root,
+            params: Some(params),
+            ..
+        } = &receipt.event
+        {
+            self.event_tx.consume_rust_status(receipt);
+            self.handle_server_status(ServerKind::Rust, root.clone(), params);
         }
     }
 
@@ -377,7 +391,11 @@ impl LspManager {
         let mut retired = Vec::new();
         for (key, overflow) in overflows {
             match overflow {
-                IngressOverflow::Dropped { through, progress } => {
+                IngressOverflow::Dropped {
+                    through,
+                    progress,
+                    rust_status,
+                } => {
                     let client = self.clients.get_mut(&key).unwrap();
                     if let Some(progress) = progress {
                         client
@@ -389,6 +407,16 @@ impl LspManager {
                         "discarded language server events for {key:?}: event queue overflow"
                     );
                     self.invalidate_server_diagnostics(&key);
+                    if let Some(status) = rust_status {
+                        self.handle_rust_status(&status);
+                    }
+                    // The dropped events may include a server's request to
+                    // refresh diagnostics, or a newly registered diagnostics
+                    // provider. The reader already recorded which providers
+                    // the server offers, but the nudge to pull again may be
+                    // gone, and the diagnostics were just invalidated. So
+                    // pull again for every open file.
+                    self.queue_open_document_pulls(&key);
                 }
                 IngressOverflow::ProgressLimit => {
                     slog_warn!("retiring language server {key:?}: exceeded the limit of {ANALYSIS_TOKEN_LIMIT} unfinished analysis progress tokens");

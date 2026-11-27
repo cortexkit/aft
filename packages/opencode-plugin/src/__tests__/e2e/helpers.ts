@@ -22,6 +22,7 @@ import {
   inlineUserConfigTier,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
+import { stagedE2eBinary } from "../../../../../tests/helpers/e2e-binary.js";
 import { hermeticGitChildEnv } from "../../../../../tests/helpers/git-env.js";
 import { warmMacosExec } from "../../../../../tests/helpers/macos-exec-warm.js";
 import {
@@ -32,7 +33,6 @@ import {
 } from "../../../../aft-bridge/src/__tests__/e2e/subc-rig.js";
 import { isolatedAftEnvironment } from "../../../../aft-bridge/src/test-child-environment.js";
 import { bridgeLogger } from "../../logger.js";
-import { e2eBinaryRequired } from "./binary-requirement.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
 // "[aft] invalidated 7 files") into the process-private test log namespace instead of
@@ -254,7 +254,7 @@ const SKIP_DIRS = new Set([
 export interface PreparedBinary {
   binaryPath: string | null;
   skipReason?: string;
-  source: "target" | "fallback" | null;
+  source: "AFT_BINARY_PATH" | "target" | "fallback" | null;
   buildAttempted: boolean;
 }
 
@@ -824,6 +824,12 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
   // Every binary this returns is about to be spawned under short per-spawn
   // timeouts, so pay macOS's one-time exec assessment here instead of inside
   // the first timed test. See warmMacosExec.
+  const staged = stagedE2eBinary(process.env);
+  if (staged) {
+    await warmMacosExec(staged);
+    return { binaryPath: staged, source: "AFT_BINARY_PATH", buildAttempted: false };
+  }
+
   const existing = await resolveAftBinaryPath(debugBinaryCandidates());
   if (existing) {
     await warmMacosExec(existing);
@@ -861,19 +867,6 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
   const skipReason = build.ok
     ? `aft binary not found at ${searched}`
     : `cargo build failed and no fallback aft binary was found\n${build.output}`;
-
-  // In CI the aft binary is always built before the Bun suites run, so a missing
-  // binary there means the build/setup broke — fail loud instead of letting 25+
-  // e2e files silently `describe.skipIf(!binaryPath)` into a false green. Locally
-  // (no CI flag) keep the quiet-skip behavior so contributors without a built
-  // binary can still run the non-e2e suites.
-  if (e2eBinaryRequired(process.env)) {
-    throw new Error(
-      `e2e setup failed: ${skipReason}\n` +
-        "The aft binary must be present in CI (built before Bun tests run). " +
-        "Refusing to silently skip e2e coverage.",
-    );
-  }
 
   return {
     binaryPath: null,

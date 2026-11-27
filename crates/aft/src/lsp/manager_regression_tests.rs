@@ -1494,6 +1494,134 @@ pub(crate) fn drain_flycheck_end_for_maintenance_test(
         .unwrap()
 }
 
+fn send_rust_status(
+    manager: &LspManager,
+    key: &ServerKey,
+    order: u64,
+    health: &str,
+    quiescent: bool,
+) {
+    send_progress_fixture_event(
+        manager,
+        key,
+        order,
+        LspEvent::Notification {
+            server_kind: ServerKind::Rust,
+            root: key.root.clone(),
+            method: "experimental/serverStatus".into(),
+            params: Some(json!({"health": health, "quiescent": quiescent})),
+        },
+    );
+}
+
+#[test]
+fn rust_server_status_overflow_does_not_strand_startup_quiescence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = ServerKey {
+        kind: ServerKind::Rust,
+        root: canonicalize_for_lsp(tmp.path()).unwrap(),
+    };
+    let mut manager = LspManager::new();
+    let client = lifecycle_fake_client_with_env(
+        &manager,
+        &key,
+        [("AFT_FAKE_LSP_SERVER_STATUS", "disabled")],
+    );
+    manager.clients.insert(key.clone(), client);
+    let file = key.root.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+    manager.sync_document_version_for_test(&key, &file, 1);
+
+    let dropped = fill_progress_queue(&manager, &key, 1);
+    send_work_done(&manager, &key, dropped, "Indexing", "end");
+    manager.drain_events();
+    assert!(!manager.producer_has_settled(&key), "no status arrived");
+
+    let dropped = fill_progress_queue(&manager, &key, dropped + 1);
+    send_rust_status(&manager, &key, dropped, "error", true);
+    send_rust_status(&manager, &key, dropped + 1, "ok", true);
+    manager.drain_events();
+
+    assert!(manager.event_rx.is_empty());
+    assert!(manager.has_client(&key));
+    assert_eq!(manager.producer_failure(&key), None);
+    assert!(
+        manager.producer_has_settled(&key),
+        "the latest status said the analyzer is quiescent even though the inbox was full"
+    );
+    publish_for_progress(&manager, &key, dropped + 2, &file);
+    manager.drain_events();
+    assert!(!manager.diagnostics.entries_for_file(&file)[0].1.provisional);
+
+    send_rust_status(&manager, &key, dropped + 3, "ok", true);
+    manager.drain_events();
+    manager
+        .clients
+        .get_mut(&key)
+        .unwrap()
+        .begin_rust_workspace_reload(std::time::SystemTime::now());
+    let dropped = fill_progress_queue(&manager, &key, dropped + 4);
+    send_work_done(&manager, &key, dropped, "Indexing", "end");
+    manager.drain_events();
+    assert!(
+        !manager.producer_has_settled(&key),
+        "overflow must not replay the status already applied to the old workspace load"
+    );
+
+    send_rust_status(&manager, &key, dropped + 1, "ok", true);
+    let dropped = fill_progress_queue(&manager, &key, dropped + 2);
+    send_rust_status(&manager, &key, dropped, "error", true);
+    manager.drain_events();
+    assert!(
+        manager.producer_failure(&key).is_some(),
+        "the newer dropped error must win over the queued healthy status"
+    );
+}
+
+#[test]
+fn lsp_inbox_overflow_requeues_diagnostic_pulls_for_open_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = ServerKey {
+        kind: ServerKind::Python,
+        root: canonicalize_for_lsp(tmp.path()).unwrap(),
+    };
+    let file = key.root.join("main.py");
+    std::fs::write(&file, "n = 1\n").unwrap();
+    let owner = Arc::new(parking_lot::Mutex::new(LspManager::new()));
+    let mut manager = owner.lock();
+    let client = lifecycle_fake_client_with_env(
+        &manager,
+        &key,
+        [
+            ("AFT_FAKE_LSP_PULL", "1"),
+            ("AFT_FAKE_LSP_NO_WATCHED_FILES", "1"),
+        ],
+    );
+    assert!(client.uses_document_pull(Some(&file)));
+    manager.clients.insert(key.clone(), client);
+    manager.sync_document_version_for_test(&key, &file, 1);
+    manager.drain_events();
+    manager.background_pull_owner = Arc::downgrade(&owner);
+    manager.background_pull_pauses = 1;
+    assert!(manager.background_pull_pending.is_empty());
+
+    let dropped = fill_progress_queue(&manager, &key, 100);
+    send_progress_fixture_event(
+        &manager,
+        &key,
+        dropped,
+        LspEvent::ServerRequest {
+            server_kind: key.kind.clone(),
+            root: key.root.clone(),
+            id: crate::lsp::jsonrpc::RequestId::Int(1),
+            method: "workspace/diagnostic/refresh".into(),
+            params: None,
+        },
+    );
+    manager.drain_events();
+    assert!(manager.background_pull_pending.contains(&(key, file)));
+}
+
 #[test]
 fn flycheck_overflow_leaves_no_running_or_completed_check_and_rearms() {
     let tmp = tempfile::tempdir().unwrap();

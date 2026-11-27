@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 
 import { type CatalogEntry, SubcClient } from "@cortexkit/subc-client";
+import { stagedE2eBinary } from "../../../../../tests/helpers/e2e-binary.js";
 import { isolatedAftEnvironment } from "../../test-child-environment.js";
 import { cachedExecutable, cachedExecutableBytes } from "../test-utils/cached-executable.js";
 
@@ -435,17 +436,8 @@ async function prepareAftBinary(): Promise<{
   skipReason?: string;
   buildAttempted: boolean;
 }> {
-  const envPath = process.env.AFT_BINARY_PATH?.trim();
-  if (envPath) {
-    if (await isExecutable(envPath)) {
-      return { binaryPath: envPath, buildAttempted: false };
-    }
-    const skipReason = `AFT_BINARY_PATH is not executable: ${envPath}`;
-    if (process.env.CI === "true") {
-      throw new Error(`e2e setup failed: ${skipReason}`);
-    }
-    return { binaryPath: null, skipReason, buildAttempted: false };
-  }
+  const staged = stagedE2eBinary(process.env);
+  if (staged) return { binaryPath: staged, buildAttempted: false };
 
   if (await isExecutable(TARGET_DEBUG_BINARY)) {
     return { binaryPath: TARGET_DEBUG_BINARY, buildAttempted: false };
@@ -465,9 +457,6 @@ async function prepareAftBinary(): Promise<{
   const skipReason = build.ok
     ? `aft binary not found at ${searched}`
     : `cargo build failed and no fallback aft binary was found\n${build.output}`;
-  if (process.env.CI === "true") {
-    throw new Error(`e2e setup failed: ${skipReason}`);
-  }
   return { binaryPath: null, skipReason, buildAttempted: true };
 }
 
