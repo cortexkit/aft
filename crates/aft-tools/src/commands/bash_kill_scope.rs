@@ -101,6 +101,8 @@ pub fn handle_bash_kill_scope_with_saved_tasks(
                 saved_recovery_gate::pass(root, saved_recovery_gate::Point::BetweenPasses);
             }
             deadline = Instant::now() + Duration::from_secs(10);
+            #[cfg(all(test, unix))]
+            observe_remote_pause(RemotePauseEvent::Deadline(deadline));
         }
         let stopped = crate::bash_background::registry::stop_tasks_in_parallel(
             all_registries.iter().zip(&members),
@@ -143,6 +145,8 @@ pub fn handle_bash_kill_scope_with_saved_tasks(
     if kill_error.is_none() {
         for (registry, index) in remote_tasks {
             let task = &mut killed[index];
+            #[cfg(all(test, unix))]
+            observe_remote_pause(RemotePauseEvent::Wait(deadline));
             task.remote =
                 Some(registry.wait_owner_pause_cancel(&task.task_id, &task.session_id, deadline));
         }
@@ -219,6 +223,46 @@ pub fn handle_bash_kill_scope_with_saved_tasks(
         data["bot_writes_already_queued"] = json!(queued.unwrap());
     }
     Response::success(ID, data)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) enum RemotePauseEvent {
+    Deadline(Instant),
+    Wait(Instant),
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static REMOTE_PAUSE_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(RemotePauseEvent)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn with_remote_pause_observer<T>(
+    observer: impl FnMut(RemotePauseEvent) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REMOTE_PAUSE_OBSERVER.replace(None);
+        }
+    }
+    REMOTE_PAUSE_OBSERVER.with_borrow_mut(|slot| {
+        assert!(slot.is_none());
+        *slot = Some(Box::new(observer));
+    });
+    let _reset = Reset;
+    operation()
+}
+
+#[cfg(all(test, unix))]
+fn observe_remote_pause(event: RemotePauseEvent) {
+    REMOTE_PAUSE_OBSERVER.with_borrow_mut(|observer| {
+        if let Some(observer) = observer {
+            observer(event);
+        }
+    });
 }
 
 #[cfg(all(test, unix))]

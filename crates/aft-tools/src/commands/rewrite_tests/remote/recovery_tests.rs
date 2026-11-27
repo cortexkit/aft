@@ -2541,6 +2541,10 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
 
 #[tokio::test]
 async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are_first() {
+    use crate::commands::bash_kill_scope::{
+        handle_bash_kill_scope, with_remote_pause_observer, RemotePauseEvent,
+    };
+
     let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
     // Prepare repositories before either remote worker connects: synchronous
     // Git setup must not starve the fake daemon's authentication handshake.
@@ -2586,54 +2590,63 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
         })
         .await;
     }
-    let local = reg::with_scope_spawn(Some(scope.clone()), || {
-        registries[1].spawn(
-            SpawnPlan::Unsandboxed,
-            "sleep 30",
-            "local".into(),
-            dirs[1].path().into(),
-            HashMap::new(),
-            crate::bash_background::HardKill::After(Duration::from_secs(30)),
-            None,
-            dirs[1].path().into(),
-            10,
-            true,
-            false,
-            Some(dirs[1].path().into()),
-        )
-    })
-    .unwrap();
+    let locals = registries
+        .iter()
+        .zip(&dirs)
+        .map(|(registry, dir)| {
+            let task = reg::with_scope_spawn(Some(scope.clone()), || {
+                registry.spawn(
+                    SpawnPlan::Unsandboxed,
+                    "sleep 30",
+                    "local".into(),
+                    dir.path().into(),
+                    HashMap::new(),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
+                    dir.path().into(),
+                    10,
+                    true,
+                    false,
+                    Some(dir.path().into()),
+                )
+            })
+            .unwrap();
+            (registry.clone(), task)
+        })
+        .collect::<Vec<_>>();
     let pausing = registries.clone();
-    let started = Instant::now();
     let operation = tokio::task::spawn_blocking(move || {
-        crate::commands::bash_kill_scope::handle_bash_kill_scope(
-            serde_json::json!({"scope":scope}),
-            Some(&scope.owner),
-            &pausing,
-        )
+        let (observed, events) = std::sync::mpsc::channel();
+        let reply = with_remote_pause_observer(
+            move |event| {
+                if matches!(event, RemotePauseEvent::Wait(_)) {
+                    for (registry, task) in &locals {
+                        assert_eq!(
+                            registry.status(task, "local", None, None, 0).unwrap().info.status,
+                            BgTaskStatus::Killed,
+                            "all local tasks must be killed before waiting on any runner"
+                        );
+                    }
+                }
+                observed.send(event).unwrap();
+            },
+            || handle_bash_kill_scope(serde_json::json!({"scope":scope}), Some(&scope.owner), &pausing),
+        );
+        (reply, events.into_iter().collect::<Vec<_>>())
     });
-    wait_for("local kill must not wait for remote cancellation", || {
-        (registries[1]
-            .status(&local, "local", None, None, 0)
-            .unwrap()
-            .info
-            .status
-            == BgTaskStatus::Killed)
-            .then_some(())
-    })
-    .await;
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "local kill waited for a runner: {:?}",
-        started.elapsed()
-    );
-    let reply = tokio::time::timeout(Duration::from_secs(12), operation)
+    // The observed wait deadlines, not the suite's scheduling, prove that
+    // both runners share one window. This timeout only catches a stuck call.
+    let (reply, events) = tokio::time::timeout(Duration::from_secs(60), operation)
         .await
-        .expect("both unaccepted tasks must share one 10-second deadline")
+        .expect("scope pause must settle")
         .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(12));
+    assert!(matches!(
+        events.as_slice(),
+        [RemotePauseEvent::Deadline(deadline), RemotePauseEvent::Wait(first), RemotePauseEvent::Wait(second)]
+            if first == deadline && second == deadline
+    ));
     assert!(reply.success, "{reply:?}");
-    assert_eq!(reply.data["killed"].as_array().unwrap().len(), 3);
+    assert_eq!(reply.data["killed"].as_array().unwrap().len(), 4);
     for (index, task) in tasks.iter().enumerate() {
         let entry = reply.data["killed"]
             .as_array()
