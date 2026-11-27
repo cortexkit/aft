@@ -57,7 +57,8 @@ use crate::parser::LangId;
 /// bytes and different names have different records; it also retained the
 /// contained type of proven standard-library smart-pointer fields (for example,
 /// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods;
-/// 15 stores each distinct method-call answer once per fragment;
+/// 15 stores each distinct method-call answer once in each file's slice of
+/// the call graph.
 /// 25 adds Rust constants, statics, and type aliases to the symbol table. The
 /// TypeScript extractor marks only exported declarations and records each
 /// exported destructuring binding as a symbol.

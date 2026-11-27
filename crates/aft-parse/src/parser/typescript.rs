@@ -117,7 +117,8 @@ pub(super) const QUERY: &str = r#"
 (export_statement) @export.stmt
 "#;
 
-/// Local bindings exported by a module clause or a default identifier.
+/// Local bindings exported by an export clause (`export { a, b as c }`) or a
+/// default identifier (`export default a`).
 pub(super) fn named_exports(source: &str, root: Node<'_>) -> HashSet<String> {
     let mut names = HashSet::new();
     for statement in root.named_children(&mut root.walk()) {
