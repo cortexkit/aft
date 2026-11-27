@@ -233,8 +233,11 @@ fn finalize_tool_response_text(
     }
 }
 
-/// Foreground and watch replies consume terminal results for their originating
-/// session. Status and kill replies only consume results delegated to awaited work.
+/// Match the bridge's `observeBackgroundReply`: a terminal `bash` reply with a
+/// string `output_preview`, or a terminal `bash_watch` from the task's session,
+/// delivers the result inline. A launch without `output_preview` leaves the
+/// completion available for a later notification or drain. Status and kill
+/// replies only consume results delegated to awaited work.
 fn acknowledge_terminal_bash_reply(
     response: &Response,
     ctx: &AppContext,

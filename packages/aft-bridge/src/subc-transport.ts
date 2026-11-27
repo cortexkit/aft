@@ -2116,9 +2116,9 @@ export class SubcTransportPool implements AftTransportPool {
     const args = isRecord(body.arguments) ? body.arguments : {};
     const data =
       isRecord(reply) && isRecord(reply.structuredContent) ? reply.structuredContent : null;
+    const launchesShell = name === "bash" || name === "powershell";
     const affectsBackground =
-      name === "bash" ||
-      name === "powershell" ||
+      launchesShell ||
       [
         "bash_status",
         "bash_kill",
@@ -2134,11 +2134,7 @@ export class SubcTransportPool implements AftTransportPool {
     if (!data || data.success !== true) {
       if (affectsBackground) {
         // This invalid_request refusal occurs before bash or powershell launches work.
-        if (
-          data?.code === "invalid_request" &&
-          (name === "bash" || name === "powershell") &&
-          typeof args.task_id !== "string"
-        )
+        if (data?.code === "invalid_request" && launchesShell && typeof args.task_id !== "string")
           return;
         if (typeof args.task_id === "string") {
           if (!record.backgroundTasks.has(args.task_id))
@@ -2148,14 +2144,21 @@ export class SubcTransportPool implements AftTransportPool {
       return;
     }
     if (typeof data.task_id === "string") {
-      // Terminal tasks remain pinned until the daemon explicitly ACKs them.
       const terminal = isTerminalStatus(data.status);
-      const running = ["starting", "running", "killing"].includes(String(data.status));
-      record.backgroundTasks.set(
-        data.task_id,
-        terminal ? "terminal" : running ? "running" : "unknown",
-      );
-      if (name === "bash" || name === "powershell") record.pendingDetach = false;
+      // Match acknowledge_terminal_bash_reply: a terminal shell reply with a
+      // string output_preview, or a terminal bash_watch from the task's session,
+      // delivers the result inline.
+      // A launch without output_preview and a bash_status poll still need an ACK.
+      if (terminal && name === "bash_watch") {
+        record.backgroundTasks.delete(data.task_id);
+      } else if (!(terminal && launchesShell && typeof data.output_preview === "string")) {
+        const running = ["starting", "running", "killing"].includes(String(data.status));
+        record.backgroundTasks.set(
+          data.task_id,
+          terminal ? "terminal" : running ? "running" : "unknown",
+        );
+      }
+      if (launchesShell) record.pendingDetach = false;
     }
     if (Array.isArray(data.bg_completions)) {
       for (const completion of data.bg_completions) {
