@@ -1370,7 +1370,8 @@ mod tests {
     }
 
     /// A leader that has exited but is not reaped yet (a zombie) is not a
-    /// running leader, so the kill neither commits for it nor hangs it up.
+    /// running leader, so the kill does not send it a hangup or claim the
+    /// exit it made on its own as the kill's.
     #[cfg(unix)]
     #[test]
     fn a_zombie_leader_is_not_running() {
