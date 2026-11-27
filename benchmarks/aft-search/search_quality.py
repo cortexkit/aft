@@ -233,7 +233,8 @@ def run(args:argparse.Namespace)->int:
         descriptor = read_json(path)
         notes: list[str] = []
         try:
-            resolved, missing_ranking = resolve_descriptor(descriptor, paths, schema_blobs=read_tool_schema_blobs(args.base_ref, args.head, paths, root=ROOT), notes=notes)
+            manifest = read_json(Path(args.manifest)) if "order_changes" in descriptor else None
+            resolved, missing_ranking = resolve_descriptor(descriptor, paths, schema_blobs=read_tool_schema_blobs(args.base_ref, args.head, paths, root=ROOT), notes=notes, manifest=manifest)
         finally:
             for note in notes: print(note)
         if missing_ranking:

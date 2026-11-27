@@ -51,6 +51,88 @@ from search_quality_lib import (
 )
 
 
+class OrderChangesTests(unittest.TestCase):
+    row_id = "followup-census:1"
+    other_id = "followup-census:2"
+
+    def setUp(self) -> None:
+        self.manifest, self.reference, self.score = synthetic_documents()
+        self.path = "crates/aft-parse/src/parser.rs"
+        self.descriptor = {
+            "slice_class": "ranking", "kind": "ranking", "targeted_mechanism": "none",
+            "order_changes": {self.row_id: "The candidate matches the module exports."},
+        }
+        self.manifest["rows"].append(dict(self.manifest["rows"][0], episode_id=self.other_id))
+        for document in (self.reference, self.score):
+            document["rows"][0].update(
+                pinned_shape="identifier", mechanism="topk_cut", census_stratum="identifier",
+                ranked_paths=["noise.rs", "opened.rs", "another.rs"],
+                metrics=row_metrics(["noise.rs", "opened.rs", "another.rs"], "opened.rs"),
+            )
+            document["rows"].append(dict(document["rows"][0], episode_id=self.other_id))
+
+    def evaluate(self):
+        return total_gate(self.reference, self.score, self.manifest, self.descriptor, [self.path])
+
+    def set_ranked_paths(self, paths: list[str]) -> None:
+        self.score["rows"][0].update(ranked_paths=paths, metrics=row_metrics(paths, "opened.rs"))
+
+    def test_listed_change_accepts_equal_or_higher_metrics(self) -> None:
+        for paths in (["another.rs", "opened.rs", "noise.rs"], ["opened.rs", "noise.rs"]):
+            with self.subTest(paths=paths):
+                self.set_ranked_paths(paths)
+                self.score["families"]["real_query"]["mrr_at_10"] = 0.1
+                result = self.evaluate()
+                self.assertEqual(result.exit_code, 0, result.reasons)
+
+    def test_listed_change_rejects_even_one_lower_metric(self) -> None:
+        self.set_ranked_paths(["noise.rs", "another.rs", "opened.rs"])
+        self.assertIn(f"order_change_metric_decreased:{self.row_id}:mrr_at_10", self.evaluate().reasons)
+
+    def test_unlisted_row_remains_exact(self) -> None:
+        self.set_ranked_paths(["another.rs", "opened.rs", "noise.rs"])
+        self.score["rows"][1]["retrieval_depth"] += 1
+        self.assertIn(f"real_query.{self.other_id}", self.evaluate().reasons[0])
+        self.assertIn("retrieval_depth", self.evaluate().reasons[0])
+
+    def test_declared_change_must_occur(self) -> None:
+        self.assertIn(f"declared_order_change_did_not_occur:{self.row_id}", self.evaluate().reasons)
+
+    def test_depth_only_change_counts(self) -> None:
+        self.score["rows"][0]["retrieval_depth"] += 1
+        self.assertEqual(self.evaluate().exit_code, 0)
+
+    def test_page_zero_only_change_counts(self) -> None:
+        self.reference["rows"][0]["page_zero_ranked_paths"] = ["noise.rs", "opened.rs"]
+        self.score["rows"][0]["page_zero_ranked_paths"] = ["opened.rs", "noise.rs"]
+        self.assertEqual(self.evaluate().exit_code, 0)
+
+    def test_listed_row_does_not_allow_request_changes(self) -> None:
+        self.set_ranked_paths(["another.rs", "opened.rs", "noise.rs"])
+        self.score["rows"][0]["request"] = {"includeTests": False, "topK": 1}
+        self.assertIn(f"real_query.{self.row_id}.request", self.evaluate().reasons[0])
+
+    def test_rejects_absent_episode_and_multiline_reason(self) -> None:
+        for reasons, expected in (
+            ({"followup-census:77": "Changed order."}, "order_changes:unknown_episode:followup-census:77"),
+            ({self.row_id: "Changed order.\n"}, f"order_changes.{self.row_id}:reason_must_be_one_line"),
+        ):
+            with self.subTest(reasons=reasons):
+                self.descriptor["order_changes"] = reasons
+                self.assertIn(expected, self.evaluate().reasons[0])
+
+    def test_engine_unwired_can_declare_order_changes(self) -> None:
+        self.descriptor.update(slice_class="engine_unwired", kind="harness", fixtures=[TOOL_CALL_PARITY_FIXTURE_SOURCE])
+        self.set_ranked_paths(["opened.rs", "noise.rs"])
+        self.assertEqual(self.evaluate().exit_code, 0)
+
+    def test_order_changes_cannot_replace_a_targeted_mechanism_or_non_ranking_contract(self) -> None:
+        for options in ({"targeted_mechanism": "topk_cut"}, {"slice_class": "non_ranking", "kind": "harness"}):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(InputFault, "malformed_descriptor:order_changes:requires_strict_row_comparison"):
+                    resolve_descriptor(dict(self.descriptor, **options), [self.path])
+
+
 class SplitPairedTests(unittest.TestCase):
     def candidate(self, combined: float, prose: float, form: str = "split", kind: str = "concept") -> dict:
         return {"rows": [{"episode_id": "followup-census:910003", "input_form": form, "answer_kind": kind,

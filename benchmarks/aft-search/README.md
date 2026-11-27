@@ -519,6 +519,15 @@ every other row field (including all other pattern-summary keys), families,
 aggregates and score-document comparisons remain strict. `pattern_counts` is
 refused on every other descriptor class.
 
+An `engine_unwired` descriptor, or a `ranking` descriptor with `kind: ranking`
+and `targeted_mechanism: none`, may declare `order_changes`. Map each changed
+episode ID to a one-line reason. Each declaration must correspond to a change in
+ranked paths or retrieval depth. No scored metric on a listed row may drop, and
+each unlisted row must remain exact. The gate recomputes real-query aggregates
+from the rows and keeps the exact- and concept-recall families unchanged. Use
+this opt-in for correctness fixes that move results without lowering scores;
+ranking descriptors that target a mechanism still have to improve it.
+
 Moving that pair is an audited act, never a repair to make a red gate green.
 Re-record only after the cause of the difference is established, on one binary,
 with `cost-gate.sh --search-quality --mode record-reference`, and say in the
