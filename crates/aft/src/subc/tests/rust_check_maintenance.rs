@@ -1,9 +1,24 @@
 use super::*;
 use crate::lsp::client::FLYCHECK_PUBLISH_SETTLE;
-use crate::lsp::manager::{regression_tests::drain_flycheck_end_for_maintenance_test, RetryClock};
+use crate::lsp::manager::{
+    regression_tests::{
+        drain_flycheck_end_for_maintenance_test, finish_flycheck_for_maintenance_test,
+        overflow_flycheck_inbox_for_maintenance_test,
+    },
+    RetryClock,
+};
 
 #[tokio::test]
 async fn idle_lsp_maintenance_persists_rust_check_after_publish_settle() {
+    assert_idle_flycheck_persistence(false).await;
+}
+
+#[tokio::test]
+async fn idle_lsp_maintenance_persists_only_the_replacement_rust_check_after_overflow() {
+    assert_idle_flycheck_persistence(true).await;
+}
+
+async fn assert_idle_flycheck_persistence(overflow: bool) {
     let (_dir, root) = test_root("idle-flycheck-settle");
     let storage = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -20,7 +35,7 @@ async fn idle_lsp_maintenance_persists_rust_check_after_publish_settle() {
     assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
     ctx.mark_subc_bound();
     let clock = Arc::new(parking_lot::Mutex::new(Instant::now()));
-    let settle_at = {
+    let (key, settle_at) = {
         let mut lsp = ctx.lsp();
         let read_clock = Arc::clone(&clock);
         lsp.set_retry_clock(RetryClock::from_fn(move || *read_clock.lock()));
@@ -52,9 +67,31 @@ async fn idle_lsp_maintenance_persists_rust_check_after_publish_settle() {
     assert!(probe(&mut live_roots).is_empty());
     assert!(persisted_record().is_none());
 
+    if overflow {
+        let replacement_order = overflow_flycheck_inbox_for_maintenance_test(
+            &mut ctx.lsp(),
+            &key,
+            &key.root.join("lib.rs"),
+        );
+        *clock.lock() = settle_at;
+        assert!(probe(&mut live_roots).is_empty());
+        // Even an explicit drain must not persist the invalidated check.
+        ctx.lsp().drain_events();
+        assert!(
+            persisted_record().is_none(),
+            "the invalidated check was saved"
+        );
+
+        let mut lsp = ctx.lsp();
+        finish_flycheck_for_maintenance_test(&mut lsp, &key, replacement_order);
+        assert_eq!(lsp.pending_event_count_for_test(), 0);
+        *clock.lock() = Instant::now() + FLYCHECK_PUBLISH_SETTLE;
+    } else {
+        *clock.lock() = end_at + DRAIN_TICK_PERIOD * 2;
+    }
+
     // The next tick crosses the settle deadline. No new LSP event or tool call
     // may be responsible for admitting this maintenance job.
-    *clock.lock() = end_at + DRAIN_TICK_PERIOD * 2;
     assert_eq!(
         probe(&mut live_roots),
         vec![(root.clone(), MaintenanceDrainKind::Lsp)],
@@ -79,6 +116,7 @@ async fn idle_lsp_maintenance_persists_rust_check_after_publish_settle() {
     let record = persisted_record().expect("idle maintenance must write the completed check");
     let record: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
     assert_eq!(record["record"]["root"], root.as_path().to_str().unwrap());
+    assert_eq!(record["record"]["diagnostics"], serde_json::json!({}));
     assert!(
         probe(&mut live_roots).is_empty(),
         "a settled check must not keep maintenance active"

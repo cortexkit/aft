@@ -442,8 +442,14 @@ impl LspManager {
             .retain(|(server, _), _| server != key);
         self.unproven_rust_compiler_reports
             .retain(|(server, _), _| server != key);
-        if let Some(client) = self.clients.get_mut(key) {
-            client.completed_rust_check = None;
+        if let Some(cache) = self
+            .clients
+            .get_mut(key)
+            .and_then(|client| client.completed_rust_check.as_mut())
+        {
+            // The missing events can invalidate a check, not the ability to
+            // certify and save another one from this analyzer instance.
+            cache.invalidate_unproven();
         }
     }
 }

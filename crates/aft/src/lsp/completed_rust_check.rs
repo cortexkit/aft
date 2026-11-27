@@ -1762,6 +1762,14 @@ impl CompletedRustCheck {
         self.started = None;
     }
 
+    /// Discard the check in progress and its reports. A saved check still
+    /// needs to pass fingerprint validation before it can be reused.
+    pub(crate) fn invalidate_unproven(&mut self) {
+        self.abort();
+        self.began = None;
+        self.reports.clear();
+    }
+
     #[cfg(test)]
     fn validated_with_runtime(&self, runtime: String, deadline: Instant) -> Option<SavedCheck> {
         let saved = self.saved.as_ref()?;
