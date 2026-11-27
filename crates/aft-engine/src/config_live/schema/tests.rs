@@ -124,8 +124,29 @@ fn config_settings_cache_dir_is_json_with_one_full_description() {
     let description = serde_json::to_string(&editor_cache_dir["description"]).unwrap();
     let serialized = serde_json::to_string(cache_dir).unwrap();
     assert_eq!(serialized.matches(description.as_str()).count(), 1);
-    for branch in cache_dir["oneOf"].as_array().unwrap() {
+    let choices = cache_dir["oneOf"].as_array().unwrap();
+    for branch in choices {
         assert_eq!(branch["additionalProperties"], false);
+    }
+    for (kind, help) in [
+        ("default", "AFT's default place for disk caches."),
+        ("main_disk", "Keep disk caches inside AFT's storage folder."),
+        (
+            "dir",
+            "Keep disk caches in a folder you choose, for example on another drive.",
+        ),
+    ] {
+        let choice = choices
+            .iter()
+            .find(|choice| choice["properties"]["kind"]["const"] == kind)
+            .unwrap();
+        assert_eq!(choice["description"], help, "{kind}");
+        if kind == "dir" {
+            assert_eq!(
+                choice["properties"]["path"]["description"],
+                "Absolute path of an existing folder. ~ means your home folder."
+            );
+        }
     }
     Schema::new(declaration).expect("valid Subconscious vocabulary");
 }

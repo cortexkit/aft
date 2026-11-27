@@ -54,15 +54,15 @@ fn annotate_cache_dir(cache_dir: &mut Value) {
             .to_owned();
         let (description, kind_description) = match Some(kind.as_str()) {
             Some("default") => (
-                "Use the same cache behavior as omitting this setting.",
+                "AFT's default place for disk caches.",
                 "Select the default cache behavior.",
             ),
             Some("main_disk") => (
-                "Put disk caches back under the storage root.",
+                "Keep disk caches inside AFT's storage folder.",
                 "Select the storage root for disk caches.",
             ),
             Some("dir") => (
-                "Use a cache parent on a separate device.",
+                "Keep disk caches in a folder you choose, for example on another drive.",
                 "Select an explicit cache parent directory.",
             ),
             other => panic!("unknown cache directory choice: {other:?}"),
@@ -73,7 +73,8 @@ fn annotate_cache_dir(cache_dir: &mut Value) {
         branch["properties"]["kind"]["description"] = json!(kind_description);
         if let Some(path) = branch["properties"].get_mut("path") {
             path["title"] = json!(titles::title("storage.cache_dir: dir.path").unwrap());
-            path["description"] = json!("Existing absolute path to the cache parent; ~ expands.");
+            path["description"] =
+                json!("Absolute path of an existing folder. ~ means your home folder.");
         }
     }
 }
