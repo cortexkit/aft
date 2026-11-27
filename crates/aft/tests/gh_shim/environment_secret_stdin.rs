@@ -64,7 +64,8 @@ fn environment_secret_input_is_not_in_argv_diagnostics_or_audit() {
         .unwrap();
     writeln!(child.stdin.take().unwrap(), "{VALUE}").unwrap();
     let result = child.wait_with_output().unwrap();
-    // 74 proves the fake gh received the real stdin and attempted to echo it.
+    // The fake gh reads stdin and exits 74 only after matching the expected
+    // value and attempting to echo it to both stdout and stderr.
     assert_eq!(result.status.code(), Some(74));
     assert!(result.stdout.is_empty());
     assert_eq!(result.stderr, b"gh-shim: upstream gh failed to set the environment secret; its output was suppressed to protect the secret value\n");
