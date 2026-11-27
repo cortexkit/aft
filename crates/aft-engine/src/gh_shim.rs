@@ -899,8 +899,7 @@ fn run_with(
 
     // Presence-based regressed-manifest arm. Decide from the installed artifact
     // BEFORE any rung probe so a governed refusal never depends on daemon
-    // reachability: a validation failure after a prior valid manifest makes
-    // governed/admin tuples refuse while mechanical operations pass through.
+    // reachability. Only the built-in safe commands can pass a broken list.
     let initial_manifest = resolve_manifest(&paths, now);
     let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
     if let ManifestResolution::Regressed { manifest, problem } = &initial_manifest {
@@ -4075,16 +4074,9 @@ impl ManifestProblem {
 /// this look tighter". The holder-side vendored vocabulary guards the widening
 /// direction; this line guards the narrowing one.
 ///
-/// DORMANCY VALVE AND LOCAL STATE. With no manifest artifact on disk the shim
-/// is dormant and passes invocations through (R2, reason
-/// `manifest_unavailable`). That valve's weakness — a local downgrade to
-/// dormant by deleting the artifact — is only reachable by an adversary with
-/// local write access, who can equally change the cached root or this
-/// verifier itself; the weakness is only reachable by an adversary the design
-/// already cannot survive. The same argument covers the local state this
-/// verifier maintains: the last-valid manifest cache and the monotonic version
-/// high-water mark are enforcement conveniences, not a security boundary, and
-/// an adversary who can delete, forge, or lower them can patch the verifier.
+/// With no verified manifest, the native guard checks local provisioning
+/// evidence and relay discovery. The unsigned last-valid cache never grants
+/// native passthrough.
 ///
 /// TOKEN LANGUAGE. The holder executes governed calls under full-installation
 /// GitHub App tokens held in custody; operation gating is holder-side
@@ -4239,8 +4231,7 @@ enum ManifestResolution {
     /// The installed artifact verified: normal classification.
     Active(Manifest),
     /// The installed artifact failed validation after a prior valid manifest:
-    /// governed/admin tuples the cache classifies are refused, while mechanical
-    /// operations pass through.
+    /// the cache may explain a refusal but does not authorize passthrough.
     Regressed {
         manifest: Manifest,
         problem: ManifestProblem,
@@ -4305,19 +4296,22 @@ fn delegate_after_invalid_manifest_notice(
 
 /// Disposition of one invocation under the regressed-manifest arm.
 ///
-/// Governed and admin tuples, as classified by the last-valid manifest, fail
-/// closed with a stable refusal; mechanical operations pass through
-/// byte-transparently. The operator bypass does not apply here: a broken
-/// manifest means the classification itself is untrusted, so no bypass can
-/// promote it.
+/// Only commands that need no manifest to prove they are safe pass through.
+/// The last-valid cache can explain a refusal but cannot authorize a command.
 fn regressed_disposition(
     args: &[OsString],
     manifest: &Manifest,
     platform: &str,
     problem: &ManifestProblem,
 ) -> RegressedDisposition {
+    if is_unbound_safe(args) {
+        return RegressedDisposition::Passthrough;
+    }
     match classify(args, manifest, platform) {
-        Classification::Mechanical => RegressedDisposition::Passthrough,
+        Classification::Mechanical => RegressedDisposition::Refuse {
+            code: RefusalCode::ManifestRegressed,
+            text: "the signed routing manifest is invalid; only known safe commands can run until the operator repairs it".into(),
+        },
         Classification::Governed { tuple, .. } | Classification::Admin { tuple } => {
             let text = match problem.untrusted_manifest_key_steering() {
                 Some(steering) => {

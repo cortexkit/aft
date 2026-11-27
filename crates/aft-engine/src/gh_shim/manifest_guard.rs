@@ -95,6 +95,8 @@ impl<'a> ManifestGuard<'a> {
 
 fn manifest_state_was_provisioned(root: &Path) -> bool {
     [
+        "gh-routing-manifest.json",
+        trust_root::FILE_NAME,
         "last-valid-manifest.json",
         "manifest-version-high-water.json",
     ]
