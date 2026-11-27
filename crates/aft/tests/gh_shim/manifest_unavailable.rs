@@ -238,6 +238,8 @@ fn gh_shim_final_policy_check_runs_after_the_native_ticket_lookup() {
             true,
         )
         .env("AFT_GH_SHIM_TICKET", "synthetic-head-ticket")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
         .output()
         .unwrap();
     assert!(
