@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/bash_background_persistence_test.rs"
+  ],
+  "note": "CI and test-only change: end-to-end suites use the aft binary CI staged (AFT_BINARY_PATH) instead of a leftover target build, the Windows native e2e job gets a cold-build budget, and one cross-session bash test waits for persisted completion. No search, routing or ranking code changes."
+}
