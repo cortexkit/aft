@@ -410,9 +410,12 @@ impl LspManager {
                     if let Some(status) = rust_status {
                         self.handle_rust_status(&status);
                     }
-                    // A diagnostic refresh or capability change can lose its
-                    // scheduling hint even though the reader kept the provider
-                    // registrations. Re-pull open files after invalidation.
+                    // The dropped events may include a server's request to
+                    // refresh diagnostics, or a newly registered diagnostics
+                    // provider. The reader already recorded which providers
+                    // the server offers, but the nudge to pull again may be
+                    // gone, and the diagnostics were just invalidated. So
+                    // pull again for every open file.
                     self.queue_open_document_pulls(&key);
                 }
                 IngressOverflow::ProgressLimit => {
