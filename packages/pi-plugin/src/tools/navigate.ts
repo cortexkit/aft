@@ -8,7 +8,6 @@ import {
   formatCallgraphSections,
   PLAIN_CALLGRAPH_THEME,
 } from "@cortexkit/aft-bridge";
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import { toolEnabled } from "../config.js";
@@ -46,12 +45,10 @@ const CALLGRAPH_SOFT_CODES = new Set(["symbol_not_found", "callgraph_building"])
 
 function navigateParamsSchema() {
   return Type.Object({
-    op: StringEnum(
-      ["call_tree", "callers", "trace_to", "trace_to_symbol", "impact", "trace_data"] as const,
-      {
-        description: "Navigation operation",
-      },
-    ),
+    op: Type.String({
+      enum: ["call_tree", "callers", "trace_to", "trace_to_symbol", "impact", "trace_data"],
+      description: "Navigation operation",
+    }),
     path: Type.String({
       description: "Source file containing the symbol (absolute or relative to project root)",
     }),

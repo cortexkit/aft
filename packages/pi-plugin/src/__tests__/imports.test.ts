@@ -8,6 +8,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TObject } from "typebox";
+import { Value } from "typebox/value";
 import { registerImportTools } from "../tools/imports.js";
 import {
   executeTool,
@@ -28,6 +30,22 @@ afterAll(() => {
 });
 
 describe("aft_import adapter", () => {
+  test("registers validate as an optional string enum without TypeBox metadata", () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge();
+    registerImportTools(api, makePluginContext(bridge));
+
+    const schema = tools.get("aft_import")!.parameters as TObject;
+    expect(JSON.stringify(schema.properties.validate)).toBe(
+      '{"type":"string","enum":["syntax","full"],"description":"Post-edit validation level (default: syntax)"}',
+    );
+    const args = { op: "organize", path: "src/app.ts" };
+    expect(Value.Check(schema, args)).toBe(true);
+    expect(Value.Check(schema, { ...args, validate: "syntax" })).toBe(true);
+    expect(Value.Check(schema, { ...args, validate: "full" })).toBe(true);
+    expect(Value.Check(schema, { ...args, validate: "none" })).toBe(false);
+  });
+
   test("add forwards Pi camelCase args through aft_import tool_call", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({

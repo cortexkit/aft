@@ -5,7 +5,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui/dist/components/text.js";
-import { type Static, type TSchema, Type } from "typebox";
+import { type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import { detectPiHarness } from "./harness.js";
 import { warn } from "./logger.js";
@@ -289,15 +289,16 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
 ): ToolDefinition<TParams, TDetails, TState> {
   if (!router || !["read", "write", "edit", "grep", "bash"].includes(tool.name)) return tool;
   const filesystemSchema = schemaDocument(tool.parameters);
+  type PreparedArgs = Parameters<typeof tool.execute>[1];
   return {
     ...tool,
     ...(tool.name === "bash" ? { readsSkillUris: true } : {}),
     parameters: ompParameters(tool.name, filesystemSchema) as TParams,
     prepareArguments(args) {
       // Native URL inputs must not undergo AFT's path/edit alias normalization.
-      if (internalTarget(tool.name, args, router)) return args as Static<TParams>;
+      if (internalTarget(tool.name, args, router)) return args as PreparedArgs;
       rejectNativeOnlyArguments(tool.name, filesystemSchema, args);
-      return (tool.prepareArguments ? tool.prepareArguments(args) : args) as Static<TParams>;
+      return tool.prepareArguments ? tool.prepareArguments(args) : (args as PreparedArgs);
     },
     async execute(id, params, signal, onUpdate, context) {
       const native = context as OmpContext;
