@@ -9974,31 +9974,32 @@ mod grant_path_tests {
         executor.register_actor(root.clone(), super::super::test_support::test_ctx());
         let holder_executor = executor.clone();
         let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        // The watchdog only breaks a deadlock if request handling tries to
+        // take the lock. A correct reply arrives before the holder is released.
+        let watchdog = Duration::from_secs(30);
         let holder = std::thread::spawn(move || {
             holder_executor.hold_state_lock_for_test(|| {
                 held_tx.send(()).unwrap();
-                std::thread::sleep(Duration::from_millis(350));
+                released
+                    .recv_timeout(watchdog)
+                    .expect("release admission lock");
             })
         });
-        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let started = Instant::now();
+        held_rx.recv_timeout(watchdog).expect("hold admission lock");
         let mut rx = deadline_test_call(
             &executor,
             &root,
             running_bash_stub,
             json!({"command":"sleep 3"}),
         );
-        let done = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
-        let elapsed = started.elapsed();
+        let done = tokio::time::timeout(watchdog, rx.recv())
+            .await
+            .expect("admission must reply while the scheduler state is held")
+            .unwrap();
+        release.send(()).expect("the lock holder must not time out");
         holder.join().unwrap();
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "admission must never park the frame runtime: {elapsed:?}"
-        );
-        assert_eq!(
-            done.unwrap().unwrap().response_for_test().data["code"],
-            "executor_busy"
-        );
+        assert_eq!(done.response_for_test().data["code"], "executor_busy");
     }
 
     async fn deadline_queue_case(saturation: bool) {
