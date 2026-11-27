@@ -2,6 +2,73 @@ use super::super::manifest_wire::Envelope;
 use super::*;
 
 #[test]
+fn gh_shim_manifest_sync_wakes_when_a_bound_route_launches_with_live_shim_enabled() {
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    // Other tests launch shells too; keep this process-wide worker private.
+    const CHILD: &str = "AFT_TEST_GH_SHIM_LIVE_LAUNCH";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gh_shim::manifest_sync::tests::gh_shim_manifest_sync_wakes_when_a_bound_route_launches_with_live_shim_enabled"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let _state = crate::test_env::gh_shim_state_guard();
+    let paths = StatePaths::from_process();
+    let storage = tempfile::tempdir().unwrap();
+    let (requested, requests) = mpsc::channel();
+    let worker = spawn_worker(
+        storage.path().join("no-vault-connection.json"),
+        Box::new(move || {
+            let _ = requested.send(());
+            Box::pin(async {
+                Ok(trust_root::Reply::Root {
+                    pin: Some(super::super::tests::fixture_pin()),
+                    generation: 1,
+                })
+            })
+        }),
+    );
+    let mut config = crate::config::Config::default();
+    config.git.co_author = "off".into();
+    config.github.shim = false;
+    let mut environment = HashMap::new();
+    crate::agent_child_env::inject(&config, storage.path(), &mut environment, None).unwrap();
+    assert!(!environment.contains_key(crate::gh_shim_paths::GH_SHIM_ENABLED_ENV));
+    assert_eq!(
+        requests.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+    assert!(!paths.trust_root.exists());
+
+    // A live config update changes the resolved setting, without a new bind.
+    config.github.shim = true;
+    crate::agent_child_env::inject(&config, storage.path(), &mut environment, None).unwrap();
+    assert_eq!(environment[crate::gh_shim_paths::GH_SHIM_ENABLED_ENV], "1");
+    requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the enabled launch should wake the attached worker");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !paths.trust_root.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    crate::agent_child_env::inject(&config, storage.path(), &mut environment, None).unwrap();
+    assert!(environment.contains_key(trust_root::ANCHOR_ENV));
+    drop(worker);
+}
+
+#[test]
 fn gh_shim_manifest_sync_notes_missing_vault_list_once_per_log_level() {
     let mut notice = MissingListNotice::default();
     assert_eq!(notice.observe(ListEvent::Missing), (true, false));

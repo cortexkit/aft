@@ -247,7 +247,7 @@ pub(super) struct A0Egress {
     slots: Arc<tokio::sync::Semaphore>,
     closing: AtomicBool,
     probe: Option<SubcTestLifecycleProbe>,
-    manifest_sync: Option<crate::gh_shim::manifest_sync::Worker>,
+    manifest_sync: Option<Arc<crate::gh_shim::manifest_sync::Worker>>,
     #[cfg(test)]
     waiter_gate: Option<Arc<WaiterGate>>,
 }
@@ -278,7 +278,7 @@ impl A0Egress {
 
     pub(super) fn with_manifest_sync(
         mut self,
-        worker: Option<crate::gh_shim::manifest_sync::Worker>,
+        worker: Option<Arc<crate::gh_shim::manifest_sync::Worker>>,
     ) -> Self {
         self.manifest_sync = worker;
         self

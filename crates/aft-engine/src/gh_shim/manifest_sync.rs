@@ -5,7 +5,8 @@ use super::manifest_wire::{Latest, Notice, Report};
 use super::*;
 use crate::secret::transport::ManagementSession;
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 const PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 type ReadRoot = dyn Fn()
@@ -616,13 +617,30 @@ where
 #[doc(hidden)]
 pub struct Worker {
     _stop: tokio::sync::oneshot::Sender<()>,
-    ready: std::sync::Arc<tokio::sync::Notify>,
+    ready: Arc<tokio::sync::Notify>,
+    activated: AtomicBool,
 }
 
+// Shell launches can wake the attached worker without keeping it alive
+// after the daemon connection closes.
+static ATTACHED_WORKER: Mutex<Weak<Worker>> = Mutex::new(Weak::new());
+
 impl Worker {
-    pub(crate) fn activate(&self) {
-        note_enabled_route();
-        self.ready.notify_one();
+    pub fn activate(&self) {
+        if !self.activated.swap(true, Ordering::AcqRel) {
+            note_enabled_route();
+            self.ready.notify_one();
+        }
+    }
+}
+
+pub(crate) fn activate_for_launch() {
+    let worker = ATTACHED_WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .upgrade();
+    if let Some(worker) = worker {
+        worker.activate();
     }
 }
 
@@ -635,14 +653,18 @@ pub fn start(
         > + Send
         + Sync
         + 'static,
-) -> Option<Worker> {
+) -> Option<Arc<Worker>> {
     if !aft_base::registration::module_consumer_allowed()
         || aft_base::registration::module_id().as_deref() != Some("aft")
     {
         return None;
     }
+    Some(spawn_worker(connection_file, Box::new(read_root)))
+}
+
+fn spawn_worker(connection_file: PathBuf, read_root: Box<ReadRoot>) -> Arc<Worker> {
     let (stop, stopped) = tokio::sync::oneshot::channel();
-    let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+    let ready = Arc::new(tokio::sync::Notify::new());
     let bound = ready.clone();
     std::thread::spawn(move || {
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -653,18 +675,25 @@ pub fn start(
                 tokio::select! {
                     _ = stopped => {},
                     _ = async {
-                        // Wait until AFT has bound a route whose resolved
-                        // settings enable the shim.
+                        // An enabled bind or shell launch can start policy sync.
                         bound.notified().await;
                         let paths = StatePaths::from_process().for_daemon();
-                        let root = RootRefresh::new(&read_root);
+                        let root = RootRefresh::new(read_root.as_ref());
                         tokio::join!(root.poll(&paths), run_with(&paths, &root, || ManagementSession::connect(&connection_file)));
                     } => {},
                 }
             });
         }
     });
-    Some(Worker { _stop: stop, ready })
+    let worker = Arc::new(Worker {
+        _stop: stop,
+        ready,
+        activated: AtomicBool::new(false),
+    });
+    *ATTACHED_WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&worker);
+    worker
 }
 
 #[cfg(test)]
