@@ -1,5 +1,13 @@
 {
   "manifest_version": 30,
+  "tiers": {
+    "admin": [
+      {
+        "tuple": "secret list",
+        "platform": ["macos", "linux"]
+      }
+    ]
+  },
   "api_rules": [
     {
       "method": "POST",

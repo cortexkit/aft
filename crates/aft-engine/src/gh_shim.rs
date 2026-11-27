@@ -33,6 +33,7 @@ use crate::db::github_read_cache::{invalidate_github_read_cache_resource, Github
 use subc_protocol::{BindIdentity, RouteTarget};
 
 mod api_rules;
+mod captured_dispatch;
 mod enable_gate;
 mod manifest_guard;
 pub mod manifest_sync;
@@ -42,6 +43,7 @@ mod numeric_id_cache;
 mod prefrontal_route;
 pub(crate) mod read_contract;
 mod rename_guard;
+mod secret_list;
 mod ticket_repository;
 mod v22_rows;
 mod v23_queue;
@@ -49,6 +51,9 @@ mod worker_reads;
 mod workflow_approval;
 
 use api_rules::{api_rule_matches_path, api_tuple, is_api_tuple};
+use captured_dispatch::run_captured_protected;
+#[cfg(test)]
+use captured_dispatch::{captured_plan, captured_rung_refusal};
 
 use prefrontal_route::select_route_holder;
 
@@ -377,7 +382,6 @@ const UNBOUND_SAFE_COMMANDS: &[&str] = &[
     "org list",
     "gist list",
     "gist view",
-    "secret list",
     "variable list",
     "variable get",
     "ruleset list",
@@ -807,6 +811,9 @@ fn run_with(
     // The manifest can disappear after authority and audit checks finish.
     // Recheck it before calling upstream gh, including audited operator writes.
     let mut delegate = |args: &[OsString]| manifest_guard.delegate(args, &mut native_delegate);
+    if secret_list::targets(args) {
+        return secret_list::dispatch(args, &paths, unix_seconds(), delegate);
+    }
     if crate::environment::non_empty_var(crate::gh_shim_speech::start_view::WORKER_POLICY_ENV)
         .as_deref()
         == Some("1")
@@ -4915,6 +4922,9 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
         return classify_api(args, manifest, platform);
     }
     let mut tuple = verb_tuple(verb, subcommand);
+    if tuple == secret_list::TUPLE {
+        return secret_list::classify(manifest, platform);
+    }
     // Only a signed queue declaration may reinterpret the queue-shaped merge
     // invocation. Direct merges and disabling auto-merge retain their admin row.
     if tuple == "pr merge"
@@ -16868,116 +16878,6 @@ mod github_read_mutation_tests {
             "the successful mutation must still evict its own issue"
         );
     }
-}
-
-fn run_captured_protected(
-    args: &[OsString],
-    paths: &StatePaths,
-    manifest_guard: &manifest_guard::ManifestGuard<'_>,
-    target: &TargetRepository,
-    cwd: &Path,
-    now: u64,
-) -> i32 {
-    use crate::gh_shim_speech::Code;
-    // Background writes retain a signed policy snapshot from command launch,
-    // but still require the current manifest. Report its absence before dispatch.
-    if matches!(
-        resolve_manifest(paths, now),
-        ManifestResolution::Invalid(_) | ManifestResolution::Dormant
-    ) {
-        if let Some(status) = manifest_guard.unavailable_refusal(args) {
-            return status;
-        }
-    }
-    let (manifest, classification, binding, rung) = match captured_plan(
-        args, paths, target, cwd, now,
-    ) {
-        Ok(plan) => plan,
-        Err(error) => {
-            let mut text = error.agent_text();
-            // run_with refuses worker writes before this head-shell path.
-            // Do not put operator-bypass advice in shared refusal text.
-            if error.code == Code::PolicyDenied && error.reason == "not_governed" {
-                text.push_str(" This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.");
-            }
-            return refuse(RefusalCode::SeamRefusal, &text);
-        }
-    };
-    // Protected invocations never hand native gh the operator's credentials.
-    dispatch_r3(
-        args,
-        classification,
-        &manifest,
-        paths,
-        &rung,
-        &binding,
-        now,
-        |_| {
-            refuse(
-                RefusalCode::SeamRefusal,
-                &captured_rung_refusal(&rung).agent_text(),
-            )
-        },
-    )
-}
-
-fn captured_rung_refusal(rung: &RungRecord) -> crate::gh_shim_speech::Refusal {
-    use crate::gh_shim_speech::{Code, Refusal};
-    // Discovery records survive module restarts. A missing daemon or relay is
-    // retryable; missing policy configuration or ambient credentials are not.
-    let temporary = match rung.rung {
-        Rung::R1 => [R1Reason::Unreachable, R1Reason::DiscoveryBudgetExhausted]
-            .into_iter()
-            .any(|reason| {
-                rung.inputs.get("connection_file").map(String::as_str) == Some(reason.diagnostic())
-            }),
-        Rung::R2 => [
-            R2Reason::DaemonUnreachable,
-            R2Reason::CatalogGhRouteAbsent,
-            R2Reason::GhRouteHolderUnbound,
-        ]
-        .into_iter()
-        .any(|reason| rung.inputs.get(reason.diagnostic()).map(String::as_str) == Some("failed")),
-        Rung::R3 => false,
-    };
-    if temporary {
-        Refusal::new(Code::AuthorityUnavailable, "relay_unavailable")
-    } else {
-        Refusal::new(Code::PolicyDenied, "not_r3")
-    }
-}
-
-fn captured_plan(
-    args: &[OsString],
-    paths: &StatePaths,
-    target: &TargetRepository,
-    cwd: &Path,
-    now: u64,
-) -> Result<(Manifest, Classification, AgentBinding, RungRecord), crate::gh_shim_speech::Refusal> {
-    use crate::gh_shim_speech::{Code, Refusal};
-    if shim_disabled_by_operator() {
-        return Err(Refusal::new(Code::PolicyDenied, "not_r3"));
-    }
-    if operator_bypass_requested() || operator_credential_use(args).is_some() {
-        return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
-    }
-    load_manifest(paths, now)
-        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let (snapshot, _, _) = capture_speech_policy()?
-        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let manifest = verified_speech_manifest(&snapshot.signed_envelope)
-        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let classification = classify(args, &manifest, current_platform());
-    if !matches!(&classification, Classification::Governed { .. }) {
-        return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
-    }
-    let binding = governing_binding(&classification, &manifest, target, cwd)
-        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
-    let determination = determine_rung(paths, target, cwd, now);
-    if determination.record.rung != Rung::R3 {
-        return Err(captured_rung_refusal(&determination.record));
-    }
-    Ok((manifest, classification, binding, determination.record))
 }
 
 pub(crate) fn speech_protected_without_view(args: &[OsString]) -> bool {

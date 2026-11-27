@@ -82,7 +82,7 @@ unapproved:
 
 - reads: `issue`/`pr`/`release`/`repo`/`run`/`workflow`/`label`/`cache`
   views, lists and downloads, `search` `issues`/`prs`/`repos`/`code`/`commits`,
-  `status`, `org list`, `gist` `list`/`view`, `secret list`, `variable`
+  `status`, `org list`, `gist` `list`/`view`, `variable`
   `list`/`get`, `ruleset` `list`/`view`/`check`, `project`
   `list`/`view`/`field-list`/`item-list`, `ssh-key list`, `gpg-key list`,
   `codespace list`, `release verify`/`verify-asset`, `attestation verify`,
@@ -174,6 +174,8 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 
 ## Rows
 
+The **Since** column names the minimum signed manifest version unless noted.
+
 | Row | Class | Since |
 | --- | --- | --- |
 | `issue view`, `issue list`, `pr view`, `pr list`, `pr diff`, `pr checks`, `run view`, `run list`, `repo clone`, `repo view` | MECHANICAL | v1 |
@@ -189,6 +191,7 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 | `repo edit`, `run delete` | ADMINISTRATION | v9 |
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
 | `api` POST `/repos/*/*/actions/runs/*/approve` | ADMINISTRATION (fork-run safety check) | v30 |
+| `secret list` (repository scope, names and update dates only) | ADMINISTRATION (operator read) | v30 |
 | `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
 | `repo rename`, `repo create` | ADMINISTRATION-AS-OPERATOR | v19 |
 | `workflow disable`, `workflow enable` | ADMINISTRATION-AS-OPERATOR | v19 |
@@ -235,6 +238,13 @@ Each job must name only listed GitHub-hosted runner labels: `ubuntu-latest`,
 labels, expressions, runner groups, reusable workflow calls, and unreadable or
 uninspectable workflows refuse before the POST. Use the operator's normal diff
 review in addition to this runner check.
+
+`secret list` is an audited operator read: it requires `GH_SHIM_BYPASS=operator`
+and a signed v30 or newer manifest declaring the row. It never returns secret
+values. Select a repository with `-R OWNER/REPO` or let the shim use `GH_REPO`
+or the current checkout's GitHub origin. The `--app` choices are `actions`,
+`dependabot`, and `codespaces`; `--json` accepts `name` and `updatedAt`.
+Organization, user, and environment scopes are refused.
 
 Every row is declared for `macos` and `linux`: the schema requires a non-empty
 `platform` list on tuples and API rules alike, so no row is OS-neutral.

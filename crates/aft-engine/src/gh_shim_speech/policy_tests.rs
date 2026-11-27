@@ -276,7 +276,10 @@ fn protected_manifest_and_operator_arms_delegate_only_on_operator_disable() {
             _ => "current_manifest_unverifiable",
         };
         assert_eq!(
-            plan.err().expect("protected preflight must refuse").reason,
+            plan.err()
+                .expect("protected preflight must refuse")
+                .refusal()
+                .reason,
             expected,
             "{mode}"
         );
@@ -636,7 +639,10 @@ fn protected_writes_refuse_during_restart_but_operator_disable_passes_through() 
             "gh-shim: gh_shim_seam_refusal: task_gh_authority_unavailable: bot writes from background commands are briefly unavailable (relay_unavailable); retry in a few seconds.".to_string()
         };
         let plan = captured_plan(&args, &fixture.paths, &target, &cwd, now);
-        let refusal = plan.err().expect("non-R3 write must not reach dispatch");
+        let refusal = plan
+            .err()
+            .expect("non-R3 write must not reach dispatch")
+            .refusal();
         assert_eq!(
             format!("gh-shim: gh_shim_seam_refusal: {}", refusal.agent_text()),
             expected
@@ -687,6 +693,34 @@ fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
     );
     assert_eq!(exit, REFUSAL_EXIT_STATUS);
     assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one (not_governed); use a permitted operation, or ask the operator to update the policy and start the command again. This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.".to_string()]);
+}
+
+const UNDECLARED_POLICY_REFUSAL: &str = "gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub command is not declared in the signed manifest (not_governed); ask the operator to update the manifest and start the command again.";
+
+#[test]
+fn captured_policy_undeclared_command_does_not_claim_to_be_a_write() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest = super::tests::fixture_manifest();
+    let _fixture = RunWithFixture::new(&manifest);
+    let _provisioned = Env::set(
+        crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+        Some(OsStr::new("1")),
+    );
+    let args = ["variable", "list", "-R", "cortexkit/aft"].map(OsString::from);
+    assert!(matches!(
+        classify(&args, &manifest, current_platform()),
+        Classification::Unclassified
+    ));
+    let (_capture, lines) = capture_refusals_for_test();
+    assert_eq!(
+        run_with(
+            &args,
+            |_| panic!("an undeclared captured invocation must not reach native gh"),
+            |_, _, _, _| panic!("an undeclared captured invocation must not reach the read probe"),
+        ),
+        REFUSAL_EXIT_STATUS,
+    );
+    assert_eq!(*lines.lock().unwrap(), [UNDECLARED_POLICY_REFUSAL]);
 }
 
 #[test]
@@ -968,14 +1002,10 @@ fn invalid_start_views_have_exact_run_with_refusals_without_delegation() {
         // A platform the fixture manifest doesn't govern refuses before the
         // rung check, as in the preflight cases above.
         let expected = if current_platform() == "unsupported" {
-            "not_governed"
+            UNDECLARED_POLICY_REFUSAL.to_string()
         } else {
-            "not_r3"
+            exact_policy_refusal("not_r3")
         };
-        assert_eq!(
-            *lines.lock().unwrap(),
-            vec![exact_policy_refusal(expected)],
-            "{invalid}"
-        );
+        assert_eq!(*lines.lock().unwrap(), vec![expected], "{invalid}");
     }
 }
