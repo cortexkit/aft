@@ -1403,6 +1403,8 @@ fn heavy_retention_due(db: &SharedDb, now_ms: i64) -> bool {
         // Let the normal sweep report contention and schedule a retry.
         return true;
     };
+    #[cfg(feature = "test-hooks")]
+    wait_at_retention_due_probe_for_test();
     let due = || -> rusqlite::Result<bool> {
         Ok(
             crate::db::bash_tasks::terminal_retention_due(&conn, now_ms)?
@@ -1411,6 +1413,29 @@ fn heavy_retention_due(db: &SharedDb, now_ms: i64) -> bool {
         )
     };
     due().unwrap_or(true)
+}
+
+/// Pause with the connection acquired, before the indexed reads. The test can
+/// commit a candidate and take the foreign write lock before the probe sees it.
+#[cfg(feature = "test-hooks")]
+fn wait_at_retention_due_probe_for_test() {
+    let Some(directory) = std::env::var_os("AFT_TEST_RETENTION_DUE_PROBE_GATE") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let release = directory.join("release");
+    if release.exists() {
+        return;
+    }
+    std::fs::write(directory.join("paused"), b"").expect("signal retention due probe");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !release.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retention due probe was not released"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn log_completed_retention_sweep(sweep: &RetentionSweep) {
