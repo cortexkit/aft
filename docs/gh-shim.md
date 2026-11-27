@@ -24,8 +24,10 @@ A root change makes lists signed by the retired key unusable. The vault must
 publish a newer list signed by the new root before governed writes can resume.
 AFT fetches the current list again when the generation changes. If the daemon
 clears the pin, AFT removes the trust file. If refreshes fail, AFT and the shim
-stop trusting a pin after 15 minutes without a successful read. A shell
-started before a rotation needs to be restarted to get the new generation.
+stop trusting a pin 15 minutes after AFT last read it from the daemon. Start
+a new shell to get the new generation after rotation. A worker shell's copy
+of `trust-root.json` is made at launch and does not refresh; start a new
+worker shell when that copy expires.
 A previously provisioned shim, or one with a list or trust file present, refuses
 writes without a verified list rather than using the operator's credentials.
 On a never-provisioned install with no such files, commands pass through only

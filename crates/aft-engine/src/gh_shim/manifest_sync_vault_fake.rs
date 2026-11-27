@@ -366,9 +366,10 @@ async fn manifest_sync_rotation_refetches_and_activates_without_a_vault_notice()
     });
     let directory = tempfile::tempdir().unwrap();
     let paths = paths(&directory).for_daemon();
-    let generation = AtomicU64::new(1);
-    let read = || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<trust_root::Reply, ()>> + Send>> {
-        let generation = generation.load(Ordering::Relaxed);
+    let generation = Arc::new(AtomicU64::new(1));
+    let read_generation = Arc::clone(&generation);
+    let read = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<trust_root::Reply, ()>> + Send>> {
+        let generation = read_generation.load(Ordering::Relaxed);
         Box::pin(async move {
             let pin = if generation == 1 { super::super::super::tests::fixture_pin() } else { super::super::super::tests::pin_for(&seed) };
             Ok(trust_root::Reply::Root { pin: Some(pin), generation })

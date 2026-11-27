@@ -221,15 +221,20 @@ pub(super) fn publish(paths: &StatePaths, reply: Reply, now: u64) -> io::Result<
             ));
         }
         state.generation = generation;
-        state.read_at = Some(Instant::now());
-        state.root = root.clone();
         if generation > persisted {
-            atomic_write(
+            if let Err(error) = atomic_write(
                 &marker,
                 &serde_json::to_vec(&generation)?,
                 AtomicWriteDurability::FileAndDirectory,
-            )?;
+            ) {
+                // A newer reply invalidates the old pin, but the new pin
+                // cannot be accepted until its generation is durable.
+                state.root = None;
+                return Err(error);
+            }
         }
+        state.read_at = Some(Instant::now());
+        state.root = root.clone();
         match &root {
             None => unlink(paths),
             Some(root) => atomic_write(
