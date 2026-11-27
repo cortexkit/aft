@@ -889,7 +889,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Groovy => Some(GROOVY_QUERY),
         LangId::ObjC => Some(OBJC_QUERY),
         LangId::Toml => None,
-        LangId::Luau => None,
+        LangId::Luau | LangId::SystemVerilog => None,
     }
 }
 
@@ -989,7 +989,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         | LangId::Json
         | LangId::Yaml
         | LangId::Toml
-        | LangId::Luau => None,
+        | LangId::Luau
+        | LangId::SystemVerilog => None,
     };
 
     query
@@ -2507,6 +2508,9 @@ fn extract_symbols_from_tree_unbounded<'tree>(
             .map(|declaration| luau_symbol(source, declaration))
             .collect());
     }
+    if lang == LangId::SystemVerilog {
+        return crate::systemverilog::extract_symbols(source, root);
+    }
 
     let query = cached_query_for(lang)?.ok_or_else(|| AftError::InvalidRequest {
         message: format!("no query patterns implemented for {:?} yet", lang),
@@ -2547,7 +2551,8 @@ fn extract_symbols_from_tree_unbounded<'tree>(
         | LangId::Vue
         | LangId::Json
         | LangId::Yaml
-        | LangId::Toml => unreachable!("handled before query lookup"),
+        | LangId::Toml
+        | LangId::SystemVerilog => unreachable!("handled before query lookup"),
     }
 }
 
@@ -2684,7 +2689,8 @@ fn node_range_with_decorators_inner<'tree>(
             | LangId::Vue
             | LangId::Json
             | LangId::Yaml
-            | LangId::Toml => false,
+            | LangId::Toml
+            | LangId::SystemVerilog => false,
         };
 
         if should_include {

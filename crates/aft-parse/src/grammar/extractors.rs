@@ -11,18 +11,28 @@ struct Extractor {
 
 // To add a downloaded language, add its LangId and extractor, then register
 // them here under the language name used in the manifest.
-const EXTRACTORS: &[Extractor] = &[Extractor {
-    language: "luau",
-    id: LangId::Luau,
-    version: luau::extractor_version,
-    parse_deadline: crate::parser::luau_parse_deadline,
-    #[cfg(feature = "wasm-grammars")]
-    queries: &[
-        luau::EXTRACTION_QUERY,
-        luau::COMPLEXITY_QUERY,
-        luau::COMMENT_QUERY,
-    ],
-}];
+const EXTRACTORS: &[Extractor] = &[
+    Extractor {
+        language: "luau",
+        id: LangId::Luau,
+        version: luau::extractor_version,
+        parse_deadline: crate::parser::luau_parse_deadline,
+        #[cfg(feature = "wasm-grammars")]
+        queries: &[
+            luau::EXTRACTION_QUERY,
+            luau::COMPLEXITY_QUERY,
+            luau::COMMENT_QUERY,
+        ],
+    },
+    Extractor {
+        language: "systemverilog",
+        id: LangId::SystemVerilog,
+        version: || 1,
+        parse_deadline: || std::time::Duration::from_secs(30),
+        #[cfg(feature = "wasm-grammars")]
+        queries: &[],
+    },
+];
 
 fn extractor(language: &str) -> Option<&'static Extractor> {
     EXTRACTORS.iter().find(|entry| entry.language == language)

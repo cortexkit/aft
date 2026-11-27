@@ -1,0 +1,4 @@
+`ifndef STREAM_CONFIG_SVH
+`define STREAM_CONFIG_SVH
+`define STREAM_WIDTH 8
+`endif

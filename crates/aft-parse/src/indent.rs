@@ -41,7 +41,8 @@ impl IndentStyle {
             | LangId::Lua
             | LangId::Scss
             | LangId::Yaml
-            | LangId::Toml => IndentStyle::Spaces(2),
+            | LangId::Toml
+            | LangId::SystemVerilog => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,
             LangId::C
@@ -181,5 +182,25 @@ pub fn source_line_ending(source: &str) -> &'static str {
         "\r\n"
     } else {
         "\n"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemverilog_defaults_to_two_spaces_but_keeps_detected_indentation() {
+        assert_eq!(
+            detect_indent("module m;\nendmodule\n", LangId::SystemVerilog),
+            IndentStyle::Spaces(2)
+        );
+        assert_eq!(
+            detect_indent(
+                "module m;\n    logic ready;\nendmodule\n",
+                LangId::SystemVerilog
+            ),
+            IndentStyle::Spaces(4)
+        );
     }
 }

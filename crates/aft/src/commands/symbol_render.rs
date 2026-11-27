@@ -34,6 +34,10 @@ pub fn symbol_kind_string(kind: &SymbolKind) -> String {
 }
 
 pub fn qualified_symbol_name(symbol: &Symbol) -> String {
+    qualified_symbol_name_with_separator(symbol, ".")
+}
+
+pub(super) fn qualified_symbol_name_with_separator(symbol: &Symbol, separator: &str) -> String {
     let mut parts = symbol
         .scope_chain
         .iter()
@@ -41,7 +45,7 @@ pub fn qualified_symbol_name(symbol: &Symbol) -> String {
         .cloned()
         .collect::<Vec<_>>();
     parts.push(symbol.name.clone());
-    parts.join(".")
+    parts.join(separator)
 }
 
 pub fn might_have_container_members(symbol: &Symbol) -> bool {

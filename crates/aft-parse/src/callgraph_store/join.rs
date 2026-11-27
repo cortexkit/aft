@@ -829,6 +829,9 @@ fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
         SymbolKind::Variable => "variable",
         SymbolKind::Heading => "heading",
         SymbolKind::FileSummary => "file_summary",
+        SymbolKind::Module => "module",
+        SymbolKind::Package => "package",
+        SymbolKind::Task => "task",
     }
 }
 
@@ -1020,6 +1023,9 @@ impl ParseBlob {
                 "type_alias" => SymbolKind::TypeAlias,
                 "heading" => SymbolKind::Heading,
                 "file_summary" => SymbolKind::FileSummary,
+                "module" => SymbolKind::Module,
+                "package" => SymbolKind::Package,
+                "task" => SymbolKind::Task,
                 _ => SymbolKind::Variable,
             };
             symbol_metadata.insert(

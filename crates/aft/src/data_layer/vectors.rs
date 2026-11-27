@@ -146,7 +146,9 @@ pub(super) fn native_path(path: &[u8]) -> Option<PathBuf> {
 /// index embeds files with its name or extension.
 fn is_semantic_path(path: &[u8]) -> bool {
     native_path(path).is_some_and(|path| {
-        is_semantic_indexed_extension(&path) || super::grammar::downloaded_language(&path).is_some()
+        // A downloadable grammar can support outline/zoom without supporting meaning search.
+        is_semantic_indexed_extension(&path)
+            || super::grammar::downloaded_language(&path) == Some("luau")
     })
 }
 
@@ -231,9 +233,9 @@ fn cut_stored(
 /// The code a chunk's kind is stored as.
 fn kind_code(kind: &SymbolKind) -> u8 {
     match kind {
-        SymbolKind::Function => 0,
+        SymbolKind::Function | SymbolKind::Task => 0,
         SymbolKind::Kernel => 1,
-        SymbolKind::Class => 2,
+        SymbolKind::Class | SymbolKind::Module | SymbolKind::Package => 2,
         SymbolKind::Method => 3,
         SymbolKind::Struct => 4,
         SymbolKind::Interface => 5,
@@ -2760,6 +2762,17 @@ mod tests {
     use aft_store::ids::{Digest128, FamilyId};
 
     use super::*;
+
+    #[cfg(feature = "wasm-grammars")]
+    #[test]
+    fn grammar_outline_only_files_are_not_admitted_to_meaning_search() {
+        for path in ["design.sv", "header.svh", "design.v", "header.vh"] {
+            assert_eq!(downloaded_language(path.as_bytes()), Some("systemverilog"));
+            assert!(!is_semantic_indexed_extension(Path::new(path)));
+            assert!(!is_semantic_path(path.as_bytes()));
+        }
+        assert!(is_semantic_path(b"design.luau"));
+    }
     use crate::data_layer::checkout::DataLayer;
     use crate::semantic_index::SemanticIndex;
 

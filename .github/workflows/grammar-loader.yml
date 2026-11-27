@@ -110,6 +110,23 @@ jobs:
           cargo test --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- grammar_
       - name: Process restart and concurrent publication
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
+      - name: SystemVerilog outline and zoom with the published grammar
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, urllib.request
+          from pathlib import Path
+          manifest = json.loads(Path('crates/aft-parse/src/grammar/manifest.json').read_text())
+          sv = next(entry for entry in manifest['grammars'] if entry['language'] == 'systemverilog')
+          with urllib.request.urlopen(sv['url'], timeout=60) as response:
+              data = response.read(sv['size'] + 1)
+          assert len(data) == sv['size'] and hashlib.sha256(data).hexdigest() == sv['sha256']
+          path = Path(os.environ['RUNNER_TEMP'], sv['sha256'] + '.wasm')
+          path.write_bytes(data)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'AFT_TEST_SYSTEMVERILOG_WASM={path}\n')
+          PY
+      - name: Verify offline SystemVerilog reading and missing-grammar errors
+        run: cargo test --features wasm-grammars,test-hooks --locked -p agent-file-tools --test integration -- systemverilog_outline_test --include-ignored
       # The no-Luau parity half needs a second, feature-less debug build of the
       # whole crate. On GitHub's macOS runners that third build would push the
       # job past its time limit, and the parity it checks doesn't depend on the

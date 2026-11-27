@@ -896,6 +896,7 @@ fn language_name(language: LangId) -> &'static str {
         LangId::Php => "php",
         LangId::Lua => "lua",
         LangId::Luau => "luau",
+        LangId::SystemVerilog => "systemverilog",
         LangId::Perl => "perl",
         LangId::Yaml => "yaml",
         LangId::Pascal => "pascal",

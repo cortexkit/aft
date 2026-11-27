@@ -50,10 +50,10 @@ pub struct GrammarUnavailable {
 }
 
 pub fn display_name(language: &str) -> &str {
-    if language == "luau" {
-        "Luau"
-    } else {
-        language
+    match language {
+        "luau" => "Luau",
+        "systemverilog" => "SystemVerilog",
+        _ => language,
     }
 }
 

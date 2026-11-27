@@ -907,6 +907,9 @@ fn outline_kind_name(kind: &crate::symbols::SymbolKind) -> &'static str {
         SymbolKind::Variable => "variable",
         SymbolKind::Heading => "heading",
         SymbolKind::FileSummary => "file_summary",
+        SymbolKind::Module => "module",
+        SymbolKind::Package => "package",
+        SymbolKind::Task => "task",
     }
 }
 
@@ -924,6 +927,9 @@ fn outline_kind(name: &str) -> Option<crate::symbols::SymbolKind> {
         "variable" => SymbolKind::Variable,
         "heading" => SymbolKind::Heading,
         "file_summary" => SymbolKind::FileSummary,
+        "module" => SymbolKind::Module,
+        "package" => SymbolKind::Package,
+        "task" => SymbolKind::Task,
         _ => return None,
     })
 }
