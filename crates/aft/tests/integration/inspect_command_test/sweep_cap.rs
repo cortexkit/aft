@@ -117,12 +117,41 @@ fn scoped_blocking_inspect_caps_the_files_it_opens() {
         uncovered[0].1.starts_with("not examined:"),
         "response: {response:#}"
     );
-    let text = response["text"].as_str().expect("rendered text");
     // The cap's unknown file is explained once in the header; exact coverage
-    // remains structured rather than repeating incompleteness in a body line.
-    assert!(
-        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: not examined:")
-            && text.contains("(1 file); retry aft_inspect."),
-        "{text}"
-    );
+    // remains structured. Verifying that the files are still current can
+    // hit the deadline after all 1,000 diagnostic reports have been collected.
+    assert_sweep_cap_header(&response);
+}
+
+fn assert_sweep_cap_header(response: &Value) {
+    const CAP: &str = "PARTIAL — diagnostics unknown: rust-analyzer @ .: not examined: a scoped inspect opens at most 1000 files; narrow the scope (1 file)";
+    const FRESHNESS: &str = "file freshness verification exceeded the request budget";
+    const RETRY: &str = "retry aft_inspect.";
+    let gaps = response["gaps"].as_array().expect("structured gaps");
+    let freshness = gaps
+        .iter()
+        .find(|gap| gap["kind"] == "stat_verification_incomplete");
+    let expected = if let Some(gap) = freshness {
+        assert_eq!(gap["reason"], format!("{FRESHNESS}; retry aft_inspect"));
+        format!("{CAP}; file freshness unverified: {FRESHNESS}; {RETRY}")
+    } else {
+        format!("{CAP}; {RETRY}")
+    };
+    let text = response["text"].as_str().expect("rendered text");
+    assert_eq!(text.lines().next(), Some(expected.as_str()), "{text}");
+}
+
+#[test]
+fn sweep_cap_header_can_explain_a_later_freshness_deadline() {
+    assert_sweep_cap_header(&json!({
+        "gaps": [],
+        "text": "PARTIAL — diagnostics unknown: rust-analyzer @ .: not examined: a scoped inspect opens at most 1000 files; narrow the scope (1 file); retry aft_inspect.\nscope: 1 root, 1001 files"
+    }));
+    assert_sweep_cap_header(&json!({
+        "gaps": [{
+            "kind": "stat_verification_incomplete",
+            "reason": "file freshness verification exceeded the request budget; retry aft_inspect"
+        }],
+        "text": "PARTIAL — diagnostics unknown: rust-analyzer @ .: not examined: a scoped inspect opens at most 1000 files; narrow the scope (1 file); file freshness unverified: file freshness verification exceeded the request budget; retry aft_inspect.\nscope: 1 root, 1001 files"
+    }));
 }

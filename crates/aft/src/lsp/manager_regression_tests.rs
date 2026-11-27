@@ -1438,10 +1438,8 @@ pub(crate) fn drain_flycheck_end_for_maintenance_test(
     manager: &mut LspManager,
     root: &Path,
     storage: &Path,
-) -> Instant {
+) -> (ServerKey, Instant) {
     use super::super::completed_rust_check::{CompletedRustCheck, Runtime};
-    use std::sync::atomic::Ordering;
-    use std::time::SystemTime;
 
     let key = ServerKey {
         kind: ServerKind::Rust,
@@ -1450,7 +1448,7 @@ pub(crate) fn drain_flycheck_end_for_maintenance_test(
     let mut client =
         lifecycle_fake_client_with_env(manager, &key, [("AFT_FAKE_LSP_SERVER_STATUS", "disabled")]);
     client.set_rust_analyzer_quiescent(true);
-    let mut cache = CompletedRustCheck::new(
+    let cache = CompletedRustCheck::new(
         &key.root,
         &key.root,
         storage,
@@ -1464,34 +1462,66 @@ pub(crate) fn drain_flycheck_end_for_maintenance_test(
         },
     )
     .unwrap();
-    // Place BEGIN beyond the timestamp guard for the newly written Cargo inputs.
-    cache.begin(SystemTime::now() + Duration::from_secs(3));
     client.completed_rust_check = Some(cache);
-    let (_, begins) = client.startup_notification_writer().unwrap();
-    begins.store(1, Ordering::Release);
-    let instance = client.instance;
     manager.clients.insert(key.clone(), client);
-    for kind in ["begin", "end"] {
-        manager
-            .event_tx
-            .send(ReceivedLspEvent {
-                event: LspEvent::Notification {
-                    server_kind: key.kind.clone(),
-                    root: key.root.clone(),
-                    method: "$/progress".into(),
-                    params: Some(json!({
-                        "token": "rust-analyzer/flycheck/0", "value": {"kind": kind}
-                    })),
-                },
-                instance: Some(instance),
-                receive_order: None,
-            })
-            .unwrap();
-    }
-    manager.drain_events();
-    manager.clients[&key]
+    finish_flycheck_for_maintenance_test(manager, &key, 1);
+    let settle_at = manager.clients[&key]
         .rust_publish_settle_deadline()
+        .unwrap();
+    (key, settle_at)
+}
+
+#[cfg(unix)]
+pub(crate) fn finish_flycheck_for_maintenance_test(
+    manager: &mut LspManager,
+    key: &ServerKey,
+    begin_order: u64,
+) {
+    // Stamp BEGIN three seconds in the future, so the check counts as
+    // starting after the Cargo inputs this test just wrote.
+    manager.clients[key].receive_flycheck_begin_for_test(
+        begin_order,
+        std::time::SystemTime::now() + Duration::from_secs(3),
+    );
+    let token = "rust-analyzer/flycheck/0";
+    send_work_done(manager, key, begin_order, token, "begin");
+    send_work_done(manager, key, begin_order + 1, token, "end");
+    manager.drain_events();
+}
+
+#[cfg(unix)]
+pub(crate) fn overflow_flycheck_inbox_for_maintenance_test(
+    manager: &mut LspManager,
+    key: &ServerKey,
+    file: &Path,
+) -> u64 {
+    send_progress_fixture_event(
+        manager,
+        key,
+        3,
+        LspEvent::Notification {
+            server_kind: key.kind.clone(),
+            root: key.root.clone(),
+            method: "textDocument/publishDiagnostics".into(),
+            params: Some(json!({
+                "uri": uri_for_path(file).unwrap(),
+                "diagnostics": [{"range": {"start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1}}, "severity": 1, "source": "rustc",
+                    "message": "compiler report from the invalidated check"}]
+            })),
+        },
+    );
+    manager.drain_events();
+    assert!(manager.clients[key]
+        .completed_rust_check
+        .as_ref()
         .unwrap()
+        .reports
+        .contains_key(file));
+    let dropped = fill_progress_queue(manager, key, 4);
+    send_work_done(manager, key, dropped, "discarded", "report");
+    manager.drain_events();
+    dropped + 1
 }
 
 fn send_rust_status(

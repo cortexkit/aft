@@ -382,12 +382,17 @@ fn read_raw_frame(reader: &mut impl io::BufRead) -> io::Result<Option<(Vec<u8>, 
 /// To the client this is a rust-analyzer that is quiescent and answering
 /// requests but has not started its check yet, as a server starved of CPU
 /// looks: the check announcement comes seconds after quiescence.
+/// AFT_FAKE_LSP_PROXY_QUIESCENCE_RELEASE_FILE holds the first quiescent
+/// status until the release file appears. A sibling `.ready` file marks the
+/// held status. The check delay does not start until that status is sent.
 fn run_proxy(program: std::ffi::OsString) -> io::Result<()> {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     let delay = std::env::var("AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(std::time::Duration::from_millis);
+    let mut quiescence_release = std::env::var_os("AFT_FAKE_LSP_PROXY_QUIESCENCE_RELEASE_FILE")
+        .map(std::path::PathBuf::from);
     let mut child = std::process::Command::new(program)
         .args(std::env::args_os().skip(1))
         .stdin(std::process::Stdio::piped())
@@ -406,17 +411,22 @@ fn run_proxy(program: std::ffi::OsString) -> io::Result<()> {
         active: bool,
         /// Whether the delay has already been applied once.
         used: bool,
+        statuses: Vec<Vec<u8>>,
+        quiescence_released: bool,
     }
     let hold = Arc::new(Mutex::new(Hold {
         queue: Vec::new(),
         active: false,
         used: false,
+        statuses: Vec::new(),
+        quiescence_released: quiescence_release.is_none(),
     }));
-    let write_frame = |frame: &[u8]| -> io::Result<()> {
+    let quiescence_sent = Arc::new(Condvar::new());
+    fn write_frame(frame: &[u8]) -> io::Result<()> {
         let mut stdout = io::stdout().lock();
         stdout.write_all(frame)?;
         stdout.flush()
-    };
+    }
     let mut reader = BufReader::new(child_stdout);
     while let Some((frame, body)) = read_raw_frame(&mut reader)? {
         let message: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -428,6 +438,29 @@ fn run_proxy(program: std::ffi::OsString) -> io::Result<()> {
                 .is_some_and(|token| token.contains("flycheck"));
         let held_kind = check_progress || method == Some("textDocument/publishDiagnostics");
         let mut state = hold.lock().expect("hold lock");
+        if method == Some("experimental/serverStatus") && !state.quiescence_released
+            && (!state.statuses.is_empty()
+                || message.pointer("/params/quiescent").and_then(Value::as_bool) == Some(true))
+        {
+            state.statuses.push(frame);
+            if let Some(release) = quiescence_release.take() {
+                std::fs::write(release.with_extension("ready"), [])?;
+                let hold = Arc::clone(&hold);
+                let quiescence_sent = Arc::clone(&quiescence_sent);
+                std::thread::spawn(move || {
+                    while !release.exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    let mut state = hold.lock().expect("hold lock");
+                    for frame in state.statuses.drain(..) {
+                        write_frame(&frame).expect("forward held server status");
+                    }
+                    state.quiescence_released = true;
+                    quiescence_sent.notify_all();
+                });
+            }
+            continue;
+        }
         if let Some(delay) = delay {
             let begins_check = check_progress
                 && message
@@ -438,7 +471,11 @@ fn run_proxy(program: std::ffi::OsString) -> io::Result<()> {
                 state.used = true;
                 state.active = true;
                 let hold = Arc::clone(&hold);
+                let quiescence_sent = Arc::clone(&quiescence_sent);
                 std::thread::spawn(move || {
+                    let state = hold.lock().expect("hold lock");
+                    drop(quiescence_sent.wait_while(state, |state| !state.quiescence_released)
+                        .expect("hold lock"));
                     std::thread::sleep(delay);
                     let mut state = hold.lock().expect("hold lock");
                     let mut stdout = io::stdout().lock();
