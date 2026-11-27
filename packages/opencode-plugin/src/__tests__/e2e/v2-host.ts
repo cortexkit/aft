@@ -13,11 +13,12 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { OpenCode, type V2Event } from "@opencode/client";
+import { stagedE2eBinary } from "../../../../../tests/helpers/e2e-binary.js";
 
 export const pluginRoot = resolve(import.meta.dir, "../../..");
 const repoRoot = resolve(pluginRoot, "../..");
 export const aftBinary =
-  process.env.AFT_BINARY_PATH?.trim() ||
+  stagedE2eBinary(process.env) ??
   join(repoRoot, "target", "debug", process.platform === "win32" ? "aft.exe" : "aft");
 
 type Content = string | Array<{ type: string; text?: string }> | null | undefined;

@@ -1599,11 +1599,16 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         self.assertEqual(required - names, set())
 
     def test_native_e2e_uses_the_job_local_binary(self) -> None:
-        jobs = self.suites[1]["jobs"]
-        for job, binary in (("e2e-windows", "aft.exe"), ("e2e-macos", "aft")):
+        jobs = {**self.suites[0]["jobs"], **self.suites[1]["jobs"]}
+        for job, binary, command in (
+            ("unit-windows-bash", "aft.exe", "bun test src/__tests__/e2e/bash.test.ts"),
+            ("unit-macos-conformance", "aft", "bun run test:unit"),
+            ("e2e-windows", "aft.exe", "tests/windows-e2e/run.ps1"),
+            ("e2e-macos", "aft", "tests/macos-e2e/run.sh"),
+        ):
             with self.subTest(job=job):
-                paths = [step["env"]["AFT_BINARY_PATH"] for step in jobs[job]["steps"]
-                         if "AFT_BINARY_PATH" in step.get("env", {})]
+                paths = [step.get("env", {}).get("AFT_BINARY_PATH") for step in jobs[job]["steps"]
+                         if command in step.get("run", "")]
                 self.assertEqual(paths, [f"${{{{ env.AFT_CI_JOB_DIR }}}}/{binary}"])
 
     def test_hosted_native_jobs_prepare_job_local_state_without_machine_cleanup(self) -> None:

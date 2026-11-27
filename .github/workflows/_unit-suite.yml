@@ -2166,9 +2166,7 @@ jobs:
           CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/target
 
       - name: Bun test (bash permission flow — full bridge + plugin + Rust)
-        run: |
-          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
-          bun test src/__tests__/e2e/bash.test.ts
+        run: bun test src/__tests__/e2e/bash.test.ts
         working-directory: packages/opencode-plugin
         shell: pwsh
         env:
