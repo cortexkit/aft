@@ -5,6 +5,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
@@ -23,47 +24,6 @@ const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const FIRST_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const CARD_PREPARATION_LIMIT: Duration = Duration::from_millis(50);
-const CLEANUP_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
-const LATE_OPEN_COMMIT_GRACE: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CleanupObservation {
-    Unconfirmed,
-    WaitingForLateOpen(tokio::time::Instant),
-    Open,
-    Ended,
-}
-
-struct CleanupControl {
-    observation: tokio::sync::watch::Sender<CleanupObservation>,
-    open_can_commit_until: Option<tokio::time::Instant>,
-}
-
-fn late_open_deadline(until_ms: u64) -> tokio::time::Instant {
-    tokio::time::Instant::now()
-        + Duration::from_millis(
-            until_ms.saturating_sub(crate::bash_background::persistence::unix_millis()),
-        )
-}
-
-#[derive(Default)]
-struct UnknownWindow {
-    elapsed: Duration,
-    previous: Option<tokio::time::Instant>,
-}
-
-impl UnknownWindow {
-    fn unknown(&mut self, now: tokio::time::Instant) -> bool {
-        if let Some(previous) = self.previous.replace(now) {
-            self.elapsed += now.saturating_duration_since(previous);
-        }
-        self.elapsed >= CLEANUP_LIFETIME
-    }
-
-    fn interrupted(&mut self) {
-        self.previous = None;
-    }
-}
 
 struct RetryLog(Option<tokio::time::Instant>);
 
@@ -127,10 +87,26 @@ impl From<CallError> for Failure {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SessionScope {
     identity: BindIdentity,
     scope: ScopeSelector,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OpenReplay {
+    scope: SessionScope,
+    label: String,
+}
+
+impl OpenReplay {
+    fn request(&self, instance: &str, key: &str) -> Request {
+        Request::Open(OpenParams {
+            instance: instance.into(),
+            key: key.into(),
+            label: self.label.clone(),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -171,6 +147,13 @@ impl Wire for DaemonWire {
             )
             .await
             .map_err(|error| match error {
+                other
+                    if other.route_open_refusal().is_some_and(|body| {
+                        body.code == subc_protocol::error_codes::SCOPE_ENDED
+                    }) =>
+                {
+                    Failure::Refused("session_ended".into())
+                }
                 CallError::Module(body) => Failure::Refused(body.code),
                 other => Failure::Transport(other.to_string()),
             })?;
@@ -212,7 +195,8 @@ pub(crate) struct Service {
     runtime: tokio::runtime::Handle,
     wire: parking_lot::RwLock<Option<Arc<dyn Wire>>>,
     registrations: tokio::sync::Mutex<()>,
-    terminal: parking_lot::Mutex<HashMap<String, Option<CleanupControl>>>,
+    terminal: parking_lot::Mutex<HashMap<String, Option<Arc<AtomicBool>>>>,
+    cleanup_wake: tokio::sync::watch::Sender<()>,
     progress: parking_lot::Mutex<HashMap<String, CancellationToken>>,
     #[cfg(all(test, unix))]
     cards: AwaitedCards,
@@ -226,6 +210,7 @@ impl Service {
             wire: Default::default(),
             registrations: Default::default(),
             terminal: Default::default(),
+            cleanup_wake: tokio::sync::watch::Sender::new(()),
             progress: Default::default(),
             #[cfg(all(test, unix))]
             cards: Default::default(),
@@ -264,54 +249,27 @@ impl Service {
         notice: Option<PushFrame>,
         mut persisted: bool,
     ) {
+        if let Event::CleanupOpen {
+            replay,
+            capacity_blocked,
+        } = event
+        {
+            self.submit_cleanup(registry, task, key, replay, capacity_blocked, persisted);
+            return;
+        }
         let terminal = !matches!(event, Event::Progress(_));
-        let cleanup = matches!(event, Event::CleanupOpen { .. });
-        let scope_ends = cleanup.then(|| registry.watch_awaited_scope_ends());
-        let (signal, mut observations) = match &event {
-            Event::CleanupOpen {
-                listed,
-                open_can_commit_until_ms,
-                sync_unknown,
-            } => {
-                let open_can_commit_until = open_can_commit_until_ms.map(late_open_deadline);
-                let (tx, rx) = tokio::sync::watch::channel(if *listed {
-                    CleanupObservation::Open
-                } else if *sync_unknown {
-                    open_can_commit_until.map_or(
-                        CleanupObservation::Ended,
-                        CleanupObservation::WaitingForLateOpen,
-                    )
-                } else {
-                    CleanupObservation::Unconfirmed
-                });
-                (
-                    Some(CleanupControl {
-                        observation: tx,
-                        open_can_commit_until,
-                    }),
-                    Some(rx),
-                )
-            }
-            _ => (None, None),
-        };
-        let until_ended = observations.clone();
         let token = CancellationToken::new();
         let mut pending_progress = None;
         if terminal {
-            match self.terminal.lock().entry(key.clone()) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(signal);
-                }
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    if matches!(event, Event::CleanupOpen { listed: true, .. }) {
-                        if let Some(control) = entry.get() {
-                            control.observation.send_replace(CleanupObservation::Open);
-                        }
-                    }
+            {
+                let mut terminal = self.terminal.lock();
+                let std::collections::hash_map::Entry::Vacant(entry) = terminal.entry(key.clone())
+                else {
                     return;
-                }
+                };
+                entry.insert(None);
             }
-            if matches!(event, Event::Cancel | Event::CleanupOpen { .. }) {
+            if matches!(event, Event::Cancel) {
                 if let Some(progress) = self.progress.lock().remove(&key) {
                     progress.cancel();
                 }
@@ -323,8 +281,7 @@ impl Service {
         }
         let service = Arc::clone(self);
         self.runtime.spawn(async move {
-            // A final output scan can report a match just before exit. Give
-            // that progress call a chance to complete before sending finish.
+            // Give any in-flight progress update a chance to arrive before finish.
             if let Some(progress) = pending_progress {
                 let _ = tokio::time::timeout(CALL_TIMEOUT, progress.cancelled()).await;
             }
@@ -333,41 +290,28 @@ impl Service {
             let mut request = None;
             let mut card_choice = None;
             let mut activation = None;
-            let mut unknown = UnknownWindow::default();
-            let sending = async {
             loop {
-                let guard = registry.clone();
-                let retained = task.clone();
-                let Ok((live, saved)) = tokio::task::spawn_blocking(move || {
-                    let live = guard.awaited_work_live(&retained);
-                    let saved = if live && !persisted {
-                        guard.persist_awaited_decision(&retained)
-                    } else {
-                        Ok(())
-                    };
-                    (live, saved)
-                })
-                .await
-                else {
+                if token.is_cancelled()
+                    || !check_send_state(&registry, &task, &key, &mut persisted, &mut retry_log)
+                        .await
+                {
                     break;
-                };
-                if token.is_cancelled() || !live {
-                    break;
-                }
-                persisted = saved.is_ok();
-                if let Err(error) = saved {
-                    retry_log.failure(format_args!(
-                        "could not persist awaited-work decision for {key}: {error}"
-                    ));
                 }
                 let wire = service.wire().filter(|_| persisted);
                 if wire.is_some() && request.is_none() {
                     match service
-                         .request_for(&registry, &task, &key, event.clone(), notice.clone(), &mut card_choice)
+                        .request_for(
+                            &registry,
+                            &task,
+                            &key,
+                            event.clone(),
+                            notice.clone(),
+                            &mut card_choice,
+                        )
                         .await
                     {
                         Ok(prepared) => {
-                             activation = activate_linked_card(service.cards(), &prepared);
+                            activation = activate_linked_card(service.cards(), &prepared);
                             request = Some(prepared);
                         }
                         Err(error) => retry_log.failure(format_args!(
@@ -381,72 +325,46 @@ impl Service {
                         result = Service::call::<ItemReply>(wire.as_ref(), req, None) => result,
                     };
                     match result {
-                        Ok(_) => break,
-                         Err(Failure::Refused(code)) if cleanup && code == "unknown_key" => {
-                            // On another route the timed-out open can still be
-                            // committing while its cleanup arrives first.
-                             retry_log.failure(format_args!(
-                                "{} waiting for uncertain open of {key}: {code}",
-                                req.method()
-                             ));
-                             let may_expire = observations.as_ref().is_some_and(|rx| *rx.borrow() == CleanupObservation::Unconfirmed);
-                             if may_expire && unknown.unknown(tokio::time::Instant::now()) {
-                                  // Reconciliation may have found that the
-                                  // orchestrator still holds the item. Wait for
-                                  // that observation before expiring its cancel.
-                                 let fence = service.registrations.lock().await;
-                                 if observations.as_ref().is_some_and(|rx| *rx.borrow() == CleanupObservation::Unconfirmed) {
-                                     log::warn!("abandoning uncertain awaited open cleanup for {key}: unknown-key retry window expired");
-                                     return Some(fence);
-                                 }
-                             }
-                        }
-                         Err(Failure::Refused(code)) if terminal && subc_protocol::error_codes::is_retryable_route_open(&code) => {
-                             unknown.interrupted();
-                             retry_log.failure(format_args!("{} route refused for {key}, will retry: {code}", req.method()));
-                         }
-                         Err(Failure::Refused(code)) => {
-                             log::warn!("{} refused for {key}: {code}", req.method());
+                        Ok(_) => {
+                            if terminal {
+                                service.cleanup_wake.send_replace(());
+                            }
                             break;
                         }
-                         Err(Failure::Transport(error) | Failure::Unknown(error)) => {
-                             unknown.interrupted();
-                             retry_log.failure(format_args!(
-                                 "{} transport failed for {key}: {error}",
-                                 req.method()
-                             ));
-                         }
+                        Err(Failure::Refused(code))
+                            if terminal
+                                && subc_protocol::error_codes::is_retryable_route_open(&code) =>
+                        {
+                            retry_log.failure(format_args!(
+                                "{} route refused for {key}, will retry: {code}",
+                                req.method()
+                            ));
+                        }
+                        Err(Failure::Refused(code)) => {
+                            log::warn!("{} refused for {key}: {code}", req.method());
+                            break;
+                        }
+                        Err(Failure::Transport(error) | Failure::Unknown(error)) => {
+                            retry_log.failure(format_args!(
+                                "{} transport failed for {key}: {error}",
+                                req.method()
+                            ));
+                        }
                     }
-                 } else if persisted && service.wire().is_none() {
-                     unknown.interrupted();
+                } else if persisted && service.wire().is_none() {
                     retry_log.failure(format_args!("awaited-work transport unavailable for {key}"));
                 }
-                 tokio::select! {
-                     _ = token.cancelled() => break,
-                     _ = wait_for_cleanup_change(observations.as_mut()), if cleanup => {
-                         unknown = UnknownWindow::default();
-                         delay = FIRST_RETRY_DELAY;
-                         continue;
-                     }
-                     _ = tokio::time::sleep(delay) => {},
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(delay) => {},
                 }
                 delay = (delay * 2).min(MAX_RETRY_DELAY);
             }
-            None };
-            let _expiry_fence = if let Some(scope_ends) = scope_ends {
-                tokio::select! {
-                    biased;
-                    fence = wait_for_cleanup_end(&service, until_ended.expect("cleanup observation")) => fence,
-                    _ = wait_for_revocation(&registry, &task, scope_ends) => None,
-                    expiry_fence = sending => expiry_fence,
-                }
-            } else {
-                sending.await
-            };
             if terminal {
-                // A confirmed link may be announced after finish. Its storage
-                // never delays the orchestrator's release of the worker.
-                if let Some(job) = activation { let _ = job.await; }
+                // A confirmed link can be announced after the worker is released.
+                if let Some(job) = activation {
+                    let _ = job.await;
+                }
                 let _ =
                     tokio::task::spawn_blocking(move || registry.retire_awaited_work(&task)).await;
                 service.terminal.lock().remove(&key);
@@ -457,6 +375,114 @@ impl Service {
                 }
                 token.cancel();
             }
+        });
+    }
+
+    fn submit_cleanup(
+        self: &Arc<Self>,
+        registry: BgTaskRegistry,
+        task: Arc<BgTask>,
+        key: String,
+        mut replay: Option<OpenReplay>,
+        capacity_blocked: bool,
+        mut persisted: bool,
+    ) {
+        let blocked = Arc::new(AtomicBool::new(capacity_blocked));
+        {
+            let mut terminal = self.terminal.lock();
+            let std::collections::hash_map::Entry::Vacant(entry) = terminal.entry(key.clone())
+            else {
+                return;
+            };
+            entry.insert(Some(blocked.clone()));
+        }
+        if let Some(progress) = self.progress.lock().remove(&key) {
+            progress.cancel();
+        }
+        let mut wake = self.cleanup_wake.subscribe();
+        let scope_ends = registry.watch_awaited_scope_ends();
+        let service = self.clone();
+        self.runtime.spawn(async move {
+            let cancel = Request::Cancel(CancelParams { instance: service.instance.clone(), key: key.clone() });
+            let mut log = RetryLog::new(!persisted);
+            let mut delay = FIRST_RETRY_DELAY;
+            let work = async {
+                loop {
+                    if !check_send_state(&registry, &task, &key, &mut persisted, &mut log).await { break; }
+                    if persisted {
+                        if let Some(open) = &replay {
+                            // Do not send an open concurrently with a sync that
+                            // may omit this key after a capacity refusal.
+                            let registration = service.registrations.lock().await;
+                            if let Some(wire) = service.wire() {
+                                let _ = wake.borrow_and_update();
+                                let (registry_write, task_write) = (registry.clone(), task.clone());
+                                let clear_capacity = tokio::task::spawn_blocking(move || registry_write.mark_cleanup_capacity(&task_write, false)).await;
+                                if !matches!(clear_capacity, Ok(Ok(()))) {
+                                    log.failure(format_args!("could not persist awaited-work open retry for {key}: {clear_capacity:?}"));
+                                } else {
+                                    blocked.store(false, Ordering::Release);
+                                    let body = open.request(&service.instance, &key);
+                                    match Service::call::<ItemReply>(wire.as_ref(), &body, Some(&open.scope)).await {
+                                        Ok(reply) if reply.item.key == key => {
+                                            drop(registration);
+                                            let (registry_write, task_write) = (registry.clone(), task.clone());
+                                            let saved = tokio::task::spawn_blocking(move || registry_write.record_confirmed_cleanup_open(&task_write)).await;
+                                            if !matches!(saved, Ok(Ok(()))) {
+                                                log.failure(format_args!("could not persist confirmation of awaited open for {key}: {saved:?}"));
+                                            }
+                                            // If the write failed, a restart can replay open.
+                                            // The orchestrator refuses an open whose key was cancelled.
+                                            replay = None;
+                                            delay = FIRST_RETRY_DELAY;
+                                            continue;
+                                        }
+                                        Err(Failure::Refused(code)) if matches!(code.as_str(), "key_reused" | "session_ended") => break,
+                                        Err(Failure::Refused(code)) if code == "too_many_open" => {
+                                            blocked.store(true, Ordering::Release);
+                                            let (registry_write, task_write) = (registry.clone(), task.clone());
+                                            let saved = tokio::task::spawn_blocking(move || registry_write.mark_cleanup_capacity(&task_write, true)).await;
+                                            drop(registration);
+                                            if !matches!(saved, Ok(Ok(()))) {
+                                                log.failure(format_args!("could not persist awaited-work capacity wait for {key}: {saved:?}"));
+                                            }
+                                            if wake.changed().await.is_err() { break; }
+                                            delay = FIRST_RETRY_DELAY;
+                                            continue;
+                                        }
+                                        Ok(_) => log.failure(format_args!("awaited open replay returned a different key for {key}")),
+                                        Err(error) => log.failure(format_args!("awaited open replay failed for {key}: {error:?}")),
+                                    }
+                                }
+                            }
+                        } else if let Some(wire) = service.wire() {
+                            match Service::call::<ItemReply>(wire.as_ref(), &cancel, None).await {
+                                Ok(reply) if reply.item.key == key => {
+                                    service.cleanup_wake.send_replace(());
+                                    break;
+                                }
+                                Err(Failure::Refused(code)) if code == "session_ended" => break,
+                                Ok(_) => log.failure(format_args!("awaited cleanup cancel returned a different key for {key}")),
+                                Err(error) => log.failure(format_args!("awaited cleanup cancel failed for {key}: {error:?}")),
+                            }
+                        }
+                    }
+                    tokio::select! {
+                        changed = wake.changed() => {
+                            if changed.is_err() { break; }
+                            delay = FIRST_RETRY_DELAY;
+                        }
+                        _ = tokio::time::sleep(delay) => delay = (delay * 2).min(MAX_RETRY_DELAY),
+                    }
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = wait_for_revocation(&registry, &task, scope_ends) => {},
+                _ = work => {},
+            }
+            let _ = tokio::task::spawn_blocking(move || registry.retire_awaited_work(&task)).await;
+            service.terminal.lock().remove(&key);
         });
     }
 
@@ -551,38 +577,34 @@ impl Service {
     }
 }
 
-async fn wait_for_cleanup_change(
-    changes: Option<&mut tokio::sync::watch::Receiver<CleanupObservation>>,
-) {
-    if let Some(changes) = changes {
-        let _ = changes.changed().await;
+async fn check_send_state(
+    registry: &BgTaskRegistry,
+    task: &Arc<BgTask>,
+    key: &str,
+    persisted: &mut bool,
+    log: &mut RetryLog,
+) -> bool {
+    let (registry, task, already_saved) = (registry.clone(), task.clone(), *persisted);
+    let Ok((live, saved)) = tokio::task::spawn_blocking(move || {
+        let live = registry.awaited_work_live(&task);
+        let saved = if live && !already_saved {
+            registry.persist_awaited_decision(&task)
+        } else {
+            Ok(())
+        };
+        (live, saved)
+    })
+    .await
+    else {
+        return false;
+    };
+    *persisted = saved.is_ok();
+    if let Err(error) = saved {
+        log.failure(format_args!(
+            "could not persist awaited-work decision for {key}: {error}"
+        ));
     }
-}
-
-async fn wait_for_cleanup_end(
-    service: &Service,
-    mut changes: tokio::sync::watch::Receiver<CleanupObservation>,
-) -> Option<tokio::sync::MutexGuard<'_, ()>> {
-    loop {
-        let observed = *changes.borrow_and_update();
-        match observed {
-            CleanupObservation::Ended => return None,
-            CleanupObservation::WaitingForLateOpen(deadline) => tokio::select! {
-                changed = changes.changed() => { if changed.is_err() { return None; } }
-                _ = tokio::time::sleep_until(deadline) => {
-                    let fence = service.registrations.lock().await;
-                    if *changes.borrow() == observed {
-                        return Some(fence);
-                    }
-                }
-            },
-            _ => {
-                if changes.changed().await.is_err() {
-                    return None;
-                }
-            }
-        }
-    }
+    live
 }
 
 async fn wait_for_revocation(
@@ -661,9 +683,8 @@ pub(crate) enum Event {
     },
     Cancel,
     CleanupOpen {
-        listed: bool,
-        open_can_commit_until_ms: Option<u64>,
-        sync_unknown: bool,
+        replay: Option<OpenReplay>,
+        capacity_blocked: bool,
     },
     Progress(String),
 }
@@ -786,37 +807,37 @@ impl Candidate {
         };
         let mut outcome = OpenOutcome::NotOpened;
         if let Some(wire) = self.service.wire().filter(|_| gate.is_some()) {
-            let request = Request::Open(OpenParams {
-                instance: self.service.instance.clone(),
-                key: key.into(),
+            let open = OpenReplay {
+                scope: self.scope.clone(),
                 label: self.label.clone(),
-            });
-            // The daemon's scoped route open and the awaited_work.open request
-            // each have a timeout before the late-commit grace starts.
-            let open_can_commit_until_ms = crate::bash_background::persistence::unix_millis()
-                .saturating_add(
-                    (CALL_TIMEOUT + CALL_TIMEOUT + LATE_OPEN_COMMIT_GRACE).as_millis() as u64,
-                );
-            match Service::call::<ItemReply>(wire.as_ref(), &request, Some(&self.scope)).await {
-                Ok(reply) if reply.item.key != key => {
-                    outcome = OpenOutcome::Unknown {
-                        open_can_commit_until_ms,
+            };
+            let (registry_write, attempt_key, saved_open) =
+                (registry.clone(), key.to_owned(), open.clone());
+            // Save the scoped request before it can reach Prefrontal. A restart
+            // during the call then has the exact key, session, scope and label.
+            let saved = tokio::task::spawn_blocking(move || {
+                registry_write.record_awaited_open_attempt(&attempt_key, saved_open)
+            })
+            .await;
+            if matches!(saved, Ok(Ok(()))) {
+                let request = open.request(&self.service.instance, key);
+                match Service::call::<ItemReply>(wire.as_ref(), &request, Some(&open.scope)).await {
+                    Ok(reply) if reply.item.key != key => outcome = OpenOutcome::Unknown,
+                    Ok(reply) if !reply.item.state.is_ended() => outcome = OpenOutcome::Opened,
+                    Ok(_) => {}
+                    Err(Failure::Refused(code)) => {
+                        log::warn!("{} refused for {key}: {code}", request.method())
+                    }
+                    Err(Failure::Transport(error)) => {
+                        log::debug!("{} transport failed for {key}: {error}", request.method())
+                    }
+                    Err(Failure::Unknown(error)) => {
+                        log::warn!("{} outcome unknown for {key}: {error}", request.method());
+                        outcome = OpenOutcome::Unknown;
                     }
                 }
-                Ok(reply) if !reply.item.state.is_ended() => outcome = OpenOutcome::Opened,
-                Ok(_) => {}
-                Err(Failure::Refused(code)) => {
-                    log::warn!("{} refused for {key}: {code}", request.method())
-                }
-                Err(Failure::Transport(error)) => {
-                    log::debug!("{} transport failed for {key}: {error}", request.method())
-                }
-                Err(Failure::Unknown(error)) => {
-                    log::warn!("{} outcome unknown for {key}: {error}", request.method());
-                    outcome = OpenOutcome::Unknown {
-                        open_can_commit_until_ms,
-                    };
-                }
+            } else {
+                log::warn!("could not persist awaited-work open attempt for {key}: {saved:?}");
             }
         }
         let registry = registry.clone();
@@ -980,49 +1001,53 @@ async fn reconcile(
     let _gate = service.registrations.lock().await;
     let listed: ListReply =
         Service::call(wire.as_ref(), &Request::List(ListParams::default()), None).await?;
-    {
-        let terminal = service.terminal.lock();
-        for item in &listed.items {
-            if let Some(Some(control)) = terminal.get(&item.key) {
-                control.observation.send_replace(CleanupObservation::Open);
-            }
-        }
-    }
-    let executor = executor.clone();
-    let (known, registries, persisted_graces) = tokio::task::spawn_blocking(move || {
+    let listed: Arc<HashSet<_>> = Arc::new(listed.items.into_iter().map(|item| item.key).collect());
+    let (executor, listed_for_scan) = (executor.clone(), listed.clone());
+    let (known, registries, mut cleanups) = tokio::task::spawn_blocking(move || {
         let registries: Vec<_> = executor
             .actor_contexts()
             .iter()
             .map(|actor| actor.bash_background().clone())
             .collect();
-        let mut known = listed
-            .items
-            .into_iter()
-            .filter_map(|item| {
+        let mut known = listed_for_scan
+            .iter()
+            .filter_map(|key| {
                 registries
                     .iter()
-                    .find(|registry| registry.knows_awaited_work(&item.key))
-                    .map(|registry| (item.key, registry.clone()))
+                    .find(|registry| registry.knows_awaited_work(key))
+                    .map(|registry| (key.clone(), registry.clone()))
             })
             .collect::<HashMap<_, _>>();
-        let mut persisted_graces = HashMap::new();
+        let mut cleanups = HashMap::new();
         for registry in &registries {
-            for (key, deadline) in registry.pending_awaited_open_cleanups() {
-                if let Some(deadline) = deadline {
-                    persisted_graces.insert(key.clone(), deadline);
-                }
+            for (key, blocked) in registry.pending_awaited_open_cleanups() {
+                cleanups.insert(key.clone(), blocked);
                 known.insert(key, registry.clone());
             }
         }
-        (known, registries, persisted_graces)
+        (known, registries, cleanups)
     })
     .await
     .map_err(|error| Failure::Transport(error.to_string()))?;
-    // Terminal retries own their decisions even after removal from the task
-    // index. Keep them, and keep uncertain opens that have not appeared in list.
-    let mut keep: HashSet<_> = service.terminal.lock().keys().cloned().collect();
+    let mut keep = HashSet::new();
+    {
+        let terminal = service.terminal.lock();
+        for (key, blocked) in terminal.iter() {
+            keep.insert(key.clone());
+            if let Some(blocked) = blocked {
+                cleanups.insert(key.clone(), blocked.load(Ordering::Acquire));
+            }
+        }
+    }
     keep.extend(known.keys().cloned());
-    let mut open: Vec<_> = keep.iter().cloned().collect();
+    // A capacity refusal inserts no row. When list also finds no item, omitting
+    // it cannot end any item as lost. The gate prevents a replay from inserting a
+    // row during this sync. Keep any listed key, even one previously refused.
+    let mut open: Vec<_> = keep
+        .iter()
+        .filter(|key| listed.contains(*key) || !cleanups.get(*key).is_some_and(|blocked| *blocked))
+        .cloned()
+        .collect();
     open.sort_unstable();
     let reply: SyncReply = Service::call(
         wire.as_ref(),
@@ -1034,53 +1059,27 @@ async fn reconcile(
     )
     .await?;
     let unknown: HashSet<_> = reply.unknown.into_iter().collect();
-    let mut keep_unconfirmed = HashSet::new();
-    {
-        let terminal = service.terminal.lock();
-        for key in &keep {
-            if let Some(Some(control)) = terminal.get(key) {
-                let observed = if !unknown.contains(key) {
-                    CleanupObservation::Open
-                } else if let Some(deadline) = control.open_can_commit_until.filter(|deadline| {
-                    *deadline > tokio::time::Instant::now()
-                        && *control.observation.borrow() != CleanupObservation::Open
-                }) {
-                    keep_unconfirmed.insert(key.clone());
-                    CleanupObservation::WaitingForLateOpen(deadline)
-                } else {
-                    CleanupObservation::Ended
-                };
-                control.observation.send_replace(observed);
-            } else if unknown.contains(key)
-                && persisted_graces.get(key).is_some_and(|until| {
-                    *until > crate::bash_background::persistence::unix_millis()
-                })
-            {
-                keep_unconfirmed.insert(key.clone());
-            }
-        }
-    }
-    keep.retain(|key| !unknown.contains(key) || keep_unconfirmed.contains(key));
+    keep.retain(|key| !unknown.contains(key) || cleanups.contains_key(key));
     settle_omitted_items(registries, Arc::new(keep)).await;
     let service_for_replay = service.clone();
     let _ = tokio::task::spawn_blocking(move || {
         for (key, registry) in known {
-            if !unknown.contains(&key) {
+            if !unknown.contains(&key) || cleanups.contains_key(&key) {
                 registry.resume_awaited_work(&key, &service_for_replay);
-            } else if keep_unconfirmed.contains(&key) {
-                registry.resume_unconfirmed_cleanup(&key, &service_for_replay);
             }
         }
     })
     .await;
     *service.wire.write() = Some(wire);
+    service.cleanup_wake.send_replace(());
     Ok(())
 }
 
 // A successful list is complete: Prefrontal commits each item before answering
 // open, and refuses as busy until its store is ready after restart. After both
 // list and sync have succeeded, an omitted item has already ended (or its open
-// never committed); settling locally must not send another notice.
+// never committed). Unresolved open replays are deliberately retained by the
+// caller; an absent item alone cannot prove that an earlier open won't commit.
 async fn settle_omitted_items(registries: Vec<BgTaskRegistry>, retained: Arc<HashSet<String>>) {
     for registry in registries {
         registry.settle_missing_awaited(retained.clone()).await;

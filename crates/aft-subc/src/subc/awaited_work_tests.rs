@@ -77,10 +77,14 @@ mod bash_background {
         cancel_offline: AtomicBool,
         route_refused: AtomicBool,
         cancel_stuck: AtomicBool,
+        replay_offline: AtomicBool,
+        replay_code: parking_lot::Mutex<Option<&'static str>>,
+        seen_opens: parking_lot::Mutex<HashSet<String>>,
+        sealed: parking_lot::Mutex<HashSet<String>>,
+        existing_open_replies: std::sync::atomic::AtomicUsize,
         cancel_refusal: AtomicBool,
         finish_failure: AtomicBool,
         warming: AtomicBool,
-        cancel_unknown: AtomicBool,
         commit_on_sync: parking_lot::Mutex<Option<String>>,
         lost: parking_lot::Mutex<Vec<String>>,
         applied_finishes: parking_lot::Mutex<Vec<FinishParams>>,
@@ -153,6 +157,27 @@ mod bash_background {
                     return Ok(serde_json::to_vec(&reply).unwrap());
                 }
                 Request::Open(open) => {
+                    let initial = self.seen_opens.lock().insert(open.key.clone());
+                    if !initial {
+                        if self.replay_offline.load(Ordering::SeqCst) {
+                            return Err(Failure::Unknown("replay response not received".into()));
+                        }
+                        if self.sealed.lock().contains(&open.key) {
+                            return Err(Failure::Refused("key_reused".into()));
+                        }
+                        let mut listed = self.listed.lock();
+                        if listed.contains(&open.key) {
+                            self.existing_open_replies.fetch_add(1, Ordering::SeqCst);
+                        } else if let Some(code) = *self.replay_code.lock() {
+                            return Err(Failure::Refused(code.into()));
+                        } else {
+                            listed.push(open.key.clone());
+                        }
+                        let mut reply = examples["item"][0].clone();
+                        reply["item"]["key"] = json!(open.key);
+                        reply["item"]["label"] = json!(open.label);
+                        return Ok(serde_json::to_vec(&reply).unwrap());
+                    }
                     self.allow_open.notified().await;
                     match self.answer {
                         Answer::Open => (open.key, Some(open.label), 0),
@@ -206,14 +231,12 @@ mod bash_background {
                 Request::Cancel(_) if self.cancel_offline.load(Ordering::SeqCst) => {
                     return Err(Failure::Transport("cancel route down".into()))
                 }
-                Request::Cancel(_)
-                    if self.cancel_unknown.load(Ordering::SeqCst)
-                        || self.cancel_refusal.swap(false, Ordering::SeqCst) =>
-                {
+                Request::Cancel(_) if self.cancel_refusal.swap(false, Ordering::SeqCst) => {
                     return Err(Failure::Refused("unknown_key".into()));
                 }
                 Request::Cancel(cancel) => {
                     self.listed.lock().retain(|key| key != &cancel.key);
+                    self.sealed.lock().insert(cancel.key.clone());
                     (cancel.key, None, 3)
                 }
                 Request::Progress(progress) => (progress.key, None, 0),
@@ -239,10 +262,14 @@ mod bash_background {
             cancel_offline: false.into(),
             route_refused: false.into(),
             cancel_stuck: false.into(),
+            replay_offline: false.into(),
+            replay_code: None.into(),
+            seen_opens: Default::default(),
+            sealed: Default::default(),
+            existing_open_replies: Default::default(),
             cancel_refusal: false.into(),
             finish_failure: false.into(),
             warming: false.into(),
-            cancel_unknown: false.into(),
             commit_on_sync: None.into(),
             lost: Vec::new().into(),
             applied_finishes: Vec::new().into(),
@@ -639,21 +666,25 @@ mod bash_background {
     }
 
     #[tokio::test]
-    async fn lost_awaited_open_reply_cancels_the_item_but_holds_the_shell_reply() {
+    async fn lost_awaited_open_reply_replays_identically_then_cancels_the_existing_item() {
         let f = Fixture::new();
-        let (service, fake, mut calls) = fake(Answer::LostReply, Vec::new());
-        fake.cancel_refusal.store(true, Ordering::SeqCst);
+        let (service, wire, mut calls) = fake(Answer::LostReply, Vec::new());
+        wire.cancel_refusal.store(true, Ordering::SeqCst);
         let mut rx = f.start(Some(service.clone()), true);
-        let (Request::Open(open), _) = call(&mut calls).await else {
+        let first = call(&mut calls).await;
+        let Request::Open(open) = &first.0 else {
             panic!("missing open")
         };
-        fake.allow_open.notify_one();
+        wire.allow_open.notify_one();
+        assert_eq!(call(&mut calls).await, first);
+        assert_eq!(wire.existing_open_replies.load(Ordering::SeqCst), 1);
         for _ in 0..2 {
             assert!(
                 matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
             );
         }
-        assert!(!fake.listed.lock().contains(&open.key));
+        assert!(wire.sealed.lock().contains(&open.key));
+        assert!(!wire.listed.lock().contains(&open.key));
         assert!(
             rx.try_recv().is_err(),
             "an uncertain open cannot hand back a launch ID"
@@ -683,16 +714,16 @@ mod bash_background {
     #[tokio::test]
     async fn awaited_resync_cannot_claim_a_live_open_or_finish_a_fallback() {
         let f = Fixture::new();
-        let (service, fake, mut calls) = fake(Answer::LostReply, Vec::new());
-        fake.cancel_offline.store(true, Ordering::SeqCst);
+        let (service, wire, mut calls) = fake(Answer::LostReply, Vec::new());
+        wire.replay_offline.store(true, Ordering::SeqCst);
         let mut rx = f.start(Some(service.clone()), true);
-        let (Request::Open(open), _) = call(&mut calls).await else {
+        let first = call(&mut calls).await;
+        let Request::Open(open) = &first.0 else {
             panic!("missing open")
         };
-        // The provider recorded the item, but hasn't sent the open reply.
-        fake.listed.lock().push(open.key.clone());
+        wire.listed.lock().push(open.key.clone());
         let sync = {
-            let (service, wire, executor) = (service.clone(), fake.clone(), f.executor.clone());
+            let (service, wire, executor) = (service.clone(), wire.clone(), f.executor.clone());
             tokio::spawn(async move { reconcile(&service, wire, &executor).await.unwrap() })
         };
         assert!(
@@ -700,7 +731,7 @@ mod bash_background {
                 .await
                 .is_err()
         );
-        fake.allow_open.notify_one();
+        wire.allow_open.notify_one();
         sync.await.unwrap();
         let mut saw_sync = false;
         while let Ok((request, _)) = calls.try_recv() {
@@ -709,21 +740,23 @@ mod bash_background {
                     assert_eq!(sync.open, [open.key.clone()]);
                     saw_sync = true;
                 }
-                Request::List(_) | Request::Cancel(_) => {}
+                Request::List(_) | Request::Open(_) => {}
                 _ => panic!("resync routed a fallback as awaited work"),
             }
         }
         assert!(saw_sync);
         assert!(rx.try_recv().is_err());
-        fake.cancel_offline.store(false, Ordering::SeqCst);
+        wire.replay_offline.store(false, Ordering::SeqCst);
+        assert_eq!(call(&mut calls).await, first);
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        );
         f.release();
         assert_eq!(
             reply(&mut rx).await.response_for_test().data["status"],
             "completed"
         );
-        assert!(
-            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
-        );
+        assert!(wire.lost.lock().is_empty());
         no_more(&mut calls).await;
     }
 
@@ -834,19 +867,27 @@ mod bash_background {
         let f = Fixture::new();
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
-        registry.seed_awaited_fallback_for_test(&key);
+        let open = record_test_open(registry, &key);
+        // Simulate an AFT restart before the first scoped open's reply was read.
         let (executor, _restarted) = restored(&f);
-        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        let (mut service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        Arc::get_mut(&mut service).unwrap().instance = "after-restart".into();
         *wire.commit_on_sync.lock() = Some(key.clone());
+        wire.seen_opens.lock().insert(key.clone());
         reconcile(&service, wire.clone(), &executor).await.unwrap();
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
         assert!(
             matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [key.clone()])
         );
+        assert_eq!(
+            call(&mut calls).await,
+            (open.request("after-restart", &key), Some(open.scope))
+        );
         assert!(
             matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
         );
         assert!(wire.lost.lock().is_empty());
+        assert!(wire.sealed.lock().contains(&key));
         no_more(&mut calls).await;
     }
 
@@ -885,28 +926,27 @@ mod bash_background {
     #[tokio::test]
     async fn awaited_open_committing_between_list_and_sync_is_kept_for_cleanup() {
         let f = Fixture::new();
-        let (service, fake, mut calls) = fake(Answer::LateCommit, Vec::new());
-        fake.cancel_unknown.store(true, Ordering::SeqCst);
+        let (service, wire, mut calls) = fake(Answer::LateCommit, Vec::new());
+        wire.replay_offline.store(true, Ordering::SeqCst);
         let mut rx = f.start(Some(service.clone()), true);
-        let (Request::Open(open), _) = call(&mut calls).await else {
+        let first = call(&mut calls).await;
+        let Request::Open(open) = &first.0 else {
             panic!("missing open")
         };
-        fake.allow_open.notify_one();
-        assert!(
-            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
-        );
+        wire.allow_open.notify_one();
+        assert_eq!(call(&mut calls).await, first);
         *service.wire.write() = None;
-        assert!(fake.listed.lock().is_empty());
-        *fake.commit_on_sync.lock() = Some(open.key.clone());
-        reconcile(&service, fake.clone(), &f.executor)
+        assert!(wire.listed.lock().is_empty());
+        *wire.commit_on_sync.lock() = Some(open.key.clone());
+        wire.replay_offline.store(false, Ordering::SeqCst);
+        reconcile(&service, wire.clone(), &f.executor)
             .await
             .unwrap();
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
         assert!(
             matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [open.key.clone()])
         );
-        assert!(fake.lost.lock().is_empty());
-        fake.cancel_unknown.store(false, Ordering::SeqCst);
+        assert_eq!(call(&mut calls).await, first);
         assert!(
             matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
         );
@@ -915,6 +955,7 @@ mod bash_background {
             reply(&mut rx).await.response_for_test().data["status"],
             "completed"
         );
+        assert!(wire.lost.lock().is_empty());
         no_more(&mut calls).await;
     }
 
@@ -985,7 +1026,7 @@ mod bash_background {
         registry.seed_awaited_fallback_for_test(&key);
         registry.set_awaited_cleanup_age_and_scope_for_test(
             &key,
-            CLEANUP_LIFETIME + Duration::from_secs(60),
+            Duration::from_secs(24 * 60 * 60 + 60),
             call_scope(true),
         );
         let (executor, restarted) = restored(&f);
@@ -1022,23 +1063,35 @@ mod bash_background {
     }
 
     #[tokio::test]
-    async fn sync_unknown_settles_awaited_cleanup_without_sending_cancel() {
+    async fn restart_replays_an_open_even_when_sync_did_not_find_it() {
         let f = Fixture::new();
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
-        registry.seed_awaited_fallback_for_test(&key);
+        let open = record_test_open(registry, &key);
+        assert!(!registry.settle_awaited_open(&key, OpenOutcome::Unknown));
         let (executor, restarted) = restored(&f);
         let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
-        reconcile(&service, wire, &executor).await.unwrap();
+        wire.seen_opens.lock().insert(key.clone());
+        reconcile(&service, wire.clone(), &executor).await.unwrap();
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
         assert!(
             matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [key.clone()])
         );
-        assert!(!restarted
-            .bash_background()
-            .notice_metadata(&key)
-            .unwrap()
-            .has_pending_fallback_cancel());
+        assert_eq!(
+            call(&mut calls).await,
+            (open.request(&service.instance, &key), Some(open.scope))
+        );
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == key)
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cleanup_to_settle(restarted.bash_background(), &key),
+        )
+        .await
+        .unwrap();
+        assert!(wire.sealed.lock().contains(&key));
+        assert!(wire.lost.lock().is_empty());
         no_more(&mut calls).await;
     }
 
@@ -1050,7 +1103,7 @@ mod bash_background {
         registry.seed_awaited_fallback_for_test(&key);
         registry.set_awaited_cleanup_age_and_scope_for_test(&key, Duration::ZERO, call_scope(true));
         let (service, wire, mut calls) = fake(Answer::Open, vec![key.clone()]);
-        wire.cancel_unknown.store(true, Ordering::SeqCst);
+        wire.cancel_stuck.store(true, Ordering::SeqCst);
         reconcile(&service, wire, &f.executor).await.unwrap();
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
         assert!(matches!(call(&mut calls).await, (Request::Sync(_), None)));
@@ -1188,20 +1241,70 @@ mod bash_background {
         route_refusal_then_resync(true).await;
     }
 
+    async fn awaited_locked_database_probe(launch_owner: bool) {
+        let f = Fixture::new();
+        let registry = f.ctx.bash_background().clone();
+        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        if launch_owner {
+            registry.set_awaited_notice_owner_for_test(&key);
+        } else {
+            registry.set_awaited_runner_harness_for_test(&key);
+        }
+        let (service, _wire, mut calls) = fake(Answer::Open, Vec::new());
+        registry.attach_awaited_for_test(&service);
+        let pool = App::default_shared()
+            .open_db(&f.dir.path().join("aft.db"))
+            .unwrap();
+        registry.set_db_pool(pool.clone());
+        let busy = pool.lock().unwrap();
+        let publish = tokio::task::spawn_blocking(move || registry.publish_awaited_for_test(&key));
+        let while_locked = tokio::time::timeout(Duration::from_millis(500), calls.recv())
+            .await
+            .ok()
+            .flatten();
+        eprintln!(
+            "awaited locked aft.db probe: owner={launch_owner} finish while locked={}",
+            while_locked.is_some()
+        );
+        drop(busy);
+        publish.await.unwrap();
+        let result = match while_locked {
+            Some(result) => result,
+            None => call(&mut calls).await,
+        };
+        assert!(matches!(result, (Request::Finish(_), None)));
+        no_more(&mut calls).await;
+    }
+
     #[tokio::test]
-    async fn awaited_cleanup_cancels_an_open_that_commits_after_sync_unknown() {
+    async fn probe_awaited_round4_locked_database_eventually_finishes() {
+        awaited_locked_database_probe(false).await;
+        awaited_locked_database_probe(true).await;
+    }
+
+    async fn cleanup_after_sync_late_commit(at_old_boundary: bool) {
         let f = Fixture::new();
         let (service, wire, mut calls) = fake(Answer::LateCommit, Vec::new());
-        wire.cancel_unknown.store(true, Ordering::SeqCst);
+        wire.replay_offline.store(true, Ordering::SeqCst);
         let mut rx = f.start(Some(service.clone()), true);
-        let (Request::Open(open), _) = call(&mut calls).await else {
+        let first = call(&mut calls).await;
+        let Request::Open(open) = &first.0 else {
             panic!("missing open")
         };
+        let old_deadline = tokio::time::Instant::now() + Duration::from_secs(62);
         wire.allow_open.notify_one();
-        assert!(
-            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        assert_eq!(call(&mut calls).await, first);
+        f.release();
+        assert_eq!(
+            reply(&mut rx).await.response_for_test().data["status"],
+            "completed"
         );
+
+        tokio::time::pause();
         *service.wire.write() = None;
+        while let Ok(request) = calls.try_recv() {
+            assert_eq!(request, first);
+        }
         reconcile(&service, wire.clone(), &f.executor)
             .await
             .unwrap();
@@ -1209,135 +1312,198 @@ mod bash_background {
         assert!(
             matches!(call(&mut calls).await, (Request::Sync(sync), None) if sync.open == [open.key.clone()])
         );
+        assert_eq!(call(&mut calls).await, first);
         assert!(wire.listed.lock().is_empty());
-        assert!(f
-            .ctx
-            .bash_background()
-            .notice_metadata(&open.key)
-            .unwrap()
-            .has_pending_fallback_cancel());
+        if at_old_boundary {
+            // Leave the open ambiguous until ten milliseconds before the boundary.
+            let remaining = old_deadline - tokio::time::Instant::now();
+            tokio::time::advance(remaining - Duration::from_millis(10)).await;
+            assert_eq!(call(&mut calls).await, first);
+            assert!(tokio::time::Instant::now() < old_deadline);
+        }
+        wire.listed.lock().push(open.key.clone());
+        wire.replay_offline.store(false, Ordering::SeqCst);
+        assert_eq!(call(&mut calls).await, first);
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        );
+        let registry = f.ctx.bash_background();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cleanup_to_settle(registry, &open.key),
+        )
+        .await
+        .unwrap();
+        assert!(wire.sealed.lock().contains(&open.key));
+        assert!(wire.listed.lock().is_empty());
+        assert!(wire.lost.lock().is_empty());
+        no_more(&mut calls).await;
+        if at_old_boundary {
+            assert!(tokio::time::Instant::now() > old_deadline);
+            registry.drop_awaited_task_registration_for_test(&open.key);
+            reconcile(&service, wire.clone(), &f.executor)
+                .await
+                .unwrap();
+            assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
+            assert!(matches!(call(&mut calls).await, (Request::Sync(_), None)));
+            assert!(wire.lost.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn awaited_cleanup_cancels_an_open_that_commits_after_sync_unknown() {
+        cleanup_after_sync_late_commit(false).await;
+    }
+
+    #[tokio::test]
+    async fn awaited_cleanup_cancels_an_open_committing_10ms_before_the_former_deadline() {
+        cleanup_after_sync_late_commit(true).await;
+    }
+
+    fn record_test_open(registry: &BgTaskRegistry, key: &str) -> OpenReplay {
+        let stamp = call_scope(true);
+        let open = OpenReplay {
+            scope: SessionScope {
+                identity: BindIdentity::new("aft-awaited-work", "shell-session"),
+                scope: ScopeSelector::new(stamp.owner, stamp.scope_ref, Some(stamp.scope_epoch)),
+            },
+            label: "exact original shell label".into(),
+        };
+        registry.seed_awaited_opening_for_test(key);
+        registry
+            .record_awaited_open_attempt(key, open.clone())
+            .unwrap();
+        open
+    }
+
+    async fn cleanup_replay_definite_refusal(code: &'static str) {
+        let f = Fixture::new();
+        let (service, wire, mut calls) = fake(Answer::LateCommit, Vec::new());
+        *wire.replay_code.lock() = Some(code);
+        let mut rx = f.start(Some(service.clone()), true);
+        let first = call(&mut calls).await;
+        let Request::Open(open) = &first.0 else {
+            panic!("missing open")
+        };
+        wire.allow_open.notify_one();
+        assert_eq!(call(&mut calls).await, first);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cleanup_to_settle(f.ctx.bash_background(), &open.key),
+        )
+        .await
+        .unwrap();
         f.release();
         assert_eq!(
             reply(&mut rx).await.response_for_test().data["status"],
             "completed"
         );
-        while let Ok((request, _)) = calls.try_recv() {
-            assert!(matches!(request, Request::Cancel(_)));
-        }
-        wire.listed.lock().push(open.key.clone());
-        wire.cancel_unknown.store(false, Ordering::SeqCst);
-        assert!(
-            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
-        );
-        assert!(wire.listed.lock().is_empty());
-        assert!(wire.lost.lock().is_empty());
-        no_more(&mut calls).await;
-    }
-
-    fn start_unconfirmed_cleanup(
-        f: &Fixture,
-        service: &Arc<Service>,
-        open_can_commit_until_ms: u64,
-    ) -> String {
-        let registry = f.ctx.bash_background();
-        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
-        registry.seed_awaited_opening_for_test(&key);
-        registry.attach_awaited_for_test(service);
-        assert!(!registry.settle_awaited_open(
-            &key,
-            OpenOutcome::Unknown {
-                open_can_commit_until_ms
-            }
-        ));
-        key
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn awaited_unconfirmed_cleanup_expires_after_a_day_of_unknown_key_replies() {
-        let f = Fixture::new();
-        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
-        wire.cancel_unknown.store(true, Ordering::SeqCst);
-        wire.route_refused.store(true, Ordering::SeqCst);
-        let key = start_unconfirmed_cleanup(&f, &service, 0);
-        assert!(matches!(call(&mut calls).await, (Request::Cancel(_), None)));
-        wire.route_refused.store(false, Ordering::SeqCst);
-        assert!(matches!(call(&mut calls).await, (Request::Cancel(_), None)));
-        let first_unknown = tokio::time::Instant::now();
-        tokio::time::advance(CLEANUP_LIFETIME - Duration::from_secs(1)).await;
-        assert!(matches!(call(&mut calls).await, (Request::Cancel(_), None)));
-        let registry = f.ctx.bash_background();
-        assert!(registry
-            .notice_metadata(&key)
-            .unwrap()
-            .has_pending_fallback_cancel());
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(matches!(call(&mut calls).await, (Request::Cancel(_), None)));
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_cleanup_to_settle(registry, &key),
-        )
-        .await
-        .unwrap();
-        assert!(first_unknown.elapsed() >= CLEANUP_LIFETIME);
-        no_more(&mut calls).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn awaited_running_cancel_stops_at_the_late_open_deadline_after_sync_unknown() {
-        let f = Fixture::new();
-        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
-        wire.cancel_unknown.store(true, Ordering::SeqCst);
-        let until = crate::bash_background::persistence::unix_millis() + 2000;
-        let key = start_unconfirmed_cleanup(&f, &service, until);
-        assert!(matches!(call(&mut calls).await, (Request::Cancel(_), None)));
-        *service.wire.write() = None;
-        reconcile(&service, wire, &f.executor).await.unwrap();
-        assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
-        assert!(matches!(call(&mut calls).await, (Request::Sync(_), None)));
-        assert!(matches!(call(&mut calls).await, (Request::Cancel(_), None)));
-        let registry = f.ctx.bash_background();
-        assert!(registry
-            .notice_metadata(&key)
-            .unwrap()
-            .has_pending_fallback_cancel());
-        tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_cleanup_to_settle(registry, &key),
-        )
-        .await
-        .unwrap();
-        while calls.try_recv().is_ok() {}
         no_more(&mut calls).await;
     }
 
     #[tokio::test]
-    async fn awaited_ended_signal_stops_a_running_cancel_even_with_a_held_reply() {
+    async fn awaited_open_replay_key_reused_retires_without_cancel() {
+        cleanup_replay_definite_refusal("key_reused").await;
+    }
+
+    #[tokio::test]
+    async fn awaited_open_replay_session_ended_retires_without_cancel() {
+        cleanup_replay_definite_refusal("session_ended").await;
+    }
+
+    async fn cleanup_replay_capacity(listed_at_sync: bool) {
         let f = Fixture::new();
-        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
-        wire.route_refused.store(true, Ordering::SeqCst);
-        let key = start_unconfirmed_cleanup(&f, &service, 0);
-        assert!(matches!(call(&mut calls).await, (Request::Cancel(_), None)));
-        wire.cancel_stuck.store(true, Ordering::SeqCst);
-        wire.route_refused.store(false, Ordering::SeqCst);
-        assert!(matches!(call(&mut calls).await, (Request::Cancel(_), None)));
-        *service.wire.write() = None;
-        reconcile(&service, wire, &f.executor).await.unwrap();
+        let (service, wire, mut calls) = fake(Answer::LateCommit, Vec::new());
+        *wire.replay_code.lock() = Some("too_many_open");
+        let mut rx = f.start(Some(service.clone()), true);
+        let first = call(&mut calls).await;
+        let Request::Open(open) = &first.0 else {
+            panic!("missing open")
+        };
+        wire.allow_open.notify_one();
+        assert_eq!(call(&mut calls).await, first);
+        no_more(&mut calls).await;
+        if listed_at_sync {
+            wire.listed.lock().push(open.key.clone());
+        }
+        reconcile(&service, wire.clone(), &f.executor)
+            .await
+            .unwrap();
         assert!(matches!(call(&mut calls).await, (Request::List(_), None)));
-        assert!(matches!(call(&mut calls).await, (Request::Sync(_), None)));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.terminal.lock().contains_key(&key) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        let (Request::Sync(sync), None) = call(&mut calls).await else {
+            panic!("missing sync")
+        };
+        assert_eq!(
+            sync.open,
+            if listed_at_sync {
+                vec![open.key.clone()]
+            } else {
+                Vec::new()
             }
-        })
-        .await
-        .unwrap();
-        assert!(!f
-            .ctx
-            .bash_background()
+        );
+        assert_eq!(call(&mut calls).await, first);
+        if !listed_at_sync {
+            no_more(&mut calls).await;
+            let registry = f.ctx.bash_background();
+            let other = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+            wire.listed.lock().push(other.clone());
+            *wire.replay_code.lock() = None;
+            registry.publish_awaited_for_test(&other);
+            assert!(
+                matches!(call(&mut calls).await, (Request::Finish(finish), None) if finish.key == other)
+            );
+            assert_eq!(call(&mut calls).await, first);
+        }
+        assert!(
+            matches!(call(&mut calls).await, (Request::Cancel(cancel), None) if cancel.key == open.key)
+        );
+        assert!(wire.sealed.lock().contains(&open.key));
+        assert!(wire.lost.lock().is_empty());
+        f.release();
+        assert_eq!(
+            reply(&mut rx).await.response_for_test().data["status"],
+            "completed"
+        );
+        no_more(&mut calls).await;
+    }
+
+    #[tokio::test]
+    async fn awaited_open_replay_waits_for_sync_or_a_freed_slot_when_at_capacity() {
+        cleanup_replay_capacity(false).await;
+    }
+
+    #[tokio::test]
+    async fn awaited_capacity_blocked_open_is_kept_if_a_later_list_shows_it() {
+        cleanup_replay_capacity(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn awaited_unconfirmed_cleanup_has_no_clock_expiry_and_stops_on_scope_end() {
+        let f = Fixture::new();
+        let registry = f.ctx.bash_background();
+        let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
+        registry.set_awaited_cleanup_age_and_scope_for_test(&key, Duration::ZERO, call_scope(true));
+        let open = record_test_open(registry, &key);
+        let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
+        wire.seen_opens.lock().insert(key.clone());
+        wire.replay_offline.store(true, Ordering::SeqCst);
+        registry.attach_awaited_for_test(&service);
+        assert!(!registry.settle_awaited_open(&key, OpenOutcome::Unknown));
+        let expected = (open.request(&service.instance, &key), Some(open.scope));
+        assert_eq!(call(&mut calls).await, expected);
+        tokio::time::advance(Duration::from_secs(48 * 60 * 60)).await;
+        assert_eq!(call(&mut calls).await, expected);
+        assert!(registry
             .notice_metadata(&key)
             .unwrap()
             .has_pending_fallback_cancel());
+        registry.fence_scope_end(&call_scope(true));
+        tokio::time::timeout(
+            FIRST_RETRY_DELAY / 2,
+            wait_for_cleanup_to_settle(registry, &key),
+        )
+        .await
+        .unwrap();
         no_more(&mut calls).await;
     }
 
@@ -1394,16 +1560,4 @@ async fn an_awaited_finish_can_be_built_when_the_card_store_never_answers() {
     );
     assert!(matches!(&request, Request::Finish(params) if params.notice_record.is_none()));
     assert!(activate_linked_card(AwaitedCards::Module, &request).is_none());
-}
-
-#[test]
-fn awaited_cleanup_credits_only_intervals_between_unknown_key_replies() {
-    let mut window = UnknownWindow::default();
-    let start = tokio::time::Instant::now();
-    assert!(!window.unknown(start));
-    assert!(!window.unknown(start + CLEANUP_LIFETIME / 2));
-    window.interrupted();
-    let reconnect = start + CLEANUP_LIFETIME * 3;
-    assert!(!window.unknown(reconnect));
-    assert!(window.unknown(reconnect + CLEANUP_LIFETIME / 2));
 }

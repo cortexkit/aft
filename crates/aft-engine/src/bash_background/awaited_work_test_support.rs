@@ -69,6 +69,15 @@ impl BgTaskRegistry {
             .unwrap();
     }
 
+    pub(crate) fn set_awaited_runner_harness_for_test(&self, key: &str) {
+        let task = self.task(key).unwrap();
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task.lock_state().unwrap();
+        state.metadata.harness = Some("runner".into());
+        self.persist_task_locked(&task, &state.metadata, &mut db)
+            .unwrap();
+    }
+
     pub(crate) fn set_awaited_cleanup_age_and_scope_for_test(
         &self,
         key: &str,
