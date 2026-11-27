@@ -52,24 +52,26 @@ describe("package manifest", () => {
     expect(manifest.files).toContain("THIRD-PARTY-NOTICES.txt");
     const notices = readFileSync(join(import.meta.dir, "../../THIRD-PARTY-NOTICES.txt"), "utf8");
     expect(notices).toContain(`${name} ${version}`);
+    expect(notices).toContain("Copyright (c) 2026 Earendil Inc.");
     expect(notices).toContain("Copyright (c) 2025 Mario Zechner");
   });
 
-  test.each(["@earendil-works/pi-tui", "@earendil-works/pi-tui/viewport", "@oh-my-pi/pi-tui"])(
-    "the bundle guard rejects each module load form for %s",
-    (specifier) => {
-      for (const source of [
-        `import '${specifier}';`,
-        `export { TUI } from '${specifier}';`,
-        `import(\`${specifier}\`);`,
-        `require('${specifier}');`,
-        `__require('${specifier}');`,
-        `__require2('${specifier}');`,
-      ]) {
-        expect(bundledTuiSpecifiers(source)).toEqual([specifier]);
-      }
-    },
-  );
+  test.each([
+    "@earendil-works/pi-tui",
+    "@earendil-works/pi-tui/viewport",
+    "@oh-my-pi/pi-tui",
+  ])("the bundle guard rejects each module load form for %s", (specifier) => {
+    for (const source of [
+      `import '${specifier}';`,
+      `export { TUI } from '${specifier}';`,
+      `import(\`${specifier}\`);`,
+      `require('${specifier}');`,
+      `__require('${specifier}');`,
+      `__require2('${specifier}');`,
+    ]) {
+      expect(bundledTuiSpecifiers(source)).toEqual([specifier]);
+    }
+  });
 
   test("the bundle guard ignores TUI branding keys and other non-specifier strings", () => {
     expect(

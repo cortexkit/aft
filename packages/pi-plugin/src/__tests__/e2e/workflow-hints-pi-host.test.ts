@@ -2,11 +2,9 @@
 /**
  * Workflow hints against a real Pi agent session.
  *
- * Prompt sections arrived in upstream Pi 0.86.0, and this package's dev
- * dependency pins an older Pi, so the test needs a newer host. It uses the Pi
- * that resolves from `AFT_PI_SECTIONS_HOST` (a directory with
- * `@earendil-works/pi-coding-agent` installed in its `node_modules`), else the
- * one this package resolves, and skips when that Pi has no prompt sections.
+ * Uses the Pi pinned by this package unless `AFT_PI_SECTIONS_HOST` points to a
+ * directory with a different `@earendil-works/pi-coding-agent` installation.
+ * The test skips if that host lacks prompt sections (introduced in Pi 0.86.0).
  *
  * Everything runs in a temporary directory with a scripted faux model, so it
  * never reads or writes the user's Pi configuration and never calls a network

@@ -1,8 +1,9 @@
-@earendil-works/pi-tui 0.80.2
-https://github.com/earendil-works/pi/blob/v0.80.2/LICENSE
+@earendil-works/pi-tui 1.7.0
+https://github.com/earendil-works/pi/blob/v1.7.0/LICENSE
 
 MIT License
 
+Copyright (c) 2026 Earendil Inc.
 Copyright (c) 2025 Mario Zechner
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
