@@ -15126,6 +15126,17 @@ INHERITED FLAGS
     }
 
     #[test]
+    fn gh_shim_without_a_pin_cannot_activate_even_a_previously_trusted_signature() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let bytes = serde_json::to_vec(&signed(&fixture_manifest(), TEST_NOW)).unwrap();
+        fs::write(&paths.manifest, bytes).unwrap();
+
+        assert!(matches!(resolve_manifest(&paths, TEST_NOW), ManifestResolution::Dormant));
+        assert_eq!(version_high_water(&paths), 0);
+    }
+
+    #[test]
     fn dormant_resolution_is_presence_based() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
