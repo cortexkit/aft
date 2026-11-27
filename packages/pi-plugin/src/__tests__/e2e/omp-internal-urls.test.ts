@@ -28,7 +28,8 @@ async function runHeadless(extensionEntry?: string): Promise<void> {
       AFT_CACHE_DIR: join(home, "cache", "aft"),
       AFT_OMP_HOST: resolve(host!),
       // Use the build under test, not first-run downloads into this empty HOME.
-      // Delegated startup keeps the installers lazy until an AFT filesystem call.
+      // A delegated child (MAGIC_CONTEXT_PI_SUBAGENT below) skips eager startup,
+      // so the installers stay lazy until an AFT filesystem call.
       AFT_BINARY_PATH:
         stagedE2eBinary(process.env) ??
         resolve(
