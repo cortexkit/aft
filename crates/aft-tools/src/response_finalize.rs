@@ -233,35 +233,56 @@ fn finalize_tool_response_text(
     }
 }
 
-/// Match the bridge's `observeBackgroundReply`: a terminal `bash` reply with a
-/// string `output_preview`, or a terminal `bash_watch` from the task's session,
-/// delivers the result inline. A launch without `output_preview` leaves the
-/// completion available for a later notification or drain. Status and kill
-/// replies only consume results delegated to awaited work.
 fn acknowledge_terminal_bash_reply(
     response: &Response,
     ctx: &AppContext,
     session_id: &str,
     command: &str,
 ) {
-    if !response.success || !matches!(command, "bash" | "bash_watch" | "bash_status" | "bash_kill")
-    {
-        return;
+    let registry = ctx.bash_background();
+    if matches!(command, "bash_status" | "bash_kill") {
+        // Status and kill may consume an awaited result, but not a legacy notice.
+        if let Some(task_id) = terminal_bash_task_id(response) {
+            registry.ack_awaited_terminal_reply(task_id, session_id);
+        }
+    } else if let Some(task_id) = inline_terminal_bash_task_id(response, command) {
+        if command == "bash_watch" {
+            if !registry.ack_awaited_terminal_reply(task_id, session_id) {
+                registry.ack_terminal_watch_reply(task_id, session_id);
+            }
+        } else {
+            registry.ack_terminal_result_for_session(task_id, session_id);
+        }
+    }
+}
+
+/// Match the bridge's `observeBackgroundReply`: a terminal `bash` or `powershell`
+/// reply with a string `output_preview`, or a terminal `bash_watch` from the
+/// task's session, delivers the result inline. A launch without `output_preview`
+/// or a `bash_status` poll leaves the completion available for notification.
+fn inline_terminal_bash_task_id<'a>(response: &'a Response, command: &str) -> Option<&'a str> {
+    let launches_shell = matches!(command, "bash" | "powershell");
+    if !(launches_shell || command == "bash_watch") {
+        return None;
     }
     // A fast background child can exit before its launch reply is built. That
     // reply has a terminal status but only launch guidance in `output`; only a
     // foreground result includes the command's `output_preview`. Acknowledging
     // launch guidance would discard a queued completion or suppress its later
     // publication, even though the caller has not received the result.
-    if command == "bash"
+    if launches_shell
         && !response
             .data
             .get("output_preview")
             .is_some_and(Value::is_string)
     {
-        return;
+        return None;
     }
-    if !response
+    terminal_bash_task_id(response)
+}
+
+fn terminal_bash_task_id(response: &Response) -> Option<&str> {
+    if !response.success || !response
         .data
         .get("status")
         .and_then(Value::as_str)
@@ -272,20 +293,9 @@ fn acknowledge_terminal_bash_reply(
             )
         })
     {
-        return;
+        return None;
     }
-    if let Some(task_id) = response.data.get("task_id").and_then(Value::as_str) {
-        let registry = ctx.bash_background();
-        if command == "bash_watch" {
-            if !registry.ack_awaited_terminal_reply(task_id, session_id) {
-                registry.ack_terminal_watch_reply(task_id, session_id);
-            }
-        } else if matches!(command, "bash_status" | "bash_kill") {
-            registry.ack_awaited_terminal_reply(task_id, session_id);
-        } else {
-            registry.ack_terminal_result_for_session(task_id, session_id);
-        }
-    }
+    response.data.get("task_id").and_then(Value::as_str)
 }
 
 /// An agent-visible reply names tasks the session has not heard about: commands
@@ -877,6 +887,24 @@ mod tests {
     use crate::harness::Harness;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::Response;
+
+    #[test]
+    fn powershell_terminal_reply_is_acknowledged_only_with_inline_output() {
+        use super::inline_terminal_bash_task_id;
+
+        let mut reply = Response::success(
+            "shell",
+            serde_json::json!({"task_id": "task", "status": "completed", "output": "guidance"}),
+        );
+        assert_eq!(inline_terminal_bash_task_id(&reply, "powershell"), None);
+        reply.data["output_preview"] = serde_json::json!("");
+        assert_eq!(
+            inline_terminal_bash_task_id(&reply, "powershell"),
+            Some("task")
+        );
+        reply.data["status"] = serde_json::json!("running");
+        assert_eq!(inline_terminal_bash_task_id(&reply, "powershell"), None);
+    }
 
     #[test]
     fn duplicate_registration_preserves_original_response_and_cancellation() {
