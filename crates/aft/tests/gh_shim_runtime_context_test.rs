@@ -2109,6 +2109,7 @@ struct SlowDaemonConfig {
     catalog_delay: Duration,
     open_route_delay: Duration,
     request_delay: Duration,
+    remove_during_session_lookup: Option<PathBuf>,
     /// When true, the configured stage delays apply only to the first
     /// accepted connection, so a retried probe (attempt 2) sees a fast
     /// daemon. Used to prove the discovery retry succeeds when the first
@@ -2169,6 +2170,7 @@ impl SlowTestDaemon {
                                 let k = key_clone.clone();
                                 let d = daemon_id_clone;
                                 let manifest = manifest.clone();
+                                let remove_during_session_lookup = config.remove_during_session_lookup.clone();
                                 let catalog_requests = Arc::clone(&catalog_requests_clone);
                                 let first_connection = connection_count == 0;
                                 connection_count += 1;
@@ -2324,7 +2326,12 @@ impl SlowTestDaemon {
                                             } else if frame.header.channel == 42 {
                                                 // The AFT daemon's gh shim relay: the version
                                                 // check's bindings read, then the bot write.
-                                                let response_body = if op.as_deref() == Some("gh_shim.bindings_read") {
+                                                let response_body = if op.as_deref() == Some("gh_shim.session_context") {
+                                                    if let Some(path) = &remove_during_session_lookup {
+                                                        fs::remove_file(path).expect("remove manifest during the ticket lookup");
+                                                    }
+                                                    json!({"status":"ok","data":{"worker":false,"head":true}})
+                                                } else if op.as_deref() == Some("gh_shim.bindings_read") {
                                                     json!({
                                                         "op": "gh_shim.bindings_read",
                                                         "status": "ok",

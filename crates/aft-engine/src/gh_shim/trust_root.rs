@@ -269,6 +269,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gh_shim_known_pin_history_refuses_rollback_but_new_roots_reset_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(dir.path().to_owned());
+        let old = super::super::tests::fixture_pin();
+        let mut current = super::super::tests::pin_for(&[31; 32]);
+        let retired = super::super::tests::pin_for(&[32; 32]);
+        current.retired_key_ids.push(retired.key_id.clone());
+        let fresh = super::super::tests::pin_for(&[33; 32]);
+        let publish_pin =
+            |pin, generation| publish(&paths, Reply::Root { pin, generation }, unix_seconds());
+        publish_pin(Some(old.clone()), 8).unwrap();
+        publish_pin(Some(current.clone()), 9).unwrap();
+        daemon_state(&paths, |state| *state = DaemonState::default());
+        assert!(publish_pin(Some(old), 8).is_err());
+        assert!(publish_pin(Some(retired), 8).is_err());
+        publish_pin(Some(current.clone()), 7).unwrap();
+        assert_eq!(read_daemon(&paths).unwrap(), current);
+        publish_pin(None, 6).unwrap();
+        assert!(matches!(
+            read_daemon(&paths),
+            Err(ManifestProblem::NoTrustRoot)
+        ));
+        assert!(publish_pin(Some(current), 8).is_err());
+        publish_pin(Some(fresh.clone()), 3).unwrap();
+        assert_eq!(read_daemon(&paths).unwrap(), fresh);
+    }
+
+    #[test]
+    fn gh_shim_corrupt_generation_marker_recovers_from_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(dir.path().to_owned());
+        fs::write(paths.root.join(HIGH_WATER), b"{not a generation").unwrap();
+        let pin = super::super::tests::fixture_pin();
+        publish(
+            &paths,
+            Reply::Root {
+                pin: Some(pin.clone()),
+                generation: 8,
+            },
+            unix_seconds(),
+        )
+        .unwrap();
+        assert_eq!(read_daemon(&paths).unwrap(), pin);
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(paths.root.join(HIGH_WATER)).unwrap()).unwrap();
+        assert_eq!(marker["generation"], 8);
+    }
+
+    #[test]
     fn gh_shim_later_head_gets_the_daemon_anchor_not_a_replaced_cache() {
         let _state = crate::test_env::gh_shim_state_guard();
         let paths = StatePaths::from_process();

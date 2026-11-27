@@ -231,6 +231,26 @@ mod tests {
         assert_eq!(agent_id(&worker, Some(&head)), Some("head-identity"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn git_hook_coauthor_requires_a_linked_head_that_agrees_with_sponsorship() {
+        use subc_protocol::scope::ParentState;
+        let head = scope_fixture(serde_json::json!({"agent_id":"head-identity"}));
+        let mut worker = scope_fixture(serde_json::json!({
+            "agent_id":"worker-identity", "on_behalf_of_agent":"different-agent"
+        }));
+        worker.kind = ScopeKind::Worker;
+        worker.parent = Some(serde_json::from_value(serde_json::json!({"owner":head.owner,"ref":head.scope_ref,"scope_epoch":head.scope_epoch})).unwrap());
+        worker.parent_state = Some(ParentState::Linked);
+        assert_eq!(agent_id(&worker, Some(&head)), None);
+        worker.attributes.on_behalf_of_agent = Some("head-identity".into());
+        assert_eq!(agent_id(&worker, Some(&head)), Some("head-identity"));
+        assert_eq!(agent_id(&worker, None), None);
+        worker.attributes.on_behalf_of_agent = None;
+        worker.parent_state = Some(ParentState::Pending);
+        assert_eq!(agent_id(&worker, Some(&head)), None);
+    }
+
     #[test]
     fn git_hook_coauthor_drops_the_answer_after_one_stale_ttl() {
         let cache = Cache::new(|_| Err(()));

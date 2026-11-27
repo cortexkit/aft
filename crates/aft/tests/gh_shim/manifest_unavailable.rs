@@ -186,6 +186,73 @@ fn gh_shim_manifest_unavailable_initially_dormant_provisioned() {
 }
 
 #[test]
+fn gh_shim_launch_marker_blocks_writes_before_a_pin_is_available() {
+    let fixture = Fixture::new();
+    let write = ["issue", "comment", "1", "--body", "not native"];
+    let output = fixture
+        .command(&write, false)
+        .env("AFT_GH_SHIM_ENABLED", "1")
+        .env_remove("AFT_GH_SHIM_TRUST_ANCHOR")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    assert_eq!(output.stderr, UNPINNED.as_bytes());
+    assert!(!fixture.record.exists());
+    fixture.assert_passthrough(&write, false);
+}
+
+#[test]
+fn gh_shim_generation_record_alone_blocks_writes() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.state.join("trust-root-generation.json"),
+        "untrusted history",
+    )
+    .unwrap();
+    fixture.assert_refused(
+        &["issue", "comment", "1", "--body", "not native"],
+        false,
+        UNPINNED,
+    );
+    fixture.assert_passthrough(&["issue", "view", "1"], false);
+}
+
+#[test]
+fn gh_shim_final_policy_check_runs_after_the_native_ticket_lookup() {
+    let fixture = Fixture::new();
+    fixture.activate();
+    let manifest = fixture.state.join("gh-routing-manifest.json");
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        remove_during_session_lookup: Some(manifest.clone()),
+        ..SlowDaemonConfig::default()
+    });
+    fixture.connect_daemon(&daemon);
+    let output = fixture
+        .command(
+            &[
+                "issue",
+                "comment",
+                "1",
+                "--body",
+                "not native",
+                "-R",
+                "outside/unbound",
+            ],
+            true,
+        )
+        .env("AFT_GH_SHIM_TICKET", "synthetic-head-ticket")
+        .output()
+        .unwrap();
+    assert!(
+        !manifest.exists(),
+        "the fake daemon did not receive the lookup: {output:?}"
+    );
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    assert_eq!(output.stderr, b"gh-shim: gh_shim_manifest_unavailable: GitHub routing policy changed before the command could run. Start the command again.\n");
+    assert!(!fixture.record.exists());
+}
+
+#[test]
 fn gh_shim_manifest_unavailable_pin_removed_after_acceptance_refuses_writes() {
     let fixture = Fixture::new();
     fixture.activate();

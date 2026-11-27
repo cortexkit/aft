@@ -807,6 +807,12 @@ pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
     }
 }
 
+fn scrub_shim_launch_environment(environment: &mut HashMap<String, String>, _windows: bool) {
+    for key in crate::gh_shim_worker_broker::CHILD_KEYS {
+        environment.remove(key);
+    }
+}
+
 /// Add governance to one child environment. This is the single seam used
 /// before foreground, background, sandboxed, and PTY launch planning.
 ///
@@ -832,9 +838,7 @@ pub fn inject(
     }
 
     let gh_enabled = config.github.shim;
-    for key in crate::gh_shim_worker_broker::CHILD_KEYS {
-        environment.remove(key);
-    }
+    scrub_shim_launch_environment(environment, cfg!(windows));
     if gh_enabled {
         if let Some(value) = crate::gh_shim::trust_root::shell_anchor() {
             environment.insert(crate::gh_shim::trust_root::ANCHOR_ENV.into(), value);
@@ -2124,6 +2128,25 @@ fn windows_gh_posix(binary: &Path) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gh_shim_windows_scrubs_all_case_variants_of_the_inherited_anchor() {
+        let canonical = crate::gh_shim::trust_root::ANCHOR_ENV;
+        let alias = canonical.to_ascii_lowercase();
+        let mut inherited = std::collections::HashMap::from([
+            (canonical.to_string(), "old anchor".to_string()),
+            (alias.clone(), "another old anchor".to_string()),
+            ("OTHER".to_string(), "unchanged".to_string()),
+        ]);
+        let mut windows = inherited.clone();
+        super::scrub_shim_launch_environment(&mut windows, true);
+        assert!(!windows.contains_key(canonical));
+        assert!(!windows.contains_key(&alias));
+        assert_eq!(windows["OTHER"], "unchanged");
+        super::scrub_shim_launch_environment(&mut inherited, false);
+        assert!(!inherited.contains_key(canonical));
+        assert!(inherited.contains_key(&alias));
+    }
+
     use super::*;
     use crate::config::{Config, GitConfig};
 
