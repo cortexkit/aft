@@ -39,7 +39,14 @@ fn manifest_sync_newer_valid_is_accepted_by_shim_equal_and_older_never_write() {
     let original = fs::read(&paths.manifest).unwrap();
     let mut equal = latest.clone();
     equal.envelope.signature = "not a signature".into();
-    assert_eq!(activate(&paths, &equal, now + 1).unwrap().verdict, "valid");
+    assert_eq!(
+        activate(&paths, &equal, now + 1).unwrap().verdict,
+        "invalid"
+    );
+    assert_eq!(
+        cached_manifest_report_at(&paths, now + 1).state,
+        Some("valid")
+    );
     activate(&paths, &candidate(28, now), now + 2);
     assert_eq!(fs::read(&paths.manifest).unwrap(), original);
     fs::remove_file(&paths.manifest).unwrap();

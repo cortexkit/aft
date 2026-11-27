@@ -866,7 +866,7 @@ fn audited_operator_write_rechecks_manifest_before_native_delegation() {
         fixture.paths.bypass_audit.is_file(),
         current_platform() != "unsupported"
     );
-    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.".to_string()]);
+    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_manifest_unavailable: GitHub routing policy changed before the command could run. Start the command again.".to_string()]);
 }
 
 #[test]

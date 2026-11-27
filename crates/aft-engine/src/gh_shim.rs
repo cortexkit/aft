@@ -15005,7 +15005,7 @@ INHERITED FLAGS
             regressed_disposition(&mechanical, &manifest, "macos", &problem),
             RegressedDisposition::Passthrough
         ));
-        let undeclared = [OsString::from("alias"), OsString::from("set")];
+        let undeclared = [OsString::from("fixture"), OsString::from("write")];
         assert!(matches!(
             regressed_disposition(&undeclared, &manifest, "macos", &problem),
             RegressedDisposition::Refuse {
@@ -15018,7 +15018,7 @@ INHERITED FLAGS
             .entry(Tier::Mechanical)
             .or_default()
             .push(TupleDecl::Details {
-                tuple: "alias set".into(),
+                tuple: "fixture write".into(),
                 platform: vec!["macos".into()],
                 api_match: None,
                 rationale: None,
@@ -15122,11 +15122,15 @@ INHERITED FLAGS
             Some("valid")
         );
 
-        publish_pin(&paths, Some(pin_for(&STANDBY_TEST_SEED)));
+        let rotated = pin_for(&STANDBY_TEST_SEED);
+        publish_pin(&paths, Some(rotated.clone()));
         let report = cached_manifest_report_at(&paths, TEST_NOW);
         assert_eq!(report.state, Some("regressed"));
         assert_eq!(report.verified_by_key_id, None);
-        assert_eq!(report.pinned_trust_root_key_id.as_deref(), Some("new-root"));
+        assert_eq!(
+            report.pinned_trust_root_key_id.as_deref(),
+            Some(rotated.key_id.as_str())
+        );
         assert_eq!(
             report.diagnostic_guidance,
             Some(UNTRUSTED_MANIFEST_KEY_STEERING)
