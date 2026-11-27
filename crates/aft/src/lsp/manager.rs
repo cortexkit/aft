@@ -6239,13 +6239,8 @@ impl LspManager {
                     params,
                     receipt.receive_order,
                 ),
-            LspEvent::Notification {
-                server_kind,
-                root,
-                method,
-                params: Some(params),
-            } if method == "experimental/serverStatus" => {
-                self.handle_server_status(server_kind.clone(), root.clone(), params);
+            LspEvent::Notification { method, .. } if method == "experimental/serverStatus" => {
+                self.handle_rust_status(receipt);
                 None
             }
             LspEvent::Notification {

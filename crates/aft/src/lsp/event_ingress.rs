@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 
 use super::analysis_progress::{self, AnalysisProgressShadow, Transition};
 use super::client::{LspEvent, ReceivedLspEvent, ServerInstanceId};
+use super::registry::ServerKind;
 use super::roots::ServerKey;
 
 pub(super) const EVENT_CAP: usize = 64;
@@ -143,14 +144,23 @@ struct Control {
     overflowed: bool,
     progress: Option<AnalysisProgressShadow>,
     progress_limit_exceeded: bool,
+    rust_status: Option<ReceivedLspEvent>,
     exit: Option<ReceivedLspEvent>,
     watched_dropped: usize,
+}
+
+impl Control {
+    fn take_rust_status_through(&mut self, through: u64) -> Option<ReceivedLspEvent> {
+        self.rust_status
+            .take_if(|status| status.receive_order.is_some_and(|order| order <= through))
+    }
 }
 
 pub(super) enum IngressOverflow {
     Dropped {
         through: u64,
         progress: Option<AnalysisProgressShadow>,
+        rust_status: Option<ReceivedLspEvent>,
     },
     ProgressLimit,
 }
@@ -208,6 +218,7 @@ impl EventIngress {
                 last_dropped: 0,
                 overflowed: false,
                 progress_limit_exceeded: false,
+                rust_status: None,
                 exit: None,
                 watched_dropped: 0,
             },
@@ -222,17 +233,29 @@ impl EventIngress {
         &self,
         event: ReceivedLspEvent,
     ) -> Result<(), TrySendError<ReceivedLspEvent>> {
-        if let Some(((instance, order), (token, transition))) = event
+        let transition = Transition::from_event(&event.event);
+        let rust_status = matches!(&event.event, LspEvent::Notification {
+            server_kind: ServerKind::Rust, method, params: Some(_), ..
+        } if method == "experimental/serverStatus");
+        if let Some((instance, order)) = event
             .instance
             .zip(event.receive_order)
-            .zip(Transition::from_event(&event.event))
+            .filter(|_| transition.is_some() || rust_status)
         {
             let mut controls = self.controls.lock();
             if let Some(control) = controls.get_mut(&instance) {
                 if control.progress_limit_exceeded {
                     return Ok(());
                 }
-                if let Some(progress) = &mut control.progress {
+                if rust_status {
+                    // rust-analyzer need not repeat a status until it changes.
+                    // Keep the latest one until the manager applies it, even
+                    // if the FIFO or startup replay discards its receipt.
+                    control.rust_status = Some(event.clone());
+                }
+                if let (Some(progress), Some((token, transition))) =
+                    (&mut control.progress, transition)
+                {
                     if !progress.record(token.to_string(), transition, order) {
                         control.progress_limit_exceeded = true;
                         control.overflowed = true;
@@ -317,11 +340,20 @@ impl EventIngress {
                     IngressOverflow::Dropped {
                         through: control.last_dropped,
                         progress: control.progress.clone(),
+                        rust_status: control.take_rust_status_through(control.last_dropped),
                     }
                 };
                 Some((control.key.clone(), overflow))
             })
             .collect()
+    }
+
+    pub(super) fn consume_rust_status(&self, event: &ReceivedLspEvent) {
+        if let Some((id, order)) = event.instance.zip(event.receive_order) {
+            if let Some(control) = self.controls.lock().get_mut(&id) {
+                control.take_rust_status_through(order);
+            }
+        }
     }
 
     pub(super) fn take_exit(&self) -> Option<ReceivedLspEvent> {
