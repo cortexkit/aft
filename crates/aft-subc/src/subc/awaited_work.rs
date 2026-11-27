@@ -24,12 +24,26 @@ const FIRST_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const CARD_PREPARATION_LIMIT: Duration = Duration::from_millis(50);
 const CLEANUP_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+const LATE_OPEN_COMMIT_GRACE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CleanupObservation {
     Unconfirmed,
+    WaitingForLateOpen(tokio::time::Instant),
     Open,
     Ended,
+}
+
+struct CleanupControl {
+    observation: tokio::sync::watch::Sender<CleanupObservation>,
+    open_can_commit_until: Option<tokio::time::Instant>,
+}
+
+fn late_open_deadline(until_ms: u64) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        + Duration::from_millis(
+            until_ms.saturating_sub(crate::bash_background::persistence::unix_millis()),
+        )
 }
 
 #[derive(Default)]
@@ -198,8 +212,7 @@ pub(crate) struct Service {
     runtime: tokio::runtime::Handle,
     wire: parking_lot::RwLock<Option<Arc<dyn Wire>>>,
     registrations: tokio::sync::Mutex<()>,
-    terminal:
-        parking_lot::Mutex<HashMap<String, Option<tokio::sync::watch::Sender<CleanupObservation>>>>,
+    terminal: parking_lot::Mutex<HashMap<String, Option<CleanupControl>>>,
     progress: parking_lot::Mutex<HashMap<String, CancellationToken>>,
     #[cfg(all(test, unix))]
     cards: AwaitedCards,
@@ -255,13 +268,29 @@ impl Service {
         let cleanup = matches!(event, Event::CleanupOpen { .. });
         let scope_ends = cleanup.then(|| registry.watch_awaited_scope_ends());
         let (signal, mut observations) = match &event {
-            Event::CleanupOpen { listed } => {
+            Event::CleanupOpen {
+                listed,
+                open_can_commit_until_ms,
+                sync_unknown,
+            } => {
+                let open_can_commit_until = open_can_commit_until_ms.map(late_open_deadline);
                 let (tx, rx) = tokio::sync::watch::channel(if *listed {
                     CleanupObservation::Open
+                } else if *sync_unknown {
+                    open_can_commit_until.map_or(
+                        CleanupObservation::Ended,
+                        CleanupObservation::WaitingForLateOpen,
+                    )
                 } else {
                     CleanupObservation::Unconfirmed
                 });
-                (Some(tx), Some(rx))
+                (
+                    Some(CleanupControl {
+                        observation: tx,
+                        open_can_commit_until,
+                    }),
+                    Some(rx),
+                )
             }
             _ => (None, None),
         };
@@ -274,9 +303,9 @@ impl Service {
                     entry.insert(signal);
                 }
                 std::collections::hash_map::Entry::Occupied(entry) => {
-                    if matches!(event, Event::CleanupOpen { listed: true }) {
-                        if let Some(signal) = entry.get() {
-                            signal.send_replace(CleanupObservation::Open);
+                    if matches!(event, Event::CleanupOpen { listed: true, .. }) {
+                        if let Some(control) = entry.get() {
+                            control.observation.send_replace(CleanupObservation::Open);
                         }
                     }
                     return;
@@ -372,8 +401,12 @@ impl Service {
                                  }
                              }
                         }
-                        Err(Failure::Refused(code)) => {
-                            log::warn!("{} refused for {key}: {code}", req.method());
+                         Err(Failure::Refused(code)) if terminal && subc_protocol::error_codes::is_retryable_route_open(&code) => {
+                             unknown.interrupted();
+                             retry_log.failure(format_args!("{} route refused for {key}, will retry: {code}", req.method()));
+                         }
+                         Err(Failure::Refused(code)) => {
+                             log::warn!("{} refused for {key}: {code}", req.method());
                             break;
                         }
                          Err(Failure::Transport(error) | Failure::Unknown(error)) => {
@@ -403,7 +436,7 @@ impl Service {
             let _expiry_fence = if let Some(scope_ends) = scope_ends {
                 tokio::select! {
                     biased;
-                    _ = wait_for_cleanup_end(until_ended.expect("cleanup observation")) => None,
+                    fence = wait_for_cleanup_end(&service, until_ended.expect("cleanup observation")) => fence,
                     _ = wait_for_revocation(&registry, &task, scope_ends) => None,
                     expiry_fence = sending => expiry_fence,
                 }
@@ -475,6 +508,14 @@ impl Service {
                 id
             }
         };
+        if let Some(unlinked) = card_choice
+            .take()
+            .flatten()
+            .filter(|proposed| Some(proposed) != id.as_ref())
+        {
+            let cards = self.cards();
+            tokio::spawn(async move { cards.discard(unlinked).await });
+        }
         Ok(self.request_body(key, event, id))
     }
 
@@ -518,12 +559,28 @@ async fn wait_for_cleanup_change(
     }
 }
 
-async fn wait_for_cleanup_end(mut changes: tokio::sync::watch::Receiver<CleanupObservation>) {
+async fn wait_for_cleanup_end(
+    service: &Service,
+    mut changes: tokio::sync::watch::Receiver<CleanupObservation>,
+) -> Option<tokio::sync::MutexGuard<'_, ()>> {
     loop {
-        if *changes.borrow_and_update() == CleanupObservation::Ended
-            || changes.changed().await.is_err()
-        {
-            return;
+        let observed = *changes.borrow_and_update();
+        match observed {
+            CleanupObservation::Ended => return None,
+            CleanupObservation::WaitingForLateOpen(deadline) => tokio::select! {
+                changed = changes.changed() => { if changed.is_err() { return None; } }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let fence = service.registrations.lock().await;
+                    if *changes.borrow() == observed {
+                        return Some(fence);
+                    }
+                }
+            },
+            _ => {
+                if changes.changed().await.is_err() {
+                    return None;
+                }
+            }
         }
     }
 }
@@ -598,9 +655,16 @@ async fn stage_notice_record(
 
 #[derive(Clone)]
 pub(crate) enum Event {
-    Finish { outcome: Outcome, summary: String },
+    Finish {
+        outcome: Outcome,
+        summary: String,
+    },
     Cancel,
-    CleanupOpen { listed: bool },
+    CleanupOpen {
+        listed: bool,
+        open_can_commit_until_ms: Option<u64>,
+        sync_unknown: bool,
+    },
     Progress(String),
 }
 
@@ -727,8 +791,18 @@ impl Candidate {
                 key: key.into(),
                 label: self.label.clone(),
             });
+            // The daemon's scoped route open and the awaited_work.open request
+            // each have a timeout before the late-commit grace starts.
+            let open_can_commit_until_ms = crate::bash_background::persistence::unix_millis()
+                .saturating_add(
+                    (CALL_TIMEOUT + CALL_TIMEOUT + LATE_OPEN_COMMIT_GRACE).as_millis() as u64,
+                );
             match Service::call::<ItemReply>(wire.as_ref(), &request, Some(&self.scope)).await {
-                Ok(reply) if reply.item.key != key => outcome = OpenOutcome::Unknown,
+                Ok(reply) if reply.item.key != key => {
+                    outcome = OpenOutcome::Unknown {
+                        open_can_commit_until_ms,
+                    }
+                }
                 Ok(reply) if !reply.item.state.is_ended() => outcome = OpenOutcome::Opened,
                 Ok(_) => {}
                 Err(Failure::Refused(code)) => {
@@ -739,7 +813,9 @@ impl Candidate {
                 }
                 Err(Failure::Unknown(error)) => {
                     log::warn!("{} outcome unknown for {key}: {error}", request.method());
-                    outcome = OpenOutcome::Unknown;
+                    outcome = OpenOutcome::Unknown {
+                        open_can_commit_until_ms,
+                    };
                 }
             }
         }
@@ -907,13 +983,13 @@ async fn reconcile(
     {
         let terminal = service.terminal.lock();
         for item in &listed.items {
-            if let Some(Some(observation)) = terminal.get(&item.key) {
-                observation.send_replace(CleanupObservation::Open);
+            if let Some(Some(control)) = terminal.get(&item.key) {
+                control.observation.send_replace(CleanupObservation::Open);
             }
         }
     }
     let executor = executor.clone();
-    let (known, registries) = tokio::task::spawn_blocking(move || {
+    let (known, registries, persisted_graces) = tokio::task::spawn_blocking(move || {
         let registries: Vec<_> = executor
             .actor_contexts()
             .iter()
@@ -929,15 +1005,16 @@ async fn reconcile(
                     .map(|registry| (item.key, registry.clone()))
             })
             .collect::<HashMap<_, _>>();
+        let mut persisted_graces = HashMap::new();
         for registry in &registries {
-            known.extend(
-                registry
-                    .pending_awaited_open_cleanups()
-                    .into_iter()
-                    .map(|key| (key, registry.clone())),
-            );
+            for (key, deadline) in registry.pending_awaited_open_cleanups() {
+                if let Some(deadline) = deadline {
+                    persisted_graces.insert(key.clone(), deadline);
+                }
+                known.insert(key, registry.clone());
+            }
         }
-        (known, registries)
+        (known, registries, persisted_graces)
     })
     .await
     .map_err(|error| Failure::Transport(error.to_string()))?;
@@ -957,25 +1034,41 @@ async fn reconcile(
     )
     .await?;
     let unknown: HashSet<_> = reply.unknown.into_iter().collect();
+    let mut keep_unconfirmed = HashSet::new();
     {
         let terminal = service.terminal.lock();
         for key in &keep {
-            if let Some(Some(observation)) = terminal.get(key) {
-                observation.send_replace(if unknown.contains(key) {
-                    CleanupObservation::Ended
-                } else {
+            if let Some(Some(control)) = terminal.get(key) {
+                let observed = if !unknown.contains(key) {
                     CleanupObservation::Open
-                });
+                } else if let Some(deadline) = control.open_can_commit_until.filter(|deadline| {
+                    *deadline > tokio::time::Instant::now()
+                        && *control.observation.borrow() != CleanupObservation::Open
+                }) {
+                    keep_unconfirmed.insert(key.clone());
+                    CleanupObservation::WaitingForLateOpen(deadline)
+                } else {
+                    CleanupObservation::Ended
+                };
+                control.observation.send_replace(observed);
+            } else if unknown.contains(key)
+                && persisted_graces.get(key).is_some_and(|until| {
+                    *until > crate::bash_background::persistence::unix_millis()
+                })
+            {
+                keep_unconfirmed.insert(key.clone());
             }
         }
     }
-    keep.retain(|key| !unknown.contains(key));
+    keep.retain(|key| !unknown.contains(key) || keep_unconfirmed.contains(key));
     settle_omitted_items(registries, Arc::new(keep)).await;
     let service_for_replay = service.clone();
     let _ = tokio::task::spawn_blocking(move || {
         for (key, registry) in known {
             if !unknown.contains(&key) {
                 registry.resume_awaited_work(&key, &service_for_replay);
+            } else if keep_unconfirmed.contains(&key) {
+                registry.resume_unconfirmed_cleanup(&key, &service_for_replay);
             }
         }
     })

@@ -23,6 +23,9 @@ pub(crate) enum State {
     },
     Cancel,
     FallbackCancel,
+    FallbackCancelDuringOpen {
+        open_can_commit_until_ms: u64,
+    },
     Settled,
 }
 
@@ -32,7 +35,10 @@ impl State {
     }
 
     fn suppresses_legacy(&self) -> bool {
-        !matches!(self, Self::FallbackCancel)
+        !matches!(
+            self,
+            Self::FallbackCancel | Self::FallbackCancelDuringOpen { .. }
+        )
     }
 
     fn decision(&self) -> Option<Event> {
@@ -77,7 +83,19 @@ impl PersistedTask {
     }
 
     pub(crate) fn has_pending_fallback_cancel(&self) -> bool {
-        matches!(self.awaited_work, Some(State::FallbackCancel))
+        matches!(
+            self.awaited_work,
+            Some(State::FallbackCancel | State::FallbackCancelDuringOpen { .. })
+        )
+    }
+
+    fn open_can_commit_until_ms(&self) -> Option<u64> {
+        match self.awaited_work {
+            Some(State::FallbackCancelDuringOpen {
+                open_can_commit_until_ms,
+            }) => Some(open_can_commit_until_ms),
+            _ => None,
+        }
     }
 }
 
@@ -100,7 +118,7 @@ impl Runtime {
 pub(crate) enum OpenOutcome {
     Opened,
     NotOpened,
-    Unknown,
+    Unknown { open_can_commit_until_ms: u64 },
 }
 
 thread_local! {
@@ -237,15 +255,17 @@ impl BgTaskRegistry {
         })
     }
 
-    pub(crate) fn pending_awaited_open_cleanups(&self) -> Vec<String> {
+    pub(crate) fn pending_awaited_open_cleanups(&self) -> Vec<(String, Option<u64>)> {
         self.task_arcs()
             .into_iter()
             .filter_map(|task| {
-                task.lock_state()
-                    .ok()?
-                    .metadata
-                    .has_pending_fallback_cancel()
-                    .then(|| task.task_id.clone())
+                let state = task.lock_state().ok()?;
+                state.metadata.has_pending_fallback_cancel().then(|| {
+                    (
+                        task.task_id.clone(),
+                        state.metadata.open_can_commit_until_ms(),
+                    )
+                })
             })
             .collect()
     }
@@ -254,7 +274,13 @@ impl BgTaskRegistry {
         task.lock_state().is_ok_and(|state| {
             matches!(
                 state.metadata.awaited_work,
-                Some(State::Open | State::Finish { .. } | State::Cancel | State::FallbackCancel)
+                Some(
+                    State::Open
+                        | State::Finish { .. }
+                        | State::Cancel
+                        | State::FallbackCancel
+                        | State::FallbackCancelDuringOpen { .. }
+                )
             ) && state
                 .metadata
                 .lifecycle_scope()
@@ -337,6 +363,28 @@ impl BgTaskRegistry {
         self.transition_awaited_open(key, OpenOutcome::Opened, true);
     }
 
+    pub(crate) fn resume_unconfirmed_cleanup(&self, key: &str, service: &Arc<Service>) {
+        let Some(task) = self.task(key) else { return };
+        let Some(deadline) = task
+            .lock_state()
+            .ok()
+            .and_then(|state| state.metadata.open_can_commit_until_ms())
+        else {
+            return;
+        };
+        self.attach_awaited_work(service);
+        self.send_awaited(
+            &task,
+            Event::CleanupOpen {
+                listed: false,
+                open_can_commit_until_ms: Some(deadline),
+                sync_unknown: true,
+            },
+            None,
+            true,
+        );
+    }
+
     pub(crate) fn settle_awaited_open(&self, key: &str, outcome: OpenOutcome) -> bool {
         self.transition_awaited_open(key, outcome, false)
     }
@@ -363,7 +411,14 @@ impl BgTaskRegistry {
                     } else {
                         state.metadata.completion_delivered =
                             !state.metadata.notify_on_completion || consumed;
-                        matches!(outcome, OpenOutcome::Unknown).then_some(State::FallbackCancel)
+                        match outcome {
+                            OpenOutcome::Unknown {
+                                open_can_commit_until_ms,
+                            } => Some(State::FallbackCancelDuringOpen {
+                                open_can_commit_until_ms,
+                            }),
+                            _ => None,
+                        }
                     };
                 }
                 None if recovering => state.metadata.awaited_work = Some(State::FallbackCancel),
@@ -384,7 +439,11 @@ impl BgTaskRegistry {
         } else if metadata.has_pending_fallback_cancel() {
             self.send_awaited(
                 &task,
-                Event::CleanupOpen { listed: recovering },
+                Event::CleanupOpen {
+                    listed: recovering,
+                    open_can_commit_until_ms: metadata.open_can_commit_until_ms(),
+                    sync_unknown: false,
+                },
                 None,
                 persisted,
             );
@@ -444,7 +503,9 @@ impl BgTaskRegistry {
         };
         let mut persisted = true;
         let decision = match &state.metadata.awaited_work {
-            None | Some(State::FallbackCancel) => return false,
+            None | Some(State::FallbackCancel | State::FallbackCancelDuringOpen { .. }) => {
+                return false
+            }
             Some(State::Open)
                 if state.awaited_runtime.kill_reply
                     && completion.status == BgTaskStatus::Killed =>
@@ -514,7 +575,9 @@ impl BgTaskRegistry {
         let marker = match state.metadata.awaited_work {
             Some(State::Opening) => State::OpeningConsumed,
             Some(State::Open) => State::Cancel,
-            None | Some(State::FallbackCancel) => return false,
+            None | Some(State::FallbackCancel | State::FallbackCancelDuringOpen { .. }) => {
+                return false
+            }
             Some(_) => return true,
         };
         let decision = marker.decision();

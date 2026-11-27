@@ -96,6 +96,14 @@ impl BgTaskRegistry {
     pub(crate) fn drop_awaited_task_registration_for_test(&self, key: &str) {
         assert!(self.inner.tasks.lock().unwrap().remove(key).is_some());
     }
+
+    pub(crate) fn freeze_awaited_finish_without_card_for_test(&self, key: &str) {
+        let task = self.task(key).unwrap();
+        assert!(self
+            .freeze_awaited_finish_notice(&task, None)
+            .unwrap()
+            .is_none());
+    }
     pub(crate) fn seed_awaited_task_for_test(&self, storage: &Path, root: &Path) -> String {
         let key = "bash-0000000000000100";
         let layout =
