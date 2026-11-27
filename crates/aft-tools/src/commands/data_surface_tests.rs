@@ -467,7 +467,9 @@ mod tests {
         ctx.data_checkout().unwrap();
         settled(&ctx);
         // A query reads through the block cache.
-        let view = ctx.data_view().unwrap();
+        let crate::data_layer::host::TextView::Ready(view) = ctx.text_view() else {
+            panic!("settled text checkout has no view");
+        };
         view.path_text(b"src/lib.rs").unwrap();
         drop(view);
         let root_memory = ctx.memory_root_snapshot();

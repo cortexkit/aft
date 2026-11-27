@@ -4,10 +4,11 @@
   "kind": "harness",
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft-tools/src/commands/grep_text_scope_tests/executor.rs",
     "crates/aft-tools/src/commands/semantic_search/mod.rs",
     "crates/aft-tools/src/commands/semantic_search/first_text_wait.rs",
     "crates/aft-engine/src/search_state/mod.rs"
   ],
   "slices": ["crate-split-34-replay-on-main"],
-  "note": "Against main at 7a29a52bcd, the replay moves search and tool schema sources into their owning crates without changing ranking or routing. Main's re-recorded reference already includes the index-store count changes, so all rows must match without exceptions."
+  "note": "Against main at df341f683a, the replay moves search and tool schema sources into their owning crates without changing ranking or routing. This includes main's grep served-source disclosure. All reference rows must match without exceptions."
 }

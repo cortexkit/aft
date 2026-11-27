@@ -1120,10 +1120,30 @@ fn explicit_file_matches(filter_root: &Path, file: &Path, filters: &PathFilters)
     filters.matches(base, file)
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 thread_local! {
     static BEFORE_DIRECTORY_WALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn with_before_directory_walk_for_test<R>(
+    before_walk: impl FnOnce() + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BEFORE_DIRECTORY_WALK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    BEFORE_DIRECTORY_WALK.with_borrow_mut(|slot| {
+        assert!(slot.is_none());
+        *slot = Some(Box::new(before_walk));
+    });
+    let _reset = Reset;
+    run()
 }
 
 fn execute_root_profiled(
@@ -1221,7 +1241,7 @@ fn execute_root_profiled(
 
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     if let Some(before_walk) = BEFORE_DIRECTORY_WALK.with_borrow_mut(Option::take) {
         before_walk();
     }

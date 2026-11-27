@@ -18,6 +18,13 @@ pub mod backup {
 pub mod grep_executor {
     use std::time::Duration;
 
+    pub fn with_before_directory_walk_for_test<R>(
+        before_walk: impl FnOnce() + 'static,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        crate::grep_executor::with_before_directory_walk_for_test(before_walk, run)
+    }
+
     pub fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
         crate::grep_executor::with_walk_limit(limit, run)
     }

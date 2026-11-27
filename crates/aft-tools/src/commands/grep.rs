@@ -2037,7 +2037,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn publication_needle() {}\n").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -2076,11 +2076,12 @@ mod tests {
                 assert_eq!(response.data["files_read_directly"], 1);
             }
         };
-        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let hold =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(&root);
+        aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         assert_rendering("building", " [index: building; searched 1 file directly]");
         drop(hold);
-        crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
+        aft_engine::test_bridge::display_data::data_layer::surfaces::serve_text_only_for_test(&ctx);
         assert_rendering("ready", "");
     }
 

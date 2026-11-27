@@ -7,10 +7,11 @@ mod tests {
     use crate::search_index::{GrepResult, IndexStatus, PathFilters, WalkBound};
     use aft_engine::test_bridge::search_misc::{fallback_grep_with_limits, literal};
 
-    /// 100 directories of 100 files, each file holding one `needle`, and a
-    /// context for it with no index of any kind, so grep walks the folder.
     #[test]
     fn grep_walk_keeps_its_source_when_the_first_index_publishes() {
+        use aft_engine::test_bridge::display_data::{data_layer::runtime, surfaces};
+        use aft_engine::test_bridge::search_misc::grep_executor::with_before_directory_walk_for_test;
+
         let project = tempfile::tempdir().unwrap();
         let root = project.path().canonicalize().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -22,16 +23,21 @@ mod tests {
             ..Default::default()
         };
         config.indexes.callgraph = false;
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
-        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let hold = runtime::hold_builds_for_test(&root);
+        surfaces::bind_for_test(&ctx);
         let checkout = ctx.data_checkout().expect("bound checkout");
         assert!(checkout.first_text_building(), "the first build is held");
 
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "grep-publication-race", "command": "grep",
+            "pattern": "publication_needle", "path": "src",
+        }))
+        .unwrap();
         // Release publication only after grep has missed the view. Wait for
         // the text index to publish before letting that same request walk.
-        BEFORE_DIRECTORY_WALK.with_borrow_mut(|slot| {
-            *slot = Some(Box::new(move || {
+        let walked = with_before_directory_walk_for_test(
+            move || {
                 let checkout = checkout.checkout();
                 let mut generation = checkout.readiness_generation();
                 drop(hold);
@@ -41,14 +47,9 @@ mod tests {
                     assert!(!remaining.is_zero(), "the text index did not publish");
                     checkout.wait_for_readiness_change(&mut generation, remaining);
                 }
-            }));
-        });
-        let request = serde_json::from_value(serde_json::json!({
-            "id": "grep-publication-race", "command": "grep",
-            "pattern": "publication_needle", "path": "src",
-        }))
-        .unwrap();
-        let walked = crate::commands::grep::handle_grep(&request, &ctx);
+            },
+            || crate::commands::grep::handle_grep(&request, &ctx),
+        );
         assert!(walked.success, "{}", walked.data);
         assert_eq!(walked.data["total_matches"], 1, "{}", walked.data);
         assert_eq!(walked.data["complete"], true, "{}", walked.data);
@@ -65,6 +66,8 @@ mod tests {
         assert!(indexed.data["fallback"].is_null(), "{}", indexed.data);
     }
 
+    /// 100 directories of 100 files, each file holding one `needle`, and a
+    /// context for it with no index of any kind, so grep walks the folder.
     fn grep_io_fixture() -> (tempfile::TempDir, AppContext) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();

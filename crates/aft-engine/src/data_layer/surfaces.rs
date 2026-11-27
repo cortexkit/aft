@@ -41,7 +41,8 @@ use aft_store::family::NewerFormat;
 pub(crate) const OFF: &str = "off";
 #[doc(hidden)]
 pub const BUILDING: &str = "building";
-pub(crate) const READY: &str = "ready";
+#[doc(hidden)]
+pub const READY: &str = "ready";
 pub(crate) const UNAVAILABLE: &str = "unavailable";
 
 /// Why a plane is off or unavailable.

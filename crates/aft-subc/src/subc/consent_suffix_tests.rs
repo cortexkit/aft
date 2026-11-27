@@ -29,7 +29,10 @@ pub(super) fn build_suffix_inventory(f: &Fixture) {
         aft_engine::data_layer::runtime::Fresh::Ready(_)
     ));
     f.ctx.pin_data_checkout(checkout);
-    assert!(f.ctx.data_view().is_some());
+    assert!(matches!(
+        f.ctx.text_view(),
+        crate::data_layer::host::TextView::Ready(_)
+    ));
 }
 
 #[tokio::test]
