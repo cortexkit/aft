@@ -42,6 +42,7 @@ import { basename, isAbsolute, join, resolve, win32 } from "node:path";
 import { error, log, warn } from "./active-logger.js";
 import { cachedFileSha256, sha256File, writeStampedFileDigest } from "./binary-identity.js";
 import { execFileSync } from "./child-process.js";
+import { formatFetchError } from "./fetch-proxy.js";
 import { readOnnxNugetLibrary } from "./onnx-nuget.js";
 import { probeOnnxRuntimeLoadable } from "./onnx-probe.js";
 import { withPathPrepended } from "./path-env.js";
@@ -799,8 +800,9 @@ async function downloadOnnxRuntime(
     log(`ONNX Runtime v${ORT_VERSION} installed to ${targetDir}`);
     return targetDir;
   } catch (err) {
-    error(`Failed to download ONNX Runtime: ${err}`);
-    lastInstallFailure = `ONNX Runtime download failed: ${err instanceof Error ? err.message : String(err)}`;
+    const msg = formatFetchError(err);
+    error(`Failed to download ONNX Runtime: ${msg}`);
+    lastInstallFailure = `ONNX Runtime download failed: ${msg}`;
     try {
       rmSync(tmpDir, { recursive: true, force: true });
     } catch {
