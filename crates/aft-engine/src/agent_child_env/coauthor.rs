@@ -53,6 +53,14 @@ impl Cache {
         {
             return entry.answer.as_ref()?.1.clone();
         }
+        let had_answer = entry.answer.is_some();
+        if entry
+            .answer
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() >= TTL * 2)
+        {
+            entry.answer = None;
+        }
         if !entry.refreshing {
             entry.refreshing = true;
             let cache = Arc::clone(self);
@@ -84,6 +92,9 @@ impl Cache {
         // lookup may hold up shell launch.
         if let Some((_, line)) = &entry.answer {
             return line.clone();
+        }
+        if had_answer {
+            return None;
         }
         let (entries, _) = self
             .ready
