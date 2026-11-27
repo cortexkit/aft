@@ -26,7 +26,8 @@ pub(super) fn append_bash_row(entry: &mut Shipped) {
 }
 
 pub(in crate::subc) fn with_bash_title(template: &str) -> String {
-    // Expand the placeholder in place to preserve the published bash row digest.
+    // Sessions and apps pin the bash row view's template digest. Expanding the
+    // shared title in place leaves the row's hashed template source byte-identical.
     let prelude = include_str!("bash-title.ui");
     let body = template.replace(
         "$BASH_TITLE",
