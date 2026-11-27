@@ -33,6 +33,28 @@ fn rust_worker_logged_manager(log: &std::path::Path) -> LspManager {
     manager
 }
 
+/// The folder spelled the way AFT's own Cargo run sees it. On Windows a temp
+/// folder can carry an 8.3 short name (`C:\Users\RUNNER~1\...` on GitHub's
+/// runners), and Cargo reports paths under the working directory exactly as it
+/// was set, while AFT runs Cargo from its canonical workspace root (the long
+/// name, without the `\\?\` prefix). On Unix the working directory Cargo reads
+/// is already resolved, so the path is used as given.
+fn windows_long_path(path: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let canonical = fs::canonicalize(path).expect("canonical fixture path");
+        let text = canonical.to_string_lossy().into_owned();
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+            _ => canonical,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 pub(crate) fn rust_worker_policy_test_guard() -> std::sync::MutexGuard<'static, ()> {
     // These fixtures share the daemon-wide worker counter even when Rust's
     // test runner executes different modules concurrently.
@@ -89,7 +111,7 @@ fn rust_worker_config_disables_all_compilation_and_head_config_is_unchanged() {
             "--format-version=1",
             "--locked",
         ])
-        .current_dir(file.parent().unwrap().parent().unwrap())
+        .current_dir(windows_long_path(file.parent().unwrap().parent().unwrap()))
         .output()
         .expect("fixture Cargo metadata");
     assert!(metadata.status.success(), "{metadata:?}");

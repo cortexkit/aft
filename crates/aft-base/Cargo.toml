@@ -36,7 +36,6 @@ regex = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 sha2 = { version = "0.10", features = ["compress"] }
 blake3 = "1"
-rustc-demangle = "0.1"
 tempfile = "3"
 filetime = { version = "0.2", optional = true }
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
@@ -75,6 +74,10 @@ subc-os = { version = "=0.1.42", features = ["tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
+
+# Allocation-trace reports name frames with dladdr, which exists only on Unix.
+[target.'cfg(unix)'.dependencies]
+rustc-demangle = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "=0.6.1", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }

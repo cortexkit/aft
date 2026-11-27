@@ -102,6 +102,16 @@ def publish_windows_git_path(exec_path: Path, path_file: Path) -> None:
     print("Git for Windows PATH order: " + ";".join(entry.as_posix() for entry in entries))
 
 
+def setup_windows_git_path() -> None:
+    # Windows can expose the Windows Subsystem for Linux bash.exe through
+    # System32. Git's bin and usr/bin directories must precede it so bash, sh,
+    # and coreutils come from the same Git for Windows installation on both
+    # hosted and managed runners.
+    path_file = Path(os.environ["GITHUB_PATH"])
+    exec_path = Path(subprocess.check_output(["git", "--exec-path"], text=True).strip())
+    publish_windows_git_path(exec_path, path_file)
+
+
 def windows_rust_environment(shared_cargo: Path, rustup: Path, writable_cargo: Path) -> dict[str, Path]:
     toolchain = rustup / "toolchains/stable-x86_64-pc-windows-msvc"
     required = [shared_cargo, rustup, toolchain]
@@ -123,9 +133,8 @@ def windows_rust_environment(shared_cargo: Path, rustup: Path, writable_cargo: P
 
 
 def setup_windows_tool_paths() -> dict[str, Union[Path, str]]:
+    setup_windows_git_path()
     path_file = Path(os.environ["GITHUB_PATH"])
-    exec_path = Path(subprocess.check_output(["git", "--exec-path"], text=True).strip())
-    publish_windows_git_path(exec_path, path_file)
     shared_cargo = Path(os.environ.get("CARGO_HOME", "C:/rust/cargo"))
     rustup_home = os.environ.get("RUSTUP_HOME")
     if not rustup_home:
@@ -282,6 +291,11 @@ def setup(root: Path, run_dir: Path, target_max_gib: int = DEFAULT_TARGET_MAX_GI
 
 def main() -> None:
     phase = sys.argv[1]
+    if phase == "windows-git-path":
+        if os.environ.get("RUNNER_OS") != "Windows":
+            raise ValueError("Git for Windows PATH setup requires a Windows runner")
+        setup_windows_git_path()
+        return
     if os.environ.get("RUNNER_ENVIRONMENT") != "self-hosted":
         if phase == "setup":
             runner_temp = Path(os.environ["RUNNER_TEMP"])

@@ -114,6 +114,34 @@ pub fn inspect_retrying_cold_deadline(
     }
 }
 
+/// Poll an inspect request until its report reaches the state the caller
+/// asserts. Real language-server startup and post-change analysis can outlive
+/// one request's own wait on a contended runner. The report state, rather than
+/// a fixed startup delay, settles the test; the deadline catches a stuck
+/// producer and the panic includes the last report.
+#[allow(dead_code)] // Shared with watcher_integration, which has no inspect tests.
+pub fn poll_inspect_until(
+    mut inspect: impl FnMut() -> serde_json::Value,
+    expectation: &str,
+    ready: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut response = inspect();
+    loop {
+        if ready(&response) {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expectation}; last inspect report: {response:#}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        response = inspect();
+    }
+}
+
 #[cfg(test)]
 mod cold_inspect_retry_tests {
     use super::inspect_retrying_cold_deadline;

@@ -164,22 +164,6 @@ const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
 const TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE: &str =
     "trigram index building; results from a bounded walk";
 
-#[cfg(test)]
-thread_local! {
-    static FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE: std::cell::Cell<Option<Duration>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Called on the searching thread each time the trigram wait sees a load
-    /// still in flight, just before it drains the loader. Tests use it to
-    /// publish an index at a known point in the request instead of racing a
-    /// sleeping publisher thread against the wait budget.
-    static SEARCH_INDEX_LOAD_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
 const BORROWED_SEMANTIC_LOADING: &str = "Semantic lane is loading the shared index";
 
 /// The opening line of a reply served while a shared (borrowed) semantic index
@@ -434,6 +418,8 @@ fn wait_for_first_text_index(ctx: &AppContext) -> extensions::ReadinessWait {
         // Readiness itself is sampled again only when the store signals it.
         let observed = generation;
         while generation == observed && Instant::now() < deadline {
+            #[cfg(test)]
+            tests::signal_first_text_wait();
             checkout.checkout().wait_for_readiness_change(
                 &mut generation,
                 deadline
@@ -10618,6 +10604,22 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    thread_local! {
+        static FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE: std::cell::Cell<Option<Duration>> =
+            const { std::cell::Cell::new(None) };
+        /// Lets a test publish a trigram index while the search sees it as still loading.
+        static SEARCH_INDEX_LOAD_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+        static FIRST_TEXT_WAIT_STARTED: std::cell::Cell<Option<std::sync::mpsc::Sender<()>>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn signal_first_text_wait() {
+        if let Some(started) = FIRST_TEXT_WAIT_STARTED.take() {
+            started.send(()).expect("publication test is listening");
+        }
+    }
+
     fn semantic_request(query: &str, top_k: usize) -> RawRequest {
         serde_json::from_value(serde_json::json!({
             "id": "semantic-search-test",
@@ -10692,34 +10694,25 @@ mod tests {
     #[test]
     fn first_text_index_search_returns_promptly_at_text_publication() {
         let (_dir, root, ctx) = first_text_index_fixture();
-        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
         let _graph_hold = crate::data_layer::checkout::hold_call_graph_for_test(&root);
         crate::data_layer::surfaces::bind_for_test(&ctx);
         assert!(first_text_index_wait_needed(&ctx));
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (started, waiting) = std::sync::mpsc::channel();
         let worker_ctx = Arc::clone(&ctx);
         let worker = thread::spawn(move || {
-            tx.send(handle_semantic_search(
-                &semantic_request("first_index_needle", 5),
-                &worker_ctx,
-            ))
-            .unwrap();
+            FIRST_TEXT_WAIT_STARTED.set(Some(started));
+            handle_semantic_search(&semantic_request("first_index_needle", 5), &worker_ctx)
         });
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
-        let published = Instant::now();
-        assert!(ctx
-            .data_checkout()
-            .unwrap()
-            .checkout()
-            .publish_text_first()
-            .unwrap());
-        let response = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("text publication wakes search while the build is still held");
-        assert!(published.elapsed() < Duration::from_secs(1));
+        // Wait until the search has sampled the building state and captured the
+        // readiness generation. Publication must wake it even if it has not
+        // parked on the condition variable yet.
+        waiting.recv().expect("search entered the first-text wait");
+        let checkout = ctx.data_checkout().unwrap();
+        let generation = checkout.checkout().readiness_generation();
+        assert!(checkout.checkout().publish_text_first().unwrap());
+        assert_ne!(checkout.checkout().readiness_generation(), generation);
+        let response = worker.join().expect("search completes at text publication");
         assert!(response.success, "{:?}", response.data);
         assert!(
             response.data["results"]
@@ -10732,9 +10725,7 @@ mod tests {
             "{:?}",
             response.data
         );
-        assert!(!ctx.data_checkout().unwrap().first_text_building());
-        worker.join().unwrap();
-        drop(hold);
+        assert!(!checkout.first_text_building());
     }
 
     #[test]
@@ -10847,12 +10838,12 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
-    #[test]
-    fn first_text_index_deferred_search_releases_executor_for_publication() {
+    #[tokio::test]
+    async fn first_text_index_deferred_search_releases_executor_for_publication() {
         use crate::context::Executor;
         use crate::executor::Lane;
         use crate::path_identity::ProjectRootId;
-        use crate::response_finalize::DispatchOutcome;
+        use crate::response_finalize::{DeferredResponseWake, DispatchOutcome};
         let (_dir, root, ctx) = first_text_index_fixture();
         let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
         crate::data_layer::surfaces::bind_for_test(&ctx);
@@ -10860,12 +10851,15 @@ mod tests {
         let root_id = ProjectRootId::from_path(&root).unwrap();
         executor.register_actor(root_id.clone(), Arc::clone(&ctx));
         let worker_ctx = Arc::clone(&ctx);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let wake = DeferredResponseWake::default();
+        let setup_wake = wake.clone();
         let (setup, _) = executor.submit_cancellable_async(
             root_id.clone(),
             Lane::HeavyInit,
             "cold-search-setup".into(),
             Box::new(move |_| {
+                let _wake = setup_wake.install();
                 let DispatchOutcome::Deferred(pending) = handle_first_index_search_deferred(
                     &semantic_request("first_index_needle", 5),
                     worker_ctx,
@@ -10879,13 +10873,11 @@ mod tests {
                 Response::success("cold-search-setup", serde_json::json!({}))
             }),
         );
-        let mut pending = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("setup leaves executor");
-        assert!(setup.blocking_recv().unwrap().success);
+        assert!(setup.await.expect("setup leaves executor").success);
+        let mut pending = rx.await.expect("setup returned the pending search");
         assert!((pending.poll)(&ctx).is_none());
         let publish_ctx = Arc::clone(&ctx);
-        let published = executor.submit(
+        let published = executor.submit_async(
             root_id,
             Lane::Mutating,
             "publish-text".into(),
@@ -10901,21 +10893,13 @@ mod tests {
         );
         assert!(
             published
-                .recv_timeout(Duration::from_secs(1))
-                .expect("publication is not blocked by the waiting search")
-                .success
+                .await
+                .expect("executor delivered the publication result")
+                .success,
+            "publication is not blocked by the waiting search"
         );
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let response = loop {
-            if let Some(response) = (pending.poll)(&ctx) {
-                break response;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "published search did not resolve"
-            );
-            thread::sleep(Duration::from_millis(5));
-        };
+        wake.notified().await;
+        let response = (pending.poll)(&ctx).expect("completion wake delivers the search reply");
         assert!(response.success, "{:?}", response.data);
     }
 

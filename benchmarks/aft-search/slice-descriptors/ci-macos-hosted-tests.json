@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Test-only change in the ranking-fenced semantic_search/mod.rs: two first-index search tests wait on the readiness event and the completion wake instead of wall-clock bounds, and their test-only thread-locals move into the test module. No search, routing or ranking code changes."
+}

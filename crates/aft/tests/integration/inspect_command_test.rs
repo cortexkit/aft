@@ -6341,14 +6341,14 @@ fn scoped_rust_inspect_recovers_after_a_stale_cargo_lock_is_fixed() {
 /// workspace whose Cargo.lock is stale for `--locked` fails, and after
 /// `cargo update` fixes the lockfile the next scoped inspect reports the new
 /// load instead of the old `cargo metadata` error.
+/// Its own Cargo check can fail before the server finishes indexing, so both
+/// directions wait for the producer state they assert instead of assuming one
+/// inspect has observed the completed workspace load.
 #[test]
 fn scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer() {
-    let available = std::process::Command::new("rust-analyzer")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if !available {
-        eprintln!("SKIP scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer: rust-analyzer is not installed (or rustup component unavailable)");
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer",
+    ) {
         return;
     }
     let (_temp_dir, root) = fixture_project();
@@ -6378,10 +6378,10 @@ fn scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer() {
     .unwrap();
     let ctx = configured_context(&root);
 
-    let stale = scoped_diagnostics_inspect(&ctx, "inspect-real-lock-stale", "src/lib.rs");
-    assert!(
-        failed_producers(&stale).contains(&"rust".to_string()),
-        "{stale:#}"
+    let _ = crate::helpers::poll_inspect_until(
+        || scoped_diagnostics_inspect(&ctx, "inspect-real-lock-stale", "src/lib.rs"),
+        "rust to report the stale lockfile as a failed producer",
+        |response| failed_producers(response).contains(&"rust".to_string()),
     );
     // rust-analyzer re-fetches its workspace once on its own shortly after
     // startup; fix the lockfile only after that, so recovery cannot come
@@ -6394,17 +6394,16 @@ fn scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer() {
         .expect("run cargo update");
     assert!(updated.status.success(), "{updated:?}");
 
-    let fixed = scoped_diagnostics_inspect(&ctx, "inspect-real-lock-fixed", "src/lib.rs");
-    assert!(
-        failed_producers(&fixed).is_empty(),
-        "the fixed lockfile must not keep reporting the old failure: {fixed:#}"
-    );
-    assert!(
-        !fixed["text"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("--locked was passed"),
-        "{fixed:#}"
+    let _ = crate::helpers::poll_inspect_until(
+        || scoped_diagnostics_inspect(&ctx, "inspect-real-lock-fixed", "src/lib.rs"),
+        "rust to reload the fixed lockfile",
+        |response| {
+            failed_producers(response).is_empty()
+                && !response["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("--locked was passed")
+        },
     );
 }
 
@@ -6497,6 +6496,7 @@ fn assert_removed_field_reported(response: &Value) {
 /// asked for its diagnostics. Unless AFT sends the save and asks again, the
 /// next inspect certifies the use site from diagnostics made before the
 /// removal.
+/// Both pre-removal inspections poll until they report zero errors.
 #[test]
 fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_analyzer() {
     if !crate::helpers::real_rust_analyzer_available(
@@ -6507,10 +6507,11 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_
     let (_temp_dir, root, s) = field_removal_crate();
     let ctx = configured_context(&root);
     enable_automatic_rust_checks(&ctx);
-    let warm = crate::helpers::inspect_retrying_cold_deadline(|| {
-        scoped_diagnostics_inspect(&ctx, "field-removal-warm", "src")
-    });
-    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+    let _ = crate::helpers::poll_inspect_until(
+        || scoped_diagnostics_inspect(&ctx, "field-removal-warm", "src"),
+        "the initial Rust diagnostics to settle clean",
+        |response| response["summary"]["diagnostics"]["errors"] == 0,
+    );
 
     let user_edit = aft::commands::edit_match::handle_edit_match(
         &request(json!({
@@ -6523,10 +6524,10 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_
         &ctx,
     );
     assert!(user_edit.success, "{user_edit:?}");
-    let before = scoped_diagnostics_inspect(&ctx, "field-removal-before", "src/user.rs");
-    assert_eq!(
-        before["summary"]["diagnostics"]["errors"], 0,
-        "control: the use site compiles before the removal: {before:#}"
+    let _ = crate::helpers::poll_inspect_until(
+        || scoped_diagnostics_inspect(&ctx, "field-removal-before", "src/user.rs"),
+        "the use site to settle clean before the removal",
+        |response| response["summary"]["diagnostics"]["errors"] == 0,
     );
 
     let removal = aft::commands::edit_match::handle_edit_match(
@@ -6564,10 +6565,11 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     // `src/s.rs`. Its change then reaches rust-analyzer only through the
     // watcher path, not through the resync AFT does for files it has
     // diagnostics for.
-    let warm = crate::helpers::inspect_retrying_cold_deadline(|| {
-        scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src/user.rs")
-    });
-    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+    let _ = crate::helpers::poll_inspect_until(
+        || scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src/user.rs"),
+        "the initial Rust diagnostics to settle clean",
+        |response| response["summary"]["diagnostics"]["errors"] == 0,
+    );
 
     fs::write(&s, "pub struct S {\n    pub a: u8,\n}\n").unwrap();
     // Feed the event the project file watcher would report for the write.
@@ -6738,12 +6740,10 @@ fn scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer() {
             .iter()
             .any(|(_, message)| message.contains("moved value"))
     };
-    let before = crate::helpers::inspect_retrying_cold_deadline(|| {
-        scoped_diagnostics_inspect(&ctx, "fixed-error-before", "src")
-    });
-    assert!(
-        moved_value(&before),
-        "control: the first check reports the error: {before:#}"
+    let _ = crate::helpers::poll_inspect_until(
+        || scoped_diagnostics_inspect(&ctx, "fixed-error-before", "src"),
+        "the first check to report the moved value",
+        |response| moved_value(response),
     );
 
     let fix = aft::commands::edit_match::handle_edit_match(

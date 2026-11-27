@@ -224,32 +224,34 @@ class LightPREventGateTests(unittest.TestCase):
             "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
         ), "ref")
 
-    def test_tests_workflow_reports_all_29_required_contexts(self) -> None:
+    def test_tests_workflow_reports_every_context_used_by_the_release_gate(self) -> None:
         root = Path(__file__).resolve().parents[2]
         workflow = workflow_gates.parse_workflow(str(root / ".github/workflows/tests.yml"))
         task_scopes = workflow["jobs"]["unit-linux-task-scopes"]
         required = {
-            line for line in (root / ".github/required-checks.txt").read_text().splitlines()
-            if line.startswith(("Unit / ", "E2E / ")) or line == task_scopes["name"]
+            context for line in (root / ".github/required-checks.txt").read_text().splitlines()
+            if (context := line.partition("#")[0].strip())
         }
         self.assertIn(task_scopes["name"], required)
-        self.assertEqual(len(required), 29)
-        jobs = {task_scopes["name"]: task_scopes}
-        for caller, file in (("Unit", "_unit-suite.yml"), ("E2E", "_e2e-suite.yml")):
-            suite = workflow_gates.parse_workflow(str(root / ".github/workflows" / file))
+        self.assertEqual(len(required), 31)
+        jobs = {job.get("name", job_id): job for job_id, job in workflow["jobs"].items()}
+        for job_id in ("unit", "e2e"):
+            caller = workflow["jobs"][job_id]
+            suite = workflow_gates.parse_workflow(str(root / caller["uses"]))
             for job in suite["jobs"].values():
-                name = f"{caller} / {job['name']}"
+                name = f"{caller['name']} / {job['name']}"
                 self.assertNotIn(name, jobs)
                 jobs[name] = job
         for context in required:
             with self.subTest(context=context):
                 self.assertIn(context, jobs)
                 self.assertNotIn("strategy", jobs[context])
-                self.assertIn(jobs[context]["if"], (
-                    "${{ github.event_name != 'pull_request' }}",
-                    "${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}",
-                    "${{ always() && github.event_name != 'pull_request' }}",
-                ))
+                if " / " in context or context == task_scopes["name"]:
+                    self.assertIn(jobs[context]["if"], (
+                        "${{ github.event_name != 'pull_request' }}",
+                        "${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}",
+                        "${{ always() && github.event_name != 'pull_request' }}",
+                    ))
 
     def test_static_integration_shards_share_one_partition_action(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -268,8 +270,8 @@ class LightPREventGateTests(unittest.TestCase):
             platform, shard = step["with"]["platform"], step["with"]["shard"]
             label, runner, timeout = {
                 "linux": ("Linux", "ubuntu-22.04", "20"),
-                "macos": ("macOS", ["self-hosted", "mac-mini"], "70"),
-                "windows": ("Windows", ["self-hosted", "narli"], "25"),
+                "macos": ("macOS", "macos-26", "70"),
+                "windows": ("Windows", "windows-2025", "25"),
             }[platform]
             with self.subTest(platform=platform, shard=shard):
                 self.assertEqual(job["name"], f"Cargo integration shard {shard}/3 ({label})")
@@ -281,21 +283,14 @@ class LightPREventGateTests(unittest.TestCase):
                     self.assertEqual(job["steps"], [{"uses": "actions/checkout@v5"}, step])
                 else:
                     steps = job["steps"]
-                    checkout = {"uses": "actions/checkout@v5"}
-                    if platform == "macos":
-                        checkout["id"] = "checkout"
-                    self.assertEqual(steps[0], checkout)
-                    start, end = (2, -1) if platform == "macos" else (1, len(steps))
-                    work = steps[start:end]
+                    self.assertEqual(steps[0], {"uses": "actions/checkout@v5"})
+                    work = steps[1:]
                     self.assertEqual(work[0]["uses"], "actions/setup-python@v6")
-                    setup: dict[str, object] = {"uses": "./.github/actions/native-ci-state"}
-                    if platform == "macos":
-                        setup["with"] = {"target-max-gib": "30"}
-                    self.assertEqual(work[1], setup)
+                    self.assertEqual(work[1], {"uses": "./.github/actions/native-ci-state"})
                     self.assertEqual(work[2]["uses"], "oven-sh/setup-bun@v2")
                     self.assertEqual(work[3]["uses"], "actions/setup-node@v5")
                     self.assertEqual(work[4], step)
-                    self.assertEqual(work[-1]["with"], {"phase": "cleanup"})
+                    self.assertEqual(work[-1], step)
         action = workflow_gates.parse_workflow(str(root / ".github/actions/integration-shard/action.yml"))
         self.assertEqual(action["runs"]["using"], "composite")
         steps = action["runs"]["steps"]
@@ -731,7 +726,7 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
             for name, job in suite["jobs"].items():
                 steps = job.get("steps", [])
                 direct = [i for i, step in enumerate(steps) if step.get("uses") == action]
-                if job.get("runs-on") != ["self-hosted", "narli"]:
+                if job.get("runs-on") != "windows-2025":
                     self.assertEqual(direct, [], name)
                     continue
                 shared = [step for step in steps if step.get("uses") == "./.github/actions/integration-shard"]
@@ -784,6 +779,102 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
         self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/6")
         self.assertEqual(gate["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst")
         self.assertEqual(shard["needs"], "unit-windows-nextest-archive")
+
+    def test_windows_tests_run_hosted_without_narli_machine_state(self) -> None:
+        suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
+        e2e = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_e2e-suite.yml"))
+        jobs = suite["jobs"]
+        hosted = {name: jobs[name] for name in (
+            "unit-windows-nextest-archive", "unit-windows-libtest-shard", "unit-windows-watcher",
+            "unit-windows-cargo", "unit-windows-cargo-2", "unit-windows-cargo-3",
+            "unit-windows-check", "unit-windows-bash",
+        )}
+        hosted["e2e-windows"] = e2e["jobs"]["e2e-windows"]
+        for name, job in hosted.items():
+            with self.subTest(job=name):
+                self.assertEqual(job["runs-on"], "windows-2025")
+                self.assertEqual(job["env"]["CARGO_BUILD_JOBS"], "2")
+                self.assertNotIn("AFT_CI_TARGET_DIR", str(job))
+                self.assertNotIn("--legacy-msvc-profile-dir", str(job))
+                self.assertFalse(any(
+                    step.get("with", {}).get("phase") == "cleanup"
+                    for step in job["steps"] if step.get("uses") == "./.github/actions/native-ci-state"
+                ))
+
+        for name in (
+            "unit-windows-nextest-archive", "unit-windows-libtest-shard", "unit-windows-watcher",
+            "unit-windows-check", "unit-windows-bash", "e2e-windows",
+        ):
+            with self.subTest(job=name, setting="hosted compiler cache"):
+                job = hosted[name]
+                self.assertEqual(job["env"]["SCCACHE_GHA_ENABLED"], "true")
+                self.assertEqual(job["env"]["RUSTC_WRAPPER"], "sccache")
+                uses = [step.get("uses", "") for step in job["steps"]]
+                self.assertTrue(any("mozilla-actions/sccache-action" in action for action in uses))
+                self.assertTrue(any("Swatinem/rust-cache" in action for action in uses))
+
+        warning_checks = [
+            step for step in hosted["unit-windows-check"]["steps"]
+            if step.get("env", {}).get("RUSTFLAGS") == "-D warnings"
+        ]
+        self.assertEqual(len(warning_checks), 2)
+        self.assertTrue(all("cargo check " in step["run"] for step in warning_checks))
+
+        for workflow in (suite, e2e):
+            for name, job in workflow["jobs"].items():
+                with self.subTest(job=name):
+                    self.assertNotIn("narli", str(job.get("runs-on", "")))
+                    self.assertNotIn("narli", str(job.get("strategy", {})))
+
+    def test_windows_release_builds_and_shipped_e2e_stay_on_narli(self) -> None:
+        release = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/release.yml"))
+        for job_id, name in (
+            ("build-win32-arm64", "Build Windows ARM64"),
+            ("build-win32-x64", "Build Windows x64"),
+            ("e2e-win32-x64", "Shipped E2E (Windows x64)"),
+        ):
+            with self.subTest(job=job_id):
+                job = release["jobs"][job_id]
+                self.assertEqual(job["name"], name)
+                self.assertEqual(job["runs-on"], ["self-hosted", "narli"])
+
+    def test_hosted_windows_git_path_precedes_every_command(self) -> None:
+        action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
+        steps = action["runs"]["steps"]
+        path_setup = next(
+            i for i, step in enumerate(steps)
+            if step.get("name") == "Prefer Git for Windows tools on hosted runners"
+        )
+        step = steps[path_setup]
+        self.assertEqual(step["shell"], "pwsh")
+        self.assertEqual(
+            step["if"],
+            "runner.os == 'Windows' && runner.environment == 'github-hosted'",
+        )
+        self.assertEqual(step["run"], "python scripts/ci-native-state.py windows-git-path")
+        for i, command in enumerate(steps):
+            if command.get("shell") == "bash" and "runner.environment == 'self-hosted'" not in command.get("if", ""):
+                self.assertLess(path_setup, i)
+
+        for filename in ("_unit-suite.yml", "_e2e-suite.yml"):
+            workflow = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows" / filename))
+            for name, job in workflow["jobs"].items():
+                if job.get("runs-on") != "windows-2025":
+                    continue
+                with self.subTest(job=name):
+                    steps = job["steps"]
+                    setup = next(
+                        i for i, step in enumerate(steps)
+                        if step.get("uses") == "./.github/actions/native-ci-state"
+                    )
+                    python = next(
+                        i for i, step in enumerate(steps)
+                        if step.get("uses") == "actions/setup-python@v6"
+                    )
+                    self.assertLess(python, setup)
+                    for i, step in enumerate(steps):
+                        if "run" in step:
+                            self.assertLess(setup, i, f"{name}: command runs before Git for Windows PATH setup")
 
 
 class UnitShardPartitionCountTests(unittest.TestCase):
@@ -904,12 +995,51 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         output = (
             "     Running unittests src\\lib.rs (target\\debug\\deps\\agent_file_tools-0123abcd.exe)\n"
             "         LINK : warning LNK4217: symbol 'wasm_engine_delete' defined in 'libwasmtime_c_api.rlib' is imported\n"
+            # Cargo's unused-dependency manifest lint ends with a bare `help:` line.
+            "warning: unused dependency `rustc-demangle`\n"
+            "  --> crates\\aft-base\\Cargo.toml:39:1\n"
+            "   |\n"
+            "   = note: `cargo::unused_dependencies` is set to `warn` by default\n"
+            "help: consider removing the dependency on `rustc-demangle`\n"
             "parser::tests::parses: test\n"
             "\n"
             "1 test, 0 benchmarks\n"
         )
         entries = namespace["parse_cargo_list"](output)
         self.assertEqual([(entry.kind, entry.name) for entry in entries], [("lib", "parser::tests::parses")])
+
+    def test_inventory_proof_resolves_bash_before_starting_it(self) -> None:
+        import ast
+        import types
+
+        wanted = {"resolve_shell_command", "run_command"}
+        nodes: list[ast.stmt] = [
+            node for node in ast.parse(PROOF_TEXT).body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        self.assertEqual(len(nodes), 2)
+        run = unittest.mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+        which = unittest.mock.Mock(return_value="C:/Program Files/Git/bin/bash.exe")
+        namespace = {
+            "ROOT": Path("D:/a/aft/aft"),
+            "os": os,
+            "sys": sys,
+            "shutil": types.SimpleNamespace(which=which),
+            "subprocess": types.SimpleNamespace(run=run, PIPE="pipe", STDOUT="stdout"),
+        }
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), namespace)
+
+        namespace["run_command"](["bash", "D:/a/aft/aft/scripts/check-cmake.sh"])
+        which.assert_called_once_with("bash")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["C:/Program Files/Git/bin/bash.exe", "D:/a/aft/aft/scripts/check-cmake.sh"],
+        )
+
+        which.return_value = None
+        with self.assertRaisesRegex(FileNotFoundError, "bash.*PATH"):
+            namespace["run_command"](["bash", "scripts/check-cmake.sh"])
+        run.assert_called_once()
 
     def test_proof_remaps_every_archive_list_and_partition_to_the_consumer(self) -> None:
         import ast
@@ -954,9 +1084,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
         job = suite["jobs"]["unit-macos-conformance"]
-        # A cold-cache build alone has taken 15 minutes on this runner, and
-        # 30-minute runs were cancelled while their tests were still passing.
-        self.assertEqual(job["timeout-minutes"], "95")  # 45 for work, 50 for the grant
+        # Preserve the timeout until cold hosted runs measure the full lane.
+        self.assertEqual(job["timeout-minutes"], "95")
 
     def test_libtest_codegen_is_split_without_rebuilding_dependencies(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -968,8 +1097,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(job["env"]["CARGO_INCREMENTAL"], "0")
         self.assertNotIn("CARGO_PROFILE_TEST_CODEGEN_UNITS", job["env"])
-        # A cold build must still have room to finish on the dedicated runner.
-        self.assertEqual(job["timeout-minutes"], "140")  # 90 for work, 50 for the grant
+        # Leave room for the cold build on the hosted runner.
+        self.assertEqual(job["timeout-minutes"], "140")
         cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
         build_steps = [command for command in cargo_steps if re.search(r"\bcargo (nextest|test)\b", command)]
         self.assertEqual(len(build_steps), 3)
@@ -989,24 +1118,29 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         archive_index = next(i for i, step in enumerate(steps) if "nextest archive" in step.get("run", ""))
         self.assertEqual(steps.index(timings), archive_index + 1)
 
-    def test_macos_tests_and_release_builds_use_the_dedicated_runner(self) -> None:
+    def test_macos_tests_run_hosted_without_mac_mini_holds(self) -> None:
         suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
-        release = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/release.yml"))
+        e2e = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_e2e-suite.yml"))
+        tests = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/tests.yml"))
         jobs = suite["jobs"]
+        hosted = {name: jobs[name] for name in jobs["unit-macos"]["needs"]}
+        hosted["e2e-macos"] = e2e["jobs"]["e2e-macos"]
+        for name, job in hosted.items():
+            with self.subTest(job=name):
+                self.assertEqual(job["runs-on"], "macos-26")
+                self.assertEqual(job["env"]["CARGO_BUILD_JOBS"], "2")
+                self.assertNotIn("AFT_CI_TARGET_DIR", str(job))
+                self.assertNotIn("steps.macos-hold", str(job))
+        for workflow in (tests, suite, e2e):
+            for name, job in workflow["jobs"].items():
+                with self.subTest(job=name):
+                    self.assertNotIn("mac-mini", str(job.get("runs-on", "")))
+                    self.assertNotIn("mac-mini", str(job.get("strategy", {})))
+                    self.assertNotIn("./.github/actions/macos-hold", [step.get("uses") for step in job.get("steps", [])])
+        self.assertFalse(any("blacksmith" in str(job.get("runs-on", "")).lower() for job in jobs.values()))
+
         producer = jobs["unit-macos-libtest-archive"]
         self.assertEqual(producer["name"], "Cargo libtest archive (macOS)")
-        for name in ("unit-macos-libtest-archive", "unit-macos-libtest-shard", "unit-macos-bin-archive", "unit-macos-nextest-archive", "unit-macos-inventory-proof"):
-            self.assertEqual(jobs[name]["runs-on"], ["self-hosted", "mac-mini"], name)
-        for arch, name in (("arm64", "Build macOS ARM64"), ("x64", "Build macOS x64")):
-            job = release["jobs"][f"build-darwin-{arch}"]
-            self.assertEqual(job["name"], name)
-            self.assertEqual(job["runs-on"], ["self-hosted", "mac-mini"], name)
-        self.assertEqual(release["jobs"]["e2e-darwin-arm64"]["runs-on"], "macos-26")
-        for workflow in (suite, release):
-            self.assertEqual(
-                [name for name, job in workflow["jobs"].items() if "blacksmith" in str(job.get("runs-on", "")).lower()],
-                [],
-            )
         shards = jobs["unit-macos-libtest-shard"]
         self.assertEqual(shards["name"], "Cargo libtest shard ${{ matrix.shard }}/5 (macOS)")
         self.assertEqual(shards["strategy"]["matrix"]["shard"], ["1", "2", "3", "4", "5"])
@@ -1014,11 +1148,22 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             self.assertIn("github.event_name", job["if"])
             self.assertNotIn("github.ref", job["if"])
 
+    def test_release_builds_and_nightly_cost_gate_stay_on_the_mac_mini(self) -> None:
+        release = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/release.yml"))
+        cost = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/cost-gate.yml"))
+        for arch, name in (("arm64", "Build macOS ARM64"), ("x64", "Build macOS x64")):
+            job = release["jobs"][f"build-darwin-{arch}"]
+            self.assertEqual(job["name"], name)
+            self.assertEqual(job["runs-on"], ["self-hosted", "mac-mini"], name)
+        self.assertEqual(release["jobs"]["e2e-darwin-arm64"]["runs-on"], "macos-26")
+        self.assertEqual(cost["jobs"]["cost-gate"]["runs-on"], ["self-hosted", "mac-mini"])
+        self.assertFalse(any("blacksmith" in str(job.get("runs-on", "")).lower() for job in release["jobs"].values()))
+
     def test_macos_libtest_timing_summaries_survive_success_and_failure(self) -> None:
         suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
         for job_id, invocation, heading, runner in (
-            ("unit-macos-libtest-archive", "/usr/bin/time -l cargo nextest archive", "Build duration", "mac-mini"),
-            ("unit-macos-libtest-shard", "./scripts/rust-test-gate.sh", "Test duration", "mac-mini"),
+            ("unit-macos-libtest-archive", "/usr/bin/time -l cargo nextest archive", "Build duration", "macos-26"),
+            ("unit-macos-libtest-shard", "./scripts/rust-test-gate.sh", "Test duration", "macos-26"),
         ):
             step = next(step for step in suite["jobs"][job_id]["steps"] if invocation in step.get("run", ""))
             self.assertEqual(step["shell"], "bash")
@@ -1036,20 +1181,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
                     self.assertIn(f"Runner: {runner} (test-runner)", text)
                     self.assertRegex(text, rf"{heading}: \d+s")
 
-    def test_mac_mini_jobs_hold_through_cleanup_and_fit_post_grant_lease(self) -> None:
+    def test_mac_mini_release_builds_hold_through_cleanup_and_fit_post_grant_lease(self) -> None:
         work_budgets = {
-            "unit-macos-nextest-archive": 30,
-            "unit-macos-libtest-archive": 90,
-            "unit-macos-bin-archive": 25,
-            "unit-macos-inventory-proof": 10,
-            "unit-macos-nextest": 20,
-            "unit-macos-nextest-2": 20,
-            "unit-macos-nextest-3": 20,
-            "unit-macos-libtest-shard": 20,
-            "unit-macos-watcher": 20,
-            "unit-macos-conformance": 45,
-            "e2e-macos": 45,
-            "native-ci-cleanup": 5,
             "build-darwin-arm64": 150,
             "build-darwin-x64": 150,
         }
@@ -1060,55 +1193,34 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         cleanup_margin_minutes = 5  # GitHub's cancellation grace period
         self.assertLessEqual(lease_minutes, 180)
 
-        held_jobs = {}
-        for filename in ("_unit-suite.yml", "_e2e-suite.yml", "tests.yml", "release.yml"):
-            jobs = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows" / filename))["jobs"]
-            for name, job in jobs.items():
-                matrix = job.get("strategy", {}).get("matrix", {})
-                if job.get("runs-on") == ["self-hosted", "mac-mini"] or "mac-mini" in matrix.get("machine", []):
-                    held_jobs[name] = job
+        jobs = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/release.yml"))["jobs"]
+        held_jobs = {name: job for name, job in jobs.items() if job.get("runs-on") == ["self-hosted", "mac-mini"]}
         self.assertEqual(held_jobs.keys(), work_budgets.keys())
 
         for name, job in held_jobs.items():
             with self.subTest(job=name):
                 steps = job["steps"]
+                self.assertEqual(len(steps), 5)
                 self.assertEqual(steps[0], {"uses": "actions/checkout@v5", "id": "checkout"})
-                release_build = name.startswith("build-darwin-")
-                acquire_index = 2 if release_build else 1
-                if release_build:
-                    self.assertEqual(steps[1], {
-                        "uses": "./.github/actions/native-ci-state",
-                        "id": "python-preflight",
-                        "with": {"phase": "python"},
-                    })
-                acquire, release = steps[acquire_index], steps[-1]
-                conditional = name == "native-ci-cleanup"
-                shard = {"shard": "${{ matrix.shard }}"} if name == "unit-macos-libtest-shard" else {}
+                self.assertEqual(steps[1], {
+                    "uses": "./.github/actions/native-ci-state",
+                    "id": "python-preflight",
+                    "with": {"phase": "python"},
+                })
+                acquire, release = steps[2], steps[-1]
                 for step, phase in ((acquire, "acquire"), (release, "release")):
                     self.assertEqual(step["uses"], "./.github/actions/macos-hold")
-                    self.assertEqual(step["with"], {"phase": phase, **shard})
-                self.assertEqual(acquire.get("if"), "matrix.machine == 'mac-mini'" if conditional else None)
-                matrix_condition = "matrix.machine == 'mac-mini' && " if conditional else ""
-                prerequisite = "python-preflight" if release_build else "checkout"
-                self.assertEqual(release["if"], f"always() && {matrix_condition}steps.{prerequisite}.outcome == 'success'")
-                if conditional:
-                    limits = re.fullmatch(r"\$\{\{ matrix\.machine == 'mac-mini' && (\d+) \|\| 5 \}\}", job["timeout-minutes"])
-                    assert limits is not None, "expected distinct Mac mini and narli timeouts"
-                    timeout = int(limits[1])
-                else:
-                    timeout = int(job["timeout-minutes"])
+                    self.assertEqual(step["with"], {"phase": phase})
+                self.assertNotIn("if", acquire)
+                self.assertEqual(release["if"], "always() && steps.python-preflight.outcome == 'success'")
                 work_budget = work_budgets[name]
-                self.assertGreaterEqual(timeout, work_budget + wait_minutes)
+                self.assertGreaterEqual(int(job["timeout-minutes"]), work_budget + wait_minutes)
                 self.assertLessEqual(renewal_minutes + work_budget + cleanup_margin_minutes, lease_minutes)
-                if release_build:
-                    # An early grant can leave nearly the whole job timeout.
-                    # All release work must be inside a separately timed step.
-                    self.assertEqual(len(steps), 5)
-                    arch = name.removeprefix("build-darwin-")
-                    self.assertEqual(steps[3]["uses"], f"./.github/actions/release-darwin-{arch}")
-                    self.assertEqual(int(steps[3]["timeout-minutes"]), work_budget)
-                else:
-                    self.assertLessEqual(timeout + cleanup_margin_minutes, lease_minutes)
+                # An early grant can leave nearly the whole job timeout.
+                # All release work must be inside a separately timed step.
+                arch = name.removeprefix("build-darwin-")
+                self.assertEqual(steps[3]["uses"], f"./.github/actions/release-darwin-{arch}")
+                self.assertEqual(int(steps[3]["timeout-minutes"]), work_budget)
 
     def test_unit_archive_compilation_isolated_and_real_cli_is_retained(self) -> None:
         lib = workflow_job("unit-macos-libtest-archive")
@@ -1227,8 +1339,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             'test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"',
             timeout_step,
         )
-        self.assertIn('"$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --list', timeout_step)
-        self.assertIn('"$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --exact', timeout_step)
+        self.assertIn('"$test_name" -- --list', timeout_step)
+        self.assertIn('"$test_name" -- --exact', timeout_step)
         self.assertIn("expected test missing from integration inventory", timeout_step)
         self.assertIn(
             "cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation",
@@ -1471,7 +1583,7 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
 
     def native_jobs(self):
         return [(name, job) for suite in self.suites for name, job in suite["jobs"].items()
-                if job.get("runs-on") in (["self-hosted", "mac-mini"], ["self-hosted", "narli"])]
+                if job.get("runs-on") in ("macos-26", "windows-2025")]
 
     def test_required_native_check_names_are_unchanged(self) -> None:
         names = {f"{prefix} / {job['name']}" for prefix, suite in zip(("Unit", "E2E"), self.suites)
@@ -1494,31 +1606,24 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                          if "AFT_BINARY_PATH" in step.get("env", {})]
                 self.assertEqual(paths, [f"${{{{ env.AFT_CI_JOB_DIR }}}}/{binary}"])
 
-    def test_every_native_job_prepares_persistent_state_and_always_cleans_processes(self) -> None:
+    def test_hosted_native_jobs_prepare_job_local_state_without_machine_cleanup(self) -> None:
         jobs = self.native_jobs()
         self.assertEqual(len(jobs), 20)
         for name, job in jobs:
             with self.subTest(job=name):
-                mac = job["runs-on"] == ["self-hosted", "mac-mini"]
-                start, end = (2, -1) if mac else (1, len(job["steps"]))
-                steps = job["steps"][start:end]
-                self.assertEqual(steps[0], {"uses": "actions/setup-python@v6", "if": "runner.environment == 'github-hosted'",
-                                             "with": {"python-version": "3.14"}})
-                setup: dict[str, object] = {"uses": "./.github/actions/native-ci-state"}
-                if mac:
-                    setup["with"] = {"target-max-gib": "30"}
-                self.assertEqual(steps[1], setup)
-                cleanup = steps[-1]
-                self.assertEqual(cleanup["uses"], "./.github/actions/native-ci-state")
-                self.assertEqual(cleanup["if"], "always() && steps.macos-hold.outcome == 'success'" if mac else "always()")
-                self.assertEqual(cleanup["with"]["phase"], "cleanup")
+                steps = job["steps"]
+                python = {"uses": "actions/setup-python@v6", "with": {"python-version": "3.14"}}
+                self.assertEqual(steps[1], python)
+                self.assertEqual(steps[2], {"uses": "./.github/actions/native-ci-state"})
+                self.assertFalse(any(
+                    step.get("with", {}).get("phase") == "cleanup"
+                    for step in steps if step.get("uses") == "./.github/actions/native-ci-state"
+                ))
                 env = job.get("env", {})
-                self.assertNotIn("SCCACHE_GHA_ENABLED", env)
-                self.assertNotIn("RUSTC_WRAPPER", env)
                 self.assertNotIn("CARGO_TARGET_DIR", env)
                 self.assertNotIn("CARGO_BUILD_TARGET_DIR", env)
 
-    def test_native_jobs_and_nested_actions_never_use_github_cache_or_artifacts(self) -> None:
+    def test_any_self_hosted_test_job_avoids_github_cache_and_artifacts(self) -> None:
         def check(steps, owner):
             for step in steps:
                 action = step.get("uses", "")
@@ -1537,17 +1642,21 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 if action.startswith("./.github/actions/"):
                     composite = workflow_gates.parse_workflow(str(REPO_ROOT / action / "action.yml"))
                     check(composite["runs"]["steps"], action)
-        for name, job in self.native_jobs():
-            check(job["steps"], name)
+        checked = 0
+        for suite in self.suites:
+            for name, job in suite["jobs"].items():
+                if "self-hosted" in job.get("runs-on", []):
+                    check(job["steps"], name)
+                    checked += 1
+        self.assertEqual(checked, 0)
 
     def test_native_jobs_prepare_host_tools_and_rust_components_before_use(self) -> None:
         shard = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/integration-shard/action.yml"))
         for name, job in self.native_jobs():
             with self.subTest(job=name):
                 steps = job["steps"]
-                bun_index = 4 if job["runs-on"] == ["self-hosted", "mac-mini"] else 3
-                self.assertEqual(steps[bun_index]["uses"], "oven-sh/setup-bun@v2")
-                self.assertEqual(steps[bun_index + 1]["uses"], "actions/setup-node@v5")
+                self.assertEqual(steps[3]["uses"], "oven-sh/setup-bun@v2")
+                self.assertEqual(steps[4]["uses"], "actions/setup-node@v5")
                 rust = [step for step in steps if step.get("uses") == "dtolnay/rust-toolchain@stable"]
                 if not rust:
                     platform = next(step["with"]["platform"] for step in steps
@@ -1558,8 +1667,6 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(rust), 1)
                 self.assertEqual(set(rust[0]["with"]["components"].split(", ")),
                                  {"rustfmt", "clippy", "rust-analyzer"})
-                if job["runs-on"] == ["self-hosted", "narli"]:
-                    self.assertIn("runner.environment == 'github-hosted'", rust[0].get("if", ""))
                 if rust[0] in steps:
                     first_use = next((i for i, step in enumerate(steps)
                                       if re.search(r"\bcargo\b|scripts/check-path-deps.py", step.get("run", ""))), len(steps))
@@ -1649,7 +1756,7 @@ while [[ "$1" != --output ]]; do shift; done
             if "AFT_NEXTEST_ARCHIVE_FILE" in step.get("env", {}):
                 self.assertIn("env.AFT_CI_ARCHIVE_DIR || runner.temp", step["env"]["AFT_NEXTEST_ARCHIVE_FILE"])
 
-    def test_native_test_steps_clear_cargo_target_overrides_and_builds_scope_the_warm_path(self) -> None:
+    def test_native_test_steps_do_not_inherit_cargo_target_overrides(self) -> None:
         checked = 0
         for name, job in self.native_jobs():
             for step in job["steps"]:
@@ -1658,8 +1765,8 @@ while [[ "$1" != --output ]]; do shift; done
                 if "CARGO_TARGET_DIR" in env:
                     if "scripts/ci-stage-aft.py" in run:
                         self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_JOB_DIR }}/cargo-target", name)
-                        self.assertEqual(env["CARGO_BUILD_BUILD_DIR"],
-                                         "${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}", name)
+                        self.assertEqual(env["CARGO_BUILD_BUILD_DIR"], "${{ github.workspace }}/target", name)
+                        self.assertNotIn("--legacy-msvc-profile-dir", run, name)
                     else:
                         self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}", name)
                     self.assertRegex(run, r"cargo (build|rustc|check|nextest (archive|list)|test)|ci-macos-integration-archive.py", name)
@@ -1671,10 +1778,6 @@ while [[ "$1" != --output ]]; do shift; done
                     self.assertNotIn("CARGO_TARGET_DIR", env, name)
                     self.assertNotIn("CARGO_BUILD_TARGET_DIR", env, name)
                     self.assertNotIn("CARGO_BUILD_BUILD_DIR", env, name)
-                    shell = step.get("shell", "pwsh" if job["runs-on"] == ["self-hosted", "narli"] else "bash")
-                    clear = ("Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR"
-                             if shell == "pwsh" else "unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR")
-                    self.assertIn(clear, run, name)
         self.assertGreater(checked, 10)
         action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/integration-shard/action.yml"))
         for step in action["runs"]["steps"]:
@@ -1696,17 +1799,11 @@ while [[ "$1" != --output ]]; do shift; done
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(path_file.read_text().strip(), (home / ".cargo/bin").as_posix())
 
-    def test_finalize_waits_for_both_suites_and_skips_prs(self) -> None:
+    def test_tests_workflow_has_no_obsolete_native_cleanup_leg(self) -> None:
         workflow = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/tests.yml"))
-        cleanup = workflow["jobs"]["native-ci-cleanup"]
-        self.assertEqual(cleanup["needs"], ["unit", "e2e"])
-        self.assertEqual(cleanup["if"], "${{ always() && github.event_name != 'pull_request' }}")
-        self.assertEqual(cleanup["strategy"]["matrix"]["machine"], ["mac-mini", "narli"])
-        self.assertEqual(cleanup["steps"][2], {"uses": "actions/setup-python@v6", "if": "runner.environment == 'github-hosted'",
-                                              "with": {"python-version": "3.14"}})
-        self.assertEqual(cleanup["steps"][-2]["with"], {
-            "phase": "${{ needs.unit.result == 'success' && needs.e2e.result == 'success' && 'finalize' || 'cleanup' }}",
-        })
+        self.assertNotIn("native-ci-cleanup", workflow["jobs"])
+        required = (REPO_ROOT / ".github/required-checks.txt").read_text()
+        self.assertNotIn("Clean native CI state", required)
 
     def test_interleaved_runs_preserve_each_others_archives_and_warm_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1784,6 +1881,31 @@ while [[ "$1" != --output ]]; do shift; done
             self.assertTrue(job.is_dir())
             self.assertNotIn("AFT_CI_TARGET_DIR", values, "hosted builds use their workspace cache")
 
+    def test_hosted_windows_path_setup_uses_git_for_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git = root / "Git"
+            expected = [git / part for part in ("bin", "cmd", "ucrt64/bin", "usr/bin")]
+            for path in expected:
+                path.mkdir(parents=True, exist_ok=True)
+            (git / "cmd/git.exe").touch()
+            (git / "bin/bash.exe").touch()
+            path_file = root / "github-path"
+            with unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "windows-git-path"]), \
+                 unittest.mock.patch.object(
+                     self.state.subprocess, "check_output", return_value=str(git / "ucrt64/libexec/git-core")
+                 ), \
+                 unittest.mock.patch.dict(os.environ, {"RUNNER_OS": "Windows", "GITHUB_PATH": str(path_file)}):
+                self.state.main()
+            self.assertEqual(
+                path_file.read_text().splitlines(), [path.as_posix() for path in reversed(expected)]
+            )
+
+            with unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "windows-git-path"]), \
+                 unittest.mock.patch.dict(os.environ, {"RUNNER_OS": "Linux", "GITHUB_PATH": str(path_file)}):
+                with self.assertRaisesRegex(ValueError, "requires a Windows runner"):
+                    self.state.main()
+
     def test_shared_target_is_cleaned_whole_only_above_the_runner_cap_on_self_hosted(self) -> None:
         for environment, cap, size, expected in (("github-hosted", 30, 78, False),
                                                   ("self-hosted", 30, 30, False), ("self-hosted", 30, 31, True),
@@ -1830,7 +1952,7 @@ while [[ "$1" != --output ]]; do shift; done
     def test_native_state_action_passes_the_target_cap_to_setup(self) -> None:
         action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
         self.assertEqual(action["inputs"]["target-max-gib"]["default"], "50")
-        step = next(step for step in action["runs"]["steps"] if "scripts/ci-native-state.py" in step.get("run", ""))
+        step = next(step for step in action["runs"]["steps"] if "AFT_CI_PHASE" in step.get("env", {}))
         self.assertEqual(step["env"]["AFT_CI_TARGET_MAX_GIB"], "${{ inputs.target-max-gib }}")
         self.assertIn('scripts/ci-native-state.py "$AFT_CI_PHASE" "$AFT_CI_TARGET_MAX_GIB"', step["run"])
         for args, cap in (([], 50), (["30"], 30), (["50"], 50)):
@@ -2095,13 +2217,14 @@ while [[ "$1" != --output ]]; do shift; done
                         self.assertEqual(step["if"], "runner.environment == 'github-hosted'", name)
                     if re.search(r"\bpython(?:3)?\s", step.get("run", "")):
                         self.assertLess(setup, i, name)
-        self.assertEqual(checked, 26)
+        self.assertEqual(checked, 5)
         action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
         steps = action["runs"]["steps"]
         self.assertEqual(steps[0]["name"], "Validate system Python on the native runner")
         self.assertEqual(steps[0]["if"], "runner.environment == 'self-hosted'")
-        self.assertIn('python="$AFT_CI_PYTHON"', steps[1]["run"])
-        self.assertEqual(steps[1]["if"], "inputs.phase != 'python'")
+        setup = next(step for step in steps if "AFT_CI_PHASE" in step.get("env", {}))
+        self.assertIn('python="$AFT_CI_PYTHON"', setup["run"])
+        self.assertEqual(setup["if"], "inputs.phase != 'python'")
 
     def test_system_python_probe_rejects_313_and_accepts_314_or_newer(self) -> None:
         match = re.search(r"probe='(.*?)'\n", self.system_python_preflight(), re.DOTALL)
@@ -2184,25 +2307,28 @@ while [[ "$1" != --output ]]; do shift; done
                     self.assertIn("System python3:", result.stdout)
 
     def test_cleanup_includes_the_injected_e2e_executable_cache(self) -> None:
+        # cleanup_processes protects its own process, so the fake leaked PID must
+        # never equal this test's PID (fresh job sandboxes hand out small PIDs).
+        leaked = os.getpid() + 1
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             local = home / "localappdata"
             binary = (local / "aft/bin/v1/aft.exe" if os.name == "nt"
                       else home / ".cache/aft/bin/v1/aft")
             with unittest.mock.patch.object(self.state.Path, "home", return_value=home), \
-                 unittest.mock.patch.object(self.state, "process_table", return_value={10: (0, str(binary))}), \
+                 unittest.mock.patch.object(self.state, "process_table", return_value={leaked: (0, str(binary))}), \
                  unittest.mock.patch.object(self.state.os, "kill") as kill, \
                  unittest.mock.patch.object(self.state.subprocess, "run") as run, \
                  unittest.mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": str(home / "workspace"), "LOCALAPPDATA": str(local)}):
                 self.state.cleanup_processes(home / "aft-ci")
             if os.name == "nt":
-                self.assertEqual(run.call_args.args[0], ["taskkill", "/T", "/F", "/PID", "10"])
+                self.assertEqual(run.call_args.args[0], ["taskkill", "/T", "/F", "/PID", str(leaked)])
             else:
-                kill.assert_called_once_with(10, self.state.signal.SIGKILL)
+                kill.assert_called_once_with(leaked, self.state.signal.SIGKILL)
 
 
 class CortexkitTrackingGateTests(unittest.TestCase):
-    """Private .cortexkit/ files must never be tracked, and CI must say so."""
+    """Only allowlisted .cortexkit/ files may be tracked, and CI must say so."""
 
     ROOT = Path(__file__).resolve().parents[2]
     SCRIPT = ROOT / "scripts/check-cortexkit-tracking.sh"
@@ -2266,6 +2392,7 @@ class CortexkitTrackingGateTests(unittest.TestCase):
                 ".cortexkit/rules/example.md",
                 ".cortexkit/WORKER.md",
                 ".cortexkit/aft.jsonc",
+                ".cortexkit/prefrontal.jsonc",
             ):
                 with self.subTest(shared=path):
                     self.assertFalse(ignored(path))
@@ -2289,6 +2416,78 @@ class CortexkitTrackingGateTests(unittest.TestCase):
             green = self._check(repo)
             self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
             self.assertTrue(draft.exists(), "git rm --cached must keep the working copy")
+
+    def test_check_rejects_tracked_file_reincluded_by_ignore_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+            private = repo / ".cortexkit/notes.md"
+            private.parent.mkdir(parents=True)
+            private.write_text("private\n")
+            with (repo / ".gitignore").open("a") as ignore_rules:
+                ignore_rules.write("\n!/.cortexkit/notes.md\n")
+            self._git(repo, "add", ".gitignore", ".cortexkit/notes.md")
+
+            red = self._check(repo)
+            self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+            self.assertIn(".cortexkit/notes.md", red.stderr)
+            self.assertIn("outside the .cortexkit/ allowlist", red.stderr)
+
+    def test_check_rejects_jsonc_settings_in_subfolders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+            nested = repo / ".cortexkit/sub/x.jsonc"
+            nested.parent.mkdir(parents=True)
+            nested.write_text("private\n")
+            self._git(repo, "add", "-f", ".cortexkit/sub/x.jsonc")
+
+            red = self._check(repo)
+            self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+            self.assertIn(".cortexkit/sub/x.jsonc", red.stderr)
+            self.assertIn("outside the .cortexkit/ allowlist", red.stderr)
+
+    def test_check_prints_a_forbidden_newline_path_unambiguously(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+            path = ".cortexkit/private\nnotes.md"
+            private = repo / path
+            private.parent.mkdir(parents=True)
+            private.write_text("private\n")
+            self._git(repo, "add", "-f", path)
+
+            red = self._check(repo)
+            self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+            self.assertIn("$'.cortexkit/private\\nnotes.md'", red.stderr)
+            self.assertNotIn(path, red.stderr)
+
+    def test_check_allows_every_shared_cortexkit_path(self) -> None:
+        for path in (
+            ".cortexkit/release-notes/v1.0.0.md",
+            ".cortexkit/release-notes/日本語.md",
+            ".cortexkit/skills/example/SKILL.md",
+            ".cortexkit/rules/example.md",
+            ".cortexkit/WORKER.md",
+            ".cortexkit/aft.jsonc",
+            ".cortexkit/prefrontal.jsonc",
+            ".cortexkit/other-tool.jsonc",
+        ):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp:
+                repo = self._fixture(Path(tmp))
+                shared = repo / path
+                shared.parent.mkdir(parents=True, exist_ok=True)
+                shared.write_text("shared\n")
+                self._git(repo, "add", "-f", path)
+
+                green = self._check(repo)
+                self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
+
+    def test_check_returns_2_when_git_ls_files_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_repo = Path(tmp) / "not-a-repo"
+            not_a_repo.mkdir()
+
+            red = self._check(not_a_repo)
+            self.assertEqual(red.returncode, 2, red.stdout + red.stderr)
+            self.assertIn("git ls-files failed", red.stderr)
 
     def test_check_rejects_tracked_aft_ci_staging_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
