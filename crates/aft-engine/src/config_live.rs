@@ -156,7 +156,8 @@ impl ConfigLiveState {
         self.sources.lock().clone()
     }
 
-    pub(crate) fn daemon_managed(&self) -> bool {
+    #[doc(hidden)]
+    pub fn daemon_managed(&self) -> bool {
         self.sources
             .lock()
             .as_ref()

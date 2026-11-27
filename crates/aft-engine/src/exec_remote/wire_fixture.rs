@@ -347,6 +347,7 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum RouteRestart {
     BeforeRun,
     AfterAccepted,

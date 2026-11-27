@@ -50,9 +50,10 @@ struct RecentCall {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RepeatOutput {
-    pub(crate) text_hash: u64,
-    pub(crate) attachment_hash: Option<u64>,
+#[doc(hidden)]
+pub struct RepeatOutput {
+    pub text_hash: u64,
+    pub attachment_hash: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -143,7 +144,8 @@ impl RepeatBreaker {
         )
     }
 
-    pub(crate) fn observe_output_at(
+    #[doc(hidden)]
+    pub fn observe_output_at(
         &self,
         session_id: &str,
         call: &RepeatObservation,
