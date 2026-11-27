@@ -197,7 +197,7 @@ pub(super) fn configure(base: &Path, command: &mut Command) {
     std::fs::write(
         state.join("trust-root.json"),
         serde_json::to_vec(&json!({
-            "key_id": "gh-routing-dev-test-key-v1",
+            "key_id": "21fe31dfa154a261",
             "public_key_hex": public_key_hex,
             "retired_key_ids": [],
             "generation": 1,
@@ -206,7 +206,7 @@ pub(super) fn configure(base: &Path, command: &mut Command) {
         .unwrap(),
     )
     .unwrap();
-    let envelope = json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"gh-routing-dev-test-key-v1","fetched_at_unix_secs":now,
+    let envelope = json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"21fe31dfa154a261","fetched_at_unix_secs":now,
         "signature":base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),"manifest_bytes":String::from_utf8(bytes).unwrap()});
     std::fs::write(
         state.join("gh-routing-manifest.json"),

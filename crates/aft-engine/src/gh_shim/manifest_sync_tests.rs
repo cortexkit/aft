@@ -167,7 +167,7 @@ async fn manifest_sync_refresh_retires_old_key_and_deletes_a_cleared_pin() {
                 let pin = match generation {
                     1 => Some(old),
                     2 => {
-                        let mut next = super::super::tests::pin_for(&[31; 32], "rotated-synthetic-key");
+                        let mut next = super::super::tests::pin_for(&[31; 32]);
                         next.retired_key_ids.push(old.key_id);
                         Some(next)
                     }
@@ -186,7 +186,7 @@ async fn manifest_sync_refresh_retires_old_key_and_deletes_a_cleared_pin() {
             assert_eq!(activate(&paths, &candidate(29, now), now).unwrap().verdict, "valid");
             generation.store(2, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(300)).await;
-            assert_eq!(trust_root::read(&paths).unwrap().key_id, "rotated-synthetic-key");
+            assert_eq!(trust_root::read(&paths).unwrap().key_id, super::super::tests::pin_for(&[31; 32]).key_id);
             assert!(matches!(load_manifest(&paths, now), Err(ManifestProblem::Invalid(reason)) if reason.starts_with("retired manifest key id")));
             generation.store(3, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(300)).await;

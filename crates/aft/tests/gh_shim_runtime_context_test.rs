@@ -46,7 +46,7 @@ fn write_manifest_value(state_home: &Path, now: u64, mut manifest: Value, manife
     let envelope = json!({
         "artifact_id": "gh-routing-manifest",
         "envelope_version": 2,
-        "key_id": "gh-routing-dev-test-key-v1",
+        "key_id": "21fe31dfa154a261",
         "fetched_at_unix_secs": now,
         "signature": base64::engine::general_purpose::STANDARD.encode(key.sign(&manifest_bytes).as_ref()),
         "manifest_bytes": String::from_utf8(manifest_bytes).expect("manifest fixture is UTF-8"),
@@ -414,7 +414,7 @@ fn assert_status_provenance(report: &Value) {
         .is_some());
     assert_eq!(
         report["cached_manifest"]["pinned_trust_root_key_id"],
-        "gh-routing-dev-test-key-v1"
+        "21fe31dfa154a261"
     );
 }
 
@@ -790,11 +790,11 @@ fn gh_shim_daemon_probe_from_sync_entry_is_r2_without_a_runtime_panic() {
         .is_some_and(|path| !path.is_empty()));
     assert_eq!(
         report["cached_manifest"]["verified_by_key_id"],
-        "gh-routing-dev-test-key-v1"
+        "21fe31dfa154a261"
     );
     assert_eq!(
         report["cached_manifest"]["pinned_trust_root_key_id"],
-        "gh-routing-dev-test-key-v1"
+        "21fe31dfa154a261"
     );
 }
 

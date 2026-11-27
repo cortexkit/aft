@@ -2,6 +2,7 @@
 
 use super::{manifest_acceptance_lock, ManifestProblem, StatePaths};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{fs, io};
 
 pub(super) const FILE_NAME: &str = "trust-root.json";
@@ -44,8 +45,16 @@ impl Pin {
         for (out, pair) in key.iter_mut().zip(hex.chunks_exact(2)) {
             *out = (digit(pair[0])? << 4) | digit(pair[1])?;
         }
-        Some(key)
+        (self.key_id == key_id(&key)).then_some(key)
     }
+}
+
+pub(super) fn key_id(public_key: &[u8]) -> String {
+    // The daemon's policy_root key ID is the first eight bytes of SHA-256.
+    Sha256::digest(public_key)[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(super) fn read(paths: &StatePaths) -> Result<Pin, ManifestProblem> {

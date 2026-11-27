@@ -215,8 +215,9 @@ fn audit_v19_full_audit_status_matches_legacy_bytes_even_with_a_lookup_record() 
         .split_once(r#""compiled_trust_set_key_ids":["#)
         .unwrap();
     let (_, after) = trust.split_once("],").unwrap();
-    let expected =
-        format!(r#"{before}"pinned_trust_root_key_id":"gh-routing-dev-test-key-v1",{after}"#);
+    let key_id = super::tests::fixture_pin().key_id;
+    let before = before.replace("gh-routing-dev-test-key-v1", &key_id);
+    let expected = format!(r#"{before}"pinned_trust_root_key_id":"{key_id}",{after}"#);
     let normalized = super::v19_compat_tests::normalize_v19_status(&rendered).unwrap();
     assert_eq!(
         normalized, expected,

@@ -41,7 +41,7 @@ pub fn write_gh_fixture_pin(state: &Path, key: &ring::signature::Ed25519KeyPair,
     std::fs::write(
         state.join("trust-root.json"),
         serde_json::to_vec(&serde_json::json!({
-            "key_id": "gh-routing-dev-test-key-v1",
+            "key_id": "21fe31dfa154a261",
             "public_key_hex": public_key_hex,
             "retired_key_ids": [],
             "generation": 1,

@@ -1123,7 +1123,7 @@ fn installed_worker_manifest() -> crate::test_env::GhShimStateGuard {
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let key = Ed25519KeyPair::from_seed_unchecked(&SEED).unwrap();
     crate::gh_shim::trust_root::seed_fixture(&root);
-    std::fs::write(root.join("gh-routing-manifest.json"),serde_json::to_vec(&json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"gh-routing-dev-test-key-v1","fetched_at_unix_secs":now,"signature":base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),"manifest_bytes":String::from_utf8(bytes).unwrap()})).unwrap()).unwrap();
+    std::fs::write(root.join("gh-routing-manifest.json"),serde_json::to_vec(&json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"21fe31dfa154a261","fetched_at_unix_secs":now,"signature":base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),"manifest_bytes":String::from_utf8(bytes).unwrap()})).unwrap()).unwrap();
     state
 }
 

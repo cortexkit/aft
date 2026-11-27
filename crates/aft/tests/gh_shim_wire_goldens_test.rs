@@ -799,7 +799,7 @@ fn write_signed_manifest(state_dir: &Path, now: u64) {
     let envelope = json!({
         "artifact_id": "gh-routing-manifest",
         "envelope_version": 2,
-        "key_id": "gh-routing-dev-test-key-v1",
+        "key_id": "21fe31dfa154a261",
         "fetched_at_unix_secs": now,
         "signature": base64::engine::general_purpose::STANDARD.encode(key.sign(&manifest_bytes).as_ref()),
         "manifest_bytes": String::from_utf8(manifest_bytes).expect("manifest is UTF-8"),
@@ -1923,7 +1923,7 @@ fn write_signed_manifest_bytes(state_dir: &Path, manifest_bytes: &[u8], now: u64
     let envelope = json!({
         "artifact_id": "gh-routing-manifest",
         "envelope_version": 2,
-        "key_id": "gh-routing-dev-test-key-v1",
+        "key_id": "21fe31dfa154a261",
         "fetched_at_unix_secs": now,
         "signature": base64::engine::general_purpose::STANDARD.encode(key.sign(manifest_bytes).as_ref()),
         "manifest_bytes": std::str::from_utf8(manifest_bytes).expect("manifest is UTF-8"),

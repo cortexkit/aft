@@ -8350,12 +8350,12 @@ pub(crate) mod tests {
         }
     }
 
-    const DEV_MANIFEST_KEY_ID: &str = "gh-routing-dev-test-key-v1";
+    const DEV_MANIFEST_KEY_ID: &str = "21fe31dfa154a261";
 
-    pub(super) fn pin_for(seed: &[u8; 32], key_id: &str) -> trust_root::Pin {
+    pub(super) fn pin_for(seed: &[u8; 32]) -> trust_root::Pin {
         let key = Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
         trust_root::Pin {
-            key_id: key_id.into(),
+            key_id: trust_root::key_id(key.public_key().as_ref()),
             public_key_hex: key
                 .public_key()
                 .as_ref()
@@ -8367,7 +8367,7 @@ pub(crate) mod tests {
     }
 
     pub(super) fn fixture_pin() -> trust_root::Pin {
-        pin_for(&TEST_SEED, DEV_MANIFEST_KEY_ID)
+        pin_for(&TEST_SEED)
     }
 
     fn publish_pin(paths: &StatePaths, pin: Option<trust_root::Pin>) {
@@ -14900,19 +14900,19 @@ INHERITED FLAGS
     fn pinned_key_verifies_but_other_and_retired_keys_do_not() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
-        let rotated_id = "synthetic-rotated-key";
-        let rotated = pin_for(&STANDBY_TEST_SEED, rotated_id);
+        let rotated = pin_for(&STANDBY_TEST_SEED);
+        let rotated_id = rotated.key_id.clone();
         let envelope = signed_with(
             &fixture_manifest(),
             TEST_NOW,
             &STANDBY_TEST_SEED,
-            rotated_id,
+            &rotated_id,
         );
         write_fixture_pin(&paths);
         fs::write(&paths.manifest, serde_json::to_vec(&envelope).unwrap()).unwrap();
 
         assert!(
-            matches!(load_manifest(&paths, TEST_NOW), Err(ManifestProblem::Invalid(reason)) if reason == "untrusted manifest key id synthetic-rotated-key")
+            matches!(load_manifest(&paths, TEST_NOW), Err(ManifestProblem::Invalid(reason)) if reason == format!("untrusted manifest key id {rotated_id}"))
         );
         publish_pin(&paths, Some(rotated.clone()));
         assert_eq!(load_manifest(&paths, TEST_NOW).unwrap().manifest_version, 1);
@@ -14920,10 +14920,10 @@ INHERITED FLAGS
         // Keep the exact same envelope and public key so accepting cached
         // verification without looking at retirement would make this go green.
         let mut retired = rotated;
-        retired.retired_key_ids.push(rotated_id.into());
+        retired.retired_key_ids.push(rotated_id.clone());
         publish_pin(&paths, Some(retired));
         assert!(
-            matches!(load_manifest(&paths, TEST_NOW), Err(ManifestProblem::Invalid(reason)) if reason == "retired manifest key id synthetic-rotated-key")
+            matches!(load_manifest(&paths, TEST_NOW), Err(ManifestProblem::Invalid(reason)) if reason == format!("retired manifest key id {rotated_id}"))
         );
     }
 
@@ -15189,7 +15189,7 @@ INHERITED FLAGS
             Some("valid")
         );
 
-        publish_pin(&paths, Some(pin_for(&STANDBY_TEST_SEED, "new-root")));
+        publish_pin(&paths, Some(pin_for(&STANDBY_TEST_SEED)));
         let report = cached_manifest_report_at(&paths, TEST_NOW);
         assert_eq!(report.state, Some("regressed"));
         assert_eq!(report.verified_by_key_id, None);
