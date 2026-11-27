@@ -726,7 +726,10 @@ async fn drive_max_paths_single_event_inner(input: FakeDaemonInput, report: bool
     send_goodbye_and_wait(&tx).await;
 }
 
+const READS_MAINTENANCE_SESSION: &str = "reads-maintenance";
+
 async fn drive_reads_during_maintenance(input: FakeDaemonInput) {
+    let drive_started = Instant::now();
     let session = subc_bridge_test::open_fake_daemon_session(input).await;
     let root = session.root1.clone();
     prepare_storm_root(&root);
@@ -739,9 +742,13 @@ async fn drive_reads_during_maintenance(input: FakeDaemonInput) {
         &mut rx,
         &mut corr,
         &root,
-        "reads-maintenance",
+        READS_MAINTENANCE_SESSION,
     )
     .await;
+    eprintln!(
+        "reads_during_maintenance: root ready at {:?}",
+        drive_started.elapsed()
+    );
 
     let mut events = Vec::with_capacity(WATCHER_BACKLOG_EVENTS);
     for index in 0..WATCHER_BACKLOG_EVENTS {
@@ -750,6 +757,10 @@ async fn drive_reads_during_maintenance(input: FakeDaemonInput) {
         events.push(json!({ "paths": [path] }));
     }
     corr += 1;
+    eprintln!(
+        "reads_during_maintenance: injecting {WATCHER_BACKLOG_EVENTS} watcher events at {:?}",
+        drive_started.elapsed()
+    );
     send_tool(
         &tx,
         1,
@@ -758,8 +769,13 @@ async fn drive_reads_during_maintenance(input: FakeDaemonInput) {
         json!({ "events": events }),
     );
     expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    eprintln!(
+        "reads_during_maintenance: maintenance injection acknowledged at {:?}",
+        drive_started.elapsed()
+    );
 
     let started = Instant::now();
+    let first_read = corr + 1;
     let mut expected = HashSet::new();
     for index in 0..6 {
         corr += 1;
@@ -781,7 +797,23 @@ async fn drive_reads_during_maintenance(input: FakeDaemonInput) {
             json!({ "pattern": format!("maintenance_marker_{:04}", index * 100) }),
         );
     }
-    collect_tool_responses(&mut rx, expected, CONCURRENCY_SCENARIO_BOUND).await;
+    collect_tool_responses(
+        &mut rx,
+        expected,
+        CONCURRENCY_SCENARIO_BOUND,
+        |corr, pending| {
+            let tool = if (corr - first_read).is_multiple_of(2) {
+                "read"
+            } else {
+                "grep"
+            };
+            eprintln!(
+                "reads_during_maintenance: {tool} reply {corr} at {:?}; {pending} remaining",
+                drive_started.elapsed()
+            );
+        },
+    )
+    .await;
     let elapsed = started.elapsed();
     // I-A target: Once interactive tool-lane isolation exists, enforce its tighter latency budget.
     assert!(
@@ -789,6 +821,10 @@ async fn drive_reads_during_maintenance(input: FakeDaemonInput) {
         "concurrent reads took {elapsed:?}"
     );
     wait_for_watcher_empty(&tx, &mut rx, &mut corr).await;
+    eprintln!(
+        "reads_during_maintenance: watcher backlog drained at {:?}",
+        drive_started.elapsed()
+    );
     send_goodbye_and_wait(&tx).await;
 }
 
@@ -848,6 +884,7 @@ async fn drive_pool_size_two(input: FakeDaemonInput) {
         &mut rx,
         HashSet::from([read_corr, grep_corr]),
         CONCURRENCY_SCENARIO_BOUND,
+        |_, _| {},
     )
     .await;
     wait_for_watcher_empty(&tx, &mut rx, &mut corr).await;
@@ -1971,6 +2008,9 @@ async fn bind_ready_search_root(
         storm_project_config(true, false, false, 0),
     );
     expect_ack_within(rx, *corr, SETUP_BIND_BOUND).await;
+    if session == READS_MAINTENANCE_SESSION {
+        eprintln!("reads_during_maintenance: bind acknowledged");
+    }
     wait_for_ready_health(
         executor,
         tx,
@@ -1986,6 +2026,7 @@ async fn collect_tool_responses(
     rx: &mut mpsc::UnboundedReceiver<Frame>,
     mut expected: HashSet<u64>,
     timeout: Duration,
+    mut answered: impl FnMut(u64, usize),
 ) {
     let deadline = Instant::now() + timeout;
     while !expected.is_empty() {
@@ -2014,6 +2055,7 @@ async fn collect_tool_responses(
             "concurrent tool failed: {body:?}"
         );
         expected.remove(&frame.header.corr);
+        answered(frame.header.corr, expected.len());
     }
 }
 
