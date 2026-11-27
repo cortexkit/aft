@@ -1477,7 +1477,8 @@ pub(crate) fn finish_flycheck_for_maintenance_test(
     key: &ServerKey,
     begin_order: u64,
 ) {
-    // Place BEGIN beyond the timestamp guard for the newly written Cargo inputs.
+    // Stamp BEGIN three seconds in the future, so the check counts as
+    // starting after the Cargo inputs this test just wrote.
     manager.clients[key].receive_flycheck_begin_for_test(
         begin_order,
         std::time::SystemTime::now() + Duration::from_secs(3),
