@@ -448,6 +448,23 @@ async fn watcher_counts(daemon: &mut Daemon) -> Value {
     response["structuredContent"]["watcher"].clone()
 }
 
+#[cfg(feature = "test-timing-hooks")]
+async fn wait_for_checkout_index(daemon: &mut Daemon) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = daemon.call("status", json!({})).await;
+        let index = &response["structuredContent"]["search_index"];
+        if index["status"] == "ready" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "text index did not publish: {index}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn rescan_total(counts: &Value) -> u64 {
     [
         "rescans_buffer_overflow_total",
@@ -587,6 +604,7 @@ async fn bound_daemon_file_changes_before_registration_are_not_complete_misses()
     let gate = state.path().join("file-window-attach.hold");
     std::fs::write(&gate, b"hold").unwrap();
     let mut daemon = Daemon::start_with_attach_gate(root, state.path(), Some(&gate)).await;
+    wait_for_checkout_index(&mut daemon).await;
     assert_visible(
         &mut daemon,
         "crates/old/src/lib.rs",
