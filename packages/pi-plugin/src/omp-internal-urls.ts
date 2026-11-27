@@ -221,6 +221,29 @@ function filesystemArgumentError(name: string, schema: TSchema, fields: string[]
   );
 }
 
+function inertBashReady(value: unknown): boolean {
+  const ready = asRecord(value);
+  return (
+    ready !== undefined &&
+    Object.entries(ready).every(([key, field]) => {
+      if (key === "log" || key === "host") return field === undefined || field === "";
+      if (key === "port" || key === "timeout") return field === undefined || field === 0;
+      return false;
+    })
+  );
+}
+
+function normalizeFilesystemArguments(name: string, params: unknown): unknown {
+  const args = asRecord(params);
+  if (!args || name !== "bash") return params;
+  const normalized = { ...args };
+  if (args.cwd === "") delete normalized.cwd;
+  if (args.async === false) delete normalized.async;
+  if (args.name === "") delete normalized.name;
+  if (inertBashReady(args.ready)) delete normalized.ready;
+  return normalized;
+}
+
 function rejectNativeOnlyArguments(name: string, schema: TSchema, params: unknown): void {
   const args = asRecord(params) ?? {};
   const nativeKeys =
@@ -297,8 +320,9 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
     prepareArguments(args) {
       // Native URL inputs must not undergo AFT's path/edit alias normalization.
       if (internalTarget(tool.name, args, router)) return args as PreparedArgs;
-      rejectNativeOnlyArguments(tool.name, filesystemSchema, args);
-      return tool.prepareArguments ? tool.prepareArguments(args) : (args as PreparedArgs);
+      const normalized = normalizeFilesystemArguments(tool.name, args);
+      rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
+      return tool.prepareArguments ? tool.prepareArguments(normalized) : (normalized as PreparedArgs);
     },
     async execute(id, params, signal, onUpdate, context) {
       const native = context as OmpContext;
@@ -316,8 +340,11 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
         });
         return delegatedResult(result, target) as AgentToolResult<TDetails>;
       }
-      rejectNativeOnlyArguments(tool.name, filesystemSchema, params);
-      const prepared = tool.prepareArguments ? tool.prepareArguments(params) : params;
+      const normalized = target ? params : normalizeFilesystemArguments(tool.name, params);
+      rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
+      const prepared = (
+        tool.prepareArguments ? tool.prepareArguments(normalized) : normalized
+      ) as Static<TParams>;
       // The OMP schema is intentionally wider. Ordinary filesystem calls still
       // obey AFT's original schema and runtime validation (e.g. required content).
       validateFilesystemArguments(tool.name, filesystemSchema, prepared);

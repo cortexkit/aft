@@ -1,6 +1,9 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { Value } from "typebox/value";
@@ -39,7 +42,7 @@ const router = {
   },
 };
 
-function setup(harness: "omp" | "pi" = "omp", withRouter = true, hashline = false) {
+function setup(harness: "omp" | "pi" = "omp", withRouter = true, hashline = false, cwd?: string) {
   const { api, tools } = makeMockApi();
   const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "AFT", output: "AFT" }));
   const config = { disabled_tools: [], bash: true, github: { read: true, write: true } };
@@ -54,7 +57,7 @@ function setup(harness: "omp" | "pi" = "omp", withRouter = true, hashline = fals
     content: [{ type: "text", text: "native status" }],
     details: { proc: { status: "killed" }, bg_completions: {}, diff: {} },
   };
-  const extCtx = Object.assign(makeExtContext(), {
+  const extCtx = Object.assign(makeExtContext(cwd), {
     invokeTool: async (params: unknown) => {
       invocations.push(params);
       return nativeResult;
@@ -65,7 +68,77 @@ function setup(harness: "omp" | "pi" = "omp", withRouter = true, hashline = fals
   return { tools, calls, invocations, extCtx, nativeResult };
 }
 
+async function withFilesystemTool(
+  name: "bash" | "edit" | "grep",
+  run: (fixture: ReturnType<typeof setup> & { root: string }) => Promise<void>,
+) {
+  const root = mkdtempSync(join(homedir(), `aft-omp-${name}-`));
+  try {
+    mkdirSync(join(root, "src"));
+    mkdirSync(join(root, "tests"));
+    const file = join(root, "src/example.ts");
+    writeFileSync(file, "before\n");
+    await run({ ...setup("omp", true, false, root), root });
+    expect(readFileSync(file, "utf8")).toBe("before\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 describe("OMP internal URL hand-back", () => {
+  test("bash filesystem route drops inert native defaults in preparation and direct execution", async () => {
+    await withFilesystemTool("bash", async (s) => {
+      const tool = s.tools.get("bash")!;
+      const { prepareArguments } = tool as unknown as {
+        prepareArguments(args: unknown): Record<string, unknown>;
+      };
+      const control = { command: "pwd", workdir: ".", timeout: 500 };
+      const padded = {
+        ...control,
+        cwd: "",
+        async: false,
+        name: "",
+        ready: { log: "", port: 0, host: "", timeout: 0 },
+      };
+      expect(Value.Check(tool.parameters as TSchema, padded)).toBe(true);
+      expect(prepareArguments({ ...control, ready: {} })).toEqual(control);
+      const prepared = prepareArguments(padded);
+      expect(prepared).toEqual(control);
+      await executeTool(tool, prepared, s.extCtx);
+      await executeTool(tool, padded, s.extCtx);
+      expect(s.calls).toHaveLength(2);
+      for (const { command, params } of s.calls) {
+        expect(command).toBe("bash");
+        expect(params).toMatchObject(control);
+        expect(params).not.toHaveProperty("cwd");
+        expect(params.background).toBe(false);
+      }
+
+      for (const [field, value] of [
+        ["cwd", "src"],
+        ["async", true],
+        ["name", "service"],
+        ["ready", { log: "listening" }],
+        ["ready", { port: 8080 }],
+        ["ready", { host: "localhost" }],
+        ["ready", { timeout: 500 }],
+      ] as const) {
+        const active = { ...padded, [field]: value };
+        const refusal = `bash: invalid AFT filesystem arguments: ${field}.`;
+        expect(() => prepareArguments(active)).toThrow(refusal);
+        await expect(executeTool(tool, active, s.extCtx)).rejects.toThrow(refusal);
+      }
+      expect(s.calls).toHaveLength(2);
+      expect(s.invocations).toHaveLength(0);
+
+      const native = { ...padded, cwd: "local://" };
+      expect(prepareArguments(native)).toBe(native);
+      await executeTool(tool, native, s.extCtx);
+      expect(s.invocations[0]).toBe(native);
+      expect(s.calls).toHaveLength(2);
+    });
+  });
+
   test("routing predicate delegates read without preparing or copying parameters", async () => {
     const s = setup();
     const params = { path: "agent://worker", offset: 0, opaque: "keep" };
