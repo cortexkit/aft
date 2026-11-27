@@ -31,20 +31,15 @@ pub(super) fn speech_launch_seed(
 ) -> Option<crate::gh_shim_speech::service::LaunchSeed> {
     use crate::gh_shim_speech::model::{LaunchAuthority, RouteOrigin};
     let lifecycle = identity.scope.clone()?;
-    let parent = lifecycle.parent.as_ref().and_then(|parent| {
-        routes
-            .values()
-            .filter_map(|route| route.scope.as_ref())
-            .find(|scope| {
-                scope.kind == subc_protocol::scope::ScopeKind::Head
-                    && scope.owner_authorized
-                    && scope.owner == parent.owner
-                    && scope.scope_ref == parent.scope_ref
-                    && scope.scope_epoch == parent.scope_epoch
-            })
+    let worker_parent = identity.run_owner.as_ref().and_then(|owner| {
+        matches!(owner.kind, codemode::RunKind::Worker { .. })
+            .then_some(owner.owner_route.scope.as_ref())
+            .flatten()
     });
+    let heads = routes.values().filter_map(|route| route.scope.as_ref());
     let coauthor_agent =
-        crate::agent_child_env::coauthor::agent_id(&lifecycle, parent).map(str::to_owned);
+        crate::agent_child_env::coauthor::agent_id(&lifecycle, worker_parent, heads)
+            .map(str::to_owned);
     let origin = |channel: RouteChannel| {
         control.and_then(|control| {
             Some(RouteOrigin {

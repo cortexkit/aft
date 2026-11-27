@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use subc_protocol::scope::{ScopeKind, ScopeStamp};
+use subc_protocol::scope::{ParentState, ScopeKind, ScopeStamp};
 
 const TTL: Duration = Duration::from_secs(10 * 60);
 const FIRST_SHELL_WAIT: Duration = Duration::from_secs(1);
@@ -127,7 +127,8 @@ pub fn install(connection_file: PathBuf) {
 
 pub(crate) fn agent_id<'a>(
     scope: &'a ScopeStamp,
-    parent: Option<&'a ScopeStamp>,
+    worker_parent: Option<&'a ScopeStamp>,
+    head_candidates: impl IntoIterator<Item = &'a ScopeStamp>,
 ) -> Option<&'a str> {
     let present = |value: Option<&'a str>| value.filter(|id| !id.is_empty());
     if !scope.owner_authorized {
@@ -140,24 +141,57 @@ pub(crate) fn agent_id<'a>(
                 present(scope.attributes.on_behalf_of_agent.as_deref()),
                 present(scope.attributes.agent_id.as_deref()),
             ) {
-                (Some(agent), None) | (None, Some(agent)) => Some(agent),
+                (Some(sponsor), None) => {
+                    let worker = worker_parent.filter(|worker| {
+                        worker.kind == ScopeKind::Worker && linked_to(scope, worker)
+                    })?;
+                    let head = worker_head(worker, head_candidates)?;
+                    (sponsor == head).then_some(head)
+                }
+                (None, Some(agent)) => Some(agent),
                 _ => None,
             }
         }
-        ScopeKind::Worker => {
-            present(scope.attributes.on_behalf_of_agent.as_deref()).or_else(|| {
-                let (parent, link) = (parent?, scope.parent.as_ref()?);
-                (parent.owner_authorized
-                    && parent.kind == ScopeKind::Head
-                    && parent.owner == link.owner
-                    && parent.scope_ref == link.scope_ref
-                    && parent.scope_epoch == link.scope_epoch)
-                    .then(|| present(parent.attributes.agent_id.as_deref()))
-                    .flatten()
-            })
-        }
+        ScopeKind::Worker => worker_head(scope, head_candidates),
         _ => None,
     }
+}
+
+fn linked_to(child: &ScopeStamp, parent: &ScopeStamp) -> bool {
+    child.parent_state == Some(ParentState::Linked)
+        && parent.owner_authorized
+        && child.parent.as_ref().is_some_and(|link| {
+            parent.owner == link.owner
+                && parent.scope_ref == link.scope_ref
+                && parent.scope_epoch == link.scope_epoch
+        })
+}
+
+fn worker_head<'a>(
+    worker: &ScopeStamp,
+    candidates: impl IntoIterator<Item = &'a ScopeStamp>,
+) -> Option<&'a str> {
+    let mut linked = candidates
+        .into_iter()
+        .filter(|head| head.kind == ScopeKind::Head && linked_to(worker, head));
+    let head = linked
+        .next()?
+        .attributes
+        .agent_id
+        .as_deref()
+        .filter(|id| !id.is_empty())?;
+    if linked.next().is_some() {
+        return None;
+    }
+    if worker
+        .attributes
+        .on_behalf_of_agent
+        .as_deref()
+        .is_some_and(|sponsor| !sponsor.is_empty() && sponsor != head)
+    {
+        return None;
+    }
+    Some(head)
 }
 
 pub(crate) struct ScopeGuard(Option<String>);
@@ -212,6 +246,17 @@ pub(super) fn scope_fixture(attributes: serde_json::Value) -> ScopeStamp {
     .unwrap()
 }
 
+#[cfg(all(test, unix))]
+pub(super) fn link_fixture(child: &mut ScopeStamp, parent: &ScopeStamp) {
+    child.parent = Some(
+        serde_json::from_value(serde_json::json!({
+            "owner":parent.owner,"ref":parent.scope_ref,"scope_epoch":parent.scope_epoch
+        }))
+        .unwrap(),
+    );
+    child.parent_state = Some(ParentState::Linked);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,33 +267,60 @@ mod tests {
     fn git_hook_coauthor_never_uses_the_classic_workers_own_agent_id() {
         let mut worker = scope_fixture(serde_json::json!({"agent_id":"worker-identity"}));
         worker.kind = subc_protocol::scope::ScopeKind::Worker;
-        assert_eq!(agent_id(&worker, None), None);
+        assert_eq!(agent_id(&worker, None, []), None);
         let head = scope_fixture(
             serde_json::json!({"agent_id":"head-identity", "on_behalf_of_agent":"not-the-head"}),
         );
-        worker.parent = Some(serde_json::from_value(serde_json::json!({"owner":head.owner,"ref":head.scope_ref,"scope_epoch":head.scope_epoch})).unwrap());
-        assert_eq!(agent_id(&head, None), Some("head-identity"));
-        assert_eq!(agent_id(&worker, Some(&head)), Some("head-identity"));
+        link_fixture(&mut worker, &head);
+        assert_eq!(agent_id(&head, None, []), Some("head-identity"));
+        assert_eq!(agent_id(&worker, None, [&head]), Some("head-identity"));
     }
 
     #[cfg(unix)]
     #[test]
     fn git_hook_coauthor_requires_a_linked_head_that_agrees_with_sponsorship() {
-        use subc_protocol::scope::ParentState;
         let head = scope_fixture(serde_json::json!({"agent_id":"head-identity"}));
         let mut worker = scope_fixture(serde_json::json!({
             "agent_id":"worker-identity", "on_behalf_of_agent":"different-agent"
         }));
         worker.kind = ScopeKind::Worker;
-        worker.parent = Some(serde_json::from_value(serde_json::json!({"owner":head.owner,"ref":head.scope_ref,"scope_epoch":head.scope_epoch})).unwrap());
-        worker.parent_state = Some(ParentState::Linked);
-        assert_eq!(agent_id(&worker, Some(&head)), None);
+        link_fixture(&mut worker, &head);
+        assert_eq!(agent_id(&worker, None, [&head]), None);
         worker.attributes.on_behalf_of_agent = Some("head-identity".into());
-        assert_eq!(agent_id(&worker, Some(&head)), Some("head-identity"));
-        assert_eq!(agent_id(&worker, None), None);
+        assert_eq!(agent_id(&worker, None, [&head]), Some("head-identity"));
+        assert_eq!(agent_id(&worker, None, []), None);
         worker.attributes.on_behalf_of_agent = None;
         worker.parent_state = Some(ParentState::Pending);
-        assert_eq!(agent_id(&worker, Some(&head)), None);
+        assert_eq!(agent_id(&worker, None, [&head]), None);
+        link_fixture(&mut worker, &head);
+        let mut other = head.clone();
+        other.attributes.agent_id = Some("different-head".into());
+        assert_eq!(agent_id(&worker, None, [&head, &other]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_hook_coauthor_worker_run_needs_both_links_and_an_agreeing_sponsor() {
+        let head = scope_fixture(serde_json::json!({"agent_id":"head-identity"}));
+        let mut worker = scope_fixture(serde_json::json!({"agent_id":"worker-identity"}));
+        worker.kind = ScopeKind::Worker;
+        worker.scope_ref = "test-worker".into();
+        link_fixture(&mut worker, &head);
+        let mut run = scope_fixture(
+            serde_json::json!({"run_id":"test-program","on_behalf_of_agent":"head-identity"}),
+        );
+        run.kind = ScopeKind::Ephemeral;
+        link_fixture(&mut run, &worker);
+        assert_eq!(
+            agent_id(&run, Some(&worker), [&head]),
+            Some("head-identity")
+        );
+        assert_eq!(agent_id(&run, None, [&head]), None);
+        run.attributes.on_behalf_of_agent = Some("wrong-sponsor".into());
+        assert_eq!(agent_id(&run, Some(&worker), [&head]), None);
+        run.attributes.on_behalf_of_agent = Some("head-identity".into());
+        run.parent_state = Some(ParentState::Ended);
+        assert_eq!(agent_id(&run, Some(&worker), [&head]), None);
     }
 
     #[test]
