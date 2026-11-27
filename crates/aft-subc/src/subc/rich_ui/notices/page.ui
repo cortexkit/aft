@@ -4,7 +4,7 @@
 
 <CodeBlock codeString={input.command} />
 
-<ToolText text={finished && !failed && input.exit_code != null ? "Exit " + Text(input.exit_code) + duration : summary} tone={failed ? "danger" : "muted"} />
+<ToolText text={finished && !failed && input.exit_code != null ? "Exit " + Text(input.exit_code) + duration : summary} tone={failed && !stopped ? "danger" : "muted"} />
 
 {input.output_preview == "" ? <ToolText text="No output was kept." tone="muted" /> : <ToolText text={"Output · " + Text(Count(Lines(input.output_preview))) + (Count(Lines(input.output_preview)) == 1 ? " line" : " lines")} />}
 

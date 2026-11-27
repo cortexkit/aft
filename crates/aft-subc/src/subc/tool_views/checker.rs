@@ -8,6 +8,8 @@ use occipital_lang::{
 use occipital_registry::{view as registry, Template};
 use serde_json::json;
 
+mod outcomes;
+
 const FINISHED_NOTICE: &str = "nv1:aft:bash_finished:1";
 
 fn fixture_json<T: serde::de::DeserializeOwned>(relative: &str) -> T {
@@ -99,19 +101,9 @@ fn tool_samples(name: &str, schema: &Value, record_schema: &RecordSchema) -> Vec
 
 fn bash_samples(input_schema: &Value, has_tail: bool) -> Vec<Value> {
     let input = json!({"command":"printf ok"});
-    let mut samples = Vec::new();
-    for (end_reason, exit_code, outcome) in [
-        ("exited", Some(0), "success"),
-        ("exited", Some(1), "error"),
-        ("timed_out", Some(124), "error"),
-        ("killed", None, "error"),
-    ] {
-        let mut record = json!({"durationMs":8,"outcome":outcome,"phase":"foreground_finished","outputBytes":3,"endReason":end_reason,"execution":"local"});
-        if let Some(code) = exit_code {
-            record["exitCode"] = json!(code);
-        }
-        samples.push(json!({"input":input,"record":record,"output":"ok\n"}));
-    }
+    let success = json!({"durationMs":8,"outcome":"success","phase":"foreground_finished","outputBytes":3,"endReason":"exited","exitCode":0,"execution":"local"});
+    let mut samples = vec![json!({"input":input,"record":success,"output":"ok\n"})];
+    samples.extend(outcomes::bash_samples(has_tail));
     let record = json!({"durationMs":8,"outcome":"success","phase":"background_started","taskId":"bash-demo1","outputBytes":0,"execution":"local"});
     let mut completion = json!({"outcome":"error","phase":"background_finished","taskId":"bash-demo1","exitCode":1,"runDurationMs":2400,"outputBytes":3,"endReason":"exited","execution":"local"});
     if has_tail {
@@ -246,6 +238,7 @@ fn notice_samples(pin: &str) -> Vec<Value> {
     if pin == FINISHED_NOTICE {
         samples.extend(finished_notice_samples());
     }
+    samples.extend(outcomes::notice_samples(pin));
     samples
 }
 

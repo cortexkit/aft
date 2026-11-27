@@ -112,8 +112,8 @@ fn notice_records_match_occipital_phone_reader_sample_contract() {
             aft_sample["templateRevision"],
             published["template_revision"]
         );
-        let finished = name == "finished";
-        assert_eq!(view.template_revision, if finished { 3 } else { 2 });
+        let terminal_capable = matches!(name, "finished" | "watch");
+        assert_eq!(view.template_revision, if terminal_capable { 3 } else { 2 });
         assert_eq!(view.notice.data_schema, published["data_schema"]);
         for (slot, document, old_digest, digest) in [
             (
@@ -144,12 +144,21 @@ fn notice_records_match_occipital_phone_reader_sample_contract() {
             let mut prior = published["template"][slot].clone();
             assert_eq!(hash(&prior), old_digest);
             prior["catalog"]["digest"] = document["catalog"]["digest"].clone();
-            let digest = if finished && slot == "page" {
+            if terminal_capable {
                 assert_eq!(hash(&prior), digest);
                 prior["source"] = document["source"].clone();
-                "sha256:be7eff349c9011a45bdfaf6f6e3adcff37e35affc2fae4e32d63f73580a5f580"
-            } else {
-                digest
+            }
+            let digest = match (name, slot) {
+                ("finished" | "watch", "row") => {
+                    "sha256:53f6286e704b9de70510c7dcce03b7fbe89991cdd2bc27c32d510f0a688fe59e"
+                }
+                ("finished", "page") => {
+                    "sha256:43583eb8147cd2f6a5c370b8226ee4a002b70bcb54d61f83958b1ef2dc105601"
+                }
+                ("watch", "page") => {
+                    "sha256:6d77314d5b03d3d40743b632bccf6f85c41ec693bd0bad570f7e953dcf781fc0"
+                }
+                _ => digest,
             };
             assert_eq!(hash(document), digest);
             assert_eq!(&prior, document);

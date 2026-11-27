@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::Kind;
-use crate::subc::tool_views::current::redeclare;
+use crate::subc::tool_views::current::{redeclare, with_bash_title};
 
 #[derive(Deserialize)]
 struct Published {
@@ -15,41 +15,48 @@ struct Published {
     template: NoticeViewTemplates,
 }
 
-static VIEWS: LazyLock<BTreeMap<String, NoticeView>> =
-    LazyLock::new(|| {
-        // All notice kinds started with the same schema and templates.
-        let mut published: Published =
-            serde_json::from_str(include_str!("shipped.json")).expect("committed notice view");
-        redeclare(&mut published.template.row);
-        redeclare(&mut published.template.page);
-        Kind::ALL
-            .into_iter()
-            .map(|kind| {
-                let pin =
-                    notice_view_key("aft", kind.name(), Kind::VERSION).expect("shipped notice pin");
-                let mut template = published.template.clone();
-                let mut revision = published.template_revision + 1;
-                if matches!(kind, Kind::Finished) {
-                    template.page["source"] =
-                        serde_json::json!(crate::subc::tool_views::current::with_bash_title(
-                            concat!(include_str!("status.ui"), "\n", include_str!("page.ui"))
-                        ));
-                    revision += 1;
-                }
-                let view = NoticeView::new(
-                    NoticeViewDefinition::new(
-                        kind.name(),
-                        Kind::VERSION,
-                        published.data_schema.clone(),
-                    ),
-                    template,
-                    revision,
-                );
-                view.check_pin("aft", &pin).expect("shipped notice view");
-                (pin, view)
-            })
-            .collect()
+static VIEWS: LazyLock<BTreeMap<String, NoticeView>> = LazyLock::new(|| {
+    // All notice kinds started with the same schema and templates.
+    let mut published: Published =
+        serde_json::from_str(include_str!("shipped.json")).expect("committed notice view");
+    redeclare(&mut published.template.row);
+    redeclare(&mut published.template.page);
+    Kind::ALL
+        .into_iter()
+        .map(|kind| {
+            let pin =
+                notice_view_key("aft", kind.name(), Kind::VERSION).expect("shipped notice pin");
+            let mut template = published.template.clone();
+            let mut revision = published.template_revision + 1;
+            if matches!(kind, Kind::Finished | Kind::Watch) {
+                update_terminal_templates(&mut template, matches!(kind, Kind::Finished));
+                revision += 1;
+            }
+            let view = NoticeView::new(
+                NoticeViewDefinition::new(
+                    kind.name(),
+                    Kind::VERSION,
+                    published.data_schema.clone(),
+                ),
+                template,
+                revision,
+            );
+            view.check_pin("aft", &pin).expect("shipped notice view");
+            (pin, view)
+        })
+        .collect()
+});
+
+fn update_terminal_templates(template: &mut NoticeViewTemplates, use_bash_title: bool) {
+    let row = concat!(include_str!("status.ui"), "\n", include_str!("row.ui"));
+    let page = concat!(include_str!("status.ui"), "\n", include_str!("page.ui"));
+    template.row["source"] = serde_json::json!(row);
+    template.page["source"] = serde_json::json!(if use_bash_title {
+        with_bash_title(page)
+    } else {
+        page.replace("$BASH_TITLE", "\"Shell \" + input.task_id")
     });
+}
 
 pub(in crate::subc) fn view_pins() -> impl Iterator<Item = &'static String> {
     VIEWS.keys()

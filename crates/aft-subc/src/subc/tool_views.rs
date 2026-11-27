@@ -70,6 +70,12 @@ pub(crate) static SHIPPED: LazyLock<BTreeMap<String, Shipped>> = LazyLock::new(|
             history: vec![manifest.clone()],
         });
     }
+    for entry in shipped
+        .values_mut()
+        .filter(|entry| entry.tool.name == "bash")
+    {
+        current::append_bash_neutral_stop(entry);
+    }
     shipped
 });
 
@@ -388,13 +394,16 @@ mod tests {
                 crate::subc::rich_ui::records::files_schema()
             };
             if has_bash_tail(pin) {
-                assert_eq!(view.template_revision, 4);
+                assert_eq!(view.template_revision, 5);
                 schema.revision = 2;
                 schema.completion_fields.insert(
                     "tail".into(),
                     cortexkit_role_tool_display::FieldKind::TextLines,
                 );
-            } else if matches!(entry.tool.name.as_str(), "edit" | "write" | "apply_patch") {
+            } else if matches!(
+                entry.tool.name.as_str(),
+                "bash" | "edit" | "write" | "apply_patch"
+            ) {
                 assert_eq!(view.template_revision, 6);
             } else {
                 assert_eq!(view.template_revision, 5);
@@ -405,10 +414,7 @@ mod tests {
                 serde_json::to_value(view.tool.as_ref().unwrap()).unwrap(),
                 json!({"name":entry.tool.name,"input_schema":entry.tool.input_schema,"semantics":entry.tool.semantics})
             );
-            let Some(published) = entry.history.iter().rev().nth(1) else {
-                assert_eq!(versions::shipped_major(pin), Some(2));
-                continue;
-            };
+            let published = entry.history.iter().rev().nth(1).expect("prior revision");
             assert_eq!(published.template_revision + 1, view.template_revision);
             assert_eq!(published.record_schema, view.record_schema);
             for (slot, profile) in [("row", "tool_row"), ("page", "tool_page")] {
@@ -416,11 +422,8 @@ mod tests {
                 let mut prior = published.template[slot].clone();
                 if entry.tool.name == "bash" {
                     assert_eq!(prior["catalog"]["digest"], current::CATALOG_DIGEST);
-                    if slot == "row" {
-                        prior["source"] = json!(current::with_bash_title(include_str!(
-                            "tool_views/bash.row.ui"
-                        )));
-                    }
+                    assert_ne!(prior["source"], template["source"]);
+                    prior["source"] = template["source"].clone();
                 } else {
                     assert_eq!(
                         prior["catalog"]["digest"],
