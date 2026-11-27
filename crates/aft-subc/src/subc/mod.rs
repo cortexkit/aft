@@ -278,7 +278,7 @@ pub(crate) use secret_consent::with_secret_identity_for_test;
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
-mod bash_notice_text;
+use aft_engine::bash_background::notice_text as bash_notice_text;
 mod keepalive;
 pub(crate) mod manifest;
 mod page_collect;

@@ -1,13 +1,78 @@
 //! Arbitrate terminal result delivery with the task's existing reply ack.
 
 use super::*;
-use crate::subc::awaited_work::{Event, OpenReplay, Service};
 use cortexkit_role_agent_orchestrator::params::Outcome;
 use std::cell::Cell;
+use std::sync::{OnceLock, Weak};
+use subc_protocol::scope::{ScopeKind, ScopeSelector, ScopeStamp};
+use subc_protocol::BindIdentity;
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 #[path = "awaited_work_test_support.rs"]
 mod test_support;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionScope {
+    pub identity: BindIdentity,
+    pub scope: ScopeSelector,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OpenReplay {
+    pub scope: SessionScope,
+    pub label: String,
+}
+
+#[derive(Clone)]
+pub enum Event {
+    Finish { outcome: Outcome, summary: String },
+    Cancel,
+    CleanupOpen { replay: Option<OpenReplay> },
+    Progress(String),
+}
+
+/// The task registry owns awaited-work decisions and persisted state. The
+/// daemon implements this sink to deliver those decisions and schedule replay
+/// without making the registry depend on daemon routes or transport.
+pub trait Sink: Send + Sync {
+    fn submit(
+        self: Arc<Self>,
+        registry: BgTaskRegistry,
+        task: Arc<BgTask>,
+        key: String,
+        event: Event,
+        notice: Option<PushFrame>,
+        persisted: bool,
+    );
+
+    fn replay_terminal(&self, run: Box<dyn FnOnce() + Send>);
+}
+
+static KILL_REPLY_SCOPE: OnceLock<fn() -> Option<ScopeStamp>> = OnceLock::new();
+
+pub fn register_kill_reply_scope(current_scope: fn() -> Option<ScopeStamp>) {
+    let _ = KILL_REPLY_SCOPE.set(current_scope);
+}
+
+fn owns_kill_reply(task_scope: &ScopeStamp) -> bool {
+    KILL_REPLY_SCOPE
+        .get()
+        .and_then(|current| current())
+        .is_some_and(|scope| {
+            scope.kind == ScopeKind::Worker
+                && scope.owner == task_scope.owner
+                && scope.scope_ref == task_scope.scope_ref
+                && scope.scope_epoch == task_scope.scope_epoch
+        })
+}
+
+fn bounded(text: &str, limit: usize) -> String {
+    let end = text
+        .char_indices()
+        .nth(limit)
+        .map_or(text.len(), |(index, _)| index);
+    text[..end].to_owned()
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,7 +151,7 @@ impl PersistedTask {
             .is_some_and(State::suppresses_legacy)
     }
 
-    pub(crate) fn has_pending_fallback_cancel(&self) -> bool {
+    pub fn has_pending_fallback_cancel(&self) -> bool {
         matches!(
             self.awaited_work,
             Some(State::FallbackCancel | State::FallbackProbe { .. })
@@ -110,7 +175,7 @@ impl Runtime {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum OpenOutcome {
+pub enum OpenOutcome {
     Opened,
     NotOpened,
     Unknown,
@@ -120,7 +185,7 @@ thread_local! {
     static CANDIDATE: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(crate) struct AwaitedSpawn(bool);
+pub struct AwaitedSpawn(bool);
 
 impl Drop for AwaitedSpawn {
     fn drop(&mut self) {
@@ -133,10 +198,10 @@ pub(crate) fn state_for_spawn() -> Option<State> {
 }
 
 impl BgTaskRegistry {
-    pub(crate) fn watch_awaited_scope_ends(&self) -> tokio::sync::watch::Receiver<()> {
+    pub fn watch_awaited_scope_ends(&self) -> tokio::sync::watch::Receiver<()> {
         self.inner.awaited_scope_ends.subscribe()
     }
-    pub(crate) fn kill_for_reply(
+    pub fn kill_for_reply(
         &self,
         key: &str,
         session: &str,
@@ -155,7 +220,7 @@ impl BgTaskRegistry {
         ) && state
             .metadata
             .lifecycle_scope()
-            .is_some_and(crate::subc::awaited_work::owns_kill_reply)
+            .is_some_and(owns_kill_reply)
             && super::super::TaskIdentity::current().as_ref() == task.launching_identity.as_ref();
         if owns_reply {
             state.awaited_runtime.kill_reply = true;
@@ -163,7 +228,7 @@ impl BgTaskRegistry {
         owns_reply
     }
 
-    pub(crate) fn awaited_finish_notice(&self, task: &BgTask) -> Option<Option<String>> {
+    pub fn awaited_finish_notice(&self, task: &BgTask) -> Option<Option<String>> {
         let state = task.lock_state().ok()?;
         match &state.metadata.awaited_work {
             Some(State::Finish {
@@ -174,7 +239,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn freeze_awaited_finish_notice(
+    pub fn freeze_awaited_finish_notice(
         &self,
         task: &BgTask,
         id: Option<String>,
@@ -215,13 +280,13 @@ impl BgTaskRegistry {
         Ok(id)
     }
 
-    pub(crate) fn prepare_awaited_spawn(&self, service: &Arc<Service>) -> AwaitedSpawn {
+    pub fn prepare_awaited_spawn(&self, service: Arc<dyn Sink>) -> AwaitedSpawn {
         self.attach_awaited_work(service);
         AwaitedSpawn(CANDIDATE.replace(true))
     }
 
-    fn attach_awaited_work(&self, service: &Arc<Service>) {
-        *self.inner.awaited_work.lock() = Arc::downgrade(service);
+    fn attach_awaited_work(&self, service: Arc<dyn Sink>) {
+        *self.inner.awaited_work.lock() = Some(Arc::downgrade(&service));
     }
 
     fn send_awaited(
@@ -231,7 +296,13 @@ impl BgTaskRegistry {
         notice: Option<PushFrame>,
         persisted: bool,
     ) {
-        if let Some(service) = self.inner.awaited_work.lock().upgrade() {
+        if let Some(service) = self
+            .inner
+            .awaited_work
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
             service.submit(
                 self.clone(),
                 task.clone(),
@@ -243,14 +314,14 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn knows_awaited_work(&self, key: &str) -> bool {
+    pub fn knows_awaited_work(&self, key: &str) -> bool {
         self.task(key).is_some_and(|task| {
             task.lock_state()
                 .is_ok_and(|state| !matches!(state.metadata.awaited_work, Some(State::Settled)))
         })
     }
 
-    pub(crate) fn pending_awaited_open_cleanups(&self) -> Vec<String> {
+    pub fn pending_awaited_open_cleanups(&self) -> Vec<String> {
         self.task_arcs()
             .into_iter()
             .filter_map(|task| {
@@ -268,7 +339,7 @@ impl BgTaskRegistry {
             .collect()
     }
 
-    pub(crate) fn awaited_work_live(&self, task: &BgTask) -> bool {
+    pub fn awaited_work_live(&self, task: &BgTask) -> bool {
         task.lock_state().is_ok_and(|state| {
             matches!(
                 state.metadata.awaited_work,
@@ -286,7 +357,7 @@ impl BgTaskRegistry {
         })
     }
 
-    pub(crate) fn retire_awaited_work(&self, task: &BgTask) {
+    pub fn retire_awaited_work(&self, task: &BgTask) {
         let mut db = DeferredDbWrites::new(self, task);
         if let Ok(mut state) = task.lock_state() {
             self.settle_awaited_locked(task, &mut state, &mut db);
@@ -315,7 +386,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) async fn settle_missing_awaited(&self, listed: Arc<HashSet<String>>) {
+    pub async fn settle_missing_awaited(&self, listed: Arc<HashSet<String>>) {
         let registry = self.clone();
         let Ok(tasks) = tokio::task::spawn_blocking(move || registry.task_arcs()).await else {
             return;
@@ -348,7 +419,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn persist_awaited_decision(&self, task: &BgTask) -> std::io::Result<()> {
+    pub fn persist_awaited_decision(&self, task: &BgTask) -> std::io::Result<()> {
         let mut db = DeferredDbWrites::new(self, task);
         let state = task
             .lock_state()
@@ -356,16 +427,12 @@ impl BgTaskRegistry {
         self.persist_task_locked(task, &state.metadata, &mut db)
     }
 
-    pub(crate) fn resume_awaited_work(&self, key: &str, service: &Arc<Service>) {
+    pub fn resume_awaited_work(&self, key: &str, service: Arc<dyn Sink>) {
         self.attach_awaited_work(service);
         self.transition_awaited_open(key, OpenOutcome::Opened, true);
     }
 
-    pub(crate) fn record_awaited_open_attempt(
-        &self,
-        key: &str,
-        open: OpenReplay,
-    ) -> std::io::Result<()> {
+    pub fn record_awaited_open_attempt(&self, key: &str, open: OpenReplay) -> std::io::Result<()> {
         let task = self
             .task(key)
             .ok_or_else(|| std::io::Error::other("unknown awaited task"))?;
@@ -382,7 +449,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn record_confirmed_cleanup_open(&self, task: &BgTask) -> std::io::Result<()> {
+    pub fn record_confirmed_cleanup_open(&self, task: &BgTask) -> std::io::Result<()> {
         self.save_cleanup_state(task, |state| {
             matches!(state, Some(State::FallbackProbe { .. })).then_some(State::FallbackCancel)
         })
@@ -416,7 +483,7 @@ impl BgTaskRegistry {
         Ok(true)
     }
 
-    pub(crate) fn settle_awaited_open(&self, key: &str, outcome: OpenOutcome) -> bool {
+    pub fn settle_awaited_open(&self, key: &str, outcome: OpenOutcome) -> bool {
         self.transition_awaited_open(key, outcome, false)
     }
 
@@ -488,11 +555,17 @@ impl BgTaskRegistry {
             }
         }
         if metadata.status.is_terminal() && !matches!(metadata.awaited_work, Some(State::Cancel)) {
-            if let Some(service) = self.inner.awaited_work.lock().upgrade() {
+            if let Some(service) = self
+                .inner
+                .awaited_work
+                .lock()
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
                 let registry = self.clone();
-                service.replay_terminal(move || {
+                service.replay_terminal(Box::new(move || {
                     registry.enqueue_completion_if_needed(&metadata, Some(&task.paths), true);
-                });
+                }));
             }
         }
         opened
@@ -508,11 +581,16 @@ impl BgTaskRegistry {
                 || (matches!(
                     state.metadata.awaited_work,
                     Some(State::Open | State::Finish { .. })
-                ) && self.inner.awaited_work.lock().strong_count() == 0)
+                ) && self
+                    .inner
+                    .awaited_work
+                    .lock()
+                    .as_ref()
+                    .is_none_or(|sink| sink.strong_count() == 0))
         })
     }
 
-    pub(crate) fn has_awaited_open_pending(&self, key: &str) -> bool {
+    pub fn has_awaited_open_pending(&self, key: &str) -> bool {
         self.task(key).is_some_and(|task| {
             task.lock_state().is_ok_and(|state| {
                 state
@@ -565,7 +643,11 @@ impl BgTaskRegistry {
                 } else {
                     Outcome::Failed
                 };
-                let summary = crate::subc::awaited_work::completion_summary(completion);
+                let value = serde_json::to_value(completion).expect("serializable bash completion");
+                let summary = bounded(
+                    &crate::bash_background::notice_text::completion(&value),
+                    2000,
+                );
                 state.metadata.awaited_work = Some(State::Finish {
                     outcome,
                     summary: summary.clone(),
@@ -596,7 +678,7 @@ impl BgTaskRegistry {
         true
     }
 
-    pub(crate) fn ack_awaited_terminal_reply(&self, key: &str, session: &str) -> bool {
+    pub fn ack_awaited_terminal_reply(&self, key: &str, session: &str) -> bool {
         let Some(task) = self.task_for_session(key, session) else {
             return false;
         };
@@ -654,7 +736,7 @@ impl BgTaskRegistry {
             if !context.is_empty() {
                 self.send_awaited(
                     &task,
-                    Event::Progress(crate::subc::awaited_work::bounded(context, 2000)),
+                    Event::Progress(bounded(context, 2000)),
                     Some(PushFrame::BashPatternMatch(pattern.clone())),
                     true,
                 );

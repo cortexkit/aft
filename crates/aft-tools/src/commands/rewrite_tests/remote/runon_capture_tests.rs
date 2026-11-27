@@ -1,5 +1,7 @@
 use super::*;
-use aft_engine::test_bridge::bash_remote::{remote_wire::Daemon, set_test_cap, BgTaskRegistryTestExt as _};
+use aft_engine::test_bridge::bash_remote::{
+    remote_wire::Daemon, set_test_cap, BgTaskRegistryTestExt as _,
+};
 
 const EDIT: &str = "until test -e .release-editor; do sleep 0.02; done; printf 'edited before capture\n' > tracked.txt";
 const HOLD: &str = "until test -e .release-editor; do sleep 0.02; done";

@@ -13,7 +13,8 @@ use subc_protocol::{BindIdentity, RouteTarget};
 use tokio_util::sync::CancellationToken;
 
 use super::rich_ui::display::AwaitedCards;
-use crate::bash_background::registry::{BgCompletion, BgTask};
+use crate::bash_background::registry::awaited_work::{Event, OpenReplay, SessionScope, Sink};
+use crate::bash_background::registry::BgTask;
 use crate::bash_background::{BgTaskRegistry, OpenOutcome};
 use crate::protocol::PushFrame;
 
@@ -88,26 +89,12 @@ impl From<CallError> for Failure {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct SessionScope {
-    identity: BindIdentity,
-    scope: ScopeSelector,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct OpenReplay {
-    scope: SessionScope,
-    label: String,
-}
-
-impl OpenReplay {
-    fn request(&self, instance: &str, key: &str) -> Request {
-        Request::Open(OpenParams {
-            instance: instance.into(),
-            key: key.into(),
-            label: self.label.clone(),
-        })
-    }
+fn open_request(open: &OpenReplay, instance: &str, key: &str) -> Request {
+    Request::Open(OpenParams {
+        instance: instance.into(),
+        key: key.into(),
+        label: open.label.clone(),
+    })
 }
 
 #[async_trait::async_trait]
@@ -412,7 +399,7 @@ impl Service {
                                 let _registration = service.registrations.lock().await;
                                 if let Some(wire) = service.wire() {
                                     let _ = wake.borrow_and_update();
-                                    let body = open.request(&service.instance, &key);
+                                    let body = open_request(open, &service.instance, &key);
                                     Some(Service::call::<ItemReply>(wire.as_ref(), &body, Some(&open.scope)).await)
                                 } else {
                                     None
@@ -567,8 +554,22 @@ impl Service {
             }),
         }
     }
+}
 
-    pub(crate) fn replay_terminal(&self, run: impl FnOnce() + Send + 'static) {
+impl Sink for Service {
+    fn submit(
+        self: Arc<Self>,
+        registry: BgTaskRegistry,
+        task: Arc<BgTask>,
+        key: String,
+        event: Event,
+        notice: Option<PushFrame>,
+        persisted: bool,
+    ) {
+        Service::submit(&self, registry, task, key, event, notice, persisted);
+    }
+
+    fn replay_terminal(&self, run: Box<dyn FnOnce() + Send>) {
         self.runtime.spawn_blocking(run);
     }
 }
@@ -671,41 +672,14 @@ async fn stage_notice_record(
     cards.commit(record).await
 }
 
-#[derive(Clone)]
-pub(crate) enum Event {
-    Finish { outcome: Outcome, summary: String },
-    Cancel,
-    CleanupOpen { replay: Option<OpenReplay> },
-    Progress(String),
-}
-
-pub(crate) fn completion_summary(completion: &BgCompletion) -> String {
-    let value = serde_json::to_value(completion).expect("serializable bash completion");
-    let text = super::bash_notice_text::completion(&value);
-    bounded(&text, 2000)
-}
-
-pub(crate) fn bounded(text: &str, limit: usize) -> String {
-    let end = text
-        .char_indices()
-        .nth(limit)
-        .map_or(text.len(), |(index, _)| index);
-    text[..end].to_owned()
-}
-
-pub(crate) fn owns_kill_reply(task_scope: &ScopeStamp) -> bool {
-    super::secret_consent::current_identity().is_some_and(|caller| {
-        let scope = caller
+pub(super) fn current_kill_reply_scope() -> Option<ScopeStamp> {
+    super::secret_consent::current_identity().and_then(|caller| {
+        caller
             .run_owner
             .as_ref()
             .and_then(|owner| owner.owner_route.scope.as_ref())
-            .or(caller.scope.as_ref());
-        scope.is_some_and(|scope| {
-            scope.kind == ScopeKind::Worker
-                && scope.owner == task_scope.owner
-                && scope.scope_ref == task_scope.scope_ref
-                && scope.scope_epoch == task_scope.scope_epoch
-        })
+            .or(caller.scope.as_ref())
+            .cloned()
     })
 }
 
@@ -771,7 +745,7 @@ impl Candidate {
         &self,
         registry: &BgTaskRegistry,
     ) -> crate::bash_background::AwaitedSpawn {
-        registry.prepare_awaited_spawn(&self.service)
+        registry.prepare_awaited_spawn(self.service.clone())
     }
 
     pub(super) async fn open(
@@ -810,7 +784,7 @@ impl Candidate {
             })
             .await;
             if matches!(saved, Ok(Ok(()))) {
-                let request = open.request(&self.service.instance, key);
+                let request = open_request(&open, &self.service.instance, key);
                 match Service::call::<ItemReply>(wire.as_ref(), &request, Some(&open.scope)).await {
                     Ok(reply) if reply.item.key != key => outcome = OpenOutcome::Unknown,
                     Ok(reply) if !reply.item.state.is_ended() => outcome = OpenOutcome::Opened,
@@ -1051,7 +1025,7 @@ async fn reconcile(
     let _ = tokio::task::spawn_blocking(move || {
         for (key, registry) in known {
             if !unknown.contains(&key) || cleanups.contains(&key) {
-                registry.resume_awaited_work(&key, &service_for_replay);
+                registry.resume_awaited_work(&key, service_for_replay);
             }
         }
     })

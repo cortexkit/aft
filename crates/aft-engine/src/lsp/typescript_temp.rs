@@ -108,7 +108,9 @@ fn sweep_at(storage: &Path, now: SystemTime, boot: Option<SystemTime>) -> usize 
             continue;
         }
         let marker = ArtifactOwner::read(&path.join(OWNER));
-        let owner = marker.as_ref().and_then(|marker| marker.owner.as_ref().map(exact_liveness));
+        let owner = marker
+            .as_ref()
+            .and_then(|marker| marker.owner.as_ref().map(exact_liveness));
         let server = match marker.map(|marker| marker.child) {
             Some(ChildState::Running(server)) => Some((server.pid, exact_liveness(&server))),
             _ => None,

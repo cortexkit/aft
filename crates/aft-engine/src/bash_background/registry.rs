@@ -1321,7 +1321,7 @@ pub(crate) struct RegistryInner {
     /// in the task's record for its project's later replay.
     saved_task_recovery: AtomicBool,
     pub(crate) completions: Mutex<completion_queue::NoticeQueue<BgCompletion>>,
-    awaited_work: parking_lot::Mutex<std::sync::Weak<crate::subc::awaited_work::Service>>,
+    awaited_work: parking_lot::Mutex<Option<std::sync::Weak<dyn awaited_work::Sink>>>,
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
     pub(crate) shutdown: AtomicBool,
@@ -1511,7 +1511,9 @@ pub struct RouteCensusTask {
 
 #[path = "task_types.rs"]
 pub(crate) mod task_types;
-pub(crate) use task_types::{BgTask, BgTaskState, TaskRuntime};
+#[doc(hidden)]
+pub use task_types::BgTask;
+pub(crate) use task_types::{BgTaskState, TaskRuntime};
 pub struct ForegroundWaitGuard {
     registry: BgTaskRegistry,
     session_id: String,
@@ -17402,7 +17404,8 @@ mod pty_capture;
 use kill_state::KillStateSave;
 
 #[path = "awaited_work.rs"]
-pub(super) mod awaited_work;
+#[doc(hidden)]
+pub mod awaited_work;
 #[path = "completion_queue.rs"]
 pub(crate) mod completion_queue;
 

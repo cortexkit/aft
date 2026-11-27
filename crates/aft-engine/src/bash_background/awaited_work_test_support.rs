@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 #[tokio::test]
 async fn an_awaited_finish_without_a_pointer_does_not_wait_for_sqlite() {
     use crate::context::{App, AppContext};
@@ -48,15 +49,15 @@ async fn an_awaited_finish_without_a_pointer_does_not_wait_for_sqlite() {
 }
 
 impl BgTaskRegistry {
-    pub(crate) fn seed_awaited_opening_for_test(&self, key: &str) {
+    pub fn seed_awaited_opening_for_test(&self, key: &str) {
         self.set_awaited_marker_for_test(key, State::Opening);
     }
 
-    pub(crate) fn seed_awaited_fallback_for_test(&self, key: &str) {
+    pub fn seed_awaited_fallback_for_test(&self, key: &str) {
         self.set_awaited_marker_for_test(key, State::FallbackCancel);
     }
 
-    pub(crate) fn set_awaited_notice_owner_for_test(&self, key: &str) {
+    pub fn set_awaited_notice_owner_for_test(&self, key: &str) {
         let task = self.task(key).unwrap();
         let mut db = DeferredDbWrites::new(self, &task);
         let mut state = task.lock_state().unwrap();
@@ -69,7 +70,7 @@ impl BgTaskRegistry {
             .unwrap();
     }
 
-    pub(crate) fn set_awaited_runner_harness_for_test(&self, key: &str) {
+    pub fn set_awaited_runner_harness_for_test(&self, key: &str) {
         let task = self.task(key).unwrap();
         let mut db = DeferredDbWrites::new(self, &task);
         let mut state = task.lock_state().unwrap();
@@ -78,7 +79,7 @@ impl BgTaskRegistry {
             .unwrap();
     }
 
-    pub(crate) fn set_awaited_cleanup_age_and_scope_for_test(
+    pub fn set_awaited_cleanup_age_and_scope_for_test(
         &self,
         key: &str,
         age: Duration,
@@ -102,18 +103,18 @@ impl BgTaskRegistry {
             .unwrap();
     }
 
-    pub(crate) fn drop_awaited_task_registration_for_test(&self, key: &str) {
+    pub fn drop_awaited_task_registration_for_test(&self, key: &str) {
         assert!(self.inner.tasks.lock().unwrap().remove(key).is_some());
     }
 
-    pub(crate) fn freeze_awaited_finish_without_card_for_test(&self, key: &str) {
+    pub fn freeze_awaited_finish_without_card_for_test(&self, key: &str) {
         let task = self.task(key).unwrap();
         assert!(self
             .freeze_awaited_finish_notice(&task, None)
             .unwrap()
             .is_none());
     }
-    pub(crate) fn seed_awaited_task_for_test(&self, storage: &Path, root: &Path) -> String {
+    pub fn seed_awaited_task_for_test(&self, storage: &Path, root: &Path) -> String {
         let key = "bash-0000000000000100";
         let layout =
             super::super::super::persistence::create_task_layout(storage, "shell-session", key)
@@ -137,11 +138,11 @@ impl BgTaskRegistry {
         key.into()
     }
 
-    pub(crate) fn attach_awaited_for_test(&self, service: &Arc<Service>) {
+    pub fn attach_awaited_for_test(&self, service: Arc<dyn Sink>) {
         self.attach_awaited_work(service);
     }
 
-    pub(crate) fn save_awaited_finish_card_for_test(&self, key: &str, id: &str) {
+    pub fn save_awaited_finish_card_for_test(&self, key: &str, id: &str) {
         let task = self.task(key).unwrap();
         {
             let mut db = DeferredDbWrites::new(self, &task);
@@ -162,13 +163,13 @@ impl BgTaskRegistry {
         );
     }
 
-    pub(crate) fn publish_awaited_for_test(&self, key: &str) {
+    pub fn publish_awaited_for_test(&self, key: &str) {
         let task = self.task(key).unwrap();
         let metadata = task.lock_state().unwrap().metadata.clone();
         self.enqueue_completion_if_needed(&metadata, Some(&task.paths), true);
     }
 
-    pub(crate) fn race_awaited_for_test(&self, key: &str, read_terminal: impl FnOnce() + Send) {
+    pub fn race_awaited_for_test(&self, key: &str, read_terminal: impl FnOnce() + Send) {
         let task = self.task(key).unwrap();
         let lock = task.lock_state().unwrap();
         let barrier = std::sync::Barrier::new(3);
@@ -190,7 +191,7 @@ impl BgTaskRegistry {
         });
     }
 
-    pub(crate) fn awaited_progress_for_test(&self, key: &str) {
+    pub fn awaited_progress_for_test(&self, key: &str) {
         let task = self.task(key).unwrap();
         // A backdated task is due for a reminder if the awaited item isn't open.
         self.configure_long_running_reminders(true, 1);

@@ -659,8 +659,11 @@ async fn late_result_bus_restart_does_not_republish_feed_acknowledged_entries() 
         ledger::get(&conn, &acknowledged).unwrap().is_none(),
         "terminal feed ack deletes its row"
     );
-    conn.execute("UPDATE call_ledger SET acked=1 WHERE call_key=?1", [&marked.call_key])
-        .unwrap();
+    conn.execute(
+        "UPDATE call_ledger SET acked=1 WHERE call_key=?1",
+        [&marked.call_key],
+    )
+    .unwrap();
     let mut state = DeliveryState::default();
     let mut publisher = RecordingPublisher::default();
     drain(&conn, &mut state, &mut publisher).await;

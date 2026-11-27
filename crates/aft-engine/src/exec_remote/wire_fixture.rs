@@ -342,11 +342,7 @@ pub async fn daemon_with_clients(script: Script, claim: &str, clients: usize) ->
     daemon_with_capabilities(script, &[claim], clients).await
 }
 
-pub async fn daemon_with_capabilities(
-    script: Script,
-    claims: &[&str],
-    clients: usize,
-) -> Daemon {
+pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: usize) -> Daemon {
     daemon_with_route_restart(script, claims, clients, None).await
 }
 

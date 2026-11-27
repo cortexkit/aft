@@ -274,8 +274,9 @@ fn acknowledge_terminal_bash_reply(
     if let Some(task_id) = response.data.get("task_id").and_then(Value::as_str) {
         let registry = ctx.bash_background();
         if command == "bash_watch" {
-            registry.ack_awaited_terminal_reply(task_id, session_id);
-            registry.ack_terminal_watch_reply(task_id, session_id);
+            if !registry.ack_awaited_terminal_reply(task_id, session_id) {
+                registry.ack_terminal_watch_reply(task_id, session_id);
+            }
         } else if matches!(command, "bash_status" | "bash_kill") {
             registry.ack_awaited_terminal_reply(task_id, session_id);
         } else {

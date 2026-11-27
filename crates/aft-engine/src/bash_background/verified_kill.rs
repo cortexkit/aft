@@ -496,13 +496,16 @@ impl BgTaskRegistry {
                 }
                 // A PTY signal targets the group named by its leader's PID.
                 let pgid = if metadata.mode == BgMode::Pty {
-                    metadata.pgid.filter(|&group| u32::try_from(group) == Ok(pid))
+                    metadata
+                        .pgid
+                        .filter(|&group| u32::try_from(group) == Ok(pid))
                 } else {
                     metadata.pgid
                 };
                 let group_gone = settle_killed_process_group(&metadata.task_id, pgid);
                 if metadata.mode == BgMode::Pty && !group_gone {
-                    let reason = note.unwrap_or_else(|| restart_fate_unknown_reason(metadata, paths));
+                    let reason =
+                        note.unwrap_or_else(|| restart_fate_unknown_reason(metadata, paths));
                     metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(reason));
                     super::super::persistence::persist_terminal_exit(paths, metadata);
                     return;
@@ -1069,9 +1072,12 @@ mod tests {
         std::fs::write(&paths.exit, b"").unwrap();
 
         let registry = BgTaskRegistry::default();
-        assert!(matches!(registry.replay_kill(&metadata), ReplayKill::Process(found) if found == pid));
+        assert!(
+            matches!(registry.replay_kill(&metadata), ReplayKill::Process(found) if found == pid)
+        );
         // An unreaped child keeps the group visible even after it stops.
-        let _listing_fault = crate::bash_background::process::test_hooks::scoped_listing_failure(pgid);
+        let _listing_fault =
+            crate::bash_background::process::test_hooks::scoped_listing_failure(pgid);
         settle_unattached_pty(&registry, &mut metadata, paths);
         assert!(child.0.try_wait().unwrap().is_some());
         assert_eq!(metadata.status, BgTaskStatus::FateUnknown);

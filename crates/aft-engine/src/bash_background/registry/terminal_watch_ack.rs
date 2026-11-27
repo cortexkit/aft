@@ -16,7 +16,7 @@ impl BgTaskRegistry {
     /// The owning session already gets the outcome in its watch reply. Persist
     /// that fact in the task file before removing any queued completion, but
     /// leave SQLite to the watchdog: a foreign writer must not delay the reply.
-    pub(crate) fn ack_terminal_watch_reply(&self, task_id: &str, session_id: &str) {
+    pub fn ack_terminal_watch_reply(&self, task_id: &str, session_id: &str) {
         let Some(task) = self.task_for_session(task_id, session_id) else {
             return;
         };

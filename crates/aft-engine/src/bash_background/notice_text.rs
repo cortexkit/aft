@@ -45,7 +45,7 @@ fn duration(ms: f64) -> String {
     }
 }
 
-pub(super) fn completion(value: &Value) -> String {
+pub fn completion(value: &Value) -> String {
     let raw_status = string(value, "status");
     let status = match raw_status {
         "timed_out" | "timeout" => "timed out".into(),
@@ -118,7 +118,7 @@ fn wrap(label: &str, body: &str) -> String {
     format!("<system-reminder>\n[{label}]\n{body}\n</system-reminder>")
 }
 
-pub(super) fn warning(value: &Value) -> String {
+pub fn warning(value: &Value) -> String {
     let hint = string(value, "hint");
     let kind = string(value, "kind");
     if matches!(kind, "config_key_dropped" | "config_migrated") {
@@ -146,7 +146,7 @@ pub(super) fn warning(value: &Value) -> String {
     format!("🔧 AFT: ⚠️ {title}{suffix}\n  {hint}")
 }
 
-pub(super) fn long_running(value: &Value) -> String {
+pub fn long_running(value: &Value) -> String {
     let command = string(value, "command");
     let utf16 = command.encode_utf16().collect::<Vec<_>>();
     let command = if utf16.len() > 120 {
@@ -158,7 +158,7 @@ pub(super) fn long_running(value: &Value) -> String {
         string(value, "task_id"), duration(value["elapsed_ms"].as_f64().unwrap_or(0.0))))
 }
 
-pub(super) fn watch(value: &Value) -> String {
+pub fn watch(value: &Value) -> String {
     let task = string(value, "task_id");
     let (label, context) = if value["batch"].is_object() {
         ("matching lines".into(), watch_batch(task, &value["batch"]))

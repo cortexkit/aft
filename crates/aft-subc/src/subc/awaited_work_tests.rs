@@ -529,7 +529,7 @@ mod bash_background {
         let (service, _fake, mut calls) = fake(Answer::Open, Vec::new());
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         read_watch(&f, &key);
         registry.publish_awaited_for_test(&key);
         assert!(
@@ -544,7 +544,7 @@ mod bash_background {
         let (service, _fake, mut calls) = fake(Answer::Open, Vec::new());
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         registry.publish_awaited_for_test(&key);
         assert!(
             matches!(call(&mut calls).await, (Request::Finish(finish), None) if finish.key == key)
@@ -559,7 +559,7 @@ mod bash_background {
         let (service, _fake, mut calls) = fake(Answer::Open, Vec::new());
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         registry.race_awaited_for_test(&key, || read_watch(&f, &key));
         match call(&mut calls).await {
             (Request::Finish(finish), None) => assert_eq!(finish.key, key),
@@ -575,7 +575,7 @@ mod bash_background {
         let (service, _fake, mut calls) = fake(Answer::Open, Vec::new());
         let registry = f.ctx.bash_background();
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         let (legacy, mut legacy_rx) = mpsc::unbounded_channel();
         f.ctx
             .set_progress_sender(Some(Arc::new(Box::new(move |frame| {
@@ -845,7 +845,7 @@ mod bash_background {
         let metadata = serde_json::to_value(registry.notice_metadata(&key).unwrap()).unwrap();
         assert_eq!(metadata["awaited_work"], "settled");
         assert_eq!(metadata["completion_delivered"], true);
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         registry.publish_awaited_for_test(&key);
         assert!(registry
             .pending_completions_for_session("shell-session")
@@ -1140,7 +1140,7 @@ mod bash_background {
         cards.pause_rename.store(true, Ordering::Release);
         let (mut service, _fake, mut calls) = fake(Answer::Open, Vec::new());
         Arc::get_mut(&mut service).unwrap().cards = AwaitedCards::Test(cards.clone());
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         registry.publish_awaited_for_test(&key);
         tokio::time::timeout(Duration::from_secs(5), cards.rename_pending.notified())
             .await
@@ -1197,7 +1197,7 @@ mod bash_background {
         let key = registry.seed_awaited_task_for_test(f.dir.path(), f.root.as_path());
         let (service, wire, mut calls) = fake(Answer::Open, vec![key.clone()]);
         wire.route_refused.store(true, Ordering::SeqCst);
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         if cancel {
             read_watch(&f, &key);
         } else {
@@ -1252,7 +1252,7 @@ mod bash_background {
             registry.set_awaited_runner_harness_for_test(&key);
         }
         let (service, _wire, mut calls) = fake(Answer::Open, Vec::new());
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         let pool = App::default_shared()
             .open_db(&f.dir.path().join("aft.db"))
             .unwrap();
@@ -1571,7 +1571,7 @@ mod bash_background {
         let (service, wire, mut calls) = fake(Answer::Open, Vec::new());
         wire.seen_opens.lock().insert(key.clone());
         wire.replay_offline.store(true, Ordering::SeqCst);
-        registry.attach_awaited_for_test(&service);
+        registry.attach_awaited_for_test(service.clone());
         assert!(!registry.settle_awaited_open(&key, OpenOutcome::Unknown));
         let expected = (open.request(&service.instance, &key), Some(open.scope));
         assert_eq!(call(&mut calls).await, expected);

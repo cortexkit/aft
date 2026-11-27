@@ -33,7 +33,7 @@ impl AppContext {
             .map(|_| (request.clone(), None, generation));
     }
 
-    pub(crate) fn retained_configure_request(&self) -> Option<(crate::protocol::RawRequest, u64)> {
+    pub fn retained_configure_request(&self) -> Option<(crate::protocol::RawRequest, u64)> {
         self.cache_recovery
             .lock()
             .as_ref()

@@ -13,6 +13,8 @@ mod gc_memo;
 mod memory_limit;
 #[cfg(feature = "test-support")]
 pub(crate) use memory_limit::MemoryPolicy as MemoryPolicyForTest;
+#[doc(hidden)]
+pub mod notice_text;
 pub mod output;
 pub mod persistence;
 pub mod process;

@@ -2,10 +2,13 @@ use super::*;
 
 impl BgTaskRegistry {
     pub(crate) fn replay_live_task_for_test(&self, storage: &Path, session: &str, task: &str) {
-        let resolved = crate::bash_background::persistence::resolve_task(storage, session, task).unwrap();
+        let resolved =
+            crate::bash_background::persistence::resolve_task(storage, session, task).unwrap();
         let metadata = read_task_at(&resolved).unwrap();
-        self.rehydrate_resolved_task_with_process_probe(metadata, resolved.paths, session, |_| true)
-            .unwrap();
+        self.rehydrate_resolved_task_with_process_probe(metadata, resolved.paths, session, |_| {
+            true
+        })
+        .unwrap();
     }
 }
 use crate::bash_background::persistence::{task_paths, write_task};

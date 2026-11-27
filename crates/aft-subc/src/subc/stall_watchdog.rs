@@ -18,11 +18,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::health::DispatchPathMetrics;
 use crate::context::DispatchLoopLiveness;
+use crate::process_identity::ProcessLiveness::{Alive, Gone};
 use aft_engine::interrupted_storage::{
     exact_liveness, old_enough, owned_metadata, predates_boot, storage_child_dir, ArtifactOwner,
     ChildState, ONE_HOUR,
 };
-use crate::process_identity::ProcessLiveness::{Alive, Gone};
 
 /// How long a loop may owe work without progressing before it is a stall.
 pub(super) const STALL_THRESHOLD: Duration = Duration::from_secs(15);
@@ -751,7 +751,9 @@ fn prune_captures_at(dir: &Path, keep: usize, now: SystemTime, boot: Option<Syst
                 ..
             }) => {}
             _ => {
-                let owner = marker.as_ref().and_then(|marker| marker.owner.as_ref().map(exact_liveness));
+                let owner = marker
+                    .as_ref()
+                    .and_then(|marker| marker.owner.as_ref().map(exact_liveness));
                 let child = match marker.map(|marker| marker.child) {
                     Some(ChildState::Running(identity)) => Some(exact_liveness(&identity)),
                     _ => None,
