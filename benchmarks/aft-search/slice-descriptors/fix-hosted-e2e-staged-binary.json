@@ -1,9 +1,9 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: no changed path matches. CI and test-only change: end-to-end suites use the aft binary CI staged (AFT_BINARY_PATH) instead of a leftover target build, the Windows native e2e job gets a cold-build budget, the beta-pin gate names the binary it builds, and one cross-session bash test (crates/aft/tests/integration/bash_background_persistence_test.rs) waits for persisted completion. No search, routing or ranking code changes."
+  "note": "CI and test-only change, apart from moving the unchanged first-text-index wait out of the ranking-fenced semantic_search/mod.rs into semantic_search/first_text_wait.rs to keep the file under its size pin; no search, routing or ranking logic changes. End-to-end suites use the aft binary CI staged (AFT_BINARY_PATH) instead of a leftover target build, the Windows native e2e job gets a cold-build budget, the beta-pin gate names the binary it builds, the first-text failure and cancellation tests assert why the wait ended through test-only signals, and one cross-session bash test waits for persisted completion."
 }
