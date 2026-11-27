@@ -6767,29 +6767,27 @@ fn reported_check_still_running(response: &Value) -> bool {
 }
 
 fn completed_rust_check_record(storage: &Path, expected_errors: u64) -> Option<PathBuf> {
+    completed_rust_check_records(storage)
+        .find_map(|(path, errors)| (errors == expected_errors).then_some(path))
+}
+
+fn completed_rust_check_records(storage: &Path) -> impl Iterator<Item = (PathBuf, u64)> {
     fs::read_dir(storage.join("rust-completed-checks"))
-        .ok()?
+        .into_iter()
+        .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .find(|path| {
-            let Some(reports) = fs::read(path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|record| record["record"]["diagnostics"].as_object().cloned())
-            else {
-                return false;
-            };
-            let errors = reports
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| {
+            let record: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            let errors = record["record"]["diagnostics"]
+                .as_object()?
                 .values()
                 .filter_map(Value::as_array)
                 .flatten()
                 .filter(|diagnostic| diagnostic["severity"] == "Error")
                 .count() as u64;
-            errors == expected_errors
+            Some((path, errors))
         })
 }
 
@@ -7080,6 +7078,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         "Cargo.lock",
         "version = 4\n[[package]]\nname = \"saved-check\"\nversion = \"0.1.0\"\n",
     );
+    let trace = aft::lsp::CompletedRustCheckTrace::start(&root);
     let new_context = || {
         crate::helpers::disable_in_process_file_watcher();
         let ctx = AppContext::new(
@@ -7122,19 +7121,12 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     }
     // Inspect certifies the live result before its detached cache writer finishes.
     // A restart can restore only the record whose atomic write has completed.
-    let record = wait_for_completed_rust_check(&storage, 0, || {}).unwrap();
-    println!(
-        "real restart: saved clean check {}",
-        fs::read_to_string(&record).unwrap()
-    );
+    wait_for_completed_rust_check(&storage, 0, || {})
+        .unwrap_or_else(|error| panic!("{error}\nRust check timeline:\n{trace}"));
     drop(ctx);
     let ctx = new_context();
     let started = std::time::Instant::now();
     let cold = scoped_diagnostics_inspect(&ctx, "saved-cold", "src");
-    println!(
-        "real restart: cold inspect {} ms: {cold:#}",
-        started.elapsed().as_millis()
-    );
     assert!(
         cold["text"]
             .as_str()
@@ -7144,12 +7136,6 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     );
     assert_eq!(cold["summary"]["diagnostics"]["errors"], 0, "{cold:#}");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
-    println!(
-        "real restart: cold inspect {} ms; record {} bytes at {}",
-        started.elapsed().as_millis(),
-        fs::metadata(&record).unwrap().len(),
-        record.display()
-    );
     // A cold request after an edit cannot reuse the previous clean check.
     drop(ctx);
     write_file(&root, "src/lib.rs", "pub fn answer() -> u8 { unknown }\n");
@@ -7200,7 +7186,8 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     while completed_rust_check_record(&storage, expected_errors).is_none() {
         assert!(
             Instant::now() < deadline,
-            "no completed Rust check with {expected_errors} errors was persisted: {errors:#}"
+            "no completed Rust check with {expected_errors} errors was persisted; on-disk counts: {:?}\n{errors:#}\nRust check timeline:\n{trace}",
+            completed_rust_check_records(&storage).collect::<Vec<_>>(),
         );
         aft::runtime_drain::drain_lsp_events(&ctx);
         thread::sleep(Duration::from_millis(50));
@@ -7210,10 +7197,6 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     let started = std::time::Instant::now();
     let restored_errors = scoped_diagnostics_inspect(&ctx, "saved-errors-cold", "src");
     let restored_elapsed = started.elapsed();
-    println!(
-        "real restart: restored errors in {} ms: {restored_errors:#}",
-        restored_elapsed.as_millis()
-    );
     assert!(
         restored_errors["text"]
             .as_str()

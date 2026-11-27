@@ -15,6 +15,8 @@ use super::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 
 mod inputs;
 use inputs::{CachedFacts, SourceInputs, UnresolvedInput};
+#[cfg(feature = "test-hooks")]
+pub(crate) mod trace;
 
 #[doc(hidden)]
 pub const BUDGET: Duration = Duration::from_secs(2);
@@ -1588,6 +1590,15 @@ impl CompletedRustCheck {
             let _ = deadline;
             self.pending = self.pre_spawn.clone();
         }
+        #[cfg(feature = "test-hooks")]
+        trace::record(
+            &self.root,
+            format_args!(
+                "begin fingerprint pending={:?} prior_record={}",
+                self.pending.as_ref().map(|fingerprint| &fingerprint.digest),
+                self.saved.is_some(),
+            ),
+        );
     }
 
     pub(crate) fn complete(&mut self) -> Option<SavedCheck> {
@@ -1605,20 +1616,47 @@ impl CompletedRustCheck {
         self.finished = false;
         let started = self.started.take();
         let Some(pending) = self.pending.take() else {
+            #[cfg(feature = "test-hooks")]
+            trace::record(
+                &self.root,
+                format_args!("check refused: no begin fingerprint"),
+            );
             return None;
         };
         let Some(mut current) = self
             .runtime
             .capture(&self.root, Some(&pending), deadline, None)
         else {
+            #[cfg(feature = "test-hooks")]
+            trace::record(
+                &self.root,
+                format_args!("check refused: no end fingerprint"),
+            );
             return None;
         };
+        #[cfg(feature = "test-hooks")]
+        trace::record(
+            &self.root,
+            format_args!(
+                "fingerprint comparison: begin={} end={} matched={}",
+                pending.digest,
+                current.digest,
+                pending.digest == current.digest,
+            ),
+        );
         if current.digest != pending.digest {
+            #[cfg(feature = "test-hooks")]
+            trace::record(&self.root, format_args!("check refused: inputs changed"));
             return None;
         }
         let Some((build_inputs, env_keys)) =
             self.runtime.build_inputs(&self.root, &current, deadline)
         else {
+            #[cfg(feature = "test-hooks")]
+            trace::record(
+                &self.root,
+                format_args!("check refused: build-script inputs unavailable"),
+            );
             return None;
         };
         if captured_before_spawn {
@@ -1669,12 +1707,27 @@ impl CompletedRustCheck {
                 self.began
             },
         ) else {
+            #[cfg(feature = "test-hooks")]
+            trace::record(
+                &self.root,
+                format_args!("check refused: expanded fingerprint unavailable"),
+            );
             return None;
         };
         #[cfg(not(unix))]
         if current.digest != pending.digest {
+            #[cfg(feature = "test-hooks")]
+            trace::record(
+                &self.root,
+                format_args!(
+                    "check refused: expanded fingerprint {} differs from begin {}",
+                    current.digest, pending.digest,
+                ),
+            );
             return None;
         }
+        #[cfg(feature = "test-hooks")]
+        trace::record(&self.root, format_args!("check certified"));
         let record = SavedCheck {
             schema: RECORD_SCHEMA,
             root: self.root.clone(),
@@ -1696,7 +1749,27 @@ impl CompletedRustCheck {
         if let Ok(worker) = std::thread::Builder::new()
             .name("aft-rust-check-save".into())
             .spawn(move || {
-                if write_record(&path, &persisted).is_none() {
+                #[cfg(feature = "test-hooks")]
+                trace::record(
+                    &persisted.root,
+                    format_args!(
+                        "writer attempting {} with {} errors",
+                        path.display(),
+                        persisted
+                            .diagnostics
+                            .values()
+                            .flatten()
+                            .filter(|row| row.severity == DiagnosticSeverity::Error)
+                            .count(),
+                    ),
+                );
+                let written = write_record(&path, &persisted).is_some();
+                #[cfg(feature = "test-hooks")]
+                trace::record(
+                    &persisted.root,
+                    format_args!("writer finished {} written={written}", path.display()),
+                );
+                if !written {
                     crate::slog_info!(
                         "rust completed-check persistence refused path={}",
                         path.display()
@@ -1717,6 +1790,8 @@ impl CompletedRustCheck {
             drop(worker);
             return Some(record);
         }
+        #[cfg(feature = "test-hooks")]
+        trace::record(&self.root, format_args!("writer could not start"));
         None
     }
 
@@ -2242,7 +2317,10 @@ mod tests {
             before_bytes,
             "compact encoding must remove every repeated field name and workspace prefix"
         );
-        println!("fixed-fixture completed-check record: before {before_bytes} bytes, after {after_bytes} bytes; expected savings {expected_savings} bytes for {} inputs", inputs.len());
+        println!(
+            "fixed-fixture completed-check record: before {before_bytes} bytes, after {after_bytes} bytes; expected savings {expected_savings} bytes for {} inputs",
+            inputs.len()
+        );
     }
 
     #[test]
@@ -3397,7 +3475,10 @@ mod tests {
         assert!(restored.validated(Instant::now() + BUDGET).is_some());
         println!(
             "repository completed-check record: before {} bytes (ledger {}), after {} bytes; {} inputs at {}",
-            before_bytes, ledger_bytes, after_bytes, record.fingerprint.files.len(),
+            before_bytes,
+            ledger_bytes,
+            after_bytes,
+            record.fingerprint.files.len(),
             cache.path.display()
         );
     }

@@ -1479,6 +1479,15 @@ impl LspClient {
                     }
                     Ok(Some(ServerMessage::Notification { method, params })) => {
                         let receive_order = reader_writer.note_received();
+                        #[cfg(feature = "test-hooks")]
+                        if reader_kind == ServerKind::Rust && method == "$/progress" {
+                            super::completed_rust_check::trace::progress_received(
+                                &reader_root,
+                                child_pid,
+                                receive_order,
+                                params.as_ref(),
+                            );
+                        }
                         if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
                             let ordinal = reader_check_begins.fetch_add(1, Ordering::SeqCst) + 1;
                             if let Ok(mut receipts) = reader_check_begin_receipts.lock() {

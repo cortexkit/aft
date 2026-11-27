@@ -1,5 +1,7 @@
 use super::*;
 use crate::lsp::analysis_progress::{Transition, ANALYSIS_TOKEN_LIMIT};
+#[cfg(feature = "test-hooks")]
+use crate::lsp::completed_rust_check::trace;
 use crate::lsp::event_ingress::{IngressOverflow, ScopedReportLease};
 
 fn earliest_settle(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
@@ -187,6 +189,8 @@ impl LspManager {
         }
         let mut completed_checks = Vec::new();
         let now = self.retry_clock.now();
+        #[cfg(feature = "test-hooks")]
+        let was_scheduled = self.rust_publish_settle_at;
         // Only future deadlines can need another timer-driven drain. A due
         // check that still lacks authority needs a new server event instead.
         self.rust_publish_settle_at = None;
@@ -198,6 +202,18 @@ impl LspManager {
                 self.rust_publish_settle_at =
                     earliest_settle(self.rust_publish_settle_at, Some(deadline));
                 continue;
+            }
+            #[cfg(feature = "test-hooks")]
+            if was_scheduled.is_some() {
+                trace::record(
+                    &key.root,
+                    format_args!(
+                        "settle: current={} provisional={} check_state={:?}",
+                        client.rust_check_completed_current(now, FLYCHECK_PUBLISH_SETTLE),
+                        client.diagnostics_are_provisional(),
+                        client.rust_check_state(now, FLYCHECK_PUBLISH_SETTLE),
+                    ),
+                );
             }
             if client.rust_check_completed_current(now, FLYCHECK_PUBLISH_SETTLE)
                 && !client.diagnostics_are_provisional()
@@ -360,7 +376,18 @@ impl LspManager {
                     title.unwrap_or("-")
                 );
             }
-            if !client.record_rust_progress(&token, kind, title, order) {
+            let matched_end = client.record_rust_progress(&token, kind, title, order);
+            #[cfg(feature = "test-hooks")]
+            if matches!(kind, "begin" | "end") {
+                trace::record(
+                    &key.root,
+                    format_args!(
+                        "manager progress {kind} token={token} order={order:?} matched_end={matched_end} message={:?}",
+                        value.get("message"),
+                    ),
+                );
+            }
+            if !matched_end {
                 return;
             }
             if value
@@ -372,6 +399,11 @@ impl LspManager {
                 })
             {
                 if let Some(cache) = client.completed_rust_check.as_mut() {
+                    #[cfg(feature = "test-hooks")]
+                    trace::record(
+                        &key.root,
+                        format_args!("check aborted after unsuccessful end"),
+                    );
                     cache.abort();
                 }
             }
@@ -419,7 +451,9 @@ impl LspManager {
                     self.queue_open_document_pulls(&key);
                 }
                 IngressOverflow::ProgressLimit => {
-                    slog_warn!("retiring language server {key:?}: exceeded the limit of {ANALYSIS_TOKEN_LIMIT} unfinished analysis progress tokens");
+                    slog_warn!(
+                        "retiring language server {key:?}: exceeded the limit of {ANALYSIS_TOKEN_LIMIT} unfinished analysis progress tokens"
+                    );
                     retired.push((key.clone(), self.detach_idle_client(&key)));
                 }
             }
