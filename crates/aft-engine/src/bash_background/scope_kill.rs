@@ -163,6 +163,17 @@ const MAX_LISTINGS: usize = 8;
 /// any reason but the process being gone (EMFILE included), or listings that
 /// never settle are errors, never an empty scope.
 fn signal_members(cgroup: &Path, signal: i32) -> io::Result<Vec<OwnedFd>> {
+    signal_members_after(cgroup, signal, || {})
+}
+
+/// [`signal_members`], running `before` once, right before the first signal
+/// actually sent; it does not run when nothing is sent.
+fn signal_members_after(
+    cgroup: &Path,
+    signal: i32,
+    before: impl FnOnce(),
+) -> io::Result<Vec<OwnedFd>> {
+    let mut before = Some(before);
     let mut opened = std::collections::BTreeMap::<u32, OwnedFd>::new();
     let mut signalled = std::collections::BTreeSet::<u32>::new();
     let mut previous = member_pids(cgroup)?;
@@ -183,6 +194,9 @@ fn signal_members(cgroup: &Path, signal: i32) -> io::Result<Vec<OwnedFd>> {
         for pid in &current {
             let Some(fd) = opened.get(pid) else { continue };
             if signal != 0 && !pidfd_exited(fd) && signalled.insert(*pid) {
+                if let Some(before) = before.take() {
+                    before();
+                }
                 unsafe {
                     libc::syscall(
                         libc::SYS_pidfd_send_signal,
@@ -208,7 +222,7 @@ fn signal_members(cgroup: &Path, signal: i32) -> io::Result<Vec<OwnedFd>> {
 
 /// SIGTERM every process in `cgroup`, then wait the termination grace period,
 /// ending early once none is left running. `before` runs right before the
-/// SIGTERM. Returns false, having sent nothing, when this kernel has no
+/// first SIGTERM actually sent, and not at all when none is. Returns false, having sent nothing, when this kernel has no
 /// pidfds; the caller then signals the process group instead.
 pub(super) fn terminate_members(
     cgroup: &Path,
@@ -218,11 +232,10 @@ pub(super) fn terminate_members(
     if !pidfds_supported() {
         return false;
     }
-    before();
     // A listing that fails or never settles may still hide members, so the
     // full grace period runs unless a listing shows none left running. The
     // caller then writes `cgroup.kill` and checks that the scope is empty.
-    let _ = signal_members(cgroup, libc::SIGTERM);
+    let _ = signal_members_after(cgroup, libc::SIGTERM, before);
     let started = Instant::now();
     while started.elapsed() < super::super::process::TERMINATE_GRACE {
         reap();
@@ -419,6 +432,40 @@ mod membership_tests {
 #[cfg(test)]
 mod grace_tests {
     use super::*;
+
+    /// The kill commits to its outcome right before the first SIGTERM it
+    /// actually sends. A listing that fails sends nothing, so nothing is
+    /// committed; a listed process is signalled and commits once.
+    #[test]
+    fn task_scope_term_commits_only_when_a_signal_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id();
+        let commits = std::cell::Cell::new(0);
+        let failed = ListingFaults {
+            pidfd_errno: Some(libc::EMFILE),
+            listings: [vec![pid]].into(),
+            ..Default::default()
+        };
+        with_listing_faults_for_test(failed, || {
+            terminate_members(dir.path(), || commits.set(commits.get() + 1), || {})
+        });
+        let after_failure = commits.get();
+        let listed = ListingFaults {
+            listings: [vec![pid]].into(),
+            ..Default::default()
+        };
+        with_listing_faults_for_test(listed, || {
+            terminate_members(dir.path(), || commits.set(commits.get() + 1), || {})
+        });
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert_eq!(after_failure, 0, "a failed listing committed the kill");
+        assert_eq!(commits.get(), 1, "the SIGTERM sent did not commit once");
+    }
 
     /// After SIGTERM, listings that never settle may hide members, so the
     /// full grace period runs before the caller's `cgroup.kill`.

@@ -2535,3 +2535,107 @@ fn handed_back_wrapper_is_reaped_by_the_watchdog() {
         "the wrapper was left unreaped"
     );
 }
+
+/// Start a real PTY command and wait for it to print `ready`.
+fn ready_pty(r: &BgTaskRegistry, root: &Path, session: &str, command: &str) -> String {
+    r.inner.shutdown.store(true, Ordering::SeqCst);
+    let id = r
+        .spawn_pty(
+            SpawnPlan::Unsandboxed,
+            command,
+            session.into(),
+            root.into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.into(),
+            8,
+            true,
+            false,
+            Some(root.into()),
+            24,
+            80,
+        )
+        .unwrap();
+    let task = r.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.pty)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    id
+}
+
+/// On the scope path the kill commits at the scope's first SIGTERM. A PTY
+/// command that handles it by exiting 0 is reported killed, not completed.
+/// The saved leader start is cleared, so no SIGHUP is sent and only the
+/// scope's SIGTERM can commit the kill.
+#[test]
+fn scoped_pty_kill_of_a_signal_handling_command_stays_killed() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    let session = "scoped-trap";
+    let id = ready_pty(
+        &r,
+        root.path(),
+        session,
+        "trap 'exit 0' HUP TERM; echo ready; while :; do sleep 0.1; done",
+    );
+    let task = r.task(&id).unwrap();
+    let pgid = {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.child_start_time_ms = None;
+        state.metadata.pgid.unwrap()
+    };
+    let procs: String = super::super::process::process_group_identities(pgid)
+        .unwrap()
+        .iter()
+        .map(|identity| format!("{}\n", identity.pid))
+        .collect();
+    let cgroup = root.path().join("scope");
+    std::fs::create_dir(&cgroup).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+    std::fs::write(cgroup.join("cgroup.kill"), "0").unwrap();
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(&id, cgroup));
+    let killed = r.kill(&id, session);
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    let killed = killed.unwrap();
+    let marker = std::fs::read_to_string(&task.paths.exit).unwrap_or_default();
+    assert_eq!(
+        killed.info.status,
+        BgTaskStatus::Killed,
+        "marker={marker:?}"
+    );
+    assert_eq!(marker, "killed");
+}
+
+/// A repeated kill that publishes a PTY's pending outcome from a `killed`
+/// marker keeps the reason stored for that outcome, not its own.
+#[test]
+fn repeated_pty_kill_keeps_the_pending_outcome_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    let session = "repeat-reason";
+    let id = ready_pty(&r, root.path(), session, "echo ready; exec sleep 30");
+    let task = r.task(&id).unwrap();
+    let reason = "killed by the `timeout` of 30s you passed (exit 124)";
+    let pgid = {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.status = BgTaskStatus::Killing;
+        state.metadata.status_reason = Some(reason.to_string());
+        state.pending_terminal_override = Some(BgTaskStatus::TimedOut);
+        state.metadata.pgid.unwrap()
+    };
+    std::fs::write(&task.paths.exit, "killed").unwrap();
+    let repeated = r.kill(&id, session);
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    let repeated = repeated.unwrap();
+    assert_eq!(repeated.info.status, BgTaskStatus::TimedOut);
+    assert_eq!(repeated.info.status_reason.as_deref(), Some(reason));
+}

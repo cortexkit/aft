@@ -503,14 +503,22 @@ pub(crate) fn is_running_in_group(identity: &ProcessIdentity, pgid: i32) -> bool
 }
 
 /// The process group a process belongs to, read the same way for every user's
-/// processes. `None` when it has exited or the platform has no such reading.
+/// processes. `None` when it has exited (a zombie included: it can no longer
+/// act on a signal and only waits to be reaped) or the platform has no such
+/// reading.
 fn process_group_of(pid: u32) -> Option<i32> {
     #[cfg(target_os = "linux")]
     return std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
-        .and_then(|stat| parse_proc_stat(&stat).map(|(_, _, pgrp)| pgrp));
+        .and_then(|stat| {
+            parse_proc_stat(&stat)
+                .filter(|(_, state, _)| !matches!(*state, "Z" | "X" | "x"))
+                .map(|(_, _, pgrp)| pgrp)
+        });
     #[cfg(target_os = "macos")]
-    return macos_kinfo(pid).map(|info| info.pgid);
+    return macos_kinfo(pid)
+        .filter(|info| !info.has_exited())
+        .map(|info| info.pgid);
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;

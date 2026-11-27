@@ -508,41 +508,6 @@ fn wait_on_rehydrated_registration_gate_for_test(task_id: &str) {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn install_kill_signal_gate_for_test(
-    task_id: &str,
-) -> (
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    KILL_SIGNAL_GATES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .insert(
-            task_id.to_string(),
-            KillSignalGate {
-                reached: reached_tx,
-                release: release_rx,
-            },
-        );
-    (reached_rx, release_tx)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn wait_on_kill_signal_gate_for_test(task_id: &str) {
-    let gate = KILL_SIGNAL_GATES
-        .get()
-        .and_then(|gates| gates.lock().unwrap().remove(task_id));
-    if let Some(gate) = gate {
-        let _ = gate.reached.send(());
-        let _ = gate.release.recv_timeout(Duration::from_secs(30));
-    }
-}
-
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 struct FinishedDeletePark {
     reached: crossbeam_channel::Sender<()>,
@@ -13842,17 +13807,20 @@ impl BgTaskRegistry {
                     }
                 } else {
                     // A repeated kill can observe the first kill's committed
-                    // waiter result; a PTY's `killed` marker keeps its outcome.
+                    // waiter result; a PTY's `killed` marker keeps its outcome,
+                    // with the reason stored for it, not this kill's.
                     let committed_piped_override =
                         if state.metadata.mode == BgMode::Pipes || marker == ExitMarker::Killed {
                             state.pending_terminal_override.clone()
                         } else {
                             None
                         };
-                    let terminal_reason = if marker == ExitMarker::Killed || resource_kill {
+                    let terminal_reason = if resource_kill {
                         reason.clone()
                     } else if committed_piped_override.is_some() {
                         state.metadata.status_reason.clone()
+                    } else if marker == ExitMarker::Killed {
+                        reason.clone()
                     } else {
                         None
                     };
@@ -17919,10 +17887,16 @@ mod watch_scan;
 mod verified_kill;
 pub(super) use verified_kill::log_bash_kill;
 pub use verified_kill::stop_tasks_in_parallel;
+#[cfg(any(test, feature = "test-support"))]
+use verified_kill::wait_on_kill_signal_gate_for_test;
 use verified_kill::{
     close_pty_master, finished_group_is_still_the_tasks, record_group_check,
     settle_killed_process_group,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use verified_kill::install_kill_signal_gate_for_test;
+#[cfg(test)]
+pub(crate) use verified_kill::KILL_PANICS;
 
 #[path = "pty_input_write.rs"]
 mod pty_input_write;

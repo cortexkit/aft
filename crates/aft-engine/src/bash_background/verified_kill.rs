@@ -656,7 +656,11 @@ impl BgTaskRegistry {
         };
         #[cfg(target_os = "linux")]
         if let Ok(Some(scope)) = self.kill_scope_handle(&metadata) {
-            return terminate_scope_or_group(&scope, || evidence, &mut commit, || {});
+            let note = terminate_scope_or_group(&scope, || evidence, &mut commit, || {});
+            // The caller writes the scope's `cgroup.kill` next, which is a
+            // signal sent even when no SIGTERM could be.
+            commit();
+            return note;
         }
         terminate_pty_task(&metadata, pid, evidence, &mut commit)
     }
@@ -678,7 +682,16 @@ impl BgTaskRegistry {
             None => return true,
             Some(Ok(None)) => return false,
             Some(Ok(Some(_))) => true,
-            Some(Err(_)) => false,
+            // As in the kill's bounded reap wait: a child that cannot be
+            // waited for (ECHILD once something else reaped it) is dropped,
+            // so the task is never kept forever.
+            Some(Err(error)) => {
+                crate::slog_warn!(
+                    "background task {} wrapper could not be reaped: {error}",
+                    task.task_id
+                );
+                false
+            }
         };
         *slot = None;
         state.child_exit_observed |= reaped;
@@ -723,9 +736,25 @@ thread_local! {
 /// pollers wait for it).
 #[cfg(unix)]
 pub(super) fn poll_as_kill(registry: &BgTaskRegistry, task: &Arc<BgTask>) {
+    with_polling_as_kill(|| {
+        let _ = registry.poll_task(task);
+    });
+}
+
+/// Run `poll` with this thread marked as polling for the kill in flight. The
+/// mark is cleared on every exit, a panic included, so later polls on a
+/// long-lived worker thread still wait for other kills.
+#[cfg(unix)]
+fn with_polling_as_kill<T>(poll: impl FnOnce() -> T) -> T {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            POLLING_AS_KILL.with(|flag| flag.set(false));
+        }
+    }
     POLLING_AS_KILL.with(|flag| flag.set(true));
-    let _ = registry.poll_task(task);
-    POLLING_AS_KILL.with(|flag| flag.set(false));
+    let _clear = Clear;
+    poll()
 }
 
 /// Whether this thread is polling on behalf of the kill in flight.
@@ -948,6 +977,49 @@ pub(super) fn close_pty_master(master: Option<Box<dyn portable_pty::MasterPty + 
     #[cfg(not(windows))]
     drop(master);
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn install_kill_signal_gate_for_test(
+    task_id: &str,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    super::KILL_SIGNAL_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id.to_string(),
+            super::KillSignalGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    (reached_rx, release_tx)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn wait_on_kill_signal_gate_for_test(task_id: &str) {
+    let gate = super::KILL_SIGNAL_GATES
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(task_id));
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(30));
+    }
+    // Stands in for a kill thread that dies after claiming its task.
+    #[cfg(test)]
+    if KILL_PANICS.lock().unwrap().remove(task_id) {
+        panic!("kill thread failed");
+    }
+}
+
+#[cfg(test)]
+pub(crate) static KILL_PANICS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 #[cfg(test)]
 mod tests {
@@ -1233,11 +1305,12 @@ mod tests {
     }
 
     /// A kill's claim on `kill_in_flight` is released even when the kill
-    /// thread panics, so the task can still be finished.
+    /// thread dies after claiming its task, so a later kill finishes it.
     #[cfg(unix)]
     #[test]
     fn kill_in_flight_is_released_when_the_kill_thread_panics() {
         let registry = BgTaskRegistry::default();
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
@@ -1256,15 +1329,137 @@ mod tests {
             )
             .unwrap();
         let task = registry.task(&task_id).unwrap();
-        task.lock_state().unwrap().kill_in_flight = true;
+        let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+        super::super::KILL_PANICS
+            .lock()
+            .unwrap()
+            .insert(task_id.clone());
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _claim = KillInFlight::new(&task, true);
-            panic!("kill thread failed");
+            registry.kill(&task_id, "session")
         }));
         let released = !task.lock_state().unwrap().kill_in_flight;
-        let _ = registry.kill(&task_id, "session");
-        assert!(panicked.is_err());
+        let finished = registry.kill(&task_id, "session");
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        assert!(panicked.is_err(), "the kill was expected to die");
         assert!(released, "a dead kill left the task claimed");
+        assert!(
+            finished.unwrap().info.status.is_terminal(),
+            "a later kill could not finish the task"
+        );
+    }
+
+    /// Whether `pid` has exited and waits to be reaped.
+    #[cfg(unix)]
+    fn is_zombie(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rfind(") ")
+                    .map(|close| stat[close + 2..].starts_with('Z'))
+            })
+            .unwrap_or(false);
+        #[cfg(target_os = "macos")]
+        return super::super::super::process::child_is_zombie_for_test(pid);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        false
+    }
+
+    /// A leader that has exited but is not reaped yet (a zombie) is not
+    /// running: it neither proves its group as a running leader nor gets
+    /// hung up.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_leader_is_not_running() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", "read _"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = leader.id();
+        let identity = ProcessIdentity::of(pid).unwrap();
+        let evidence = GroupEvidence {
+            pgid: pid as i32,
+            owned_leader: None,
+            identities: vec![identity.clone()],
+        };
+        assert!(evidence.leader_running(), "precondition: a running leader");
+        drop(leader.stdin.take());
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !is_zombie(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the leader never became a zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let running = evidence.leader_running();
+        let in_group = super::super::super::process::is_running_in_group(&identity, pid as i32);
+        let _ = leader.wait();
+        assert!(!running, "a zombie leader was taken as running");
+        assert!(!in_group, "a zombie was taken as running in its group");
+    }
+
+    /// The mark that lets a kill's own poll past the in-flight deferral is
+    /// cleared even when the poll panics.
+    #[cfg(unix)]
+    #[test]
+    fn polling_as_kill_is_cleared_when_the_poll_panics() {
+        let panicked = std::panic::catch_unwind(|| {
+            with_polling_as_kill(|| {
+                assert!(polling_as_kill());
+                panic!("finalization failed");
+            })
+        });
+        assert!(panicked.is_err());
+        assert!(!polling_as_kill(), "the mark outlived a panicking poll");
+    }
+
+    /// A terminal task's wrapper that cannot be waited for (something else
+    /// already reaped it) is dropped, so the task is not kept forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_that_cannot_be_waited_for_is_dropped() {
+        let registry = BgTaskRegistry::default();
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "sleep 30",
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(std::time::Duration::from_secs(30)),
+                None,
+                dir.path().into(),
+                8,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        let task = registry.task(&task_id).unwrap();
+        let pid = task.lock_state().unwrap().metadata.child_pid.unwrap() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        task.lock_state()
+            .unwrap()
+            .metadata
+            .mark_terminal(BgTaskStatus::Killed, Some(137), None);
+        let emptied = registry.reap_terminal_child(&task);
+        let slot_empty = matches!(task.lock_state().unwrap().runtime, TaskRuntime::Piped(None));
+        assert!(
+            emptied,
+            "the task was kept for a child that cannot be waited for"
+        );
+        assert!(slot_empty);
     }
 
     /// A group number is checked again right before SIGKILL; a group no longer
