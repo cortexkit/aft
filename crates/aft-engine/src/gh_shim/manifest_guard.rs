@@ -2,20 +2,31 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
+use super::manifest_acceptance::{resolve_with_basis, DecisionBasis};
 use super::{
-    connection_file_from_config_doc, current_platform, delegate_after_invalid_manifest_notice,
-    gh_shim_state_dir_from, is_unbound_safe, read_user_config_doc, refuse, regressed_disposition,
-    relay_client, resolve_manifest, trust_root, unix_seconds, ManifestProblem, ManifestResolution,
-    RefusalCode, RegressedDisposition, StatePaths, DISCOVERY_BUDGET, NO_TRUST_ROOT_REFUSAL,
+    current_platform, delegate_after_invalid_manifest_notice, gh_shim_state_dir_from,
+    is_unbound_safe, refuse, regressed_disposition, trust_root, unix_seconds, ManifestProblem,
+    ManifestResolution, RefusalCode, RegressedDisposition, StatePaths, NO_TRUST_ROOT_REFUSAL,
 };
 
 pub(super) struct ManifestGuard<'a> {
     paths: &'a StatePaths,
+    initial: ManifestResolution,
+    basis: DecisionBasis,
 }
 
 impl<'a> ManifestGuard<'a> {
     pub(super) fn new(paths: &'a StatePaths) -> Self {
-        Self { paths }
+        let (initial, basis) = resolve_with_basis(paths, unix_seconds());
+        Self {
+            paths,
+            initial,
+            basis,
+        }
+    }
+
+    pub(super) fn initial(&self) -> &ManifestResolution {
+        &self.initial
     }
 
     pub(super) fn dispatch_without_valid_manifest(
@@ -72,8 +83,17 @@ impl<'a> ManifestGuard<'a> {
         args: &[OsString],
         delegate: impl FnOnce(&[OsString]) -> i32,
     ) -> i32 {
+        let (current, basis) = resolve_with_basis(self.paths, unix_seconds());
+        if self.basis != basis
+            || std::mem::discriminant(&self.initial) != std::mem::discriminant(&current)
+        {
+            return refuse(
+                RefusalCode::ManifestUnavailable,
+                "GitHub routing policy changed before the command could run. Start the command again.",
+            );
+        }
         if !is_unbound_safe(args) {
-            match resolve_manifest(self.paths, unix_seconds()) {
+            match current {
                 ManifestResolution::Invalid(_) | ManifestResolution::Dormant => {
                     if let Some(status) = self.unavailable_refusal(args) {
                         return status;

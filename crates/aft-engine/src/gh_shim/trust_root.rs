@@ -62,10 +62,10 @@ pub struct Pin {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct StoredRoot {
+pub(super) struct StoredRoot {
     #[serde(flatten)]
-    pin: Pin,
-    generation: u64,
+    pub(super) pin: Pin,
+    pub(super) generation: u64,
     read_at_unix_secs: u64,
 }
 
@@ -114,8 +114,12 @@ pub(super) fn key_id(public_key: &[u8]) -> String {
 }
 
 pub(super) fn read(paths: &StatePaths) -> Result<Pin, ManifestProblem> {
+    read_snapshot(paths).map(|root| root.pin)
+}
+
+pub(super) fn read_snapshot(paths: &StatePaths) -> Result<StoredRoot, ManifestProblem> {
     if paths.daemon_trust {
-        return read_daemon(paths);
+        return daemon_root(paths).ok_or(ManifestProblem::NoTrustRoot);
     }
     let anchor = std::env::var(ANCHOR_ENV)
         .ok()
@@ -129,7 +133,7 @@ fn read_file(
     paths: &StatePaths,
     anchor: Option<&Anchor>,
     now: u64,
-) -> Result<Pin, ManifestProblem> {
+) -> Result<StoredRoot, ManifestProblem> {
     let anchor = anchor.ok_or(ManifestProblem::NoTrustRoot)?;
     let invalid = || ManifestProblem::Invalid("invalid daemon signing root".into());
     let bytes = match fs::read(&paths.trust_root) {
@@ -148,7 +152,7 @@ fn read_file(
         return Err(ManifestProblem::NoTrustRoot);
     }
     root.pin.public_key().ok_or_else(invalid)?;
-    Ok(root.pin)
+    Ok(root)
 }
 
 fn daemon_root(paths: &StatePaths) -> Option<StoredRoot> {
@@ -325,7 +329,9 @@ mod tests {
         .unwrap();
         let anchor = test_anchor(&paths).unwrap();
         assert_eq!(
-            read_file(&paths, Some(&anchor), now + MAX_AGE.as_secs() - 1).unwrap(),
+            read_file(&paths, Some(&anchor), now + MAX_AGE.as_secs() - 1)
+                .unwrap()
+                .pin,
             pin
         );
         assert!(matches!(

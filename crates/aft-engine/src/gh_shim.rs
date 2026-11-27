@@ -35,7 +35,8 @@ use subc_protocol::{BindIdentity, RouteTarget};
 mod api_rules;
 mod captured_dispatch;
 mod enable_gate;
-mod environment_admin;
+mod manifest_acceptance;
+use manifest_acceptance::{load_verified_manifest, manifest_acceptance_lock, resolve_manifest};
 mod manifest_guard;
 mod state_paths;
 use state_paths::StatePaths;
@@ -900,9 +901,9 @@ fn run_with(
     // Presence-based regressed-manifest arm. Decide from the installed artifact
     // BEFORE any rung probe so a governed refusal never depends on daemon
     // reachability. Only the built-in safe commands can pass a broken list.
-    let initial_manifest = resolve_manifest(&paths, now);
+    let initial_manifest = manifest_guard.initial();
     let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
-    if let ManifestResolution::Regressed { manifest, problem } = &initial_manifest {
+    if let ManifestResolution::Regressed { manifest, problem } = initial_manifest {
         match read_identity(args, manifest, &paths, &RelayContext::from_process()) {
             Ok(Some(true)) => {
                 return refuse(
@@ -934,7 +935,7 @@ fn run_with(
     // path below unchanged. Without a signed manifest there are no bindings to
     // compare against; the fallback checks manifest history before allowing
     // upstream execution.
-    if let ManifestResolution::Active(manifest) = &initial_manifest {
+    if let ManifestResolution::Active(manifest) = initial_manifest {
         if let Some(status) =
             worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
         {
@@ -4086,43 +4087,6 @@ fn load_manifest(paths: &StatePaths, now: u64) -> Result<Manifest, ManifestProbl
     load_verified_manifest(paths, now).map(|verified| verified.manifest)
 }
 
-fn load_verified_manifest(
-    paths: &StatePaths,
-    now: u64,
-) -> Result<VerifiedManifest, ManifestProblem> {
-    if !paths.root.exists() {
-        return Err(ManifestProblem::Missing);
-    }
-    let _acceptance_lock = manifest_acceptance_lock(paths)
-        .map_err(|_| ManifestProblem::Invalid("manifest acceptance lock unavailable".into()))?;
-    let bytes = fs::read(&paths.manifest).map_err(|_| ManifestProblem::Missing)?;
-    let pin = trust_root::read(paths)?;
-    let envelope: SignedManifest = serde_json::from_slice(&bytes)
-        .map_err(|error| ManifestProblem::Invalid(error.to_string()))?;
-    let verified = validate_manifest_candidate(paths, &envelope, now, &pin)?;
-    let manifest = &verified.manifest;
-    if manifest.manifest_version > version_high_water(paths) {
-        write_version_high_water(paths, manifest.manifest_version);
-    }
-    write_last_valid_manifest(paths, manifest, &bytes);
-    retain_manifest(paths, &envelope, manifest.manifest_version);
-    Ok(verified)
-}
-
-// The daemon publisher and short-lived shim processes share this OS lock so a
-// newer acceptance cannot race a publisher's high-water check and rename.
-fn manifest_acceptance_lock(paths: &StatePaths) -> io::Result<crate::fs_lock::AdvisoryLockGuard> {
-    crate::private_storage::open_root(&paths.root)?;
-    let file = crate::private_storage::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(paths.root.join("manifest-acceptance.lock"))?;
-    file.lock()?;
-    Ok(crate::fs_lock::AdvisoryLockGuard::from_locked_file(file))
-}
-
 // Sync preflights a candidate without changing any accepted state. The shim's
 // status and execution paths use this same verifier before recording acceptance.
 fn validate_manifest_candidate(
@@ -4262,20 +4226,6 @@ impl ManifestResolution {
             Self::Regressed { problem, .. } | Self::Invalid(problem) => Some(problem),
             Self::Active(_) | Self::Dormant => None,
         }
-    }
-}
-
-fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
-    match load_manifest(paths, now) {
-        Ok(manifest) => ManifestResolution::Active(manifest),
-        Err(ManifestProblem::Missing | ManifestProblem::NoTrustRoot) => ManifestResolution::Dormant,
-        Err(problem) => match read_last_valid_manifest(paths) {
-            Some(cache) => ManifestResolution::Regressed {
-                manifest: cache.manifest,
-                problem,
-            },
-            None => ManifestResolution::Invalid(problem),
-        },
     }
 }
 
