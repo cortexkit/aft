@@ -4056,8 +4056,7 @@ impl ManifestProblem {
 
     fn fallback_notice_reason(&self) -> String {
         match self {
-            Self::Missing => "manifest unavailable".to_string(),
-            Self::NoTrustRoot => self.status_label(),
+            Self::Missing | Self::NoTrustRoot => "manifest unavailable".to_string(),
             Self::Invalid(reason) => reason.clone(),
             Self::BelowFloor { manifest_floor } => {
                 format!("manifest floor {manifest_floor}, shim floor {SCHEMA_FLOOR}")
@@ -4154,9 +4153,10 @@ fn load_verified_manifest(
     let _acceptance_lock = manifest_acceptance_lock(paths)
         .map_err(|_| ManifestProblem::Invalid("manifest acceptance lock unavailable".into()))?;
     let bytes = fs::read(&paths.manifest).map_err(|_| ManifestProblem::Missing)?;
+    let pin = trust_root::read(paths)?;
     let envelope: SignedManifest = serde_json::from_slice(&bytes)
         .map_err(|error| ManifestProblem::Invalid(error.to_string()))?;
-    let verified = validate_manifest_candidate(paths, &envelope, now)?;
+    let verified = validate_manifest_candidate(paths, &envelope, now, &pin)?;
     let manifest = &verified.manifest;
     if manifest.manifest_version > version_high_water(paths) {
         write_version_high_water(paths, manifest.manifest_version);
@@ -4186,6 +4186,7 @@ fn validate_manifest_candidate(
     paths: &StatePaths,
     envelope: &SignedManifest,
     now: u64,
+    pin: &trust_root::Pin,
 ) -> Result<VerifiedManifest, ManifestProblem> {
     if envelope.artifact_id != MANIFEST_ARTIFACT_ID {
         return Err(ManifestProblem::Invalid("artifact id mismatch".to_string()));
@@ -4200,7 +4201,7 @@ fn validate_manifest_candidate(
     let VerifiedManifest {
         manifest,
         verified_by_key_id,
-    } = verify_manifest_envelope(envelope, &trust_root::read(paths)?)?;
+    } = verify_manifest_envelope(envelope, pin)?;
     manifest.validate().map_err(ManifestProblem::Invalid)?;
     if manifest.schema_floor < SCHEMA_FLOOR {
         return Err(ManifestProblem::BelowFloor {
@@ -7637,7 +7638,10 @@ fn build_self_report(paths: &StatePaths, full_audit: bool) -> SelfReport {
     let (cached_manifest, last_rung) = if disabled {
         (disabled_manifest_report(), disabled_last_rung_report())
     } else {
-        (cached_manifest_report(paths), last_rung_report(paths))
+        (
+            cached_manifest_report_at(paths, unix_seconds()),
+            last_rung_report(paths),
+        )
     };
     let last_probe = if disabled {
         None
@@ -7723,10 +7727,6 @@ fn disabled_last_rung_report() -> LastRungReport {
         recorded_by_version: None,
         recorded_by_repo_key: None,
     }
-}
-
-fn cached_manifest_report(paths: &StatePaths) -> CachedManifestReport {
-    cached_manifest_report_at(paths, unix_seconds())
 }
 
 fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestReport {
@@ -14960,6 +14960,7 @@ INHERITED FLAGS
     fn envelope_v1_shapes_are_refused_by_the_v2_verifier() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
+        write_fixture_pin(&paths);
         let manifest = fixture_manifest();
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let key = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();

@@ -674,7 +674,9 @@ fn gh_shim_s2_one_agent_many_repos_exercises_binding_and_failure_arms() {
     assert_eq!(regressed.status.code(), Some(86));
     let regressed_stderr = String::from_utf8_lossy(&regressed.stderr);
     assert!(regressed_stderr.contains("gh_shim_manifest_regressed"));
-    assert!(regressed_stderr.contains("update aft, or install a manifest signed by a trusted key"));
+    assert!(regressed_stderr.contains(
+        "ask the operator to install a manifest signed by the daemon's pinned policy root"
+    ));
     assert!(
         !regressed_recorder.exists(),
         "a regressed governed invocation must not reach ambient gh"

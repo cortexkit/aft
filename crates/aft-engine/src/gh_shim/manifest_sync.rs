@@ -211,7 +211,9 @@ fn activate(paths: &StatePaths, latest: &Latest, now: u64) -> Option<Report> {
         signature: latest.envelope.signature.clone(),
         manifest_bytes: latest.envelope.manifest_bytes.clone(),
     };
-    let verified = match validate_manifest_candidate(paths, &envelope, now) {
+    let verified = match trust_root::read(paths)
+        .and_then(|pin| validate_manifest_candidate(paths, &envelope, now, &pin))
+    {
         Ok(verified) => verified,
         Err(problem) => return Some(candidate_report(latest, problem_reason(&problem))),
     };

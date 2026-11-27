@@ -150,7 +150,7 @@ thread_local! {
     static FIXTURE: RefCell<Option<Arc<Cache>>> = const { RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn with_fixture<T>(
     lookup: impl Fn(&str) -> Result<Option<String>, ()> + Send + Sync + 'static,
     run: impl FnOnce() -> T,
@@ -165,7 +165,7 @@ pub(super) fn with_fixture<T>(
     run()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn scope_fixture(attributes: serde_json::Value) -> ScopeStamp {
     serde_json::from_value(serde_json::json!({
         "owner": {"kind":"reserved","module_id":"test-module"},

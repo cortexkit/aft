@@ -89,3 +89,8 @@ pub(super) fn publish(paths: &StatePaths, reply: Reply, now: u64) -> io::Result<
         }
     }
 }
+
+#[cfg(all(test, unix))]
+pub(crate) fn seed_fixture(root: &std::path::Path) {
+    super::tests::write_fixture_pin(&StatePaths::from_root(root.to_path_buf()));
+}

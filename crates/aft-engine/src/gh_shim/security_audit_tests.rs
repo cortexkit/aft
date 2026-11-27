@@ -206,14 +206,21 @@ fn audit_v19_full_audit_status_matches_legacy_bytes_even_with_a_lookup_record() 
         br#"{"outcome":"unavailable","reason":"old daemon","at_unix_secs":7}"#,
     )
     .unwrap();
-    // The historical capture predates the summary default; --audit retains its schema.
+    // The status keeps the historical audit shape, apart from the changed
+    // source of trust reported in cached_manifest.
     let rendered = render_self_report(&fixture.paths, true).unwrap();
     let captured = include_str!("../../../aft/tests/fixtures/gh_shim/v19-main-status.jsonc");
     let (_, expected) = captured.split_once("// END HEADER\n").unwrap();
+    let (before, trust) = expected
+        .split_once(r#""compiled_trust_set_key_ids":["#)
+        .unwrap();
+    let (_, after) = trust.split_once("],").unwrap();
+    let expected =
+        format!(r#"{before}"pinned_trust_root_key_id":"gh-routing-dev-test-key-v1",{after}"#);
     let normalized = super::v19_compat_tests::normalize_v19_status(&rendered).unwrap();
     assert_eq!(
         normalized, expected,
-        "v19 full-audit status must match the frozen origin/main binary capture"
+        "v19 full-audit status must match the frozen capture except for trust provenance"
     );
 }
 
