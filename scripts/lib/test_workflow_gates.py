@@ -7,7 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import runpy
 import shlex
@@ -61,29 +61,79 @@ class BunSetupWorkflowTests(unittest.TestCase):
     def test_setup_bun_uses_only_the_committed_version_file_and_workflow_token(self) -> None:
         root = Path(__file__).resolve().parents[2]
         github = root / ".github"
-        self.assertRegex((root / ".bun-version").read_text().strip(), r"\A\d+\.\d+\.\d+\Z")
-        paths = [
-            path
+        pin = ".bun-version"
+        self.assertRegex((root / pin).read_text().strip(), r"\A\d+\.\d+\.\d+\Z")
+        definitions = {
+            path: workflow_gates.parse_workflow(str(path))
             for directory in (github / "workflows", github / "actions")
             for pattern in ("*.yml", "*.yaml")
             for path in directory.rglob(pattern)
-            if "oven-sh/setup-bun@" in path.read_text()
-        ]
-        for path in paths:
-            config = workflow_gates.parse_workflow(str(path))
-            groups = config.get("jobs", {"composite": config.get("runs", {})})
-            installs = [(group, index, step.get("with", {}))
-                        for group, job in groups.items()
-                        for index, step in enumerate(job.get("steps", []))
-                        if step.get("uses", "").startswith("oven-sh/setup-bun@")]
-            self.assertTrue(installs, f"unrecognized Bun setup steps in {path.relative_to(root)}")
-            for group, index, inputs in installs:
-                with self.subTest(path=path.relative_to(root), group=group, step=index):
-                    self.assertNotIn("bun-version", inputs, "direct versions, including latest, override .bun-version")
-                    self.assertNotIn("bun-download-url", inputs, "custom URLs bypass the shared version pin")
-                    self.assertEqual(inputs.get("bun-version-file"), ".bun-version")
-                    self.assertEqual(inputs.get("token"), "${{ github.token }}")
-        self.assertTrue(paths, "no Bun setup manifests checked")
+        }
+        groups = {
+            (path, name): job.get("steps", [])
+            for path, config in definitions.items()
+            for name, job in config.get("jobs", {"composite": config.get("runs", {})}).items()
+        }
+
+        def ordered_steps(path, group, ancestors=()):
+            self.assertNotIn(path, ancestors, f"recursive composite action: {path}")
+            for index, step in enumerate(groups[path, group]):
+                yield (path, group, index), step
+                action = step.get("uses", "")
+                if action.startswith("./.github/actions/"):
+                    for name in ("action.yml", "action.yaml"):
+                        nested = root / action / name
+                        if (nested, "composite") in groups:
+                            yield from ordered_steps(nested, "composite", (*ancestors, path))
+                            break
+
+        setup_action = "oven-sh/setup-bun@"
+        expected_sites = {
+            (path, group, index)
+            for (path, group), steps in groups.items()
+            for index, step in enumerate(steps)
+            if step.get("uses", "").startswith(setup_action)
+        }
+        workflow_refs = {
+            "",
+            "${{ github.sha }}",
+            # Landing policy validates the original PR head when there is one.
+            "${{ github.event.pull_request.head.sha || github.sha }}",
+        }
+        seen_sites = set()
+        for path, job in groups:
+            if not path.is_relative_to(github / "workflows"):
+                continue
+            checkout_pins = set()
+            # Composite steps use the caller's workspace and earlier checkouts.
+            for site, step in ordered_steps(path, job):
+                action = step.get("uses", "")
+                inputs = step.get("with") or {}
+                if action.startswith("actions/checkout@"):
+                    checkout_pin = PurePosixPath(inputs.get("path", ".")) / pin
+                    checkout_pins.discard(checkout_pin)
+                    # Do not rely on a checkout of another repository or an
+                    # arbitrary ref such as a release tag that predates the pin.
+                    if (
+                        not step.get("if")
+                        and not inputs.get("sparse-checkout")
+                        and inputs.get("repository", "${{ github.repository }}") == "${{ github.repository }}"
+                        and inputs.get("ref", "") in workflow_refs
+                    ):
+                        checkout_pins.add(checkout_pin)
+                if action.startswith(setup_action):
+                    seen_sites.add(site)
+                    with self.subTest(workflow=path.relative_to(root), job=job, step=site):
+                        self.assertNotIn("bun-version", inputs, "direct versions, including latest, override .bun-version")
+                        self.assertNotIn("bun-download-url", inputs, "custom URLs bypass the shared version pin")
+                        self.assertEqual(inputs.get("token"), "${{ github.token }}")
+                        self.assertIn(
+                            PurePosixPath(inputs.get("bun-version-file") or ""), checkout_pins,
+                            f"Bun must read {pin} from a preceding checkout of the workflow source; "
+                            f"valid paths: {[str(p) for p in sorted(checkout_pins)]}",
+                        )
+        self.assertTrue(expected_sites, "no Bun setup sites found")
+        self.assertEqual(seen_sites, expected_sites, "a Bun setup site was not checked in its caller's job")
 
 
 class ReleaseDebugArtifactWorkflowTests(unittest.TestCase):
