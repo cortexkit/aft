@@ -56,7 +56,6 @@
       "system_text_digests_match_text",
       "system_text_preflight_digest_stable",
       "catalog_schema_digest_stable",
-      "catalog_capability_filter_matches_describe",
       "catalog_digest_only",
       "catalog_unknown_preset_refused",
       "catalog_disabled_tool_absent",
@@ -87,12 +86,13 @@
       "crash_after_prepared_not_started",
       "crash_after_authorized_not_started",
       "tool_result_v1_valid",
-      "system_text_preset_optional_served"
+      "system_text_preset_optional_served",
+      "catalog_capability_filter_matches_describe",
+      "catalog_filter_preserves_plan_item",
+      "catalog_filter_model_refused"
     ],
     "inapplicable_cases": [
-      "system_text_default_served",
-      "catalog_filter_model_refused",
-      "catalog_filter_preserves_plan_item"
+      "system_text_default_served"
     ],
     "capabilities": [
       "disable_tool",
@@ -154,7 +154,6 @@
             "system_text_facts_malformed_refused",
             "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
-            "catalog_capability_filter_matches_describe",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
             "catalog_disabled_tool_absent",
@@ -222,9 +221,7 @@
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
             "stop_session_label_bounded",
-            "stop_session_items_bounded",
-            "catalog_filter_model_refused",
-            "catalog_filter_preserves_plan_item"
+            "stop_session_items_bounded"
           ],
           "capabilities": [
             "disable_tool",
@@ -262,7 +259,6 @@
             "system_text_facts_malformed_refused",
             "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
-            "catalog_capability_filter_matches_describe",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
             "catalog_disabled_tool_absent",
@@ -330,9 +326,7 @@
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
             "stop_session_label_bounded",
-            "stop_session_items_bounded",
-            "catalog_filter_model_refused",
-            "catalog_filter_preserves_plan_item"
+            "stop_session_items_bounded"
           ],
           "capabilities": [
             "disable_tool",
@@ -371,7 +365,6 @@
             "system_text_facts_malformed_refused",
             "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
-            "catalog_capability_filter_matches_describe",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
             "catalog_disabled_tool_absent",
@@ -439,9 +432,7 @@
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
             "stop_session_label_bounded",
-            "stop_session_items_bounded",
-            "catalog_filter_model_refused",
-            "catalog_filter_preserves_plan_item"
+            "stop_session_items_bounded"
           ],
           "capabilities": [
             "disable_tool",
@@ -479,7 +470,6 @@
             "system_text_facts_malformed_refused",
             "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
-            "catalog_capability_filter_matches_describe",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
             "catalog_disabled_tool_absent",
@@ -547,9 +537,7 @@
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
             "stop_session_label_bounded",
-            "stop_session_items_bounded",
-            "catalog_filter_model_refused",
-            "catalog_filter_preserves_plan_item"
+            "stop_session_items_bounded"
           ],
           "capabilities": [
             "disable_tool",
@@ -588,7 +576,6 @@
             "system_text_facts_malformed_refused",
             "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
-            "catalog_capability_filter_matches_describe",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
             "catalog_disabled_tool_absent",
@@ -656,9 +643,7 @@
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
             "stop_session_label_bounded",
-            "stop_session_items_bounded",
-            "catalog_filter_model_refused",
-            "catalog_filter_preserves_plan_item"
+            "stop_session_items_bounded"
           ],
           "capabilities": [
             "disable_tool",
@@ -690,7 +675,6 @@
             "system_text_facts_malformed_refused",
             "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
-            "catalog_capability_filter_matches_describe",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
             "catalog_disabled_tool_absent",
@@ -758,9 +742,7 @@
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
             "stop_session_label_bounded",
-            "stop_session_items_bounded",
-            "catalog_filter_model_refused",
-            "catalog_filter_preserves_plan_item"
+            "stop_session_items_bounded"
           ],
           "capabilities": [
             "disable_tool",
