@@ -111,7 +111,7 @@ async fn gh_shim_attached_all_off_does_not_poll_or_create_policy_state() {
     )
     .await;
     jail.bind_grant_head().await;
-    let reply = jail.tool_reply_on_channel(2, "bash", json!({"command":"test -z \"${AFT_GH_SHIM_ENABLED+x}${AFT_GH_SHIM_TRUST_ANCHOR+x}\" && printf SHIM_OFF"})).await;
+    let reply = jail.tool_reply_on_channel(2, "bash", json!({"description":"Check disabled routing", "command":"test -z \"${AFT_GH_SHIM_ENABLED+x}${AFT_GH_SHIM_TRUST_ANCHOR+x}\" && printf SHIM_OFF"})).await;
     let text = model_text(&reply);
     assert!(text.contains("SHIM_OFF"), "{text}");
     let _ = tokio::time::timeout(Duration::from_millis(250), async {
@@ -174,7 +174,7 @@ async fn gh_shim_attached_head_without_first_pin_refuses_before_upstream() {
     )
     .await;
     jail.bind_grant_head().await;
-    let reply = jail.tool_reply_on_channel(2, "bash", json!({"command":"printf 'marker=%s anchor=%s\\n' \"$AFT_GH_SHIM_ENABLED\" \"${AFT_GH_SHIM_TRUST_ANCHOR-unset}\"; gh issue comment 1 --body test; printf 'exit=%s\\n' \"$?\""})).await;
+    let reply = jail.tool_reply_on_channel(2, "bash", json!({"description":"Check refusal before the first pin", "command":"printf 'marker=%s anchor=%s\\n' \"$AFT_GH_SHIM_ENABLED\" \"${AFT_GH_SHIM_TRUST_ANCHOR-unset}\"; gh issue comment 1 --body test; printf 'exit=%s\\n' \"$?\""})).await;
     let text = model_text(&reply);
     assert!(text.contains("marker=1 anchor=unset"), "{text}");
     assert!(
@@ -209,7 +209,7 @@ async fn gh_shim_attached_refresh_pins_when_an_enabled_harness_overrides_a_top_l
     jail.bind_head_for_harness(jail.base.clone(), "opencode")
         .await;
     jail.wait_for_fixture_pin().await;
-    let reply = jail.tool_reply_on_channel(2, "bash", json!({"command":"test \"$AFT_GH_SHIM_ENABLED\" = 1 && test -n \"$AFT_GH_SHIM_TRUST_ANCHOR\" && printf 'HARNESS_PINNED'"})).await;
+    let reply = jail.tool_reply_on_channel(2, "bash", json!({"description":"Check the harness policy pin", "command":"test \"$AFT_GH_SHIM_ENABLED\" = 1 && test -n \"$AFT_GH_SHIM_TRUST_ANCHOR\" && printf 'HARNESS_PINNED'"})).await;
     let text = model_text(&reply);
     assert!(text.contains("HARNESS_PINNED"), "{text}");
 }

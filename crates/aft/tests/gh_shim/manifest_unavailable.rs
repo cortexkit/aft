@@ -468,7 +468,7 @@ fn gh_shim_manifest_unavailable_write_relay_does_not_replace_manifest_history() 
 
     fixture.high_water();
     for bypass in [false, true] {
-        fixture.assert_refused(&write, bypass, UNAVAILABLE);
+        fixture.assert_refused(&write, bypass, UNPINNED);
         fixture.assert_passthrough(&["issue", "view", "1"], bypass);
     }
     assert_eq!(daemon.catalog_requests(), 0);
@@ -504,7 +504,7 @@ fn gh_shim_live_off_delegates_when_a_provisioned_manifest_is_missing_or_invalid(
     let fixture = Fixture::new();
     fixture.high_water();
     let write = ["issue", "comment", "1", "--body", "offline"];
-    fixture.assert_refused(&write, false, UNAVAILABLE);
+    fixture.assert_refused(&write, false, UNPINNED);
 
     fixture.disable_shim();
     for invalid in [false, true] {
@@ -621,7 +621,7 @@ fn gh_shim_live_off_affects_new_children_but_not_an_already_launched_child() {
     let old = finish(old_child);
     assert_eq!(old.status.code(), Some(86), "{old:?}");
     assert_eq!(old.stdout, b"1\n");
-    assert_eq!(old.stderr, UNAVAILABLE.as_bytes());
+    assert_eq!(old.stderr, UNPINNED.as_bytes());
     assert!(!fixture.record.exists());
 }
 
