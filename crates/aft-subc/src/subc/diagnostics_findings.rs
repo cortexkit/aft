@@ -592,7 +592,9 @@ mod tests {
     }
 
     fn snapshot(metrics: &Value) -> Vec<Finding> {
-        from_health(metrics, Some(0), None, 1_000_000, 60_000)
+        // Finding classification tests use complete evidence. Deadline tests
+        // inject exhaustion separately.
+        from_health_with_budget(metrics, Some(0), None, 1_000_000, 60_000, || false)
     }
 
     #[test]
