@@ -192,6 +192,141 @@ class ReleaseDebugArtifactWorkflowTests(unittest.TestCase):
                     self.assertNotIn("pdb", config.get("name", ""))
 
 
+class InstallerReleaseAssetTests(unittest.TestCase):
+    TARGETS = ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "windows-arm64", "windows-x64")
+    TAG = "v99.8.7-rc.1"
+
+    def setUp(self) -> None:
+        self.root = Path(__file__).resolve().parents[2]
+        scratch = self.root / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        temp = tempfile.TemporaryDirectory(prefix="release-manifest-", dir=scratch)
+        self.addCleanup(temp.cleanup)
+        self.workdir = Path(temp.name)
+        self.script = self.root / "scripts/release-installer-assets.py"
+        self.stage = self.workdir / "installer-assets"
+        self.output = self.workdir / "release-assets"
+        self.output.mkdir()
+
+    def test_release_manifest_records_the_tested_binary_version_before_upload(self) -> None:
+        workflow = workflow_gates.parse_workflow(str(self.root / ".github/workflows/release.yml"))
+        steps = workflow["jobs"]["github-release"]["steps"]
+        indexes = {step.get("name"): i for i, step in enumerate(steps)}
+        package = indexes["Package alpha distribution zips"]
+        assemble = indexes["Assemble and verify installer release assets"]
+        self.assertLess(indexes["Verify tested Linux binary for release"], package)
+        self.assertLess(package, assemble)
+        self.assertLess(assemble, indexes["Create GitHub Release"])
+
+        for target in self.TARGETS:
+            raw = target.replace("windows-", "win32-") + ".exe" if target.startswith("windows-") else target
+            (self.output / f"aft-{raw}").write_text("fixture binary bytes")
+        binary = self.output / "aft-linux-x64"
+        binary.write_text('#!/bin/sh\n[ "$1" = "--version" ] || exit 2\nprintf "aft 99.8.7-rc.1\\n"\n')
+        binary.chmod(0o755)
+        (self.workdir / "scripts").mkdir()
+        shutil.copy(self.script, self.workdir / "scripts")
+        for index in (package, assemble):
+            result = subprocess.run(
+                ["bash", "-e", "-c", steps[index]["run"]],
+                cwd=self.workdir,
+                env={**os.environ, "GITHUB_REF_NAME": self.TAG},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result)
+        self.assertEqual(
+            {path.name for path in self.output.glob("ck-aft-*")},
+            {f"ck-aft-{target}.zip{suffix}" for target in self.TARGETS for suffix in ("", ".sha256")},
+        )
+        manifest = json.loads((self.output / "release-manifest.json").read_text())
+        self.assertRegex(manifest["requires_core"], r"^[0-9]+\.[0-9]+\.[0-9]+$")
+        expected = subprocess.check_output([binary, "--version"], text=True).rstrip("\n")
+        self.assertEqual(manifest["binaries"], {"ck-aft": {"reports": expected}})
+
+    def write_sidecar(self, path: Path) -> None:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        path.with_suffix(".zip.sha256").write_text(f"{digest}  {path.name}\n")
+
+    def stage_assets(self) -> Path:
+        self.stage.mkdir(exist_ok=True)
+        for target in self.TARGETS:
+            path = self.stage / f"ck-aft-{target}.zip"
+            member = zipfile.ZipInfo("ck-aft.exe" if target.startswith("windows-") else "ck-aft")
+            member.external_attr = 0o100755 << 16
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(member, b"fixture binary bytes")
+            self.write_sidecar(path)
+        return self.stage / "ck-aft-darwin-x64.zip"
+
+    def assert_assembly_refused(self, diagnostic: str) -> None:
+        result = subprocess.run(
+            [sys.executable, self.script, "assemble", self.stage, self.output, self.TAG],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1, result)
+        self.assertIn(diagnostic, result.stderr)
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_assembly_rejects_missing_sidecar(self) -> None:
+        path = self.stage_assets()
+        path.with_suffix(".zip.sha256").unlink()
+        self.assert_assembly_refused(f"wrong asset inventory: missing ['{path.name}.sha256']")
+
+    def test_assembly_rejects_missing_zip(self) -> None:
+        path = self.stage_assets()
+        path.unlink()
+        self.assert_assembly_refused(f"wrong asset inventory: missing ['{path.name}']")
+
+    def test_assembly_rejects_extra_zip(self) -> None:
+        path = self.stage_assets()
+        extra = self.stage / "ck-aft-extra.zip"
+        shutil.copyfile(path, extra)
+        self.assert_assembly_refused(f"unexpected ['{extra.name}']")
+
+    def test_assembly_rejects_digest_mismatch(self) -> None:
+        path = self.stage_assets()
+        path.with_suffix(".zip.sha256").write_text(f"{'0' * 64}  {path.name}\n")
+        self.assert_assembly_refused("checksum does not match the ZIP")
+
+    def test_assembly_rejects_two_member_zip_with_matching_digest(self) -> None:
+        path = self.stage_assets()
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr("extra", b"unexpected bytes")
+        self.write_sidecar(path)
+        self.assert_assembly_refused("expected only a nonempty ck-aft at the ZIP root")
+
+    def test_assembly_rejects_corrupt_zip_with_matching_digest(self) -> None:
+        path = self.stage_assets()
+        path.write_bytes(path.read_bytes().replace(b"fixture binary bytes", b"fixture corrupt byte"))
+        self.write_sidecar(path)
+        self.assert_assembly_refused("ZIP integrity check failed")
+
+    def test_release_manifest_rejects_malformed_assets(self) -> None:
+        path = self.workdir / "release-manifest.json"
+        for raw, diagnostic in (
+            ('{"requires_core":', "Expecting value"),
+            ('["1.2.3"]', "manifest must be a JSON object"),
+            ('{}', "requires_core must be a MAJOR.MINOR.PATCH string"),
+            ('{"requires_core": 123}', "requires_core must be a MAJOR.MINOR.PATCH string"),
+            ('{"requires_core": "1.2.3-rc.1"}', "requires_core must be a MAJOR.MINOR.PATCH string"),
+            ('{"requires_core": "1.2.3", "version": "4.5.6"}', "unknown manifest keys: version"),
+            ('{"requires_core": "1.2.3", "binaries": []}', "binaries must be a JSON object"),
+            ('{"requires_core": "1.2.3", "binaries": {"ck-aft": {"reports": "aft 4.5.6", "version": "4.5.6"}}}',
+             "binaries.ck-aft must contain only a reports key"),
+            ('{"requires_core": "1.2.3", "binaries": {"ck-aft": {"reports": 456}}}',
+             "binaries.ck-aft.reports must be a non-empty string"),
+        ):
+            with self.subTest(manifest=raw):
+                path.write_text(raw)
+                result = subprocess.run(
+                    [sys.executable, self.script, "check-manifest", path], capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 1, result)
+                self.assertIn(diagnostic, result.stderr)
+
+
 class CacheSaveRefGateTests(unittest.TestCase):
     """A main-only cache write is policy; a main-only check or job is dead code."""
 

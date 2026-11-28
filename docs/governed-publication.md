@@ -74,6 +74,14 @@ it reports when GitHub and npm succeeded but crates.io failed, and still exits
 1. Other blocking job failures retain fail-fast cancellation. Check the named
 jobs before treating a red run as a complete release failure.
 
+The GitHub release includes `release-manifest.json` alongside the `ck-aft` ZIPs
+and checksum sidecars. Its `requires_core` is the oldest `ck-subc` version this
+AFT release can register with. To change the floor for future releases, edit
+`REQUIRES_CORE` in `scripts/release-installer-assets.py` before tagging. The
+release job checks the ZIP inventory, digests, archive contents and manifest
+before uploading them to the draft. The manifest records the tested binary's
+version output for `ck setup` to check after installation.
+
 After the GitHub release exists, retry crates.io without rebuilding, rerunning
 E2E or republishing GitHub/npm:
 
