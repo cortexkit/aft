@@ -99,7 +99,7 @@ async fn consent_head_reader_missing_outside_paths_do_not_hold() {
         ),
         (
             "read",
-            json!({"filePath":missing}),
+            json!({"path":missing}),
             read_dispatch,
             "not_found",
             "read: file not found",
@@ -140,7 +140,7 @@ async fn consent_head_reader_missing_outside_paths_do_not_hold() {
         .send_tool_options(
             &f.head,
             "read",
-            json!({"filePath": f.dir.path().join("elsewhere.txt")}),
+            json!({"path": f.dir.path().join("elsewhere.txt")}),
             20,
             read_dispatch,
             false,
@@ -172,7 +172,7 @@ async fn consent_head_outside_missing_write_and_dangling_link_still_hold() {
         .checkout_tool(
             &f.head,
             "write",
-            json!({"filePath": missing, "content": "new"}),
+            json!({"path": missing, "content": "new"}),
             11,
             scope_dispatch,
         )
