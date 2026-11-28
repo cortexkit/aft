@@ -2075,3 +2075,59 @@ test("non-object formatter value keeps the section-drop notice", () => {
   expect(config.checker).toEqual({ go: "go" });
   expect(loaded.stderr).toContain("Discarded invalid configuration section: formatter");
 });
+
+test("harness block emptied by refusal does not clear the file's formatters", () => {
+  const fixture = createConfigFixture();
+  writeFileSync(
+    fixture.userConfigPath,
+    JSON.stringify({
+      formatter: { rust: "none", python: "ruff" },
+      harnesses: { pi: { formatter: { rust: "nixfmt" }, validate_on_edit: "syntax" } },
+    }),
+  );
+  const loaded = runConfigLoader(fixture.projectDirectory, {
+    HOME: join(fixture.root, "home"),
+    XDG_CONFIG_HOME: fixture.xdgConfigHome,
+  });
+  const config = JSON.parse(loaded.stdout);
+  expect(config.formatter).toEqual({ rust: "none", python: "ruff" });
+  expect(config.validate_on_edit).toBe("syntax");
+  expect(loaded.stderr).toContain("formatter.rust");
+});
+
+test("explicitly empty harness formatter block still clears", () => {
+  const fixture = createConfigFixture();
+  writeFileSync(
+    fixture.userConfigPath,
+    JSON.stringify({
+      formatter: { rust: "none" },
+      harnesses: { pi: { formatter: {} } },
+    }),
+  );
+  const loaded = runConfigLoader(fixture.projectDirectory, {
+    HOME: join(fixture.root, "home"),
+    XDG_CONFIG_HOME: fixture.xdgConfigHome,
+  });
+  const config = JSON.parse(loaded.stdout);
+  expect(config.formatter).toEqual({});
+});
+
+test("harness block with a non-refusal invalid formatter value is dropped whole", () => {
+  const fixture = createConfigFixture();
+  writeFileSync(
+    fixture.userConfigPath,
+    JSON.stringify({
+      formatter: { go: "gofmt" },
+      harnesses: {
+        pi: { formatter: { rust: "not-a-tool", go: "nixfmt" }, validate_on_edit: "syntax" },
+      },
+    }),
+  );
+  const loaded = runConfigLoader(fixture.projectDirectory, {
+    HOME: join(fixture.root, "home"),
+    XDG_CONFIG_HOME: fixture.xdgConfigHome,
+  });
+  const config = JSON.parse(loaded.stdout);
+  expect(config.formatter).toEqual({ go: "gofmt" });
+  expect(config.validate_on_edit).toBeUndefined();
+});

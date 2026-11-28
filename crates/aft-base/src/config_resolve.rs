@@ -2031,12 +2031,28 @@ fn apply_harness_override(
             // this file's map, so the block's other formatter entries (and
             // the rest of the block) survive and the warning names where the
             // pair was actually written.
+            let block_had_formatter_entries = override_config
+                .formatter
+                .as_ref()
+                .is_some_and(|formatter| !formatter.is_empty());
             sanitize_formatter_map(
                 &mut override_config,
                 &format!("harnesses.{key}.formatter"),
                 &tier.tier,
                 warnings,
             );
+            // A block whose formatter map was emptied only by refusals said
+            // "override these entries", not "clear the file's formatters":
+            // fold it as absent so the file's own map survives. An explicitly
+            // empty {} still replaces, as written.
+            if block_had_formatter_entries
+                && override_config
+                    .formatter
+                    .as_ref()
+                    .is_some_and(HashMap::is_empty)
+            {
+                override_config.formatter = None;
+            }
             merge_trusted_config(raw, override_config);
             raw.indexes = merge_indexes(raw.indexes, override_indexes, !trusted);
         }
@@ -2355,10 +2371,16 @@ fn formatter_map_schema(generator: &mut schemars::SchemaGenerator) -> schemars::
         .get("additionalProperties")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({ "type": "string" }));
+    // A pattern-matched key is excluded from additionalProperties, so the
+    // pattern entry carries the full value schema plus the pair refusal;
+    // additionalProperties (kept) still checks the sole unmatched key, `nix`.
+    // [\s\S] (not `.`) so keys containing line breaks — which the loaders
+    // refuse as unknown languages — are flagged too, and `$` stays the
+    // string end (no `m` flag) so a plain `nix` never matches.
     schema.insert(
         "patternProperties".to_string(),
         serde_json::json!({
-            "^(?!nix$).*$": { "allOf": [value_schema, { "not": { "const": "nixfmt" } }] }
+            "^(?!nix$)[\\s\\S]*$": { "allOf": [value_schema, { "not": { "const": "nixfmt" } }] }
         }),
     );
     schema
@@ -4290,6 +4312,43 @@ mod tests {
             refusal.is_some_and(|warning| warning.tier == "user"),
             "the refusal must name the block that set it: {:?}",
             result.warnings
+        );
+    }
+
+    #[test]
+    fn a_harness_block_emptied_by_refusal_leaves_the_files_formatters_intact() {
+        // "Override these entries" must not become "clear the map" when every
+        // entry was refused; an explicit {} still clears, as written.
+        let emptied = super::resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"formatter":{"rust":"none","python":"ruff"},"harnesses":{"opencode":{"formatter":{"rust":"nixfmt"}}}}"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert!(emptied.errors.is_empty(), "{:?}", emptied.errors);
+        assert_eq!(
+            emptied
+                .config
+                .formatter
+                .get("rust")
+                .map(String::as_str)
+                .zip(emptied.config.formatter.get("python").map(String::as_str)),
+            Some(("none", "ruff")),
+            "refusal must not clear the file's own map: {:?}",
+            emptied.config.formatter
+        );
+        let explicit_empty = super::resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"formatter":{"rust":"none"},"harnesses":{"opencode":{"formatter":{}}}}"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert!(
+            explicit_empty.errors.is_empty() && explicit_empty.config.formatter.is_empty(),
+            "an explicit empty block must still clear: {:?}",
+            explicit_empty.config.formatter
         );
     }
 

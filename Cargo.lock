@@ -260,6 +260,7 @@ dependencies = [
  "crossbeam-channel",
  "dekobon-tree-sitter-groovy",
  "env_logger",
+ "fancy-regex 0.14.0",
  "filetime",
  "flate2",
  "fsevent-sys",

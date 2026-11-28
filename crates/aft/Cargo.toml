@@ -329,6 +329,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# ECMA-style look-around for validating JSON Schema patterns in tests.
+fancy-regex = "0.14"
 aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
 aft-db = { path = "../aft-db", version = "0.66.0", features = ["test-support"] }
 aft-parse = { path = "../aft-parse", version = "0.66.0", features = ["test-support"] }

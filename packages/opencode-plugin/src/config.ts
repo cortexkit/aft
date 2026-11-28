@@ -1361,30 +1361,37 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig | n
         partialConfig[key] = parsed[key];
       }
     } else if (key === "formatter" && isConfigRecord(configForParsing.formatter)) {
-      // A formatter map fails as a whole when one pair is bad (e.g.
-      // formatter.rust = "nixfmt"), but the other languages' settings are
-      // valid and must survive: keep every entry except the offending ones.
+      // A formatter map fails as a whole when a refused nixfmt pair is in it,
+      // but the other languages' settings are valid and must survive: drop
+      // only the refused pairs and re-validate. Any other invalid value keeps
+      // the pre-existing whole-section drop, matching the Rust resolver.
       // A non-object value (number, array) falls through to the generic
       // section drop: its entries are not recoverable language settings.
-      const kept: Record<string, string> = {};
       const dropped: string[] = [];
+      const attempted: Record<string, unknown> = {};
       for (const [language, value] of Object.entries(configForParsing.formatter)) {
-        if (!FormatterEnum.safeParse(value).success || (value === "nixfmt" && language !== "nix")) {
+        if (value === "nixfmt" && language !== "nix") {
           dropped.push(language);
           continue;
         }
-        kept[language] = value as string;
+        attempted[language] = value;
       }
-      if (Object.keys(kept).length > 0) {
-        partialConfig.formatter = kept;
-      }
-      if (dropped.length > 0) {
+      const retried = AftConfigSchema.safeParse({ formatter: attempted });
+      if (dropped.length > 0 && retried.success) {
+        if (Object.keys(attempted).length > 0) {
+          partialConfig.formatter = (retried.data as { formatter: Record<string, string> })
+            .formatter;
+        }
         invalidSections.push(
           `formatter: dropped ${dropped.map((l) => `formatter.${l}`).join(", ")} — ${sectionResult.error.issues
             .filter((i) => i.path[0] === "formatter")
             .map((i) => `${i.path.join(".")}: ${i.message}`)
             .join(", ")}`,
         );
+      } else {
+        // Not (only) a refusal we may recover: drop the section as before.
+        warn(`Discarded invalid configuration section: ${key}`);
+        invalidSections.push(key);
       }
     } else if (key === "harnesses" && isConfigRecord(configForParsing.harnesses)) {
       // A harness block that fails only on refused formatter pairs keeps the
@@ -1407,15 +1414,22 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig | n
           droppedBlocks.push(name);
           continue;
         }
-        const keptFormatter = Object.fromEntries(
-          Object.entries(block.formatter).filter(
-            ([language, value]) =>
-              FormatterEnum.safeParse(value).success &&
-              !(value === "nixfmt" && language !== "nix"),
-          ),
-        );
+        const recoveredFormatter: Record<string, unknown> = {};
+        for (const [language, value] of Object.entries(block.formatter)) {
+          if (value === "nixfmt" && language !== "nix") continue;
+          recoveredFormatter[language] = value;
+        }
+        const recoveredBlock: Record<string, unknown> = { ...block };
+        if (Object.keys(recoveredFormatter).length > 0) {
+          recoveredBlock.formatter = recoveredFormatter;
+        } else {
+          // Every entry was refused (or the map was empty): the block did not
+          // ask to clear the file's formatters, so fold it without a formatter
+          // key rather than as an empty override map.
+          delete recoveredBlock.formatter;
+        }
         const retried = AftConfigSchema.safeParse({
-          harnesses: { [name]: { ...block, formatter: keptFormatter } },
+          harnesses: { [name]: recoveredBlock },
         });
         if (retried.success) {
           const parsed = (retried.data as { harnesses: Record<string, unknown> }).harnesses;

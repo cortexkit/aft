@@ -134,7 +134,7 @@
         ]
       },
       "patternProperties": {
-        "^(?!nix$).*$": {
+        "^(?!nix$)[\\s\\S]*$": {
           "allOf": [
             {
               "type": "string",
@@ -1037,7 +1037,7 @@
               ]
             },
             "patternProperties": {
-              "^(?!nix$).*$": {
+              "^(?!nix$)[\\s\\S]*$": {
                 "allOf": [
                   {
                     "type": "string",

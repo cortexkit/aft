@@ -15,6 +15,49 @@ fn user_fixture(value: Value) -> crate::config_resolve::ConfigTier {
 }
 
 #[test]
+fn formatter_schema_pattern_flags_every_non_nix_key() {
+    fn find(node: &serde_json::Value, out: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "patternProperties" {
+                        if let Some(pairs) = value.as_object() {
+                            out.extend(pairs.keys().filter(|p| p.contains("(?!nix")).cloned());
+                        }
+                    }
+                    find(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|i| find(i, out)),
+            _ => {}
+        }
+    }
+    let schema = editor_schema();
+    let mut patterns = Vec::new();
+    find(&schema, &mut patterns);
+    assert_eq!(
+        patterns.len(),
+        2,
+        "top-level and harness block: {patterns:?}"
+    );
+    for pattern in patterns {
+        // JSON Schema patterns are ECMA-262: `regex` has no look-around, so
+        // evaluate with a lookahead-capable engine.
+        let re = fancy_regex::Regex::new(&pattern).expect("valid ECMA-style pattern");
+        for flagged in ["rust", "rust\n", "x\u{2028}y", "nix ", "nix\n"] {
+            assert!(
+                re.is_match(flagged).unwrap(),
+                "{flagged:?} must be flagged by {pattern}"
+            );
+        }
+        assert!(
+            !(re.is_match("nix").unwrap()),
+            "nix must stay outside {pattern}"
+        );
+    }
+}
+
+#[test]
 fn config_settings_editor_output_is_unchanged() {
     let mut bytes = serde_json::to_vec_pretty(&editor_schema()).unwrap();
     bytes.push(b'\n');

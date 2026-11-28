@@ -305,7 +305,9 @@ Omit an optional setting instead of using `null`.
   // in effect and a lower-precedence config file's value for that language survives.
   // Harness blocks follow the same rule: a refused pair is dropped from the
   // block (the notice names harnesses.<name>.formatter) and the block's rest
-  // still applies; a block's formatter map as a whole replaces the file's.
+  // still applies; a block's formatter map as a whole replaces the file's —
+  // unless refusal emptied it, which folds as no formatter override, while an
+  // explicitly empty {} still replaces and clears, as written.
   "formatter": {
     "typescript": "biome",
     "rust": "rustfmt"
