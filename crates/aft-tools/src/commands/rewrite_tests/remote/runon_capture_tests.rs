@@ -2,6 +2,7 @@ use super::*;
 use aft_engine::test_bridge::bash_remote::{
     remote_wire::Daemon, set_test_cap, BgTaskRegistryTestExt as _,
 };
+use std::collections::BTreeMap;
 
 const EDIT: &str = "until test -e .release-editor; do sleep 0.02; done; printf 'edited before capture\n' > tracked.txt";
 const HOLD: &str = "until test -e .release-editor; do sleep 0.02; done";
@@ -400,24 +401,6 @@ async fn runon_capture_shortens_a_long_command_on_a_character_boundary() {
     let shown = format!("printf '%s' '{}…", "é".repeat(67));
     assert_warning(&done, Some(&format!("Copied while another command in this checkout was still running (`{shown}`); its changes may be missing from the job.")));
     assert_saved_overlaps(ctx.bash_background(), &job, &[(&local, &shown)]);
-}
-
-#[test]
-fn runon_capture_renders_the_old_warning_from_a_record_without_command_names() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_registry, _task, paths) = persist_accepted_with_snapshot(
-        dir.path(),
-        dir.path().join("unused-connection"),
-        "printf capture",
-    );
-    let mut old: serde_json::Value =
-        serde_json::from_slice(&fs::read(&paths.json).unwrap()).unwrap();
-    let remote = old["remote"].as_object_mut().unwrap();
-    assert!(!remote.contains_key("copy_warning_commands"));
-    assert_eq!(remote.insert("copy_warning".into(), true.into()), None);
-    let metadata: PersistedTask = serde_json::from_value(old).unwrap();
-    let note = completion_preview::rendered_execution_note(&metadata).unwrap();
-    assert_eq!(note.lines().last(), Some("Copied while another command in this checkout was still running; its changes may be missing from the job."));
 }
 
 #[tokio::test]

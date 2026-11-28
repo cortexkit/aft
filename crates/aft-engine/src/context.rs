@@ -10364,7 +10364,8 @@ impl AppContext {
         self.standalone_plugin_host.store(true, Ordering::Release);
     }
 
-    pub(crate) fn missing_plugin_route(&self) -> bool {
+    #[doc(hidden)]
+    pub fn missing_plugin_route(&self) -> bool {
         matches!(
             crate::access_policy::current_ask_route(),
             crate::access_policy::AskRoute::Lowered

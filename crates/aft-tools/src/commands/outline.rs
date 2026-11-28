@@ -2734,7 +2734,7 @@ fn outline_many_files(
                 skipped_files.push(((index, 0), SkippedFile::new(file, "denied_floor")));
             }
             Err(response) if response.data["code"] == "path_not_found" => {
-                skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
+                skipped_files.push(((index, 0), SkippedFile::new(file, "file_not_found")));
             }
             Err(response) => return Err(response),
         }
