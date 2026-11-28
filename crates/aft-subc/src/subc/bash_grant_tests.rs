@@ -247,9 +247,14 @@ fn grant_case(name: &str, role: tool_provider::RouteRole, trust: BindTrust) -> G
 /// The grants a first, unapproved call is refused with. They are the same
 /// strings a model can derive from the command text on its own.
 async fn first_refusal(case: &GrantCase) -> Vec<String> {
-    let refusal = call_bash(&case.executor, &case.routes, 7, json!({"command": COMMAND}))
-        .await
-        .bash();
+    let refusal = call_bash(
+        &case.executor,
+        &case.routes,
+        7,
+        json!({"command": COMMAND, "description":"Run the grant fixture"}),
+    )
+    .await
+    .bash();
     assert_eq!(refusal["code"], "permission_required", "{refusal}");
     let grants = grants_named_by(&refusal);
     assert!(

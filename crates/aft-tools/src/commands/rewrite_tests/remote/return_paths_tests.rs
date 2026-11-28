@@ -28,8 +28,10 @@ async fn runon_return_paths_can_copy_back_outside_cwd_but_inside_the_checkout() 
         exec_runs(&daemon)[0]["return_paths"],
         serde_json::json!(REQUESTED)
     );
-    assert_eq!(fs::read(dir.path().join(CAPTURE)).unwrap(), b"hello");
     let output = reply.data["output"].as_str().unwrap();
+    let copied = fs::read(dir.path().join(CAPTURE))
+        .unwrap_or_else(|error| panic!("return file missing: {error}; runner output: {output}"));
+    assert_eq!(copied, b"hello");
     assert!(
         output.contains(
             "These files changed on the server and were NOT copied back:\n  \

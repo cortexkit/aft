@@ -676,14 +676,6 @@ fn audit_restart_wait_is_not_started_and_changed_scope_or_digest_conflicts() {
     ));
 }
 
-pub(super) fn shell_fixture_arguments(name: &str, mut arguments: Value) -> Value {
-    if let Some(args) = arguments.as_object_mut().filter(|_| name == "bash") {
-        args.entry("description")
-            .or_insert_with(|| json!("Run the approval fixture"));
-    }
-    arguments
-}
-
 async fn audit_keyed_reply(
     f: &Fixture,
     run: &RouteIdentity,
@@ -701,7 +693,7 @@ async fn audit_keyed_reply(
         1,
         9499,
         serde_json::to_vec(
-            &json!({"name":name,"preset":"head","arguments":shell_fixture_arguments(name, arguments),"call_key":call_key}),
+            &json!({"name":name,"preset":"head","arguments":crate::subc::bash_selector_tests::shell_fixture_arguments(name, arguments),"call_key":call_key}),
         )
         .unwrap(),
     )

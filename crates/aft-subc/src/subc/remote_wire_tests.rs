@@ -89,7 +89,7 @@ fn pin(
 }
 
 fn request(name: &str, preset: &str, args: Value, key: &str, pin: String) -> Value {
-    json!({"op":"tool.call", "name":name, "preset":preset, "arguments":args, "call_key":key, "schema_pin":pin})
+    json!({"op":"tool.call", "name":name, "preset":preset, "arguments":crate::subc::bash_selector_tests::shell_fixture_arguments(name, args), "call_key":key, "schema_pin":pin})
 }
 
 fn reply(frame: Frame) -> Value {

@@ -1491,20 +1491,7 @@ async fn bind_route_on_channel(stream: &mut TcpStream, root: &Path, v1: bool, ch
 }
 
 async fn send_tool_call(stream: &mut TcpStream, corr: u64, name: &str, arguments: Value) {
-    let body = json!({ "name": name, "arguments": arguments });
-    send_frame(
-        stream,
-        Frame::build(
-            FrameType::Request,
-            Flags::new(false, Priority::Interactive, false),
-            ROUTE_CHANNEL,
-            1,
-            corr,
-            serde_json::to_vec(&body).expect("tool call body"),
-        )
-        .expect("tool call frame"),
-    )
-    .await;
+    send_tool_call_with_preset(stream, corr, name, arguments, None).await;
 }
 
 /// [`send_tool_call`] naming the catalog preset the caller runs under, as a

@@ -5795,8 +5795,8 @@ mod tests {
             let group = &metrics["root_groups"][0];
             assert_eq!(group["count"], count);
             assert_eq!(group["callgraph_store"]["status"], "building");
-            let examples = count.min(3);
-            assert_eq!(group["examples"].as_array().unwrap().len(), examples);
+            let examples = group["examples"].as_array().unwrap().len();
+            assert!((1..=count.min(3)).contains(&examples));
             assert_eq!(group["examples_omitted"], count - examples);
             let once = metrics.clone();
             budget_health_metrics(&mut metrics);

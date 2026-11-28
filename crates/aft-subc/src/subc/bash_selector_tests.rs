@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) fn shell_fixture_arguments(name: &str, mut arguments: Value) -> Value {
+    if let Some(args) = arguments.as_object_mut().filter(|_| name == "bash") {
+        args.entry("description")
+            .or_insert_with(|| json!("Run the shell fixture"));
+    }
+    arguments
+}
+
 #[tokio::test]
 async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() {
     let (dir, root) = test_support::test_root("v1-bash-selector");
