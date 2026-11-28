@@ -3368,7 +3368,7 @@ fn handle_configure_inner(
             identity_provisional = true;
             degraded_reasons
                 .push(crate::root_identity::key::PROVISIONAL_IDENTITY_REASON.to_string());
-            // A busy database still uses the background identity retry.
+            // A busy database still triggers the background retry that resolves the root's artifact identity.
             next_config.indexes.trigram = false;
             next_config.indexes.semantic = false;
             next_config.indexes.callgraph = false;

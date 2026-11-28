@@ -2215,7 +2215,7 @@ fn handle_semantic_search_inner(
     if let Some(external_root) = external_root {
         return handle_external_unindexed_fallback(req, ctx, &params, top_k, &shape, external_root);
     }
-    // An unsettled identity prevents index reads; use bounded grep instead.
+    // An unsettled artifact identity prevents index reads; use bounded grep instead.
     if let Some(reason) = ctx.artifact_identity_provisional_reason() {
         return semantic_unavailable_grep_fallback_response(
             req,
