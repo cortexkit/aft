@@ -450,6 +450,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "commands/inspect.rs",
+        enclosing_item: "assert_timeout, walk_with_expired_phase_deadline_reports_real_truncation",
+        location_or_primitive: "walk_truncated",
+        reason: "The deadline tests assert whether an inspect reply discloses an incomplete walk; neither assertion cuts a result list.",
+    },
+    ExclusionEntry {
+        file: "commands/read/opened_checks.rs",
+        enclosing_item: "authorized",
+        location_or_primitive: ".take()",
+        reason: "A test hook takes its one pending callback so it runs once; it does not cut file content or a result list.",
+    },
+    ExclusionEntry {
         file: "access_policy/linked_worktree.rs",
         enclosing_item: "nearest_common_dir, read_pointer",
         location_or_primitive: "MAX_ANCESTORS, MAX_POINTER_BYTES",
