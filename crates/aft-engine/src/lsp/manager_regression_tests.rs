@@ -1409,7 +1409,12 @@ fn flycheck_overflow_leaves_no_running_or_completed_check_and_rearms() {
     manager.drain_events();
     assert_eq!(manager.rust_check_state(&key), RustCheckState::Running);
 
-    fill_progress_queue(&manager, &key, 1);
+    // The fake server's startup status can take the last slot while we fill
+    // the queue. Use no receive order for filler so dropping it cannot make
+    // real events from the server look older than the overflow.
+    while manager.event_rx.len() < EVENT_CAP {
+        manager.event_tx.send(progress("report")).unwrap();
+    }
     manager.event_tx.send(progress("end")).unwrap();
     manager.drain_events();
     assert_eq!(
@@ -1433,12 +1438,28 @@ fn flycheck_overflow_leaves_no_running_or_completed_check_and_rearms() {
     manager.rearm_unreported_rust_check(&key);
     assert_eq!(manager.rust_check_state(&key), RustCheckState::Running);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !manager.rust_check_completed_current(&key) {
-        assert!(
-            Instant::now() < deadline,
-            "the replacement check did not complete"
-        );
-        manager.drain_events();
+    let mut events_drained = 0;
+    let mut events_accepted = 0;
+    loop {
+        let drained = manager.drain_events();
+        events_drained += drained.processed;
+        events_accepted += drained.events.len();
+        if manager.rust_check_completed_current(&key) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let checks = std::fs::read_to_string(&log);
+            let lines = checks
+                .as_deref()
+                .map(|text| text.lines().collect::<Vec<_>>());
+            panic!(
+                "the replacement check did not complete: rust_check_state={:?}, \
+                 checks.log exists={}, checks.log lines={lines:?}, \
+                 events drained={events_drained} ({events_accepted} accepted)",
+                manager.rust_check_state(&key),
+                log.exists(),
+            );
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     let checks = std::fs::read_to_string(log).unwrap();
