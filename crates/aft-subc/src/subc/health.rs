@@ -10657,8 +10657,11 @@ mod tests {
         let report_metrics = report.metrics.expect("health metrics");
 
         assert_eq!(report_metrics["root_count"].as_u64(), Some(50));
-        for plane in ["search_index", "semantic_index", "callgraph_store"] {
-            let off = if plane == "semantic_index" { 25 } else { 0 };
+        for (plane, off) in [
+            ("search_index", 50),
+            ("semantic_index", 25),
+            ("callgraph_store", 50),
+        ] {
             assert_eq!(
                 report_metrics["index_plane_counts"][plane],
                 json!({"ready": 0, "building": 0, "unavailable": 0, "off": off, "disabled": 50 - off}),
