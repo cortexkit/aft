@@ -34,7 +34,7 @@ impl LinuxBirth {
 
 /// A PID and its recorded epoch start time, with a stronger birth on Linux.
 /// Use [`Self::same_process`] to compare identities. An old record without a
-/// native birth can match two identities with the same epoch. Those identities
+/// Linux birth record can match two identities with the same epoch. Those identities
 /// do not match each other if their native births differ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessIdentity {

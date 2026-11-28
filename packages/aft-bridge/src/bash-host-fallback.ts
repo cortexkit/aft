@@ -11,7 +11,7 @@ export const BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES = 100 * 1024;
 export const BASH_HOST_FALLBACK_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const BASH_HOST_FALLBACK_REFUSAL = "AFT module connection is down";
 
-/** The bash `description` prompt shared by both plugins and the generated catalog. */
+/** The Bash `description` prompt shared by the OpenCode and Pi plugins and the generated catalog. */
 export const BASH_DESCRIPTION = "Human-readable description shown in UI (5-10 words)";
 
 // Agent-visible text, approved by Ufuk; change it only with his approval.

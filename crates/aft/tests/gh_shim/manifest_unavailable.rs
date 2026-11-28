@@ -565,6 +565,7 @@ fn gh_shim_live_off_does_not_bypass_native_worker_guard() {
 
 #[test]
 fn gh_shim_live_off_affects_new_children_but_not_an_already_launched_child() {
+    use aft::config::Config;
     use std::io::Write;
     use std::process::{Child, Stdio};
 

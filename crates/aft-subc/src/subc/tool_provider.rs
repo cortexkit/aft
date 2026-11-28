@@ -5169,7 +5169,8 @@ mod tests {
         }
     }
 
-    const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
+    const REGENERATE_CATALOG: &str =
+        "cargo test -p aft-subc --lib regenerate_tool_provider_catalog --locked -- --ignored";
     const NOTICE_TEMPLATE_VECTORS: &str = "../../test-vectors/aft-notice-templates-v1.2";
 
     fn notice_template_vectors() -> BTreeMap<String, String> {
@@ -5186,7 +5187,7 @@ mod tests {
                 "for completion output tails, which also changes their `generation` and\n",
                 "`catalog_digest`. The reader catalog and `*.sends.json` files are unchanged.\n",
                 "Versions 1 and 1.1 remain as published.\n\n",
-                "Regenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;\n",
+                "Regenerate with `cargo test -p aft-subc --lib regenerate_notice_template_vectors -- --ignored`;\n",
                 "`notice_template_vectors_match_samples` compares every byte.\n",
             ).into(),
         );
@@ -5362,7 +5363,7 @@ mod tests {
         }
         std::fs::write(
             Path::new(crate::test_support::manifest_dir())
-                .join("tests/fixtures/tool_provider_bash_false_catalog.json"),
+                .join("../aft/tests/fixtures/tool_provider_bash_false_catalog.json"),
             serde_json::to_vec(&bash_false_catalog(BASH_FALSE_CONFIG)).unwrap(),
         )
         .unwrap();

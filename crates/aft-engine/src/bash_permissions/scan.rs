@@ -296,7 +296,7 @@ pub(crate) struct DirectoryTarget {
 /// invalid. Shell behavior the check cannot follow continues to run as before.
 /// Follow reachable outer-shell folder and physical-mode alternatives, keeping
 /// successful and failed commands separate so `&&` and `||` stay correlated.
-/// Treat a valid `cd` to a known copied directory as successful until a command
+/// Treat a valid `cd` to a directory in the checkout snapshot as successful until a command
 /// could modify the copied directories or affect how `cd` resolves paths. Keep
 /// tracking cwd even when the `known_directory` probe can no longer prove success.
 /// Before a command after `;` or a newline, use an unknown cwd if a speculative

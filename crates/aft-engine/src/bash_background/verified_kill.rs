@@ -1075,7 +1075,7 @@ mod tests {
         assert!(
             matches!(registry.replay_kill(&metadata), ReplayKill::Process(found) if found == pid)
         );
-        // An unreaped child keeps the group visible even after it stops.
+        // Until we wait on the stopped child, its process group stays visible.
         let _listing_fault =
             crate::bash_background::process::group_listing_test::scoped_listing_failure(pgid);
         settle_unattached_pty(&registry, &mut metadata, paths);
