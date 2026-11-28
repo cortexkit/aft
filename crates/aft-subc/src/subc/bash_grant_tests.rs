@@ -88,7 +88,7 @@ fn grant_test_route(
     role: tool_provider::RouteRole,
     trust: BindTrust,
 ) -> HashMap<RouteChannel, RouteIdentity> {
-    let identity = RouteIdentity(Arc::new(RouteIdentityData {
+    let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: root.clone(),
         project_root: root.as_path().into(),

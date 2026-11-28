@@ -24,7 +24,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     ));
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root.clone(), ctx));
-    let identity = RouteIdentity(Arc::new(RouteIdentityData {
+    let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: root.clone(),
         project_root: root.as_path().into(),
@@ -199,7 +199,7 @@ async fn route_cancel_test_tool(
     arguments: Value,
     preview: bool,
 ) -> mpsc::Receiver<wire::WriterFrame> {
-    let identity = RouteIdentity(Arc::new(RouteIdentityData {
+    let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: root.clone(),
         project_root: root.as_path().into(),
@@ -731,7 +731,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
     ));
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-    let identity = RouteIdentity(Arc::new(RouteIdentityData {
+    let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: root.clone(),
         project_root: root.as_path().into(),

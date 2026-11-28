@@ -25,7 +25,15 @@ pub(super) fn prepare_bind(
 ) {
     // Configure replay needs the current fleet snapshot, even though this
     // route will not be installed until after its acknowledgment is written.
-    sync_bound_root(executor, delivery, routes, root_channels, root, metrics);
+    let ctx = actor_context(executor, root, Some(metrics));
+    sync_bound_root(
+        ctx.as_deref(),
+        delivery,
+        routes,
+        root_channels,
+        root,
+        metrics,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -41,9 +49,23 @@ pub(super) fn install_route(
 ) {
     let root = identity.root.clone();
     let previous_root = routes.get(&channel).map(|route| route.root.clone());
-    insert_route_channel(routes, root_channels, channel, identity);
+    let ctx = actor_context(executor, &root, Some(metrics));
+    installed_routes::insert_route_channel_with_actor(
+        routes,
+        root_channels,
+        channel,
+        identity,
+        ctx.as_deref(),
+    );
     publish_sessions(delivery, routes);
-    sync_bound_root(executor, delivery, routes, root_channels, &root, metrics);
+    sync_bound_root(
+        ctx.as_deref(),
+        delivery,
+        routes,
+        root_channels,
+        &root,
+        metrics,
+    );
     if additional_root != &root {
         sync_policy(executor, routes, root_channels, additional_root, metrics);
     }
@@ -54,15 +76,15 @@ pub(super) fn install_route(
 }
 
 fn sync_bound_root(
-    executor: &Executor,
+    ctx: Option<&AppContext>,
     delivery: &Arc<RouteDeliverySessions>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     root: &ProjectRootId,
     metrics: &DispatchPathMetrics,
 ) {
-    if let Some(ctx) = actor_context(executor, root, Some(metrics)) {
-        apply_policy(&ctx, root, indexed_worker_only(routes, root_channels, root));
+    if let Some(ctx) = ctx {
+        apply_policy(ctx, root, indexed_worker_only(routes, root_channels, root));
         metrics.mark_frame_loop_wait_for_root(
             "bash.live_delivery_sessions",
             root,

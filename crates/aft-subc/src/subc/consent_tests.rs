@@ -858,7 +858,7 @@ fn identity(root: &Path, scope: Option<subc_protocol::scope::ScopeStamp>) -> Rou
     let session = scope
         .as_ref()
         .map_or("standalone".to_string(), |stamp| stamp.scope_ref.clone());
-    RouteIdentity(Arc::new(RouteIdentityData {
+    RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),

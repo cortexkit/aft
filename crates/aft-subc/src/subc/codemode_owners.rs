@@ -162,7 +162,7 @@ impl Snapshot {
         };
         Some((
             channel,
-            RouteIdentity(Arc::new(RouteIdentityData {
+            RouteIdentity::new(Arc::new(RouteIdentityData {
                 output_scope: Default::default(),
                 root,
                 project_root: self.project_root,

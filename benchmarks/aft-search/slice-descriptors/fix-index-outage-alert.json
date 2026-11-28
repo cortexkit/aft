@@ -1,0 +1,7 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "note": "AFT's health reports an index that has not been ready on any open project for an hour, without changing search ranking."
+}

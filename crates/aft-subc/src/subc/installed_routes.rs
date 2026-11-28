@@ -17,6 +17,31 @@ pub(super) struct RouteBindCompletion {
     pub(super) flags: Flags,
 }
 
+#[derive(Debug)]
+pub(super) struct RouteIdentity(
+    pub(super) Arc<RouteIdentityData>,
+    Option<aft_engine::context::MeaningOpenerGuard>,
+);
+
+impl RouteIdentity {
+    pub(super) fn new(data: Arc<RouteIdentityData>) -> Self {
+        Self(data, None)
+    }
+
+    fn into_snapshot(self) -> Self {
+        drop(self.1);
+        Self::new(self.0)
+    }
+}
+
+impl Clone for RouteIdentity {
+    fn clone(&self) -> Self {
+        // Only the installed entry owns the guard. Work queued on a route
+        // can keep its identity without keeping the route open.
+        Self::new(Arc::clone(&self.0))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RootChannels {
     pub(super) channels: HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -190,7 +215,7 @@ pub(super) fn remove_route_channel(
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     channel: RouteChannel,
 ) -> Option<RouteIdentity> {
-    let removed = routes.remove(&channel);
+    let removed = routes.remove(&channel).map(RouteIdentity::into_snapshot);
     if let Some(identity) = &removed {
         status_unbound(identity);
         runner_notices::route_unbound(identity);
@@ -200,29 +225,42 @@ pub(super) fn remove_route_channel(
     removed
 }
 
+pub(super) fn insert_route_channel_with_actor(
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    channel: RouteChannel,
+    mut identity: RouteIdentity,
+    ctx: Option<&AppContext>,
+) {
+    if opens_meaning_root(&identity) {
+        crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
+        identity.1 = ctx.map(AppContext::track_meaning_opener);
+    }
+    crate::late_result_bus::status::route_bound(
+        Arc::as_ptr(&identity.0) as usize,
+        &identity.session,
+    );
+    let root = identity.root.clone();
+    if let Some(previous) = routes
+        .insert(channel, identity)
+        .map(RouteIdentity::into_snapshot)
+    {
+        status_unbound(&previous);
+        runner_notices::route_unbound(&previous);
+        remove_root_channel(root_channels, &previous.root, channel);
+        release_semantic_opener_if_unrouted(routes, &previous);
+    }
+    root_channels.entry(root).or_default().insert(channel);
+}
+
+#[cfg(test)]
 pub(super) fn insert_route_channel(
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     channel: RouteChannel,
     identity: RouteIdentity,
 ) {
-    if opens_meaning_root(&identity) {
-        crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
-    }
-    crate::late_result_bus::status::route_bound(
-        Arc::as_ptr(&identity.0) as usize,
-        &identity.session,
-    );
-    if let Some(previous) = routes.insert(channel, identity.clone()) {
-        status_unbound(&previous);
-        runner_notices::route_unbound(&previous);
-        remove_root_channel(root_channels, &previous.root, channel);
-        release_semantic_opener_if_unrouted(routes, &previous);
-    }
-    root_channels
-        .entry(identity.root.clone())
-        .or_default()
-        .insert(channel);
+    insert_route_channel_with_actor(routes, root_channels, channel, identity, None);
 }
 
 #[cfg(test)]
@@ -318,6 +356,7 @@ mod tests {
         use crate::semantic_admission::{admission, SemanticAdmission::*};
 
         let (_dir, root) = test_root("meaning-route-lifetime");
+        let ctx = test_ctx();
         let mut routes = HashMap::new();
         let mut roots = HashMap::new();
         let plugin = route_key(61, 1);
@@ -330,14 +369,17 @@ mod tests {
             ("opencode", Some("worker"), NotOpened),
             ("pi", Some("ephemeral"), NotOpened),
         ] {
-            insert_route_channel(
+            insert_route_channel_with_actor(
                 &mut routes,
                 &mut roots,
                 plugin,
                 meaning_route(&root, harness, scope),
+                Some(&ctx),
             );
             let observed = admission(root.as_path(), &[]);
+            assert_eq!(ctx.has_meaning_opener(), expected == InteractiveSession);
             remove_route_channel(&mut routes, &mut roots, plugin);
+            assert!(!ctx.has_meaning_opener(), "closed {harness} {scope:?}");
             assert_eq!(observed, expected, "{harness} {scope:?}");
         }
 
@@ -345,34 +387,74 @@ mod tests {
         let second = route_key(63, 1);
         let worker = route_key(64, 1);
         for (channel, scope) in [(first, "head"), (second, "head"), (worker, "worker")] {
-            insert_route_channel(
+            insert_route_channel_with_actor(
                 &mut routes,
                 &mut roots,
                 channel,
                 meaning_route(&root, "broca", Some(scope)),
+                Some(&ctx),
             );
         }
+        let detached_snapshot = routes[&first].clone();
         remove_route_channel(&mut routes, &mut roots, first);
         assert_eq!(admission(root.as_path(), &[]), InteractiveSession);
+        assert!(ctx.has_meaning_opener(), "second Head is still installed");
         remove_route_channel(&mut routes, &mut roots, second);
+        assert!(
+            !ctx.has_meaning_opener(),
+            "a detached identity is not a live route"
+        );
+        assert_eq!(detached_snapshot.root, root);
         assert_eq!(
             admission(root.as_path(), &[]),
             NotOpened,
             "a worker with the same session does not hold the opener"
         );
-        insert_route_channel(
+        insert_route_channel_with_actor(
             &mut routes,
             &mut roots,
             first,
             meaning_route(&root, "broca", Some("head")),
+            Some(&ctx),
         );
         assert_eq!(admission(root.as_path(), &[]), InteractiveSession);
+        assert!(ctx.has_meaning_opener());
         clear_installed_routes(&mut routes);
+        assert!(!ctx.has_meaning_opener());
         assert_eq!(
             admission(root.as_path(), &[]),
             NotOpened,
             "connection teardown closes the opener"
         );
+    }
+
+    #[test]
+    fn meaning_opener_is_released_on_same_channel_replacement() {
+        let (_left_dir, left) = test_root("meaning-route-before-replacement");
+        let (_right_dir, right) = test_root("meaning-route-after-replacement");
+        let left_ctx = test_ctx();
+        let right_ctx = test_ctx();
+        let mut routes = HashMap::new();
+        let mut roots = HashMap::new();
+        let channel = route_key(61, 1);
+        for (root, ctx) in [(&left, &left_ctx), (&right, &right_ctx)] {
+            insert_route_channel_with_actor(
+                &mut routes,
+                &mut roots,
+                channel,
+                meaning_route(root, "runner", Some("head")),
+                Some(ctx),
+            );
+            assert!(ctx.has_meaning_opener());
+        }
+        assert!(
+            !left_ctx.has_meaning_opener(),
+            "the previous root still owns a guard"
+        );
+        // The closed identity can outlive the installed route.
+        let closed = remove_route_channel(&mut routes, &mut roots, channel).unwrap();
+        assert_eq!(closed.root, right);
+        assert!(!right_ctx.has_meaning_opener());
     }
 
     #[test]

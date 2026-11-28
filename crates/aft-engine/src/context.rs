@@ -2559,14 +2559,6 @@ impl App {
     pub fn actor_root_count(&self) -> usize {
         self.active_actor_roots.load(Ordering::SeqCst)
     }
-
-    pub fn set_open_route_count(&self, count: usize) {
-        self.open_routes.store(count, Ordering::SeqCst);
-    }
-
-    pub fn open_route_count(&self) -> usize {
-        self.open_routes.load(Ordering::SeqCst)
-    }
 }
 
 impl Default for App {
@@ -2932,6 +2924,7 @@ pub struct AppContext {
     /// this Arc so a sender installed after construction is observed at emit time.
     progress_sender: SharedProgressSender,
     status_emitter: StatusEmitter,
+    meaning_openers: Arc<AtomicUsize>,
     /// Present only for daemon-bound actors. Standalone NDJSON contexts never
     /// acquire a status-holder transport and therefore keep the solo bar path.
     fleet_status_client: RwLock<Option<crate::fleet_status::FleetStatusClient>>,
@@ -3127,6 +3120,8 @@ pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
 }
 
 mod lsp_access;
+mod route_lifetime;
+pub use route_lifetime::MeaningOpenerGuard;
 #[path = "context/runtime_handles.rs"]
 mod runtime_handles;
 mod watcher_matcher;
@@ -3398,6 +3393,7 @@ impl AppContext {
             configure_warnings_rx,
             progress_sender: Arc::clone(&progress_sender),
             status_emitter,
+            meaning_openers: Default::default(),
             fleet_status_client: RwLock::new(None),
             status_bar_last_emitted: StatusBarEmission::default(),
             status_bar_cached: RwLock::new(StatusBarCache::default()),

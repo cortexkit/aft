@@ -23,7 +23,7 @@ mod slow_restore;
 
 fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteIdentity {
     let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":name,"scope_epoch":7})),"owner_authorized":true,"attributes":{"agent_id":match kind {"head"=>Some(name),"ephemeral" if parent.is_none()=>Some("head"),_=>None}}})).unwrap();
-    RouteIdentity(Arc::new(RouteIdentityData {
+    RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),
@@ -495,7 +495,7 @@ fn with_carrier(route: &RouteIdentity, principal: &str) -> RouteIdentity {
     if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
         *principal_id = Some(principal.into());
     }
-    RouteIdentity(Arc::new(data))
+    RouteIdentity::new(Arc::new(data))
 }
 
 fn assert_saved_scope_grants(
@@ -636,7 +636,7 @@ fn basal_session_run(parent: &RouteIdentity, worker: bool) -> RouteIdentity {
             .spawn_principal
             .clone(),
     }));
-    RouteIdentity(Arc::new(run))
+    RouteIdentity::new(Arc::new(run))
 }
 
 #[test]
@@ -776,7 +776,7 @@ fn linked_worktree_reads_follow_only_the_authenticated_heads_repository() {
     );
     let mut flow = copied_identity(&head);
     flow.scope.as_mut().unwrap().attributes.flow_id = Some("flow".into());
-    read(&RouteIdentity(Arc::new(flow)), &linked_file, ask);
+    read(&RouteIdentity::new(Arc::new(flow)), &linked_file, ask);
     check(
         &head,
         BindTrust::Untrusted,
@@ -836,7 +836,7 @@ fn saved_scope_grants_basal_codemode_keeps_grants_but_flow_id_loses_them() {
     flow.scope.as_mut().unwrap().attributes.flow_id = Some("flow-target-lease".into());
     assert_saved_scope_grants(
         &ctx,
-        &RouteIdentity(Arc::new(flow)),
+        &RouteIdentity::new(Arc::new(flow)),
         &outside,
         Some(crate::access_policy::ScopeGrantsDenial::Flow),
     );
@@ -871,7 +871,7 @@ fn saved_scope_grants_unknown_scope_kind_fails_closed_with_typed_reason() {
     std::fs::write(&outside, "saved authority").unwrap();
     let mut unknown = copied_identity(&worker);
     unknown.scope.as_mut().unwrap().kind = subc_protocol::scope::ScopeKind::Ephemeral;
-    let unknown = with_carrier(&RouteIdentity(Arc::new(unknown)), "reserved:basal");
+    let unknown = with_carrier(&RouteIdentity::new(Arc::new(unknown)), "reserved:basal");
     assert_saved_scope_grants(
         &ctx,
         &unknown,
@@ -882,13 +882,13 @@ fn saved_scope_grants_unknown_scope_kind_fails_closed_with_typed_reason() {
     parentless.scope.as_mut().unwrap().parent = None;
     assert_saved_scope_grants(
         &ctx,
-        &RouteIdentity(Arc::new(parentless)),
+        &RouteIdentity::new(Arc::new(parentless)),
         &outside,
         Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
     );
     let mut missing = copied_identity(&worker);
     missing.scope = None;
-    let missing = RouteIdentity(Arc::new(missing));
+    let missing = RouteIdentity::new(Arc::new(missing));
     register(&missing, &ctx).unwrap();
     assert_saved_scope_grants(
         &ctx,
@@ -905,7 +905,7 @@ fn federated_scope_cannot_use_saved_grants_or_act_as_a_worker() {
     std::fs::write(&outside, "saved authority").unwrap();
     let mut federated = copied_identity(&worker);
     federated.scope.as_mut().unwrap().kind = subc_protocol::scope::ScopeKind::Federated;
-    let federated = RouteIdentity(Arc::new(federated));
+    let federated = RouteIdentity::new(Arc::new(federated));
     assert!(!alfonso_worker(&federated));
     assert!(head_scope(&federated).is_none());
     assert_saved_scope_grants(
@@ -921,7 +921,7 @@ fn worker_at_parent_epoch(worker: &RouteIdentity, parent: &str, epoch: u64) -> R
     let parent_stamp = data.scope.as_mut().unwrap().parent.as_mut().unwrap();
     parent_stamp.scope_ref = parent.into();
     parent_stamp.scope_epoch = epoch;
-    RouteIdentity(Arc::new(data))
+    RouteIdentity::new(Arc::new(data))
 }
 
 #[test]
@@ -958,7 +958,7 @@ fn grants_head_policy_never_crosses_identity_future_or_end_boundaries() {
         .unwrap()
         .owner =
         serde_json::from_value(json!({"kind":"reserved","module_id":"another-owner"})).unwrap();
-    for caller in [different, future, RouteIdentity(Arc::new(other_owner))] {
+    for caller in [different, future, RouteIdentity::new(Arc::new(other_owner))] {
         let error = remote_policy::catalog(
             catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
             &caller,
@@ -1172,7 +1172,7 @@ fn copied_identity(identity: &RouteIdentity) -> RouteIdentityData {
 fn at_epoch(identity: &RouteIdentity, epoch: u64) -> RouteIdentity {
     let mut data = copied_identity(identity);
     data.scope.as_mut().unwrap().scope_epoch = epoch;
-    RouteIdentity(Arc::new(data))
+    RouteIdentity::new(Arc::new(data))
 }
 
 #[cfg(unix)]
@@ -1657,7 +1657,7 @@ async fn grants_revived_launch_isolates_ref_owner_session_and_preset() {
                 data.root = ProjectRootId::from_path(&data.project_root).unwrap();
             }
         }
-        let other = RouteIdentity(Arc::new(data));
+        let other = RouteIdentity::new(Arc::new(data));
         let ctx = Arc::new(ctx);
         first_read(ctx.clone(), other.clone(), preset).await;
         let db = ctx.db().unwrap();

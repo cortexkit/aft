@@ -9,7 +9,7 @@ fn identity(root: &Path, scope: Value, principal: &str) -> RouteIdentity {
     } else {
         subc_protocol::call_mode::CallMode::Classic
     };
-    RouteIdentity(Arc::new(RouteIdentityData {
+    RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),

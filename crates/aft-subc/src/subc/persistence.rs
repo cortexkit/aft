@@ -972,7 +972,7 @@ mod tests {
             "kind": "worker", "owner_authorized": true,
         }))
         .unwrap();
-        let worker = RouteIdentity(Arc::new(RouteIdentityData {
+        let worker = RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
             project_root: unscoped.project_root.clone(),

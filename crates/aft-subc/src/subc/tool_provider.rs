@@ -7440,7 +7440,7 @@ pub(in crate::subc) mod route_tests {
         let (_dir, root) = test_support::test_root("tool-provider-admission");
         let ctx = test_support::test_ctx();
         ctx.mark_database_runtime_initializing_for_test();
-        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+        let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().into(),
@@ -7784,7 +7784,7 @@ pub(in crate::subc) mod route_tests {
     /// A tool-provider/v1 route whose access questions go to an OpenCode
     /// plugin prompt, so an outside read on it would normally ask the person.
     fn plugin_prompt_v1_identity(root: &crate::path_identity::ProjectRootId) -> RouteIdentity {
-        RouteIdentity(Arc::new(RouteIdentityData {
+        RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().into(),
@@ -8961,7 +8961,7 @@ pub(in crate::subc) mod route_tests {
         let _stop = StopChild(metadata.pgid.unwrap());
         let ctx = runner_restore_context(&root);
         let project_id = ProjectRootId::from_path(&project).unwrap();
-        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+        let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: project_id,
             project_root: project.clone(),
@@ -9186,7 +9186,7 @@ pub(in crate::subc) mod route_tests {
     /// catalog can record its edit mode under the route's key.
     fn head_route(root: &ProjectRootId, session: &str) -> RouteIdentity {
         let scope = serde_json::from_value(json!({"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "head-scope", "scope_epoch": 1, "kind": "head", "owner_authorized": true})).unwrap();
-        RouteIdentity(Arc::new(RouteIdentityData {
+        RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().into(),
@@ -10284,7 +10284,7 @@ pub(in crate::subc) mod route_tests {
         ctx.set_db(Arc::new(std::sync::Mutex::new(
             crate::db::open(&storage.path().join("aft.db")).unwrap(),
         )));
-        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+        let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: ProjectRootId::from_path(&root).unwrap(),
             project_root: root.clone(),

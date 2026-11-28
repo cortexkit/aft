@@ -12,11 +12,11 @@
     "reason": "Split bridge integration tests by tool family pending; AFT crate split lane."
   },
   "crates/aft-subc/src/subc/mod.rs": {
-    "lines": 12347,
+    "lines": 12344,
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft-engine/src/context.rs": {
-    "lines": 11109,
+    "lines": 11105,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft-engine/src/lsp/manager.rs": {
@@ -80,7 +80,7 @@
     "reason": "Split inspect command assembly by area pending; AFT crate split lane."
   },
   "crates/aft-subc/src/subc/health.rs": {
-    "lines": 5262,
+    "lines": 5229,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."
   }
 }

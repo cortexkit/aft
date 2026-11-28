@@ -680,8 +680,8 @@ pub const PROVISIONAL_IDENTITY_REASON: &str =
     "identity provisional: aft.db was busy at bind; indexes start once the database is free";
 /// Replaces [`PROVISIONAL_IDENTITY_REASON`] once the background retry gives up.
 pub(crate) const PROVISIONAL_IDENTITY_EXHAUSTED_REASON: &str = "identity provisional: aft.db stayed busy or unreadable for 5 minutes after bind, so this folder has no search, semantic or call-graph index. Close whatever holds aft.db open (usually another AFT process in a long write), then reopen this folder's session to bind it again";
-pub(crate) const GIT_IDENTITY_UNAVAILABLE_REASON: &str =
-    "identity provisional: git_identity_unavailable";
+#[doc(hidden)]
+pub const GIT_IDENTITY_UNAVAILABLE_REASON: &str = "identity provisional: git_identity_unavailable";
 
 /// Like [`resolve_root_identity_with_recheck`], but a busy aft.db yields a
 /// provisional identity instead of an error. The caller must not store any
