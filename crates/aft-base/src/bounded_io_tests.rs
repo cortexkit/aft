@@ -690,43 +690,40 @@ fn queued_time_does_not_consume_running_access_budget() {
 
 #[test]
 fn running_access_keeps_shorter_request_deadline() {
-    let (started_tx, started_rx) = channel();
+    // A running operation keeps the caller's shorter deadline. Read the actual
+    // deadline after the helper starts; do not make helper startup a latency
+    // test. `mutation_admission_keeps_the_running_access_cap` and
+    // `running_helper_timeout_has_only_native_platform_hint` pin the separate
+    // `read_blocked` expiry and its native diagnostic.
+    let watchdog = Duration::from_secs(30);
+    let budget = Budget::after(watchdog);
+    let request_deadline = budget.deadline;
+    let (deadline_tx, deadline_rx) = channel();
     let (release_tx, release_rx) = channel();
-    let (finished_tx, finished_rx) = channel();
     let caller = std::thread::spawn(move || {
-        with_budget(Some(Budget::after(Duration::from_millis(80))), || {
+        with_budget(Some(budget), || {
             run_with_timeout(
                 Path::new("running-past-request"),
                 None,
                 Limiter::new(1),
-                Duration::from_secs(1),
+                watchdog * 2,
                 None,
                 move |_| {
-                    let _ = started_tx.send(());
-                    let _ = release_rx.recv();
-                    let _ = finished_tx.send(());
+                    deadline_tx
+                        .send(HELPER_DEADLINE.with(std::cell::Cell::get))
+                        .unwrap();
+                    release_rx.recv().unwrap();
                     Ok(())
                 },
             )
         })
     });
-    let started = started_rx.recv_timeout(IO_BUDGET);
-    let error = caller.join().unwrap().unwrap_err();
-    let _ = release_tx.send(());
-    finished_rx.recv_timeout(IO_BUDGET).unwrap();
-    started.expect("the filesystem operation must actually start");
-    assert_eq!(timeout_code(&error), "read_blocked");
-    let message = error.to_string();
-    let duration = message
-        .split_once("within ")
-        .unwrap()
-        .1
-        .split_once(" s")
-        .unwrap()
-        .0
-        .parse::<f64>()
-        .unwrap();
-    assert!((0.0..=0.080).contains(&duration), "{error}");
+    let deadline = deadline_rx
+        .recv_timeout(watchdog)
+        .expect("the filesystem operation must actually start");
+    release_tx.send(()).unwrap();
+    caller.join().unwrap().unwrap();
+    assert_eq!(deadline, Some(request_deadline));
 }
 
 #[cfg(unix)]
