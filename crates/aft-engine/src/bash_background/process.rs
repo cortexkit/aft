@@ -151,7 +151,7 @@ pub(crate) mod group_listing_test {
             .insert(pgid);
     }
 
-    #[cfg(all(unix, feature = "test-support"))]
+    #[cfg(any(all(target_os = "linux", test), all(unix, feature = "test-support")))]
     pub(crate) fn scoped_listing_failure(pgid: i32) -> impl Drop {
         struct RestoreListing(i32);
 
