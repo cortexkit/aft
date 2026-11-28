@@ -1186,14 +1186,15 @@ pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum LineEnding {
+#[doc(hidden)]
+pub enum LineEnding {
     Lf,
     Crlf,
 }
 
 impl LineEnding {
     /// Mixed files use their majority ending; ties and files without newlines use LF.
-    pub(crate) fn dominant(source: &str) -> Self {
+    pub fn dominant(source: &str) -> Self {
         let (mut lf, mut crlf) = (0, 0);
         for (index, _) in source.match_indices('\n') {
             if index > 0 && source.as_bytes()[index - 1] == b'\r' {
@@ -1209,7 +1210,7 @@ impl LineEnding {
         }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Lf => "\n",
             Self::Crlf => "\r\n",
