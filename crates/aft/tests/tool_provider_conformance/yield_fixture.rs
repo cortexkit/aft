@@ -20,8 +20,9 @@ impl Drop for ReleaseGuard<'_> {
 }
 
 pub(super) fn call(subject: &Subject, tagged: bool) -> Option<CallSpec> {
-    // A handed-back call needs a session for its completion notice; worker
-    // calls have no session to wake, and the reader has no shell tool.
+    // A call returned while it is still running needs a session for its
+    // completion notice. Worker calls have no session to wake, and reader
+    // routes do not offer a shell tool.
     if subject.preset == Some("worker") || !subject.serves_shell() || cfg!(windows) {
         return None;
     }
@@ -41,7 +42,7 @@ pub(super) fn call(subject: &Subject, tagged: bool) -> Option<CallSpec> {
         );
         Some((
             "bash".into(),
-            json!({"command": command, "wait": true, "timeout": 300000}),
+            json!({"command": command, "description":"Wait for the yield fixture release", "wait": true, "timeout": 300000}),
         ))
     } else {
         std::fs::write(&file, b"read fixture\n").expect("write read fixture");
