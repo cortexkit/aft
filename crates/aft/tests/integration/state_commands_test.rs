@@ -689,19 +689,51 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     );
     assert_eq!(grep["success"], true, "{grep}");
     assert_eq!(grep["fallback"], "filesystem", "{grep}");
-    assert_eq!(
-        grep["index"]["trigram"]["reason"], "identity_provisional",
-        "{grep}"
-    );
+    assert_index_unavailable(&grep["index"]["trigram"]);
+    let glob = aft.send(&json!({"id": "glob", "command": "glob", "pattern": "*.rs"}).to_string());
+    assert_eq!(glob["success"], true, "{glob}");
+    assert_index_unavailable(&glob["index"]["trigram"]);
     let search = aft.send(
         &json!({"id": "search", "command": "semantic_search", "query": "unreadable_git_marker", "top_k": 5}).to_string(),
     );
     assert_eq!(search["success"], true, "{search}");
-    assert!(
-        search.to_string().contains("git_identity_unavailable"),
-        "{search}"
+    for lane in ["trigram", "semantic"] {
+        assert_index_unavailable(&search["lanes"][lane]);
+    }
+    let callers_request = json!({"id": "callers", "command": "callers", "file": source, "symbol": "unreadable_git_marker"});
+    let callers = aft.send(&callers_request.to_string());
+    assert_eq!(callers["code"], "callgraph_unavailable", "{callers}");
+    assert_index_unavailable(&callers["index"]["callgraph"]);
+    let zoom = aft.send(&json!({"id": "zoom-graph", "command": "zoom", "file": source, "symbol": "unreadable_git_marker", "callgraph": true}).to_string());
+    assert_eq!(zoom["success"], true, "{zoom}");
+    assert_eq!(zoom["callgraph"]["code"], "callgraph_unavailable", "{zoom}");
+    assert_index_unavailable(&zoom["callgraph"]["index"]);
+    let inspect = aft.send(
+        &json!({"id": "inspect", "command": "inspect", "sections": ["dead_code"]}).to_string(),
     );
-    assert!(search.to_string().contains("dubious ownership"), "{search}");
+    assert_eq!(inspect["success"], true, "{inspect}");
+    let dead_code = &inspect["analyses"]["dead_code"];
+    assert_eq!(dead_code["code"], "callgraph_unavailable", "{inspect}");
+    assert_index_unavailable(&dead_code["index"]);
+    let status_request = json!({ "id": "status", "command": "status" });
+    let status = aft.send(&status_request.to_string());
+    for index in ["search_index", "semantic_index", "callgraph_store"] {
+        assert_index_unavailable(&status[index]);
+    }
+    assert_no_artifact_state(storage.path());
+
+    let mut off = bind.clone();
+    off["config"] = super::helpers::user_config(json!({
+        "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+    }));
+    let response = aft.send(&off.to_string());
+    assert_eq!(response["success"], true, "{response}");
+    let callers = aft.send(&callers_request.to_string());
+    assert_eq!(callers["code"], "callgraph_off", "{callers}");
+    let status = aft.send(&status_request.to_string());
+    assert_eq!(status["search_index"]["status"], "off", "{status}");
+    assert_eq!(status["callgraph_store"]["status"], "off", "{status}");
+    assert_eq!(status["semantic_index"]["status"], "disabled", "{status}");
     assert_no_artifact_state(storage.path());
 
     fs::remove_file(blocked).unwrap();
@@ -715,6 +747,15 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
         "git"
     );
     assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+fn assert_index_unavailable(index: &Value) {
+    assert_eq!(index["status"], "unavailable", "{index}");
+    let reason = index["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("git_identity_unavailable"), "{index}");
+    assert!(reason.contains("dubious ownership"), "{index}");
+    assert!(!reason.contains("enable it"), "{index}");
 }
 
 /// After a finalizing bind, wait until the index store has built exactly one
