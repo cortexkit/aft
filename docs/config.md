@@ -303,6 +303,9 @@ Omit an optional setting instead of using `null`.
   // (the Rust resolver warns, the plugins report a validation error) instead of
   // disabling that language's formatter detection — the map's other entries stay
   // in effect and a lower-precedence config file's value for that language survives.
+  // Harness blocks follow the same rule: a refused pair is dropped from the
+  // block (the notice names harnesses.<name>.formatter) and the block's rest
+  // still applies; a block's formatter map as a whole replaces the file's.
   "formatter": {
     "typescript": "biome",
     "rust": "rustfmt"

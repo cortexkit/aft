@@ -2448,3 +2448,40 @@ test("formatter refusal keeps the lower file's value for that language", () => {
   expect(config.formatter).toEqual({ rust: "none" });
   expect(loaded.stderr).toContain("formatter.rust");
 });
+
+test("harness block keeps its rest when a formatter pair is refused", () => {
+  const fixture = createConfigFixture();
+  writeFileSync(
+    fixture.userConfigPath,
+    JSON.stringify({
+      formatter: { rust: "none" },
+      harnesses: {
+        opencode: { formatter: { rust: "nixfmt", go: "gofmt" } },
+        other: { formatter: { python: "ruff" } },
+      },
+    }),
+  );
+  const loaded = runConfigLoader(fixture.projectDirectory, {
+    HOME: join(fixture.root, "home"),
+    XDG_CONFIG_HOME: fixture.xdgConfigHome,
+  });
+  const config = JSON.parse(loaded.stdout);
+  expect(config.formatter).toEqual({ go: "gofmt" });
+  expect(loaded.stderr).toContain("formatter.rust");
+});
+
+test("non-object formatter value keeps the section-drop notice", () => {
+  const fixture = createConfigFixture();
+  writeFileSync(
+    fixture.userConfigPath,
+    JSON.stringify({ formatter: 42, checker: { go: "go" } }),
+  );
+  const loaded = runConfigLoader(fixture.projectDirectory, {
+    HOME: join(fixture.root, "home"),
+    XDG_CONFIG_HOME: fixture.xdgConfigHome,
+  });
+  const config = JSON.parse(loaded.stdout);
+  expect(config.formatter).toBeUndefined();
+  expect(config.checker).toEqual({ go: "go" });
+  expect(loaded.stderr).toContain("Discarded invalid configuration section: formatter");
+});

@@ -135,9 +135,29 @@
       },
       "patternProperties": {
         "^(?!nix$).*$": {
-          "not": {
-            "const": "nixfmt"
-          }
+          "allOf": [
+            {
+              "type": "string",
+              "enum": [
+                "biome",
+                "oxfmt",
+                "prettier",
+                "deno",
+                "ruff",
+                "black",
+                "rustfmt",
+                "goimports",
+                "gofmt",
+                "nixfmt",
+                "none"
+              ]
+            },
+            {
+              "not": {
+                "const": "nixfmt"
+              }
+            }
+          ]
         }
       }
     },
@@ -1018,9 +1038,29 @@
             },
             "patternProperties": {
               "^(?!nix$).*$": {
-                "not": {
-                  "const": "nixfmt"
-                }
+                "allOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "biome",
+                      "oxfmt",
+                      "prettier",
+                      "deno",
+                      "ruff",
+                      "black",
+                      "rustfmt",
+                      "goimports",
+                      "gofmt",
+                      "nixfmt",
+                      "none"
+                    ]
+                  },
+                  {
+                    "not": {
+                      "const": "nixfmt"
+                    }
+                  }
+                ]
               }
             }
           },

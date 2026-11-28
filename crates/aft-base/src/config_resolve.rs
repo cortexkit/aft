@@ -1159,7 +1159,7 @@ pub fn resolve_config_for_harness(
         // into the accumulated map: dropping the entry here keeps the file's
         // other formatter keys alive and lets a lower file's value for that
         // language survive (a post-merge removal would erase both).
-        sanitize_formatter_map(&mut raw, &tier.tier, &mut warnings);
+        sanitize_formatter_map(&mut raw, "formatter", &tier.tier, &mut warnings);
 
         if is_user {
             merge_trusted_config(&mut merged, raw);
@@ -2027,6 +2027,16 @@ fn apply_harness_override(
             // A project harness block, like the project base, may only turn an
             // index off; a user harness block overrides the user base.
             let override_indexes = override_config.indexes.take();
+            // Refuse bad nixfmt pairs inside the block before it folds into
+            // this file's map, so the block's other formatter entries (and
+            // the rest of the block) survive and the warning names where the
+            // pair was actually written.
+            sanitize_formatter_map(
+                &mut override_config,
+                &format!("harnesses.{key}.formatter"),
+                &tier.tier,
+                warnings,
+            );
             merge_trusted_config(raw, override_config);
             raw.indexes = merge_indexes(raw.indexes, override_indexes, !trusted);
         }
@@ -2333,24 +2343,39 @@ fn merge_project_sandbox(
 
 /// Formatter map schema: the shared value enum plus a `patternProperties`
 /// rule so editors flag `nixfmt` under any language key other than `nix` —
-/// the same rule the resolver enforces when the config is read.
+/// the same rule the resolver enforces when the config is read. Pattern keys
+/// no longer fall under `additionalProperties` (a matched property is
+/// excluded from it), so the pattern entry carries the value schema itself
+/// in `allOf`, keeping every key's value check alive; `additionalProperties`
+/// still covers the exempt `nix` key.
 fn formatter_map_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let mut schema =
         <HashMap<String, RawFormatter> as schemars::JsonSchema>::json_schema(generator);
+    let value_schema = schema
+        .get("additionalProperties")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({ "type": "string" }));
     schema.insert(
         "patternProperties".to_string(),
         serde_json::json!({
-            "^(?!nix$).*$": { "not": { "const": "nixfmt" } }
+            "^(?!nix$).*$": { "allOf": [value_schema, { "not": { "const": "nixfmt" } }] }
         }),
     );
     schema
 }
 
 /// Drops `formatter.<language> = "nixfmt"` pairs where the key is not `nix`,
-/// per config file and before files merge, warning once per dropped pair.
-/// The other entries of the file survive, and a lower-precedence file's value
-/// for the same language is not erased by a post-merge removal.
-fn sanitize_formatter_map(raw: &mut RawAftConfig, tier: &str, warnings: &mut Vec<ConfigWarning>) {
+/// per config file (and per harness block, before it folds into the file's
+/// map) and before files merge, warning once per dropped pair. The other
+/// entries of the map survive, and a lower-precedence file's value for the
+/// same language is not erased by a post-merge removal. `source` names where
+/// the pair was written (top-level `formatter` or `harnesses.<name>.formatter`).
+fn sanitize_formatter_map(
+    raw: &mut RawAftConfig,
+    source: &str,
+    tier: &str,
+    warnings: &mut Vec<ConfigWarning>,
+) {
     let Some(formatter) = raw.formatter.as_mut() else {
         return;
     };
@@ -2365,7 +2390,7 @@ fn sanitize_formatter_map(raw: &mut RawAftConfig, tier: &str, warnings: &mut Vec
             tier: tier.to_string(),
             value: format!("{language}=nixfmt"),
             message: format!(
-                "nixfmt formats Nix files only; formatter.{language} = \"nixfmt\" is dropped and {language} keeps its configured formatter or detection"
+                "nixfmt formats Nix files only; {source}.{language} = \"nixfmt\" is dropped and {language} keeps its configured formatter or detection"
             ),
         });
     }
@@ -4233,6 +4258,37 @@ mod tests {
         assert!(
             refusal.is_some_and(|warning| warning.tier == "project"),
             "the refusal must be reported against the file that set it: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn nixfmt_refusal_in_a_harness_block_names_the_block_and_keeps_its_rest() {
+        // A pair written under harnesses.opencode.formatter is dropped from
+        // the block (the block's other formatter entries survive) and the
+        // warning points at the block, not at a top-level key nobody wrote.
+        let result = super::resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"formatter":{"rust":"none"},"harnesses":{"opencode":{"formatter":{"rust":"nixfmt","go":"gofmt"}}}}"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.formatter.get("go").map(String::as_str),
+            Some("gofmt"),
+            "the block's valid entry must survive its bad sibling: {:?}",
+            result.config.formatter
+        );
+        let refusal = result.warnings.iter().find(|warning| {
+            warning
+                .message
+                .contains("harnesses.opencode.formatter.rust")
+        });
+        assert!(
+            refusal.is_some_and(|warning| warning.tier == "user"),
+            "the refusal must name the block that set it: {:?}",
             result.warnings
         );
     }

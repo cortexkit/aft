@@ -31,7 +31,8 @@ const NIX_OUTLINE_DEPTH: usize = 1;
 /// the bound, bindings whose entry no longer fits are skipped (their subtree
 /// not descended) while the walk continues over the rest, so the outline
 /// keeps an in-order bounded subset of exact rows — each kept symbol is
-/// complete and correct, but the kept set need not be a prefix of the walk. The cap bounds retained name bytes, not total record
+/// complete and correct, but the kept set need not be a prefix of the walk.
+/// The cap bounds retained name bytes, not total record
 /// bytes: per-symbol overhead is uncharged and stays a linear factor of
 /// the file size — what is ruled out is the super-linear name copy.
 /// Stored signature bytes are bounded separately, by the

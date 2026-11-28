@@ -1794,14 +1794,15 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig {
       if (parsed[key] !== undefined) {
         partialConfig[key] = parsed[key];
       }
-    } else if (key === "formatter") {
+    } else if (key === "formatter" && isConfigRecord(configForParsing.formatter)) {
       // A formatter map fails as a whole when one pair is bad (e.g.
       // formatter.rust = "nixfmt"), but the other languages' settings are
       // valid and must survive: keep every entry except the offending ones.
-      const raw = (configForParsing.formatter ?? {}) as Record<string, unknown>;
+      // A non-object value (number, array) falls through to the generic
+      // section drop: its entries are not recoverable language settings.
       const kept: Record<string, string> = {};
       const dropped: string[] = [];
-      for (const [language, value] of Object.entries(raw)) {
+      for (const [language, value] of Object.entries(configForParsing.formatter)) {
         if (!FormatterEnum.safeParse(value).success || (value === "nixfmt" && language !== "nix")) {
           dropped.push(language);
           continue;
@@ -1818,6 +1819,56 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig {
             .map((i) => `${i.path.join(".")}: ${i.message}`)
             .join(", ")}`,
         );
+      }
+    } else if (key === "harnesses" && isConfigRecord(configForParsing.harnesses)) {
+      // A harness block that fails only on refused formatter pairs keeps the
+      // rest of the block (and its sibling blocks): drop the bad pairs and
+      // re-validate. A block invalid for any other reason is dropped whole,
+      // as before — mirroring the resolver, which drops the entry, not the block.
+      const keptBlocks: Record<string, unknown> = {};
+      const droppedBlocks: string[] = [];
+      const recovered: string[] = [];
+      for (const [name, block] of Object.entries(configForParsing.harnesses)) {
+        const direct = AftConfigSchema.safeParse({ harnesses: { [name]: block } });
+        if (direct.success) {
+          const parsed = (direct.data as { harnesses: Record<string, unknown> }).harnesses;
+          if (parsed[name] !== undefined) {
+            keptBlocks[name] = parsed[name];
+          }
+          continue;
+        }
+        if (!isConfigRecord(block) || !isConfigRecord(block.formatter)) {
+          droppedBlocks.push(name);
+          continue;
+        }
+        const keptFormatter = Object.fromEntries(
+          Object.entries(block.formatter).filter(
+            ([language, value]) =>
+              FormatterEnum.safeParse(value).success &&
+              !(value === "nixfmt" && language !== "nix"),
+          ),
+        );
+        const retried = AftConfigSchema.safeParse({
+          harnesses: { [name]: { ...block, formatter: keptFormatter } },
+        });
+        if (retried.success) {
+          const parsed = (retried.data as { harnesses: Record<string, unknown> }).harnesses;
+          if (parsed[name] !== undefined) {
+            keptBlocks[name] = parsed[name];
+            recovered.push(name);
+          }
+        } else {
+          droppedBlocks.push(name);
+        }
+      }
+      if (Object.keys(keptBlocks).length > 0) {
+        partialConfig.harnesses = keptBlocks;
+      }
+      if (recovered.length > 0) {
+        warn(`Recovered harness blocks after dropping refused formatter pairs: ${recovered.join(", ")}`);
+      }
+      if (droppedBlocks.length > 0) {
+        invalidSections.push(`harnesses: dropped ${droppedBlocks.join(", ")} — refused or invalid block`);
       }
     } else {
       warn(`Discarded invalid configuration section: ${key}`);
@@ -2244,9 +2295,10 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   );
   // A project may switch an index off, never back on.
   const indexes = mergeIndexes(base.indexes, override.indexes, true);
-  // Harness blocks merge after schema validation, so the nixfmt language-key
-  // rule is re-applied here: a harness override of formatter.rust = "nixfmt"
-  // is dropped and the base tier's value for that language survives.
+  // Defense in depth for in-memory shorthand callers: file-loaded configs
+  // cannot carry a foreign nixfmt pair past the schema (and the partial
+  // loader recovers around it), but a programmatic caller merging raw maps
+  // still gets the drop-the-entry rule, so the base tier's value survives.
   const harnessFormatter = Object.fromEntries(
     Object.entries(override.formatter ?? {}).filter(
       ([language, value]) => !(value === "nixfmt" && language !== "nix"),

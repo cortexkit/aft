@@ -222,7 +222,7 @@ mod tests {
             {
                 continue;
             }
-            if key.0.ends_with(".storage.cache_dir") {
+            if key.0.ends_with(".storage.cache_dir") || key.0.ends_with(".formatter") {
                 assert!(actual
                     .get(&key)
                     .is_some_and(|actual| actual.starts_with(text)));
