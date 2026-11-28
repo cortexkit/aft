@@ -14,11 +14,12 @@
 //! index of the multi-link files found under the registered protected roots,
 //! keyed by device and inode. Creating a hard link updates the file's change
 //! time (`st_ctime`), and a new or replaced protected file is a new inode with
-//! a fresh change time. So a multi-link file whose change time predates the
-//! index has had the same names since the index was built, and the index's
-//! answer for it is current. A multi-link file changed since then rebuilds the
-//! index before it is judged. Single-link files and older multi-link files
-//! (package-manager stores, local Git clones) never cause a walk.
+//! a fresh change time. A complete index can allow an unknown multi-link file
+//! whose change time predates the walk. A more recent change time triggers a
+//! new walk before the file is judged. An incomplete index refuses every
+//! unknown multi-link file because the walk may have missed a protected name.
+//! The next multi-link check after a short retry interval rebuilds an
+//! incomplete index; a change to the protected roots also triggers a rebuild.
 //!
 //! Windows lists a file's names directly (`FindFirstFileNameW`), so it keeps
 //! no index and judges each name by location.
@@ -181,10 +182,12 @@ mod unix {
     const CLOCK_SLACK: Duration = Duration::from_secs(2);
     const WALK_ENTRY_LIMIT: usize = 20_000;
     const WALK_TIME_LIMIT: Duration = Duration::from_millis(500);
+    const INCOMPLETE_RETRY_INTERVAL: Duration = CLOCK_SLACK;
 
     pub(super) struct Index {
         generation: u64,
         built_at: SystemTime,
+        walk_started: Instant,
         /// False when the walk stopped at its entry or time bound.
         complete: bool,
         examined: usize,
@@ -202,24 +205,18 @@ mod unix {
         let changed = change_time(metadata);
         let generation = GENERATION.load(Ordering::SeqCst);
         let mut slot = INDEX.lock();
-        if slot
-            .as_ref()
-            .is_none_or(|index| index.generation != generation || !index.predates(changed))
-        {
+        refresh_index(&mut slot, generation, changed, Instant::now(), || {
             let roots = ROOTS.lock().clone();
             let index = Index::build(generation, &roots, WALK_ENTRY_LIMIT, WALK_TIME_LIMIT);
             if !index.complete && !LOGGED_INCOMPLETE.swap(true, Ordering::Relaxed) {
                 log::warn!(
-                    "[aft] protected-file index stopped after {} entries; files with several links changed since then are refused",
+                    "[aft] protected-file index stopped after {} entries; multi-link files outside the index are refused until a complete walk",
                     index.examined
                 );
             }
-            *slot = Some(index);
-        }
-        let Some(protected) = slot
-            .as_ref()
-            .and_then(|index| index.verdict(identity, changed))
-        else {
+            index
+        });
+        let Some(protected) = slot.as_ref().and_then(|index| index.verdict(identity)) else {
             return Ok(());
         };
         drop(slot);
@@ -227,6 +224,21 @@ mod unix {
             return Ok(());
         }
         Err(refusal(path, protected))
+    }
+
+    pub(super) fn refresh_index(
+        slot: &mut Option<Index>,
+        generation: u64,
+        changed: SystemTime,
+        now: Instant,
+        build: impl FnOnce() -> Index,
+    ) {
+        if slot
+            .as_ref()
+            .is_none_or(|index| index.needs_rebuild(generation, changed, now))
+        {
+            *slot = Some(build());
+        }
     }
 
     fn change_time(metadata: &Metadata) -> SystemTime {
@@ -250,12 +262,13 @@ mod unix {
             time_limit: Duration,
         ) -> Self {
             let built_at = SystemTime::now();
+            let walk_started = Instant::now();
             let mut walk = Walk {
                 entries: HashMap::new(),
                 examined: 0,
                 complete: true,
                 entry_limit,
-                deadline: Instant::now() + time_limit,
+                deadline: walk_started + time_limit,
             };
             for tree in &roots.trees {
                 walk.tree(tree);
@@ -269,6 +282,7 @@ mod unix {
             Self {
                 generation,
                 built_at,
+                walk_started,
                 complete: walk.complete,
                 examined: walk.examined,
                 entries: walk.entries,
@@ -281,24 +295,34 @@ mod unix {
             changed + CLOCK_SLACK < self.built_at
         }
 
+        fn needs_rebuild(&self, generation: u64, changed: SystemTime, now: Instant) -> bool {
+            if self.generation != generation {
+                return true;
+            }
+            if self.complete {
+                return !self.predates(changed);
+            }
+            now.duration_since(self.walk_started) >= INCOMPLETE_RETRY_INTERVAL
+        }
+
         /// `Some` when the file must be refused, with the protected name when
-        /// one is known. A file the index does not hold is refused only when
-        /// the walk was cut short and the file changed after it started, so
-        /// the walk may have missed its protected name.
-        pub(super) fn verdict(
-            &self,
-            identity: (u64, u64),
-            changed: SystemTime,
-        ) -> Option<Option<PathBuf>> {
+        /// one is known. An unknown multi-link file is refused whenever the
+        /// walk was cut short, regardless of when the file last changed.
+        pub(super) fn verdict(&self, identity: (u64, u64)) -> Option<Option<PathBuf>> {
             if let Some(protected) = self.entries.get(&identity) {
                 return Some(Some(protected.clone()));
             }
-            (!self.complete && !self.predates(changed)).then_some(None)
+            (!self.complete).then_some(None)
         }
 
         #[cfg(test)]
         pub(super) fn summary(&self) -> (bool, usize) {
             (self.complete, self.examined)
+        }
+
+        #[cfg(test)]
+        pub(super) fn walk_started(&self) -> Instant {
+            self.walk_started
         }
     }
 

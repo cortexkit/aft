@@ -109,39 +109,89 @@ fn links_and_protected_files_made_after_the_index_are_refused() {
 
 #[cfg(unix)]
 #[test]
-fn a_walk_cut_short_refuses_only_recently_changed_unknown_files() {
+fn a_walk_cut_short_refuses_an_old_alias_to_a_missed_protected_file() {
     use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, SystemTime};
     let f = Fixture::new();
-    for index in 0..4 {
-        let name = f.protected.join(format!("key-{index}"));
-        std::fs::write(&name, "key").unwrap();
-        std::fs::hard_link(&name, f.protected.join(format!("key-{index}.bak"))).unwrap();
-    }
+    let alias = f.project.join("alias.txt");
+    std::fs::hard_link(&f.secret, &alias).unwrap();
+    let metadata = std::fs::metadata(&alias).unwrap();
+    let identity = (metadata.dev(), metadata.ino());
     let roots = Roots {
         trees: [f.protected.clone()].into(),
         data_roots: BTreeSet::new(),
     };
-    let index = unix::Index::build(0, &roots, 2, std::time::Duration::from_secs(5));
-    assert_eq!(index.summary(), (false, 2));
-    let metadata = std::fs::metadata(&f.project).unwrap();
-    let unknown = (metadata.dev(), metadata.ino());
-    // Changed after the walk started: the walk may have missed its other name.
-    assert_eq!(
-        index.verdict(unknown, std::time::SystemTime::now()),
-        Some(None)
-    );
-    // Unchanged since long before the walk: its names were all present then.
-    assert_eq!(
-        index.verdict(unknown, std::time::SystemTime::UNIX_EPOCH),
-        None
-    );
+    // The budget admits the root but not the protected file inside it.
+    let incomplete = unix::Index::build(0, &roots, 1, Duration::from_secs(5));
+    let started = incomplete.walk_started();
+    let mut slot = Some(incomplete);
+    unix::refresh_index(&mut slot, 0, SystemTime::UNIX_EPOCH, started, || {
+        panic!("a fresh incomplete index should not be rebuilt")
+    });
+    let index = slot.unwrap();
+    assert_eq!(index.summary(), (false, 1));
+    assert_eq!(index.verdict(identity), Some(None));
+}
 
-    let complete = unix::Index::build(0, &roots, 1_000, std::time::Duration::from_secs(5));
-    assert!(complete.summary().0);
-    assert_eq!(
-        complete.verdict(unknown, std::time::SystemTime::now()),
-        None
-    );
+#[cfg(unix)]
+#[test]
+fn a_walk_cut_short_refuses_an_unrelated_old_multi_link_file_until_retry() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, SystemTime};
+    let f = Fixture::new();
+    let plain = f.project.join("plain.txt");
+    std::fs::write(&plain, "plain").unwrap();
+    std::fs::hard_link(&plain, f.project.join("plain-link.txt")).unwrap();
+    let metadata = std::fs::metadata(&plain).unwrap();
+    let identity = (metadata.dev(), metadata.ino());
+    let roots = Roots {
+        trees: [f.protected.clone()].into(),
+        data_roots: BTreeSet::new(),
+    };
+    let incomplete = unix::Index::build(0, &roots, 1, Duration::from_secs(5));
+    let started = incomplete.walk_started();
+    let mut slot = Some(incomplete);
+    let old = SystemTime::UNIX_EPOCH;
+    unix::refresh_index(&mut slot, 0, old, started, || {
+        panic!("a fresh incomplete index should not be rebuilt")
+    });
+    let index = slot.as_ref().unwrap();
+    assert_eq!(index.summary(), (false, 1));
+    assert_eq!(index.verdict(identity), Some(None));
+
+    unix::refresh_index(&mut slot, 0, SystemTime::now(), started, || {
+        panic!("recent file changes must not bypass the retry interval")
+    });
+    let after_retry_interval = started + Duration::from_secs(2);
+    unix::refresh_index(&mut slot, 0, old, after_retry_interval, || {
+        unix::Index::build(0, &roots, 2, Duration::from_secs(5))
+    });
+    unix::refresh_index(&mut slot, 0, old, after_retry_interval, || {
+        panic!("an old file should reuse the complete index")
+    });
+    let complete = slot.unwrap();
+    assert_eq!(complete.summary(), (true, 2));
+    assert_eq!(complete.verdict(identity), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_root_change_rebuilds_an_incomplete_index_without_waiting() {
+    use std::time::{Duration, SystemTime};
+    let f = Fixture::new();
+    let mut roots = Roots {
+        trees: [f.protected.clone()].into(),
+        data_roots: BTreeSet::new(),
+    };
+    let incomplete = unix::Index::build(0, &roots, 1, Duration::from_secs(5));
+    let started = incomplete.walk_started();
+    let mut slot = Some(incomplete);
+    assert_eq!(slot.as_ref().unwrap().summary(), (false, 1));
+    roots.trees.insert(f.project);
+    unix::refresh_index(&mut slot, 1, SystemTime::UNIX_EPOCH, started, || {
+        unix::Index::build(1, &roots, 3, Duration::from_secs(5))
+    });
+    assert_eq!(slot.unwrap().summary(), (true, 3));
 }
 
 #[cfg(unix)]
@@ -176,10 +226,7 @@ fn cortexkit_data_roots_cover_closed_folders_and_credential_names_only() {
     for (name, protected) in files {
         use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::metadata(root.join(name)).unwrap();
-        let verdict = index.verdict(
-            (metadata.dev(), metadata.ino()),
-            std::time::SystemTime::UNIX_EPOCH,
-        );
+        let verdict = index.verdict((metadata.dev(), metadata.ino()));
         assert_eq!(verdict.is_some(), protected, "{name}");
     }
 }
