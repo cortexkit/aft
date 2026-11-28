@@ -2093,9 +2093,13 @@ test("harness block emptied by refusal does not clear the file's formatters", ()
   expect(config.formatter).toEqual({ rust: "none", python: "ruff" });
   expect(config.validate_on_edit).toBe("syntax");
   expect(loaded.stderr).toContain("formatter.rust");
+  expect(loaded.stderr).toContain("Recovered harness blocks");
 });
 
 test("explicitly empty harness formatter block still clears", () => {
+  // No project file in this fixture: with one present, a cleared {} is
+  // omitted from the loader output rather than serialized, which behaves the
+  // same downstream (no pairs) — the guarantee pinned here is the fold.
   const fixture = createConfigFixture();
   writeFileSync(
     fixture.userConfigPath,
@@ -2130,4 +2134,24 @@ test("harness block with a non-refusal invalid formatter value is dropped whole"
   const config = JSON.parse(loaded.stdout);
   expect(config.formatter).toEqual({ go: "gofmt" });
   expect(config.validate_on_edit).toBeUndefined();
+});
+
+test("top-level formatter map with a non-refusal invalid value keeps the whole-section drop", () => {
+  // Parity with the Rust resolver: recovery is only for refused nixfmt pairs.
+  // A refused pair plus an enum-invalid value (or garbage alone) drops the
+  // whole section with the standard notice instead of rescuing valid entries.
+  for (const formatter of [
+    { rust: "nixfmt", go: "not-a-tool" },
+    { go: "gofmt", other: "garbage" },
+  ]) {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ formatter }));
+    const loaded = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    const config = JSON.parse(loaded.stdout);
+    expect(config.formatter).toBeUndefined();
+    expect(loaded.stderr).toContain("Discarded invalid configuration section: formatter");
+  }
 });
