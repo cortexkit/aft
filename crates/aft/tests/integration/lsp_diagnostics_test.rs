@@ -3154,9 +3154,15 @@ fn lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer(
     let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
     *ctx.watcher_rx().lock() = Some(watcher_rx);
 
-    let stale = poll_lsp_diagnostics(&ctx, &lib, Duration::from_secs(60), |response| {
-        error_lines_for(response).contains(&2)
+    // A pull can succeed while rust-analyzer is still indexing. Wait for a
+    // complete report; the deadline only guards against a hung cold load.
+    let stale = poll_lsp_diagnostics(&ctx, &lib, Duration::from_secs(180), |response| {
+        response["complete"] == true
     });
+    assert_eq!(
+        stale["complete"], true,
+        "control: timed out waiting for a complete report from rust-analyzer: {stale:#}"
+    );
     assert_eq!(
         error_lines_for(&stale),
         vec![2],
