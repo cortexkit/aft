@@ -1,3 +1,5 @@
+#[cfg(feature = "test-hooks")]
+mod conformance_read_gate;
 mod standalone_input;
 
 #[cfg(test)]
@@ -1578,6 +1580,8 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
+    #[cfg(feature = "test-hooks")]
+    conformance_read_gate::wait(&req);
     if req.worker_session() {
         ctx.disable_rust_cargo_for_worker();
     }

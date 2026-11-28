@@ -1030,9 +1030,8 @@ fn runner_notices_shared_send_samples_follow_until_receipt_or_not_delivered() {
                 "{name}: no extra send"
             );
         }
-        let task = Completion::new_runner(
+        let task = Completion::running_runner(
             &format!("bash-00000000001{index:03x}03"),
-            0,
             "reserved:thalamus-harness",
             "thalamus-harness",
         );
@@ -1442,9 +1441,22 @@ impl Completion {
     }
 
     fn new_runner(task: &str, offers: usize, principal: &str, raw: &str) -> Self {
+        Self::with_state(task, offers, principal, raw, false)
+    }
+
+    fn running(task: &str) -> Self {
+        Self::running_runner(task, "reserved:broca", "broca")
+    }
+
+    fn running_runner(task: &str, principal: &str, raw: &str) -> Self {
+        Self::with_state(task, 0, principal, raw, true)
+    }
+
+    fn with_state(task: &str, offers: usize, principal: &str, raw: &str, running: bool) -> Self {
         use crate::bash_background::persistence::{
             create_task_layout, write_task_at, PersistedTask,
         };
+        use crate::bash_background::BgTaskStatus;
         let (root_dir, root) = super::super::test_support::test_root("runner-notices");
         let storage = tempfile::tempdir().unwrap();
         let mut route = super::super::test_support::route_identity_with_harness(
@@ -1474,17 +1486,21 @@ impl Completion {
             true,
             false,
         );
-        metadata.mark_terminal(
-            crate::bash_background::BgTaskStatus::Completed,
-            Some(0),
-            None,
-        );
+        if running {
+            metadata.status = BgTaskStatus::Running;
+        } else {
+            metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        }
         metadata.launching_raw_harness = Some(raw.into());
         metadata.runner_completion_offers = offers;
-        let finished = metadata.finished_at.unwrap();
+        let finished = metadata.finished_at.unwrap_or_default();
         write_task_at(&paths, &metadata).unwrap();
         let registry = crate::bash_background::BgTaskRegistry::default();
-        registry.replay_session(storage.path(), task).unwrap();
+        if running {
+            registry.replay_live_task_for_test(storage.path(), task, task);
+        } else {
+            registry.replay_session(storage.path(), task).unwrap();
+        }
         Self {
             _root: root_dir,
             storage,
@@ -1493,6 +1509,21 @@ impl Completion {
             task: task.into(),
             finished,
         }
+    }
+
+    fn kill(&mut self) {
+        let _scope = crate::bash_background::task_identity_scope(Some(self.route.task_identity()));
+        let killed = self.registry.kill(&self.task, &self.task).unwrap();
+        assert_eq!(
+            killed.info.status,
+            crate::bash_background::BgTaskStatus::Killed
+        );
+        self.finished = self
+            .registry
+            .notice_metadata(&self.task)
+            .unwrap()
+            .finished_at
+            .unwrap();
     }
 
     fn frame(&self) -> PushFrame {
@@ -1606,7 +1637,7 @@ fn runner_notices_run_owned_task_sends_only_to_its_parent_session_scope() {
         (true, "bash-f58a000000000002", "worker:session"),
     ] {
         let stamp = run_stamp(worker);
-        let task = with_scope_spawn(Some(stamp.clone()), || Completion::new(name, 0));
+        let mut task = with_scope_spawn(Some(stamp.clone()), || Completion::running(name));
         let capture = test_endpoint::capture(name, false);
         let scheduler = Scheduler::default();
         let mut watch = crate::protocol::BashPatternMatchFrame::new(
@@ -1614,11 +1645,15 @@ fn runner_notices_run_owned_task_sends_only_to_its_parent_session_scope() {
         );
         watch.launching_identity = Some(task.route.task_identity());
 
-        for (frame, id_prefix) in [
-            (task.reminder(600_000), "aft:bash-reminder:"),
-            (PushFrame::BashPatternMatch(watch), "aft:bash-watch:"),
-            (task.frame(), "aft:bash:"),
-        ] {
+        for id_prefix in ["aft:bash-reminder:", "aft:bash-watch:", "aft:bash:"] {
+            let frame = match id_prefix {
+                "aft:bash-reminder:" => task.reminder(600_000),
+                "aft:bash-watch:" => {
+                    task.kill();
+                    PushFrame::BashPatternMatch(watch.clone())
+                }
+                _ => task.frame(),
+            };
             let finished = task.finished;
             assert!(offer(
                 &scheduler,
@@ -1674,10 +1709,16 @@ fn runner_notices_run_owned_task_drops_notices_without_verified_parent() {
         ("bash-f58a000000000003", missing),
         ("bash-f58a000000000004", pending),
     ] {
-        let task = with_scope_spawn(Some(stamp), || Completion::new(name, 0));
+        let mut task = with_scope_spawn(Some(stamp), || Completion::running(name));
         let capture = test_endpoint::capture(name, false);
         let scheduler = Scheduler::default();
-        for frame in [task.reminder(600_000), task.frame()] {
+        for completion in [false, true] {
+            let frame = if completion {
+                task.kill();
+                task.frame()
+            } else {
+                task.reminder(600_000)
+            };
             let finished = task.finished;
             assert!(offer(
                 &scheduler,
@@ -1992,7 +2033,7 @@ fn runner_notices_not_delivered_cap_is_five_and_is_retired_durably() {
 fn runner_notices_not_delivered_reminder_drops_once_without_resend() {
     let _guard = DELIVERY_COUNTER_TEST.lock().unwrap();
     let before = NOT_DELIVERED.load(Ordering::Relaxed);
-    let task = Completion::new("bash-00000000000f0004", 0);
+    let task = Completion::running("bash-00000000000f0004");
     let capture = test_endpoint::capture(&task.task, false);
     capture.reply(undelivered("handover_failed"));
     let scheduler = Scheduler::default();
@@ -3620,7 +3661,7 @@ fn runner_notices_delivery_order_capability_cache_is_incarnation_scoped() {
 #[test]
 fn runner_notices_optional_members_are_gated_and_task_choice_is_frozen() {
     for (index, capability) in [None, Some(false), Some(true)].into_iter().enumerate() {
-        let task = Completion::new(&format!("bash-00000000000e000{index}"), 0);
+        let mut task = Completion::running(&format!("bash-00000000000e000{index}"));
         let capture = test_endpoint::capture(&task.task, false);
         capture.delivery_order(capability);
         let scheduler = Scheduler::default();
@@ -3668,6 +3709,7 @@ fn runner_notices_optional_members_are_gated_and_task_choice_is_frozen() {
             Some(recent),
             "the frozen interval must also govern actual scheduling"
         );
+        task.kill();
         let completion_text = super::super::bash_notice_text::completion(
             &serde_json::to_value(task.frame()).unwrap(),
         );
@@ -3708,8 +3750,90 @@ fn runner_notices_optional_members_are_gated_and_task_choice_is_frozen() {
 }
 
 #[test]
+fn runner_notices_drop_queued_reminders_after_killed_completion() {
+    let mut task = Completion::running("bash-00000000000e0011");
+    let capture = test_endpoint::capture(&task.task, false);
+    let reminders = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(
+        task.registry
+            .notice_metadata(&task.task)
+            .unwrap()
+            .started_at,
+    ));
+    let due = Instant::now();
+    for minutes in [320, 330] {
+        let elapsed = minutes * 60_000;
+        let now = Arc::clone(&clock);
+        assert!(offer(
+            &reminders,
+            task.registry.clone(),
+            task.reminder(elapsed),
+            PathBuf::new(),
+            false,
+            move || now.load(Ordering::Relaxed),
+        ));
+    }
+    task.kill();
+    assert!(!task.delivered());
+    let completions = Scheduler::default();
+    clock.store(task.finished, Ordering::Relaxed);
+    task.offer(&completions, Arc::clone(&clock));
+    assert!(matches!(step(&completions, Instant::now()), Next::Done));
+    let completion = capture.receiver.try_recv().unwrap();
+    assert!(completion.request["params"]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("(killed)"));
+    assert!(task.delivered());
+
+    for minutes in [320, 330] {
+        let elapsed = Duration::from_secs(minutes * 60);
+        clock.store(
+            task.finished + elapsed.as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        assert!(matches!(step(&reminders, due + elapsed), Next::Done));
+    }
+    let sent: Vec<_> = capture
+        .receiver
+        .try_iter()
+        .map(|item| item.request)
+        .collect();
+    assert!(sent.is_empty(), "sent stale reminders after kill: {sent:?}");
+    assert!(reminders.entries.lock().unwrap().is_empty());
+}
+
+#[test]
+fn runner_notices_drop_reminder_when_kill_wins_during_send_preparation() {
+    let task = Completion::running("bash-00000000000e0012");
+    let capture = test_endpoint::capture(&task.task, false);
+    let scheduler = Scheduler::default();
+    let registry = task.registry.clone();
+    let name = task.task.clone();
+    assert!(offer(
+        &scheduler,
+        task.registry.clone(),
+        task.reminder(600_000),
+        PathBuf::new(),
+        false,
+        move || {
+            // The scheduler reads its first metadata snapshot before reading the clock.
+            let killed = registry.kill(&name, &name).unwrap();
+            assert_eq!(
+                killed.info.status,
+                crate::bash_background::BgTaskStatus::Killed
+            );
+            600_000
+        },
+    ));
+    assert!(matches!(step(&scheduler, Instant::now()), Next::Done));
+    assert!(!task.delivered());
+    assert!(capture.receiver.try_recv().is_err());
+}
+
+#[test]
 fn runner_notices_reminder_retry_and_restart_replay_preserve_bytes() {
-    let task = Completion::new("bash-00000000000e0010", 0);
+    let task = Completion::running("bash-00000000000e0010");
     let capture = test_endpoint::capture(&task.task, false);
     capture.delivery_order(Some(true));
     capture.retry(1);
@@ -3736,9 +3860,7 @@ fn runner_notices_reminder_retry_and_restart_replay_preserve_bytes() {
 
     task.registry.detach();
     let restarted = crate::bash_background::BgTaskRegistry::default();
-    restarted
-        .replay_session(task.storage.path(), &task.task)
-        .unwrap();
+    restarted.replay_live_task_for_test(task.storage.path(), &task.task, &task.task);
     let metadata = restarted.notice_metadata(&task.task).unwrap();
     let id = format!(
         "aft:bash-reminder:{}:{}",
@@ -3768,7 +3890,7 @@ fn runner_notices_reminder_retry_and_restart_replay_preserve_bytes() {
 #[test]
 fn runner_notices_member_refusal_drops_reminder_and_freezes_completion_fallback() {
     for (index, field) in ["dedupe_key", "expires_at_ms"].into_iter().enumerate() {
-        let task = Completion::new(&format!("bash-00000000000e002{index}"), 0);
+        let mut task = Completion::running(&format!("bash-00000000000e002{index}"));
         let capture = test_endpoint::capture(&task.task, true);
         capture.delivery_order(Some(true));
         capture.refuse("invalid_params", Some(field));
@@ -3802,6 +3924,7 @@ fn runner_notices_member_refusal_drops_reminder_and_freezes_completion_fallback(
         );
 
         capture.refuse("invalid_params", Some(field));
+        task.kill();
         task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
         let now = std::time::Instant::now();
         let (next, logs) = crate::logging::capture_log_lines(|| step(&scheduler, now));

@@ -1,11 +1,287 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 pub(super) fn kill(cgroup: &Path) -> io::Result<()> {
     kill_with(cgroup, |file| file.write_all(b"1"))
 }
 
+/// Fault seams for the scope listing and pidfds, for tests on this thread.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ListingFaults {
+    /// Fail every `pidfd_open` with this errno (EMFILE: no descriptors left).
+    pub pidfd_errno: Option<i32>,
+    /// Fail walking a cgroup's child directories.
+    pub walk_error: bool,
+    /// Listings to return instead of reading `cgroup.procs`, in order; the
+    /// last one repeats.
+    pub listings: std::collections::VecDeque<Vec<u32>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LISTING_FAULTS: std::cell::RefCell<ListingFaults> = std::cell::RefCell::new(ListingFaults::default());
+}
+
+#[cfg(test)]
+pub(crate) fn with_listing_faults_for_test<T>(faults: ListingFaults, run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LISTING_FAULTS.with(|slot| *slot.borrow_mut() = ListingFaults::default());
+        }
+    }
+    LISTING_FAULTS.with(|slot| *slot.borrow_mut() = faults);
+    let _restore = Restore;
+    run()
+}
+
+/// The processes in a cgroup and every cgroup below it, sorted. A cgroup that
+/// is gone lists none. Any listing or walk that cannot be read is an error:
+/// a scope that cannot be listed is never taken for an empty one.
+fn member_pids(cgroup: &Path) -> io::Result<Vec<u32>> {
+    #[cfg(test)]
+    if let Some(listing) = LISTING_FAULTS.with(|slot| {
+        let mut faults = slot.borrow_mut();
+        match faults.listings.len() {
+            0 => None,
+            1 => faults.listings.front().cloned(),
+            _ => faults.listings.pop_front(),
+        }
+    }) {
+        return Ok(listing);
+    }
+    let gone = |directory: &Path, error: &io::Error| {
+        error.kind() == io::ErrorKind::NotFound && matches!(directory.try_exists(), Ok(false))
+    };
+    let mut pids = Vec::new();
+    let mut pending = vec![cgroup.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        match std::fs::read_to_string(directory.join("cgroup.procs")) {
+            Ok(text) => pids.extend(
+                text.split_whitespace()
+                    .filter_map(|pid| pid.parse::<u32>().ok()),
+            ),
+            // A cgroup removed while it was being listed has no processes.
+            Err(error) if gone(&directory, &error) => continue,
+            Err(error) => return Err(error),
+        }
+        #[cfg(test)]
+        if LISTING_FAULTS.with(|slot| slot.borrow().walk_error) {
+            return Err(io::Error::other("injected cgroup walk failure"));
+        }
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if gone(&directory, &error) => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    #[cfg(test)]
+    if let Some(errno) = LISTING_FAULTS.with(|slot| slot.borrow().pidfd_errno) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    let pid = libc::pid_t::try_from(pid).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+#[cfg(test)]
+thread_local! {
+    static PIDFDS_UNAVAILABLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make this thread behave as if the kernel had no pidfds (before Linux 5.3).
+#[cfg(test)]
+pub(crate) fn with_pidfds_unavailable_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PIDFDS_UNAVAILABLE_FOR_TEST.with(|slot| slot.set(false));
+        }
+    }
+    PIDFDS_UNAVAILABLE_FOR_TEST.with(|slot| slot.set(true));
+    let _restore = Restore;
+    run()
+}
+
+/// Whether this kernel can open pidfds (Linux 5.3 and later).
+fn pidfds_supported() -> bool {
+    #[cfg(test)]
+    if PIDFDS_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        !matches!(
+            pidfd_open(std::process::id()),
+            Err(error) if error.raw_os_error() == Some(libc::ENOSYS)
+        )
+    })
+}
+
+/// Whether the process behind a pidfd has exited (zombies included).
+fn pidfd_exited(fd: &OwnedFd) -> bool {
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    (unsafe { libc::poll(&mut poll, 1, 0) }) > 0
+}
+
+/// The most listings of a scope taken while waiting for two in a row to agree.
+const MAX_LISTINGS: usize = 8;
+
+/// Signal every process in `cgroup` that has not exited, and return the
+/// pidfds of the ones still running; signal 0 only finds them. A listed pid
+/// can exit and be given to an unrelated process before it is signalled, so
+/// each is signalled through a pidfd, which names one process for good. A pid
+/// still listed after its pidfd was opened belongs to that pidfd's process,
+/// if that process is still alive when signalled; a dead one makes the signal
+/// fail harmlessly. The scope is listed again until two listings agree, so a
+/// process that appears meanwhile is opened and signalled too.
+///
+/// It fails closed: an unreadable listing, a pidfd that cannot be opened for
+/// any reason but the process being gone (EMFILE included), or listings that
+/// never settle are errors, never an empty scope.
+fn signal_members(cgroup: &Path, signal: i32) -> io::Result<Vec<OwnedFd>> {
+    signal_members_after(cgroup, signal, || {})
+}
+
+/// [`signal_members`], running `before` once, right before the first signal
+/// actually sent; it does not run when nothing is sent.
+fn signal_members_after(
+    cgroup: &Path,
+    signal: i32,
+    before: impl FnOnce(),
+) -> io::Result<Vec<OwnedFd>> {
+    let mut before = Some(before);
+    let mut opened = std::collections::BTreeMap::<u32, OwnedFd>::new();
+    let mut signalled = std::collections::BTreeSet::<u32>::new();
+    let mut previous = member_pids(cgroup)?;
+    for _ in 0..MAX_LISTINGS {
+        for &pid in &previous {
+            if opened.contains_key(&pid) {
+                continue;
+            }
+            match pidfd_open(pid) {
+                Ok(fd) => {
+                    opened.insert(pid, fd);
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let current = member_pids(cgroup)?;
+        for pid in &current {
+            let Some(fd) = opened.get(pid) else { continue };
+            if signal != 0 && !pidfd_exited(fd) && signalled.insert(*pid) {
+                if let Some(before) = before.take() {
+                    before();
+                }
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd.as_raw_fd(),
+                        signal,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0_u32,
+                    );
+                }
+            }
+        }
+        if current == previous {
+            return Ok(opened
+                .into_iter()
+                .filter(|(pid, fd)| current.binary_search(pid).is_ok() && !pidfd_exited(fd))
+                .map(|(_, fd)| fd)
+                .collect());
+        }
+        previous = current;
+    }
+    Err(io::Error::other("task scope membership kept changing"))
+}
+
+/// SIGTERM every process in `cgroup`, then wait the termination grace period,
+/// ending early once none is left running. `before` runs right before the
+/// first SIGTERM actually sent, and not at all when none is. Returns false, having sent nothing, when this kernel has no
+/// pidfds; the caller then signals the process group instead.
+pub(super) fn terminate_members(
+    cgroup: &Path,
+    before: impl FnOnce(),
+    mut reap: impl FnMut(),
+) -> bool {
+    if !pidfds_supported() {
+        return false;
+    }
+    // A listing that fails or never settles may still hide members, so the
+    // full grace period runs unless a listing shows none left running. The
+    // caller then writes `cgroup.kill` and checks that the scope is empty.
+    let _ = signal_members_after(cgroup, libc::SIGTERM, before);
+    let started = Instant::now();
+    while started.elapsed() < super::super::process::TERMINATE_GRACE {
+        reap();
+        if signal_members(cgroup, 0).is_ok_and(|live| live.is_empty()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// SIGKILL every process in `cgroup` through pidfds, for a kernel without
+/// `cgroup.kill` (before Linux 5.14) or a `cgroup.kill` write that failed.
+/// Returns whether the scope was confirmed empty; false whenever that cannot
+/// be shown. Without pidfds the process group was already terminated, so an
+/// empty listing (a scope folder that lingers) is the only confirmation.
+pub(super) fn kill_members(cgroup: &Path) -> bool {
+    if !pidfds_supported() {
+        return member_pids(cgroup).is_ok_and(|pids| pids.is_empty());
+    }
+    for _ in 0..3 {
+        let Ok(signalled) = signal_members(cgroup, libc::SIGKILL) else {
+            return false;
+        };
+        if signalled.is_empty() {
+            return true;
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !signalled.iter().all(pidfd_exited) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    signal_members(cgroup, 0).is_ok_and(|live| live.is_empty())
+}
+
+/// Whether a process may still be running in `cgroup` or below it. A listing
+/// that cannot be read counts as possibly running.
+pub(super) fn has_members(cgroup: &Path) -> bool {
+    if pidfds_supported() {
+        return signal_members(cgroup, 0).map_or(true, |live| !live.is_empty());
+    }
+    member_pids(cgroup).map_or(true, |pids| !pids.is_empty())
+}
 fn open_kill_file(path: &Path) -> io::Result<File> {
     #[cfg(test)]
     if let Some(error) = OPEN_ERROR_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
@@ -109,5 +385,118 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    /// A process that joins the scope between two listings is opened and
+    /// signalled too: the scope is listed again until two listings agree.
+    #[test]
+    fn task_scope_term_reaches_a_member_that_appears_between_listings() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut first, mut late) = (sleeper(), sleeper());
+        let faults = ListingFaults {
+            listings: [
+                vec![first.id()],
+                vec![first.id(), late.id()],
+                vec![first.id(), late.id()],
+            ]
+            .into(),
+            ..Default::default()
+        };
+        with_listing_faults_for_test(faults, || {
+            let _ = signal_members(dir.path(), libc::SIGTERM).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stopped = (false, false);
+        while Instant::now() < deadline && !(stopped.0 && stopped.1) {
+            stopped.0 |= first.try_wait().unwrap().is_some();
+            stopped.1 |= late.try_wait().unwrap().is_some();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = (first.kill(), late.kill(), first.wait(), late.wait());
+        assert_eq!(stopped, (true, true), "a member was left unsignalled");
+    }
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+
+    /// The kill commits to its outcome right before the first SIGTERM it
+    /// actually sends. A listing that fails sends nothing, so nothing is
+    /// committed; a listed process is signalled and commits once.
+    #[test]
+    fn task_scope_term_commits_only_when_a_signal_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id();
+        let commits = std::cell::Cell::new(0);
+        let failed = ListingFaults {
+            pidfd_errno: Some(libc::EMFILE),
+            listings: [vec![pid]].into(),
+            ..Default::default()
+        };
+        with_listing_faults_for_test(failed, || {
+            terminate_members(dir.path(), || commits.set(commits.get() + 1), || {})
+        });
+        let after_failure = commits.get();
+        let listed = ListingFaults {
+            listings: [vec![pid]].into(),
+            ..Default::default()
+        };
+        with_listing_faults_for_test(listed, || {
+            terminate_members(dir.path(), || commits.set(commits.get() + 1), || {})
+        });
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert_eq!(after_failure, 0, "a failed listing committed the kill");
+        assert_eq!(commits.get(), 1, "the SIGTERM sent did not commit once");
+    }
+
+    /// After SIGTERM, listings that never settle may hide members, so the
+    /// full grace period runs before the caller's `cgroup.kill`.
+    #[test]
+    fn task_scope_term_keeps_its_grace_when_listings_never_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sleepers: Vec<_> = (0..2)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let (a, b) = (sleepers[0].id(), sleepers[1].id());
+        let faults = ListingFaults {
+            listings: (0..4_000)
+                .map(|round| if round % 2 == 0 { vec![a] } else { vec![b] })
+                .collect(),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        with_listing_faults_for_test(faults, || terminate_members(dir.path(), || {}, || {}));
+        let elapsed = started.elapsed();
+        for sleeper in &mut sleepers {
+            let _ = sleeper.kill();
+            let _ = sleeper.wait();
+        }
+        assert!(
+            elapsed >= super::super::super::process::TERMINATE_GRACE,
+            "the grace period was cut short: {elapsed:?}"
+        );
     }
 }

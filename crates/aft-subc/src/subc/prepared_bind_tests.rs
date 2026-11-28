@@ -10,6 +10,7 @@ async fn bind_publication_rejects_missing_or_mismatched_applied_snapshot() {
         let a0 = A0Egress::new(writer.clone(), done);
         let completion = RouteBindCompletion {
             expected_snapshot_id: Some(9),
+            gh_shim_enabled: false,
             applied_snapshot_id: applied,
             route,
             identity: test_support::route_identity(&root, "witness"),
@@ -111,7 +112,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
     let a0 = A0Egress::new(writer.clone(), done.clone());
     let metrics = Arc::new(DispatchPathMetrics::new());
     let (lossy_tx, _lossy) = mpsc::channel(8);
-    let (reliable_tx, _reliable) = mpsc::unbounded_channel();
+    let (reliable_tx, _reliable) = push::ReliableIngress::channel(Arc::default());
     let senders = PushSenders {
         lossy_tx,
         reliable_tx,

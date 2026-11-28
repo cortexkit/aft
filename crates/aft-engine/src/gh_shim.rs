@@ -32,19 +32,37 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod api_rules;
+mod captured_dispatch;
 mod enable_gate;
+mod environment_admin;
+mod manifest_acceptance;
+use manifest_acceptance::{load_verified_manifest, manifest_acceptance_lock, resolve_manifest};
 mod manifest_guard;
+mod state_paths;
+use state_paths::StatePaths;
 pub mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
-mod numeric_id_cache;
 mod prefrontal_route;
 pub(crate) mod read_contract;
 mod rename_guard;
+mod repo_scope;
+mod secret_list;
 mod ticket_repository;
+#[doc(hidden)]
+pub mod trust_root;
 mod v22_rows;
 mod v23_queue;
+mod variable_rows;
 mod worker_reads;
+mod workflow_approval;
+
+use api_rules::{api_rule_matches_path, api_tuple, is_api_tuple};
+use captured_dispatch::run_captured_protected;
+#[cfg(test)]
+use captured_dispatch::{captured_plan, captured_rung_refusal};
+use repo_scope::{canonical_repository_key, valid_repository_component};
 
 use prefrontal_route::select_route_holder;
 
@@ -373,8 +391,6 @@ const UNBOUND_SAFE_COMMANDS: &[&str] = &[
     "org list",
     "gist list",
     "gist view",
-    "secret list",
-    "variable list",
     "variable get",
     "ruleset list",
     "ruleset view",
@@ -545,7 +561,6 @@ const REPO_VALUE_FLAGS: &[&str] = &[
     "--config-dir",
 ];
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
-const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
 /// Refusal text for a write-class command from a worker shell. A worker shell
 /// carries a read broker, never a write ticket, so no write can ever be
@@ -562,7 +577,9 @@ fn governance_probe_timeout_text(elapsed_ms: u64, stage: ProbeStage) -> String {
         "governance probe timed out after {elapsed_ms} ms at {stage} (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry"
     )
 }
-const UNTRUSTED_MANIFEST_KEY_STEERING: &str = "the manifest may be newer than this aft build's trust set - update aft, or install a manifest signed by a trusted key";
+const UNTRUSTED_MANIFEST_KEY_STEERING: &str =
+    "ask the operator to install a manifest signed by the daemon's pinned policy root";
+const NO_TRUST_ROOT_REFUSAL: &str = "GitHub writes are refused because this shell has no usable pinned policy root. Start a new shell. If the problem persists, ask the operator to check the daemon and run `ck policy-root set` if no root is pinned. Known safe commands still work.";
 const PRE_PROVENANCE_RECORD: &str = "unrecorded (pre-provenance record)";
 const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 
@@ -593,10 +610,11 @@ pub enum RefusalCode {
     OperatorCredentials,
     RenamePublished,
     RenameUnverified,
+    WorkflowApprovalRefused,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::WorkerNativeGh,
         Self::WorkerWriteRefused,
         Self::Unclassified,
@@ -620,6 +638,7 @@ impl RefusalCode {
         Self::OperatorCredentials,
         Self::RenamePublished,
         Self::RenameUnverified,
+        Self::WorkflowApprovalRefused,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -647,6 +666,7 @@ impl RefusalCode {
             Self::OperatorCredentials => "gh_shim_operator_credentials",
             Self::RenamePublished => "gh_shim_rename_published",
             Self::RenameUnverified => "gh_shim_rename_unverified",
+            Self::WorkflowApprovalRefused => "gh_shim_workflow_approval_refused",
         }
     }
 }
@@ -762,12 +782,37 @@ pub fn run_from_env() -> i32 {
 }
 
 fn run(args: &[OsString]) -> i32 {
-    run_with(args, delegate, worker_reads::identity_for_command)
+    run_with_native(
+        args,
+        native_guard::delegate,
+        worker_reads::identity_for_command,
+    )
 }
 
+#[cfg(test)]
 fn run_with(
     args: &[OsString],
     mut native_delegate: impl FnMut(&[OsString]) -> i32,
+    read_identity: impl FnMut(
+        &[OsString],
+        &Manifest,
+        &StatePaths,
+        &RelayContext,
+    ) -> Result<Option<bool>, String>,
+) -> i32 {
+    run_with_native(
+        args,
+        |guard, args| match guard {
+            Some(guard) => guard.delegate(args, &mut native_delegate),
+            None => native_delegate(args),
+        },
+        read_identity,
+    )
+}
+
+fn run_with_native(
+    args: &[OsString],
+    mut native_dispatch: impl FnMut(Option<&manifest_guard::ManifestGuard<'_>>, &[OsString]) -> i32,
     mut read_identity: impl FnMut(
         &[OsString],
         &Manifest,
@@ -782,19 +827,21 @@ fn run_with(
         );
     }
     let paths = StatePaths::from_process();
-    let manifest_guard = manifest_guard::ManifestGuard::new(&paths);
-    // The manifest can disappear after authority and audit checks finish.
-    // Recheck it before calling upstream gh, including audited operator writes.
-    let mut delegate = |args: &[OsString]| manifest_guard.delegate(args, &mut native_delegate);
-    if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
-        if let Some(line) = co_author_line(&paths) {
-            println!("{line}");
-        }
-        return 0;
-    }
     if is_reserved_self_report(args) {
         print_self_report(&paths, status_audit_requested(args));
         return 0;
+    }
+    // Opting out skips shim governance, not the native-gh restriction on workers.
+    if shim_disabled_by_operator() {
+        return native_dispatch(None, args);
+    }
+    let manifest_guard = manifest_guard::ManifestGuard::new(&paths);
+    let mut delegate = |args: &[OsString]| native_dispatch(Some(&manifest_guard), args);
+    if secret_list::targets(args) {
+        return secret_list::dispatch(args, &paths, unix_seconds(), delegate);
+    }
+    if let Some(status) = variable_rows::dispatch(args, &paths, &mut delegate) {
+        return status;
     }
     if crate::environment::non_empty_var(crate::gh_shim_speech::start_view::WORKER_POLICY_ENV)
         .as_deref()
@@ -855,6 +902,12 @@ fn run_with(
     {
         return refuse(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT);
     }
+    if workflow_approval::targets_approval(args) {
+        return workflow_approval::dispatch(args, &paths, now, delegate);
+    }
+    if let Some(status) = environment_admin::dispatch(args, &paths, &cwd, now, &mut delegate) {
+        return status;
+    }
     // Explicit operator administration keeps its audited path; worker writes
     // have already been refused above, regardless of the bypass request.
     if !operator_bypass_requested() && crate::gh_shim_speech::start_view::protected(args) {
@@ -870,11 +923,10 @@ fn run_with(
 
     // Presence-based regressed-manifest arm. Decide from the installed artifact
     // BEFORE any rung probe so a governed refusal never depends on daemon
-    // reachability: a validation failure after a prior valid manifest makes
-    // governed/admin tuples refuse while mechanical operations pass through.
-    let initial_manifest = resolve_manifest(&paths, now);
+    // reachability. Only the built-in safe commands can pass a broken list.
+    let initial_manifest = manifest_guard.initial();
     let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
-    if let ManifestResolution::Regressed { manifest, problem } = &initial_manifest {
+    if let ManifestResolution::Regressed { manifest, problem } = initial_manifest {
         match read_identity(args, manifest, &paths, &RelayContext::from_process()) {
             Ok(Some(true)) => {
                 return refuse(
@@ -904,9 +956,9 @@ fn run_with(
     // login. Decide that before the rung probe: the answer does not depend on
     // the governance daemon, and a bound target falls through to the governed
     // path below unchanged. Without a signed manifest there are no bindings to
-    // compare against; the fallback checks manifest history and daemon routing
-    // before allowing upstream execution.
-    if let ManifestResolution::Active(manifest) = &initial_manifest {
+    // compare against; the fallback checks manifest history before allowing
+    // upstream execution.
+    if let ManifestResolution::Active(manifest) = initial_manifest {
         if let Some(status) =
             worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
         {
@@ -915,7 +967,6 @@ fn run_with(
         // Check operator bypasses before discovery can report governed routing as
         // unavailable and hide the credential-specific refusal.
         if operator_bypass_requested()
-            && !shim_disabled_by_operator()
             && match classify(args, manifest, current_platform()) {
                 Classification::Admin { .. } => true,
                 Classification::Governed { tuple, .. } => {
@@ -933,9 +984,7 @@ fn run_with(
         // The operator's token works on every repository, bound or not, and
         // an agent holding it could reach GitHub around the shim, so this
         // check comes before any target is resolved.
-        if let Some((command, credential_use)) =
-            operator_credential_use(args).filter(|_| !shim_disabled_by_operator())
-        {
+        if let Some((command, credential_use)) = operator_credential_use(args) {
             return dispatch_operator_credentials(
                 args,
                 &command,
@@ -946,9 +995,7 @@ fn run_with(
                 delegate,
             );
         }
-        if let Some(write) = unbound_write(args, manifest, current_platform(), &target, &cwd)
-            .filter(|_| !shim_disabled_by_operator())
-        {
+        if let Some(write) = unbound_write(args, manifest, current_platform(), &target, &cwd) {
             return dispatch_unbound_write(
                 args,
                 &write,
@@ -961,7 +1008,7 @@ fn run_with(
     }
     let determination = determine_rung(&paths, &target, &cwd, now);
     if determination.record.rung != Rung::R3 {
-        let disposition = match resolve_manifest(&paths, now) {
+        let disposition = match manifest_guard.observe(now) {
             ManifestResolution::Active(manifest) => non_r3_governance_disposition(
                 &cwd,
                 &target,
@@ -1025,7 +1072,7 @@ fn run_with(
     // A valid manifest gates R3 both during fresh discovery and when a cached
     // R3 determination is reused. If it disappears or fails validation between
     // those two moments, use the same unavailable-manifest gate as below R3.
-    let manifest = match resolve_manifest(&paths, now) {
+    let manifest = match manifest_guard.observe(now) {
         ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed { manifest, problem } => {
             if let Some(status) = captured_now() {
@@ -2493,48 +2540,6 @@ struct LastProbeReport {
     outcome: String,
 }
 
-#[derive(Clone, Debug)]
-struct StatePaths {
-    root: PathBuf,
-    manifest: PathBuf,
-    rung: PathBuf,
-    bypass_audit: PathBuf,
-    unexpected_gh_route_advertisers: PathBuf,
-    seam_state: PathBuf,
-    last_valid_manifest: PathBuf,
-    version_high_water: PathBuf,
-    numeric_ids: PathBuf,
-    manifests_dir: PathBuf,
-    last_probe: PathBuf,
-}
-
-impl StatePaths {
-    fn from_process() -> Self {
-        Self::from_root(gh_shim_state_dir_from(
-            crate::environment::non_empty_os_var(GH_SHIM_STATE_DIR_ENV).as_deref(),
-            crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
-            crate::environment::non_empty_os_var("HOME").as_deref(),
-        ))
-    }
-
-    fn from_root(root: PathBuf) -> Self {
-        crate::private_storage::tighten_root(&root);
-        Self {
-            manifest: root.join("gh-routing-manifest.json"),
-            rung: root.join("rung-cache.json"),
-            bypass_audit: root.join("operator-bypass.jsonl"),
-            unexpected_gh_route_advertisers: root.join("unexpected-gh-route-advertisers.json"),
-            seam_state: root.join("seam-state.json"),
-            last_valid_manifest: root.join("last-valid-manifest.json"),
-            version_high_water: root.join("manifest-version-high-water.json"),
-            numeric_ids: root.join("numeric-ids.json"),
-            manifests_dir: root.join("manifests"),
-            last_probe: root.join("last-probe.json"),
-            root,
-        }
-    }
-}
-
 /// The gh-shim state files this process's environment resolves to, for the
 /// test-gate check that none of them lands in the operator's real state home.
 #[cfg(test)]
@@ -3422,7 +3427,7 @@ fn checkout_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBindin
 pub(crate) fn verified_worker_read_repository(
     repository_at_mint: Option<&str>,
 ) -> Result<String, String> {
-    let paths = StatePaths::from_process();
+    let paths = StatePaths::from_process().for_daemon();
     let ManifestResolution::Active(manifest) = resolve_manifest(&paths, unix_seconds()) else {
         return Err("worker read relay requires a verified active manifest".into());
     };
@@ -3450,6 +3455,11 @@ pub(crate) fn seed_worker_state(root: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let result = (|| {
         let paths = StatePaths::from_process();
+        if !paths.root.exists() {
+            return Ok(());
+        }
+        let _lock = manifest_acceptance_lock(&paths).map_err(|error| error.to_string())?;
+        trust_root::seed_worker(&paths, root).map_err(|error| error.to_string())?;
         let source = match std::fs::File::open(&paths.manifest) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -3503,79 +3513,6 @@ fn target_or_checkout_binding(
     })
 }
 
-fn co_author_line(paths: &StatePaths) -> Option<String> {
-    // Commits are made in the checkout, so the trailer names the checkout's
-    // bot rather than any repository a `gh` command might target.
-    let cwd = std::env::current_dir().ok()?;
-    let manifest = load_manifest(paths, unix_seconds()).ok()?;
-    let binding = checkout_agent_binding(&manifest, &cwd)?;
-    let login = binding.agent_id;
-    if !valid_github_login(&login) {
-        return None;
-    }
-    let numeric_id =
-        cached_numeric_id(paths, &login).or_else(|| resolve_and_cache_numeric_id(paths, &login))?;
-    Some(format!(
-        "Co-authored-by: {login} <{numeric_id}+{login}@users.noreply.github.com>"
-    ))
-}
-
-fn valid_github_login(login: &str) -> bool {
-    let core = login.strip_suffix("[bot]").unwrap_or(login);
-    !core.is_empty()
-        && core.len() <= 100
-        && !core.starts_with('-')
-        && !core.ends_with('-')
-        && core
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
-fn cached_numeric_ids(paths: &StatePaths) -> BTreeMap<String, u64> {
-    fs::read(&paths.numeric_ids)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn cached_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> {
-    cached_numeric_ids(paths)
-        .get(login)
-        .copied()
-        .filter(|id| *id > 0)
-}
-
-fn resolve_and_cache_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> {
-    native_guard::permission_from_process().ok()?;
-    let image = executing_image();
-    let real_gh = resolve_real_gh(&image)?;
-    let encoded_login = url::form_urlencoded::byte_serialize(login.as_bytes()).collect::<String>();
-    let mut command = Command::new(real_gh);
-    command.args(["api", &format!("users/{encoded_login}"), "--jq", ".id"]);
-    let numeric_id = numeric_id_from_command(
-        command,
-        std::time::Instant::now() + crate::format::AVAILABILITY_PROBE_BUDGET,
-    )?;
-    numeric_id_cache::record(paths, login, numeric_id);
-    Some(numeric_id)
-}
-
-fn numeric_id_from_command(command: Command, deadline: std::time::Instant) -> Option<u64> {
-    let output = crate::format::capture_probe_command(command, "gh", deadline, || {
-        crate::executor::current_job_cancelled()
-    })
-    .ok()?;
-    if !output.status.success() || output.truncated {
-        return None;
-    }
-    output
-        .stdout
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|id| *id > 0)
-}
-
 fn repository_key_from_origin(project_root: &Path) -> Option<String> {
     // The binding key comes from parsing the local origin remote, not a network
     // lookup, so a signed manifest selects the same agent when offline.
@@ -3600,51 +3537,6 @@ fn origin_remote(cwd: &Path) -> Option<String> {
         .flatten()
         .map(|remote| remote.trim().to_string())
         .filter(|remote| !remote.is_empty())
-}
-
-fn canonical_repository_key(value: &str) -> Option<String> {
-    let remote = value.trim().trim_end_matches('/');
-    let path = if let Some(path) = [
-        "https://github.com/",
-        "http://github.com/",
-        "ssh://git@github.com/",
-        "git://github.com/",
-        "git@github.com:",
-        "github.com/",
-    ]
-    .iter()
-    .find_map(|prefix| remote.strip_prefix(prefix))
-    {
-        path
-    } else if remote.contains("://") || remote.contains('@') || remote.contains(':') {
-        // Repository bindings identify GitHub repositories. A foreign remote is
-        // intentionally unmapped rather than treated as an owner/name string.
-        return None;
-    } else {
-        remote
-    }
-    .trim_end_matches(".git")
-    .trim_matches('/');
-    let mut parts = path.split('/');
-    let owner = parts.next()?;
-    let repository = parts.next()?;
-    (valid_repository_component(owner)
-        && valid_repository_component(repository)
-        && parts.next().is_none())
-    .then(|| {
-        format!(
-            "{}/{}",
-            owner.to_ascii_lowercase(),
-            repository.to_ascii_lowercase()
-        )
-    })
-}
-
-fn valid_repository_component(value: &str) -> bool {
-    !matches!(value, "" | "." | "..")
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn gh_session_id(agent_id: &str) -> String {
@@ -4055,7 +3947,7 @@ struct VerifiedManifest {
 
 struct VerifiedEnvelope {
     envelope: SignedManifest,
-    trust_set: Vec<Option<ManifestTrustKey>>,
+    pin: trust_root::Pin,
     verified: VerifiedManifest,
 }
 
@@ -4068,22 +3960,22 @@ thread_local! {
 
 fn verify_manifest_envelope(
     envelope: &SignedManifest,
-    trust_set: &[Option<ManifestTrustKey>],
+    pin: &trust_root::Pin,
 ) -> Result<VerifiedManifest, ManifestProblem> {
     if let Some(verified) = VERIFIED_ENVELOPE.with(|cached| {
         cached
             .borrow()
             .as_ref()
-            .filter(|cached| cached.envelope == *envelope && cached.trust_set == trust_set)
+            .filter(|cached| cached.envelope == *envelope && cached.pin == *pin)
             .map(|cached| cached.verified.clone())
     }) {
         return Ok(verified);
     }
-    let verified = verify_manifest_signature_with_provenance(envelope, trust_set)?;
+    let verified = verify_manifest_signature_with_provenance(envelope, pin)?;
     VERIFIED_ENVELOPE.with(|cached| {
         *cached.borrow_mut() = Some(VerifiedEnvelope {
             envelope: envelope.clone(),
-            trust_set: trust_set.to_vec(),
+            pin: pin.clone(),
             verified: verified.clone(),
         });
     });
@@ -4093,6 +3985,7 @@ fn verify_manifest_envelope(
 #[derive(Clone, Debug)]
 enum ManifestProblem {
     Missing,
+    NoTrustRoot,
     Invalid(String),
     BelowFloor {
         manifest_floor: u64,
@@ -4109,7 +4002,7 @@ enum ManifestProblem {
 impl ManifestProblem {
     fn diagnostic(&self) -> SelfReportDiagnostic {
         match self {
-            Self::Missing => SelfReportDiagnostic::ManifestUnavailable,
+            Self::Missing | Self::NoTrustRoot => SelfReportDiagnostic::ManifestUnavailable,
             Self::Invalid(_) => SelfReportDiagnostic::ManifestInvalid,
             Self::BelowFloor { .. } => SelfReportDiagnostic::ManifestBelowFloor,
             Self::RolledBack { .. } => SelfReportDiagnostic::ManifestRollback,
@@ -4119,6 +4012,7 @@ impl ManifestProblem {
     fn status_label(&self) -> String {
         match self {
             Self::Missing => "unavailable".to_string(),
+            Self::NoTrustRoot => "no pinned policy root".to_string(),
             Self::Invalid(error) => format!("invalid ({error})"),
             Self::BelowFloor { manifest_floor } => format!(
                 "{} (manifest floor {manifest_floor}, shim floor {SCHEMA_FLOOR})",
@@ -4136,7 +4030,7 @@ impl ManifestProblem {
 
     fn fallback_notice_reason(&self) -> String {
         match self {
-            Self::Missing => "manifest unavailable".to_string(),
+            Self::Missing | Self::NoTrustRoot => "manifest unavailable".to_string(),
             Self::Invalid(reason) => reason.clone(),
             Self::BelowFloor { manifest_floor } => {
                 format!("manifest floor {manifest_floor}, shim floor {SCHEMA_FLOOR}")
@@ -4152,7 +4046,11 @@ impl ManifestProblem {
 
     fn untrusted_manifest_key_steering(&self) -> Option<&'static str> {
         match self {
-            Self::Invalid(reason) if reason.starts_with("untrusted manifest key id ") => {
+            Self::NoTrustRoot => Some(NO_TRUST_ROOT_REFUSAL),
+            Self::Invalid(reason)
+                if reason.starts_with("untrusted manifest key id ")
+                    || reason.starts_with("retired manifest key id ") =>
+            {
                 Some(UNTRUSTED_MANIFEST_KEY_STEERING)
             }
             Self::Missing
@@ -4200,61 +4098,16 @@ impl ManifestProblem {
 /// this look tighter". The holder-side vendored vocabulary guards the widening
 /// direction; this line guards the narrowing one.
 ///
-/// DORMANCY VALVE AND LOCAL STATE. With no manifest artifact on disk the shim
-/// is dormant and passes invocations through (R2, reason
-/// `manifest_unavailable`). That valve's weakness — a local downgrade to
-/// dormant by deleting the artifact — is only reachable by an adversary with
-/// local write access, who can equally patch the compiled-in trust set or this
-/// verifier itself; the weakness is only reachable by an adversary the design
-/// already cannot survive. The same argument covers the local state this
-/// verifier maintains: the last-valid manifest cache and the monotonic version
-/// high-water mark are enforcement conveniences, not a security boundary, and
-/// an adversary who can delete, forge, or lower them can patch the verifier.
+/// With no verified manifest, the native guard checks local provisioning
+/// evidence and relay discovery. The unsigned last-valid cache never grants
+/// native passthrough.
 ///
 /// TOKEN LANGUAGE. The holder executes governed calls under full-installation
 /// GitHub App tokens held in custody; operation gating is holder-side
 /// classification over the routed request. The shim never holds any token in
 /// either direction.
 fn load_manifest(paths: &StatePaths, now: u64) -> Result<Manifest, ManifestProblem> {
-    load_manifest_with_trust_set(paths, now, compiled_manifest_trust_set())
-        .map(|verified| verified.manifest)
-}
-
-fn load_manifest_with_trust_set(
-    paths: &StatePaths,
-    now: u64,
-    trust_set: &[Option<ManifestTrustKey>],
-) -> Result<VerifiedManifest, ManifestProblem> {
-    if !paths.root.exists() {
-        return Err(ManifestProblem::Missing);
-    }
-    let _acceptance_lock = manifest_acceptance_lock(paths)
-        .map_err(|_| ManifestProblem::Invalid("manifest acceptance lock unavailable".into()))?;
-    let bytes = fs::read(&paths.manifest).map_err(|_| ManifestProblem::Missing)?;
-    let envelope: SignedManifest = serde_json::from_slice(&bytes)
-        .map_err(|error| ManifestProblem::Invalid(error.to_string()))?;
-    let verified = validate_manifest_candidate(paths, &envelope, now, trust_set)?;
-    let manifest = &verified.manifest;
-    if manifest.manifest_version > version_high_water(paths) {
-        write_version_high_water(paths, manifest.manifest_version);
-    }
-    write_last_valid_manifest(paths, manifest, &bytes);
-    retain_manifest(paths, &envelope, manifest.manifest_version);
-    Ok(verified)
-}
-
-// The daemon publisher and short-lived shim processes share this OS lock so a
-// newer acceptance cannot race a publisher's high-water check and rename.
-fn manifest_acceptance_lock(paths: &StatePaths) -> io::Result<crate::fs_lock::AdvisoryLockGuard> {
-    crate::private_storage::open_root(&paths.root)?;
-    let file = crate::private_storage::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(paths.root.join("manifest-acceptance.lock"))?;
-    file.lock()?;
-    Ok(crate::fs_lock::AdvisoryLockGuard::from_locked_file(file))
+    load_verified_manifest(paths, now).map(|verified| verified.manifest)
 }
 
 // Sync preflights a candidate without changing any accepted state. The shim's
@@ -4263,7 +4116,7 @@ fn validate_manifest_candidate(
     paths: &StatePaths,
     envelope: &SignedManifest,
     now: u64,
-    trust_set: &[Option<ManifestTrustKey>],
+    pin: &trust_root::Pin,
 ) -> Result<VerifiedManifest, ManifestProblem> {
     if envelope.artifact_id != MANIFEST_ARTIFACT_ID {
         return Err(ManifestProblem::Invalid("artifact id mismatch".to_string()));
@@ -4278,7 +4131,7 @@ fn validate_manifest_candidate(
     let VerifiedManifest {
         manifest,
         verified_by_key_id,
-    } = verify_manifest_envelope(envelope, trust_set)?;
+    } = verify_manifest_envelope(envelope, pin)?;
     manifest.validate().map_err(ManifestProblem::Invalid)?;
     if manifest.schema_floor < SCHEMA_FLOOR {
         return Err(ManifestProblem::BelowFloor {
@@ -4308,45 +4161,40 @@ fn validate_manifest_candidate(
     })
 }
 
-/// Verify the signature over the envelope's exact manifest bytes, then parse.
-/// No manifest content is interpreted before its bytes verify.
+/// Verify the received bytes, not a reserialization of the manifest.
 #[cfg(test)]
 fn verify_manifest_signature(envelope: &SignedManifest) -> Result<Manifest, ManifestProblem> {
-    verify_manifest_signature_with(envelope, compiled_manifest_trust_set())
-}
-
-#[cfg(test)]
-fn verify_manifest_signature_with(
-    envelope: &SignedManifest,
-    trust_set: &[Option<ManifestTrustKey>],
-) -> Result<Manifest, ManifestProblem> {
-    verify_manifest_signature_with_provenance(envelope, trust_set).map(|verified| verified.manifest)
+    verify_manifest_signature_with_provenance(envelope, &tests::fixture_pin())
+        .map(|verified| verified.manifest)
 }
 
 fn verify_manifest_signature_with_provenance(
     envelope: &SignedManifest,
-    trust_set: &[Option<ManifestTrustKey>],
+    pin: &trust_root::Pin,
 ) -> Result<VerifiedManifest, ManifestProblem> {
     #[cfg(test)]
     MANIFEST_WORK.with(|count| {
         let (verifications, writes) = count.get();
         count.set((verifications + 1, writes));
     });
-    let Some(key) = trust_set
-        .iter()
-        .flatten()
-        .find(|slot| slot.key_id == envelope.key_id)
-        .copied()
-    else {
+    let key_id = &envelope.key_id;
+    if pin.retired_key_ids.contains(key_id) {
         return Err(ManifestProblem::Invalid(format!(
-            "untrusted manifest key id {}",
-            envelope.key_id
+            "retired manifest key id {key_id}"
         )));
-    };
+    }
+    if pin.key_id != *key_id {
+        return Err(ManifestProblem::Invalid(format!(
+            "untrusted manifest key id {key_id}"
+        )));
+    }
+    let key = pin
+        .public_key()
+        .ok_or_else(|| ManifestProblem::Invalid("invalid daemon signing root".into()))?;
     let signature = base64::engine::general_purpose::STANDARD
         .decode(&envelope.signature)
         .map_err(|_| ManifestProblem::Invalid("invalid detached signature encoding".to_string()))?;
-    UnparsedPublicKey::new(&ED25519, key.public_key)
+    UnparsedPublicKey::new(&ED25519, key)
         .verify(envelope.manifest_bytes.as_bytes(), &signature)
         .map_err(|_| {
             ManifestProblem::Invalid("detached signature verification failed".to_string())
@@ -4356,105 +4204,8 @@ fn verify_manifest_signature_with_provenance(
     })?;
     Ok(VerifiedManifest {
         manifest,
-        verified_by_key_id: key.key_id.to_string(),
+        verified_by_key_id: pin.key_id.clone(),
     })
-}
-
-/// One trusted manifest signing key: a stable key id plus the Ed25519 public
-/// key bytes that id binds.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ManifestTrustKey {
-    key_id: &'static str,
-    public_key: &'static [u8],
-}
-
-// A manifest signature is the barrier preventing an agent from editing its own
-// cache to turn a governed verb into a mechanical one. The development key is
-// deliberately compiled only in debug builds so fixtures can exercise R3. A
-// release build has no trust root until the separately reviewed CKCRED custody
-// release supplies one, which keeps release binaries at R2 rather than making a
-// governance claim with a test key.
-//
-// TWO-KEY TRUST SET. The release trust array ships with TWO key slots from day
-// one: the live signing key and a cold standby with a distinct key id. The dev
-// set keeps its single test key.
-//
-// The production signing keys are minted and held by the key-custody process
-// outside this repository; a separately reviewed release copies each approved
-// public key into these slots (the private half never approaches the build).
-// Until that happens both slots stay empty and release binaries remain at R2.
-//
-// Two-release rotation procedure once the slots are filled:
-//   1. Ship a release whose standby slot carries the standby key. Both slots
-//      verify; the live key still signs. The standby key comes from custody,
-//      never from a self-generated filler.
-//   2. Promote the standby by shipping a manifest signed by it. The trust set
-//      already accepts it, so promotion does not depend on updating binaries
-//      first.
-//   3. One release later, remove the old key. Between promotion and removal a
-//      compromise of the old key can still sign, so the removal release is
-//      part of the rotation rather than optional cleanup.
-//
-// Slot layout: index 0 is the LIVE signing key, index 1 is the COLD STANDBY.
-// The first manifest signature verifying under a newly installed live key is
-// the stored-key-equals-published-half acceptance test for that installation.
-//
-// LIVE KEY PROVENANCE (2026-08-27 CKCRED ceremony): `signing:gh-manifest-root:1`,
-// minted in-vault via `ck auth mint-signing-key` (private half never exported;
-// extraction-refusal proven by a live `credential.get` attack against a bearer
-// handle, then the handle revoked). Public half read back over the route plane
-// and independently verified in Node's stdlib Ed25519 with a tamper control.
-const PROD_MANIFEST_KEY_ID: &str = "c9ad111282d1da10";
-const PROD_MANIFEST_PUBLIC_KEY: [u8; 32] = [
-    0x5f, 0x4c, 0x81, 0x90, 0x18, 0xe2, 0xb6, 0x8d, 0x18, 0xdb, 0xce, 0x6a, 0xc3, 0x6f, 0x9b, 0x84,
-    0x65, 0x28, 0x84, 0x14, 0x75, 0x55, 0xe8, 0x44, 0x2e, 0xf7, 0x6d, 0x7f, 0xb4, 0x7a, 0x42, 0xf4,
-];
-const PROD_MANIFEST_TRUST_KEY: ManifestTrustKey = ManifestTrustKey {
-    key_id: PROD_MANIFEST_KEY_ID,
-    public_key: &PROD_MANIFEST_PUBLIC_KEY,
-};
-
-#[cfg(not(debug_assertions))]
-const RELEASE_MANIFEST_TRUST_SET: &[Option<ManifestTrustKey>; 2] = &[
-    Some(PROD_MANIFEST_TRUST_KEY), // live
-    None,                          // cold standby (filled by a future custody release)
-];
-
-// The dev test key exists in debug images and in test builds of any profile
-// (so `cargo test --release` compiles); it never enters a release trust set,
-// so the release-profile lib tests that verify under it are debug-only below.
-#[cfg(any(debug_assertions, test))]
-const DEV_MANIFEST_KEY_ID: &str = "gh-routing-dev-test-key-v1";
-#[cfg(any(debug_assertions, test))]
-const DEV_MANIFEST_PUBLIC_KEY: [u8; 32] = [
-    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
-    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
-];
-// Debug images verify BOTH eras: the production root (so fleet manifests work
-// on dev builds) and the dev test key (so fixtures can exercise R3 without a
-// custody round-trip). The envelope's key_id selects at verify time.
-#[cfg(debug_assertions)]
-const DEV_MANIFEST_TRUST_SET: &[Option<ManifestTrustKey>; 2] = &[
-    Some(PROD_MANIFEST_TRUST_KEY),
-    Some(ManifestTrustKey {
-        key_id: DEV_MANIFEST_KEY_ID,
-        public_key: &DEV_MANIFEST_PUBLIC_KEY,
-    }),
-];
-
-fn compiled_manifest_trust_set() -> &'static [Option<ManifestTrustKey>] {
-    #[cfg(debug_assertions)]
-    {
-        DEV_MANIFEST_TRUST_SET
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        RELEASE_MANIFEST_TRUST_SET
-    }
-}
-
-fn trust_set_key_ids(trust_set: &[Option<ManifestTrustKey>]) -> Vec<&'static str> {
-    trust_set.iter().flatten().map(|key| key.key_id).collect()
 }
 
 /// Outcome of resolving the installed manifest artifact for an invocation.
@@ -4467,8 +4218,7 @@ enum ManifestResolution {
     /// The installed artifact verified: normal classification.
     Active(Manifest),
     /// The installed artifact failed validation after a prior valid manifest:
-    /// governed/admin tuples the cache classifies are refused, while mechanical
-    /// operations pass through.
+    /// the cache may explain a refusal but does not authorize passthrough.
     Regressed {
         manifest: Manifest,
         problem: ManifestProblem,
@@ -4502,20 +4252,6 @@ impl ManifestResolution {
     }
 }
 
-fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
-    match load_manifest(paths, now) {
-        Ok(manifest) => ManifestResolution::Active(manifest),
-        Err(ManifestProblem::Missing) => ManifestResolution::Dormant,
-        Err(problem) => match read_last_valid_manifest(paths) {
-            Some(cache) => ManifestResolution::Regressed {
-                manifest: cache.manifest,
-                problem,
-            },
-            None => ManifestResolution::Invalid(problem),
-        },
-    }
-}
-
 fn delegate_after_invalid_manifest_notice(
     args: &[OsString],
     problem: &ManifestProblem,
@@ -4533,19 +4269,22 @@ fn delegate_after_invalid_manifest_notice(
 
 /// Disposition of one invocation under the regressed-manifest arm.
 ///
-/// Governed and admin tuples, as classified by the last-valid manifest, fail
-/// closed with a stable refusal; mechanical operations pass through
-/// byte-transparently. The operator bypass does not apply here: a broken
-/// manifest means the classification itself is untrusted, so no bypass can
-/// promote it.
+/// Only commands that need no manifest to prove they are safe pass through.
+/// The last-valid cache can explain a refusal but cannot authorize a command.
 fn regressed_disposition(
     args: &[OsString],
     manifest: &Manifest,
     platform: &str,
     problem: &ManifestProblem,
 ) -> RegressedDisposition {
+    if is_unbound_safe(args) {
+        return RegressedDisposition::Passthrough;
+    }
     match classify(args, manifest, platform) {
-        Classification::Mechanical => RegressedDisposition::Passthrough,
+        Classification::Mechanical => RegressedDisposition::Refuse {
+            code: RefusalCode::ManifestRegressed,
+            text: "the signed routing manifest is invalid; only known safe commands can run until the operator repairs it".into(),
+        },
         Classification::Governed { tuple, .. } | Classification::Admin { tuple } => {
             let text = match problem.untrusted_manifest_key_steering() {
                 Some(steering) => {
@@ -4671,7 +4410,7 @@ struct RetainedManifest {
 /// superseded v9 must never be filed as v12.
 ///
 /// ADMISSION FILTER (both must hold):
-///   1. the envelope signature already verified against the compiled trust root
+///   1. the envelope signature already verified against the pinned trust root
 ///      (the caller reuses that result — this function does not re-verify), and
 ///   2. the `manifest_version` parsed from inside the verified payload bytes
 ///      equals the version used in the filing name.
@@ -4906,6 +4645,15 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
         return classify_api(args, manifest, platform);
     }
     let mut tuple = verb_tuple(verb, subcommand);
+    if tuple == secret_list::TUPLE {
+        return secret_list::classify(manifest, platform);
+    }
+    if tuple == environment_admin::SECRET_SET {
+        return environment_admin::classify_secret(args, manifest, platform);
+    }
+    if let Some(classification) = variable_rows::classify(&tuple, args, manifest, platform) {
+        return classification;
+    }
     // Only a signed queue declaration may reinterpret the queue-shaped merge
     // invocation. Direct merges and disabling auto-merge retain their admin row.
     if tuple == "pr merge"
@@ -5001,6 +4749,13 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     let Some(shape) = api_request_shape(args) else {
         return Classification::Unclassified;
     };
+    if workflow_approval::is_approval_path(&shape.path) {
+        return workflow_approval::classify(&shape, manifest, platform);
+    }
+    if let Some(classification) = environment_admin::classify_api(args, &shape, manifest, platform)
+    {
+        return classification;
+    }
     // The method upstream `gh` sends: a field or `--input` payload without a
     // named method is a POST, which is how a review reply is usually written.
     // Before v22 no POST rule exists, so an implicit POST stays undeclared
@@ -5020,7 +4775,10 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
         .api_rules
         .iter()
         .filter(|rule| {
-            rule.method.eq_ignore_ascii_case(&method)
+            !matches!(
+                (method.as_str(), rule.path_glob.as_str()),
+                ("PUT", environment_admin::PUT_GLOB) | ("POST", environment_admin::POLICY_GLOB)
+            ) && rule.method.eq_ignore_ascii_case(&method)
                 && platform_matches(&rule.platform, platform)
                 && api_rule_matches_path(rule, &path)
         })
@@ -5080,54 +4838,6 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
         Tier::Governed => Classification::Unclassified,
         Tier::Admin => unreachable!("admin API rules return before field protection"),
     }
-}
-
-fn api_rule_matches_path(rule: &ApiRule, path: &str) -> bool {
-    if rule.path_glob == PRIVATE_REPORTING_PATH_GLOB {
-        // glob's `*` can span slashes. This setting is a single repository
-        // endpoint, not a subtree or a similarly named neighbouring setting.
-        let segments = path.split('/').collect::<Vec<_>>();
-        return matches!(segments.as_slice(), ["", "repos", owner, repo, "private-vulnerability-reporting"]
-            if !owner.is_empty() && !repo.is_empty());
-    }
-    if matches!(
-        rule.path_glob.as_str(),
-        REVIEW_REPLY_PATH_GLOB
-            | PULL_EDIT_PATH_GLOB
-            | STACK_CREATE_PATH_GLOB
-            | STACK_ADD_PATH_GLOB
-            | STACK_UNSTACK_PATH_GLOB
-            | MERGE_ASYNC_PATH_GLOB
-    ) {
-        // The same reason: `/repos/*/*/pulls/*` must name one pull request,
-        // not every endpoint below it, so each `*` matches one non-empty
-        // path segment.
-        let pattern = rule.path_glob.split('/').collect::<Vec<_>>();
-        let segments = path.split('/').collect::<Vec<_>>();
-        return pattern.len() == segments.len()
-            && pattern.iter().zip(&segments).all(|(expected, actual)| {
-                if *expected == "*" {
-                    !actual.is_empty()
-                } else {
-                    expected == actual
-                }
-            });
-    }
-    glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(path))
-}
-
-/// Stable name for an API rule, shared by admin bypass audit records and the
-/// governed own-comment row: `api:<METHOD>:<path glob>`.
-fn api_tuple(rule: &ApiRule) -> String {
-    format!(
-        "api:{}:{}",
-        rule.method.to_ascii_uppercase(),
-        rule.path_glob
-    )
-}
-
-fn is_api_tuple(tuple: &str) -> bool {
-    tuple.starts_with("api:")
 }
 
 fn api_method_and_path(args: &[OsString]) -> Option<(String, String, bool)> {
@@ -5329,17 +5039,22 @@ fn attach_invocation(
     Ok(request)
 }
 
-pub(crate) fn capture_speech_policy() -> Result<
-    Option<(
-        crate::gh_shim_speech::model::PolicySnapshot,
-        BTreeMap<String, String>,
-        u64,
-    )>,
-    crate::gh_shim_speech::Refusal,
-> {
+type CapturedSpeechPolicy = (
+    crate::gh_shim_speech::model::PolicySnapshot,
+    BTreeMap<String, String>,
+    u64,
+);
+
+pub(crate) fn capture_speech_policy(
+) -> Result<Option<CapturedSpeechPolicy>, crate::gh_shim_speech::Refusal> {
+    capture_speech_policy_at(&StatePaths::from_process().for_daemon())
+}
+
+fn capture_speech_policy_at(
+    paths: &StatePaths,
+) -> Result<Option<CapturedSpeechPolicy>, crate::gh_shim_speech::Refusal> {
     use crate::gh_shim_speech::{Code, Refusal};
     use sha2::Digest;
-    let paths = StatePaths::from_process();
     if !paths.manifest.exists()
         && !paths.last_valid_manifest.exists()
         && !paths.version_high_water.exists()
@@ -5358,7 +5073,7 @@ pub(crate) fn capture_speech_policy() -> Result<
     let bytes = accepted.signed_envelope;
     let current = fs::read(&paths.manifest)
         .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let manifest = verified_speech_manifest(&bytes)
+    let manifest = verified_speech_manifest_at(&bytes, paths)
         .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     if manifest.manifest_version != high.newest_accepted_version {
         return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
@@ -5383,7 +5098,10 @@ pub(crate) fn capture_speech_policy() -> Result<
     )))
 }
 
-fn verified_speech_manifest(bytes: &[u8]) -> Result<Manifest, crate::gh_shim_speech::Refusal> {
+fn verified_speech_manifest_at(
+    bytes: &[u8],
+    paths: &StatePaths,
+) -> Result<Manifest, crate::gh_shim_speech::Refusal> {
     let invalid = |check| {
         crate::gh_shim_speech::snapshot_invalid(
             "gh_shim::verified_speech_manifest",
@@ -5399,8 +5117,9 @@ fn verified_speech_manifest(bytes: &[u8]) -> Result<Manifest, crate::gh_shim_spe
     if envelope.envelope_version != ENVELOPE_VERSION {
         return Err(invalid("envelope_version"));
     }
-    let verified = verify_manifest_envelope(&envelope, compiled_manifest_trust_set())
-        .map_err(|_| invalid("envelope_verification"))?;
+    let pin = trust_root::read(paths).map_err(|_| invalid("envelope_verification"))?;
+    let verified =
+        verify_manifest_envelope(&envelope, &pin).map_err(|_| invalid("envelope_verification"))?;
     let manifest = verified.manifest;
     manifest
         .validate()
@@ -5419,7 +5138,8 @@ pub(crate) fn speech_start_classification(
     args: &[OsString],
 ) -> Result<bool, crate::gh_shim_speech::Refusal> {
     use sha2::Digest;
-    let manifest = verified_speech_manifest(&snapshot.signed_envelope)?;
+    let manifest =
+        verified_speech_manifest_at(&snapshot.signed_envelope, &StatePaths::from_process())?;
     if snapshot.version != manifest.manifest_version
         || snapshot.artifact_id != manifest.artifact_id
         || snapshot.digest.as_slice() != sha2::Sha256::digest(&snapshot.signed_envelope).as_slice()
@@ -5532,6 +5252,7 @@ pub(crate) fn validate_speech_policy(
 ) -> Result<(), crate::gh_shim_speech::Refusal> {
     use crate::gh_shim_speech::{Code, Refusal};
     use sha2::Digest;
+    let paths = StatePaths::from_process().for_daemon();
     invocation.validate()?;
     let actual = wire_mutation_semantics(request)
         .ok_or_else(|| Refusal::new(Code::PolicyDenied, "payload_denied"))?;
@@ -5542,7 +5263,7 @@ pub(crate) fn validate_speech_policy(
         {
             return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
         }
-        let manifest = verified_speech_manifest(&snapshot.signed_envelope)?;
+        let manifest = verified_speech_manifest_at(&snapshot.signed_envelope, &paths)?;
         if manifest.manifest_version != snapshot.version
             || manifest.artifact_id != snapshot.artifact_id
             || current.version < start.version
@@ -7748,10 +7469,10 @@ struct CachedManifestReport {
     /// Signed provenance metadata for the manifest used by this report; it does
     /// not control artifact validity after signature verification.
     issued_at_unix_secs: Option<u64>,
-    /// The compiled trust-set key that verified the installed envelope.
+    /// The pinned policy root that verified the installed envelope.
     verified_by_key_id: Option<String>,
     /// Key identifiers compiled into this executing image's manifest trust set.
-    compiled_trust_set_key_ids: Vec<&'static str>,
+    pinned_trust_root_key_id: Option<String>,
     version_error: Option<String>,
     state: Option<&'static str>,
     state_error: Option<String>,
@@ -7844,7 +7565,10 @@ fn build_self_report(paths: &StatePaths, full_audit: bool) -> SelfReport {
     let (cached_manifest, last_rung) = if disabled {
         (disabled_manifest_report(), disabled_last_rung_report())
     } else {
-        (cached_manifest_report(paths), last_rung_report(paths))
+        (
+            cached_manifest_report_at(paths, unix_seconds()),
+            last_rung_report(paths),
+        )
     };
     let last_probe = if disabled {
         None
@@ -7904,7 +7628,7 @@ fn disabled_manifest_report() -> CachedManifestReport {
         version: None,
         issued_at_unix_secs: None,
         verified_by_key_id: None,
-        compiled_trust_set_key_ids: trust_set_key_ids(compiled_manifest_trust_set()),
+        pinned_trust_root_key_id: None,
         version_error: None,
         state: Some("disabled"),
         state_error: None,
@@ -7932,26 +7656,14 @@ fn disabled_last_rung_report() -> LastRungReport {
     }
 }
 
-fn cached_manifest_report(paths: &StatePaths) -> CachedManifestReport {
-    cached_manifest_report_at(paths, unix_seconds())
-}
-
 fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestReport {
-    cached_manifest_report_at_with(paths, now, compiled_manifest_trust_set())
-}
-
-fn cached_manifest_report_at_with(
-    paths: &StatePaths,
-    now: u64,
-    trust_set: &[Option<ManifestTrustKey>],
-) -> CachedManifestReport {
-    let compiled_trust_set_key_ids = trust_set_key_ids(trust_set);
-    match load_manifest_with_trust_set(paths, now, trust_set) {
+    let pinned_trust_root_key_id = trust_root::read(paths).ok().map(|pin| pin.key_id);
+    match load_verified_manifest(paths, now) {
         Ok(verified) => CachedManifestReport {
             version: Some(verified.manifest.manifest_version),
             issued_at_unix_secs: Some(verified.manifest.issued_at_unix_secs),
+            pinned_trust_root_key_id: Some(verified.verified_by_key_id.clone()),
             verified_by_key_id: Some(verified.verified_by_key_id),
-            compiled_trust_set_key_ids,
             version_error: None,
             state: Some("valid"),
             state_error: None,
@@ -7964,7 +7676,7 @@ fn cached_manifest_report_at_with(
                 version: None,
                 issued_at_unix_secs: None,
                 verified_by_key_id: None,
-                compiled_trust_set_key_ids,
+                pinned_trust_root_key_id,
                 version_error: Some(error.clone()),
                 state: None,
                 state_error: Some(error),
@@ -7982,7 +7694,7 @@ fn cached_manifest_report_at_with(
                     version: Some(cache.manifest.manifest_version),
                     issued_at_unix_secs: Some(cache.manifest.issued_at_unix_secs),
                     verified_by_key_id: None,
-                    compiled_trust_set_key_ids,
+                    pinned_trust_root_key_id,
                     version_error: None,
                     state: Some("regressed"),
                     state_error: None,
@@ -7998,7 +7710,7 @@ fn cached_manifest_report_at_with(
                         version: None,
                         issued_at_unix_secs: None,
                         verified_by_key_id: None,
-                        compiled_trust_set_key_ids,
+                        pinned_trust_root_key_id,
                         version_error: Some(error.clone()),
                         state: None,
                         state_error: Some(error),
@@ -8150,26 +7862,6 @@ fn executing_image_path_positions(image: &Path) -> Vec<usize> {
         .collect()
 }
 
-fn delegate(args: &[OsString]) -> i32 {
-    native_guard::dispatch(
-        args,
-        &RelayContext::from_process(),
-        native_guard::ShellSignals::from_process(),
-        |args| delegate_allowed(args),
-    )
-}
-
-fn delegate_allowed(args: &[OsString]) -> i32 {
-    let image = executing_image();
-    let Some(real_gh) = resolve_real_gh(&image) else {
-        return refuse(
-            RefusalCode::NoRealGh,
-            "PATH contains no upstream gh after skipping the executing shim image",
-        );
-    };
-    exec_real_gh(real_gh, args)
-}
-
 fn resolve_real_gh(executing_image: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let shims_dir = crate::environment::non_empty_os_var("AFT_GH_SHIMS_DIR").map(PathBuf::from);
@@ -8239,30 +7931,6 @@ fn same_image(left: &Path, right: &Path) -> bool {
         }
     }
     false
-}
-
-#[cfg(unix)]
-fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
-    use std::os::unix::process::CommandExt;
-    let error = Command::new(real_gh).args(args).exec();
-    // `exec` returns only if a candidate disappeared after the PATH scan. This
-    // remains a shim refusal, rather than silently treating a failed exec as a
-    // successful no-op.
-    refuse(
-        RefusalCode::NoRealGh,
-        &format!("unable to exec upstream gh: {error}"),
-    )
-}
-
-#[cfg(not(unix))]
-fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
-    match Command::new(real_gh).args(args).status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(error) => refuse(
-            RefusalCode::NoRealGh,
-            &format!("unable to exec upstream gh: {error}"),
-        ),
-    }
 }
 
 fn refusal_line(code: RefusalCode, text: &str) -> String {
@@ -8347,6 +8015,11 @@ mod v22_tests;
 #[cfg(test)]
 #[path = "gh_shim/v23_tests.rs"]
 mod v23_tests;
+
+#[cfg(test)]
+#[path = "gh_shim/workflow_approval_tests.rs"]
+mod workflow_approval_tests;
+
 // The review-thread rows are declared for Linux and macOS only, and the
 // signed fixtures verify only under the debug test key.
 #[cfg(test)]
@@ -8372,34 +8045,6 @@ pub(crate) mod tests {
     /// budget. Tests of the budget itself (expired deadlines, slow test
     /// daemons, probe stages) keep `DISCOVERY_BUDGET` so they still time out.
     const TEST_DISCOVERY_DEADLINE: Duration = Duration::from_secs(60);
-
-    #[cfg(unix)]
-    #[test]
-    fn supplemental_numeric_id_probe_does_not_accept_an_expired_deadline() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "printf '123\\n'"]);
-        assert_eq!(
-            numeric_id_from_command(command, std::time::Instant::now()),
-            None
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supplemental_numeric_id_probe_refuses_overflow_instead_of_parsing_a_prefix() {
-        let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            "printf '123\\n'; head -c 5000 /dev/zero | tr '\\000' ' '",
-        ]);
-        assert_eq!(
-            numeric_id_from_command(
-                command,
-                std::time::Instant::now() + crate::format::AVAILABILITY_PROBE_BUDGET
-            ),
-            None
-        );
-    }
 
     #[test]
     fn empty_home_uses_userprofile_for_config_and_parent_exclusion() {
@@ -8615,7 +8260,7 @@ pub(crate) mod tests {
     }
 
     fn write_envelope_fixture(paths: &StatePaths, envelope_json: &str) {
-        fs::create_dir_all(&paths.root).expect("state root");
+        write_fixture_pin(paths);
         fs::write(&paths.manifest, envelope_json.as_bytes()).expect("manifest cache");
     }
 
@@ -8758,6 +8403,12 @@ pub(crate) mod tests {
         assert_eq!(calls, 0);
 
         write_signed_manifest(&paths, fixture_manifest(), unix_seconds());
+        let changed = guard.delegate(&os_args(&["pr", "merge", "1", "--squash"]), |_| {
+            panic!("a native action classified before activation must not run")
+        });
+        assert_eq!(changed, 86);
+
+        let guard = manifest_guard::ManifestGuard::new(&paths);
         let status = guard.delegate(&os_args(&["pr", "merge", "1", "--squash"]), |_| {
             calls += 1;
             73
@@ -11571,7 +11222,7 @@ pub(crate) mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 23);
+        assert_eq!(RefusalCode::ALL.len(), 24);
         assert_eq!(
             RefusalCode::WorkerWriteRefused.as_str(),
             crate::gh_shim_speech::WORKER_WRITE_CODE
@@ -15110,74 +14761,76 @@ INHERITED FLAGS
     }
 
     #[test]
-    fn standby_key_fixture_verifies_under_a_two_slot_trust_set_and_unknown_key_ids_are_refused() {
-        let envelope: SignedManifest = serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/signed-envelope-v2-standby-key.json"
-        ))
-        .expect("standby envelope fixture");
-
-        let standby = Ed25519KeyPair::from_seed_unchecked(&STANDBY_TEST_SEED).expect("standby key");
-        assert_ne!(standby.public_key().as_ref(), DEV_MANIFEST_PUBLIC_KEY);
-        let standby_public: &'static [u8] =
-            Box::leak(standby.public_key().as_ref().to_vec().into_boxed_slice());
-        let trust_set = [
-            Some(ManifestTrustKey {
-                key_id: DEV_MANIFEST_KEY_ID,
-                public_key: &DEV_MANIFEST_PUBLIC_KEY,
-            }),
-            Some(ManifestTrustKey {
-                key_id: DEV_STANDBY_MANIFEST_KEY_ID,
-                public_key: standby_public,
-            }),
-        ];
-
-        // A standby-signed manifest is accepted under the two-slot set.
-        let manifest =
-            verify_manifest_signature_with(&envelope, &trust_set).expect("standby slot verifies");
-        assert_eq!(
-            manifest.manifest_version,
-            fixture_manifest().manifest_version
+    fn pinned_key_verifies_but_other_and_retired_keys_do_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let rotated = pin_for(&STANDBY_TEST_SEED);
+        let rotated_id = rotated.key_id.clone();
+        let envelope = signed_with(
+            &fixture_manifest(),
+            TEST_NOW,
+            &STANDBY_TEST_SEED,
+            &rotated_id,
         );
+        write_fixture_pin(&paths);
+        fs::write(&paths.manifest, serde_json::to_vec(&envelope).unwrap()).unwrap();
 
-        // A third, unknown key id is refused by the same set.
-        let mut unknown = envelope.clone();
-        unknown.key_id = "gh-routing-unknown-key".to_string();
+        assert!(
+            matches!(load_manifest(&paths, TEST_NOW), Err(ManifestProblem::Invalid(reason)) if reason == format!("untrusted manifest key id {rotated_id}"))
+        );
+        publish_pin(&paths, Some(rotated.clone()));
+        assert_eq!(load_manifest(&paths, TEST_NOW).unwrap().manifest_version, 1);
+
+        // Keep the exact same envelope and public key so accepting cached
+        // verification without looking at retirement would make this go green.
+        let mut retired = rotated;
+        retired.retired_key_ids.push(rotated_id.clone());
+        assert!(
+            matches!(verify_manifest_envelope(&envelope, &retired), Err(ManifestProblem::Invalid(reason)) if reason == format!("retired manifest key id {rotated_id}"))
+        );
+        publish_pin(&paths, Some(retired));
         assert!(matches!(
-            verify_manifest_signature_with(&unknown, &trust_set),
-            Err(ManifestProblem::Invalid(_))
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::NoTrustRoot)
         ));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn compiled_trust_set_shape_matches_the_two_slot_design() {
-        let slots = compiled_manifest_trust_set();
-        // Every profile trusts the production root minted in the 2026-08-27
-        // CKCRED ceremony (`signing:gh-manifest-root:1`); the bytes here are
-        // the published public half, re-asserted so a trust-slot edit cannot
-        // silently swap the live key.
-        let live = slots[0].expect("live slot carries the production root");
-        assert_eq!(live.key_id, PROD_MANIFEST_KEY_ID);
-        assert_eq!(live.public_key, &PROD_MANIFEST_PUBLIC_KEY);
-        #[cfg(debug_assertions)]
-        {
-            // Debug images verify both eras: prod live + the dev test key so
-            // fixtures exercise R3 without a custody round-trip.
-            assert_eq!(slots.len(), 2);
-            assert_eq!(slots[1].unwrap().key_id, DEV_MANIFEST_KEY_ID);
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            // The release set keeps two slots: prod live + a cold standby that
-            // stays empty until a future custody release fills it.
-            assert_eq!(slots.len(), 2);
-            assert!(slots[1].is_none());
-        }
-    }
+    fn worker_receives_an_owner_only_copy_of_the_pinned_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::test_env::process_env_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().join("main"));
+        let _state = ScopedTestEnvVar::set(GH_SHIM_STATE_DIR_ENV, paths.root.to_str());
+        write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
+        let worker = StatePaths::from_root(directory.path().join("worker"));
 
+        let anchor = trust_root::shell_anchor().unwrap();
+        let _anchor = ScopedTestEnvVar::set(trust_root::ANCHOR_ENV, Some(&anchor));
+        seed_worker_state(&worker.root).unwrap();
+        assert_eq!(
+            fs::read(&worker.trust_root).unwrap(),
+            fs::read(&paths.trust_root).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&worker.trust_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            load_manifest(&worker, TEST_NOW).unwrap().manifest_version,
+            1
+        );
+    }
     #[test]
     fn envelope_v1_shapes_are_refused_by_the_v2_verifier() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
+        write_fixture_pin(&paths);
         let manifest = fixture_manifest();
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let key = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
@@ -15213,6 +14866,20 @@ INHERITED FLAGS
     }
 
     #[test]
+    fn gh_shim_without_a_pin_cannot_activate_even_a_previously_trusted_signature() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let bytes = serde_json::to_vec(&signed(&fixture_manifest(), TEST_NOW)).unwrap();
+        fs::write(&paths.manifest, bytes).unwrap();
+
+        assert!(matches!(
+            resolve_manifest(&paths, TEST_NOW),
+            ManifestResolution::Dormant
+        ));
+        assert_eq!(version_high_water(&paths), 0);
+    }
+
+    #[test]
     fn dormant_resolution_is_presence_based() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
@@ -15225,6 +14892,7 @@ INHERITED FLAGS
         // A failing artifact with no last-valid cache falls back without a
         // regressed classification, but remains distinguishable from a missing
         // public-install manifest so the invocation can announce the fallback.
+        write_fixture_pin(&paths);
         let untrusted = signed_with(
             &fixture_manifest(),
             TEST_NOW,
@@ -15257,7 +14925,10 @@ INHERITED FLAGS
 
         // A failed validation immediately enters the regressed arm; time passing
         // does not participate in manifest validity.
-        let ManifestResolution::Regressed { manifest, problem } = resolve_manifest(&paths, now)
+        let ManifestResolution::Regressed {
+            mut manifest,
+            problem,
+        } = resolve_manifest(&paths, now)
         else {
             panic!("expected the regressed arm");
         };
@@ -15292,13 +14963,31 @@ INHERITED FLAGS
             regressed_disposition(&mechanical, &manifest, "macos", &problem),
             RegressedDisposition::Passthrough
         ));
-        let undeclared = [OsString::from("alias"), OsString::from("set")];
+        let undeclared = [OsString::from("fixture"), OsString::from("write")];
         assert!(matches!(
             regressed_disposition(&undeclared, &manifest, "macos", &problem),
             RegressedDisposition::Refuse {
                 code: RefusalCode::Unclassified,
                 ..
             }
+        ));
+        manifest
+            .tiers
+            .entry(Tier::Mechanical)
+            .or_default()
+            .push(TupleDecl::Details {
+                tuple: "fixture write".into(),
+                platform: vec!["macos".into()],
+                api_match: None,
+                rationale: None,
+            });
+        assert!(matches!(
+            classify(&undeclared, &manifest, "macos"),
+            Classification::Mechanical
+        ));
+        assert!(matches!(
+            regressed_disposition(&undeclared, &manifest, "macos", &problem),
+            RegressedDisposition::Refuse { .. }
         ));
 
         // The self report is loud about the regressed validation failure.
@@ -15329,8 +15018,8 @@ INHERITED FLAGS
             Some(DEV_MANIFEST_KEY_ID)
         );
         assert_eq!(
-            manifest_report.compiled_trust_set_key_ids,
-            trust_set_key_ids(compiled_manifest_trust_set())
+            manifest_report.pinned_trust_root_key_id.as_deref(),
+            Some(DEV_MANIFEST_KEY_ID)
         );
 
         let provenance = RungRecordProvenance {
@@ -15382,55 +15071,28 @@ INHERITED FLAGS
     }
 
     #[test]
-    fn trust_set_provenance_explains_image_level_untrusted_key_regression() {
+    fn status_identifies_the_pin_that_rejected_a_previously_valid_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
         write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
-        let verifier_a = [Some(ManifestTrustKey {
-            key_id: DEV_MANIFEST_KEY_ID,
-            public_key: &DEV_MANIFEST_PUBLIC_KEY,
-        })];
-        let verifier_b = [Some(PROD_MANIFEST_TRUST_KEY)];
-
-        let report_a = cached_manifest_report_at_with(&paths, TEST_NOW, &verifier_a);
-        assert_eq!(report_a.state, Some("valid"));
         assert_eq!(
-            report_a.verified_by_key_id.as_deref(),
-            Some(DEV_MANIFEST_KEY_ID)
-        );
-        assert_eq!(
-            report_a.compiled_trust_set_key_ids,
-            vec![DEV_MANIFEST_KEY_ID]
+            cached_manifest_report_at(&paths, TEST_NOW).state,
+            Some("valid")
         );
 
-        let report_b = cached_manifest_report_at_with(&paths, TEST_NOW, &verifier_b);
-        assert_eq!(report_b.state, Some("regressed"));
-        assert_eq!(report_b.verified_by_key_id, None);
+        let rotated = pin_for(&STANDBY_TEST_SEED);
+        publish_pin(&paths, Some(rotated.clone()));
+        let report = cached_manifest_report_at(&paths, TEST_NOW);
+        assert_eq!(report.state, Some("regressed"));
+        assert_eq!(report.verified_by_key_id, None);
         assert_eq!(
-            report_b.compiled_trust_set_key_ids,
-            vec![PROD_MANIFEST_KEY_ID]
+            report.pinned_trust_root_key_id.as_deref(),
+            Some(rotated.key_id.as_str())
         );
         assert_eq!(
-            report_b.diagnostic_guidance,
+            report.diagnostic_guidance,
             Some(UNTRUSTED_MANIFEST_KEY_STEERING)
         );
-
-        let cached = read_last_valid_manifest(&paths).expect("verifier A wrote last-valid cache");
-        let governed = [
-            OsString::from("issue"),
-            OsString::from("comment"),
-            OsString::from("42"),
-            OsString::from("--body"),
-            OsString::from("hello"),
-        ];
-        let untrusted =
-            ManifestProblem::Invalid(format!("untrusted manifest key id {DEV_MANIFEST_KEY_ID}"));
-        let RegressedDisposition::Refuse { text, .. } =
-            regressed_disposition(&governed, &cached.manifest, "macos", &untrusted)
-        else {
-            panic!("a governed command must refuse under verifier B");
-        };
-        assert!(text.ends_with(UNTRUSTED_MANIFEST_KEY_STEERING));
     }
 
     #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
@@ -16899,116 +16561,6 @@ mod github_read_mutation_tests {
             "the successful mutation must still evict its own issue"
         );
     }
-}
-
-fn run_captured_protected(
-    args: &[OsString],
-    paths: &StatePaths,
-    manifest_guard: &manifest_guard::ManifestGuard<'_>,
-    target: &TargetRepository,
-    cwd: &Path,
-    now: u64,
-) -> i32 {
-    use crate::gh_shim_speech::Code;
-    // Background writes retain a signed policy snapshot from command launch,
-    // but still require the current manifest. Report its absence before dispatch.
-    if matches!(
-        resolve_manifest(paths, now),
-        ManifestResolution::Invalid(_) | ManifestResolution::Dormant
-    ) {
-        if let Some(status) = manifest_guard.unavailable_refusal(args) {
-            return status;
-        }
-    }
-    let (manifest, classification, binding, rung) = match captured_plan(
-        args, paths, target, cwd, now,
-    ) {
-        Ok(plan) => plan,
-        Err(error) => {
-            let mut text = error.agent_text();
-            // run_with refuses worker writes before this head-shell path.
-            // Do not put operator-bypass advice in shared refusal text.
-            if error.code == Code::PolicyDenied && error.reason == "not_governed" {
-                text.push_str(" This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.");
-            }
-            return refuse(RefusalCode::SeamRefusal, &text);
-        }
-    };
-    // Protected invocations never hand native gh the operator's credentials.
-    dispatch_r3(
-        args,
-        classification,
-        &manifest,
-        paths,
-        &rung,
-        &binding,
-        now,
-        |_| {
-            refuse(
-                RefusalCode::SeamRefusal,
-                &captured_rung_refusal(&rung).agent_text(),
-            )
-        },
-    )
-}
-
-fn captured_rung_refusal(rung: &RungRecord) -> crate::gh_shim_speech::Refusal {
-    use crate::gh_shim_speech::{Code, Refusal};
-    // Discovery records survive module restarts. A missing daemon or relay is
-    // retryable; missing policy configuration or ambient credentials are not.
-    let temporary = match rung.rung {
-        Rung::R1 => [R1Reason::Unreachable, R1Reason::DiscoveryBudgetExhausted]
-            .into_iter()
-            .any(|reason| {
-                rung.inputs.get("connection_file").map(String::as_str) == Some(reason.diagnostic())
-            }),
-        Rung::R2 => [
-            R2Reason::DaemonUnreachable,
-            R2Reason::CatalogGhRouteAbsent,
-            R2Reason::GhRouteHolderUnbound,
-        ]
-        .into_iter()
-        .any(|reason| rung.inputs.get(reason.diagnostic()).map(String::as_str) == Some("failed")),
-        Rung::R3 => false,
-    };
-    if temporary {
-        Refusal::new(Code::AuthorityUnavailable, "relay_unavailable")
-    } else {
-        Refusal::new(Code::PolicyDenied, "not_r3")
-    }
-}
-
-fn captured_plan(
-    args: &[OsString],
-    paths: &StatePaths,
-    target: &TargetRepository,
-    cwd: &Path,
-    now: u64,
-) -> Result<(Manifest, Classification, AgentBinding, RungRecord), crate::gh_shim_speech::Refusal> {
-    use crate::gh_shim_speech::{Code, Refusal};
-    if shim_disabled_by_operator() {
-        return Err(Refusal::new(Code::PolicyDenied, "not_r3"));
-    }
-    if operator_bypass_requested() || operator_credential_use(args).is_some() {
-        return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
-    }
-    load_manifest(paths, now)
-        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let (snapshot, _, _) = capture_speech_policy()?
-        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let manifest = verified_speech_manifest(&snapshot.signed_envelope)
-        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
-    let classification = classify(args, &manifest, current_platform());
-    if !matches!(&classification, Classification::Governed { .. }) {
-        return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
-    }
-    let binding = governing_binding(&classification, &manifest, target, cwd)
-        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
-    let determination = determine_rung(paths, target, cwd, now);
-    if determination.record.rung != Rung::R3 {
-        return Err(captured_rung_refusal(&determination.record));
-    }
-    Ok((manifest, classification, binding, determination.record))
 }
 
 pub(crate) fn speech_protected_without_view(args: &[OsString]) -> bool {

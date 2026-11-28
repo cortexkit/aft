@@ -6,10 +6,69 @@ BOTH the signed manifest declares it AND this build's classifier allowlist
 admits it at that manifest version, so a signed artifact alone cannot widen what
 the shim will speak.
 
+## Signing root
+
+The shim verifies lists only against this installation's policy root. The
+operator pins the vault's signing root with `ck policy-root set --vault-key
+<id>` and applies the printed digest with `ck config apply <digest>`. AFT starts
+fetching policy after a route configured to enable the shim binds. That
+includes per-client overrides such as `harnesses.opencode.github.shim`.
+If a live settings update enables the shim on an already-bound route, the
+next enabled shell launch starts fetching instead. Until then AFT does not
+poll the pin or create policy state. AFT reads the pin before activating a
+new list and every five minutes. The AFT relay, worker broker and speech
+verifier use the pin in memory, never the cached pin on disk. Each new shell
+gets the current key ID, public key and generation from AFT. The shim checks
+them against `trust-root.json` beside the list. The cached key must also be the
+current key in `trust-root-generation.json`, and must not be superseded or
+retired there. This closes trust on a recorded rotation or clear even if the
+old pin file is left behind. A worker shell gets a private copy of the list,
+pin and generation record from AFT. There is no built-in signing key or
+fallback key. The file is owner-only on Unix. On Windows it inherits the state
+directory's ACL, so keep that directory private; there is no worker copy.
+
+The filter prevents accidental writes under the person's GitHub login. It
+doesn't protect against a shell that sets its own environment variables or
+chooses to run the real `gh` directly. The key AFT gives a new shell keeps
+another agent from replacing that shell's trust merely by changing shared
+files. The AFT relay and worker broker still verify policy independently.
+
+A root change makes lists signed by the retired key unusable. The vault must
+publish a newer list signed by the new root before governed writes can resume.
+AFT fetches the current list again when the generation changes. If the daemon
+clears the pin, AFT removes the trust file. If refreshes fail, AFT and the shim
+stop trusting a pin 15 minutes after AFT last read it from the daemon. Relaunch
+a shell that started before the first pin arrived or before a rotation to
+get the current key and generation. A worker shell's copy
+of `trust-root.json` is made at launch and does not refresh; start a new
+worker shell when that copy expires.
+A shell AFT started with the shim enabled refuses writes without a verified
+list, even before the first pin arrives. A list, a trust file, or a record of
+a previous pin or accepted list also prevents fallback to the person's login.
+With no launch marker or such files, commands pass through only when the
+shim can rule out a write relay, as on a standalone install.
+
+Commit attribution is separate. In `git.co_author: "auto"` mode, the Git
+hook uses the committing agent's GitHub identity from Entorhinal, not the bot
+bound to the repository in the list. For a worker, the daemon's parent link
+must identify exactly one active head session that AFT can see. If the daemon
+also names a sponsoring agent for the worker or a program it runs, that name
+must agree with the head's identity. Auto attribution requires a shell launched
+through a route where
+the daemon identifies the agent and that agent has a GitHub identity in
+Entorhinal. It does not require a verified list. A standalone shell, or one
+launched without a daemon-stamped agent identity, gets no automatic trailer.
+Start a new shell after upgrading to pick up the new hook environment.
+
 ## Shim status
 
 `gh --status` prints one JSON document from local shim state, including
-`cached_manifest` and `last_rung`. The audit fields are `bypass_audit_count`
+`cached_manifest` and `last_rung`. `cached_manifest.pinned_trust_root_key_id`
+replaces `cached_manifest.compiled_trust_set_key_ids`. It reports the cached
+pin only when it matches the key and generation AFT gave the shell at launch
+and is fresh. `verified_by_key_id`
+is unchanged and reports the key that verified the list.
+The audit fields are `bypass_audit_count`
 (the total number of operator-bypass entries) and `bypass_audit_recent`
 (the newest 10 entries, or all entries when fewer exist, with the newest last).
 The summary streams the JSONL file and retains only those 10 entries in memory.
@@ -82,8 +141,8 @@ unapproved:
 
 - reads: `issue`/`pr`/`release`/`repo`/`run`/`workflow`/`label`/`cache`
   views, lists and downloads, `search` `issues`/`prs`/`repos`/`code`/`commits`,
-  `status`, `org list`, `gist` `list`/`view`, `secret list`, `variable`
-  `list`/`get`, `ruleset` `list`/`view`/`check`, `project`
+  `status`, `org list`, `gist` `list`/`view`, `variable get`,
+  `ruleset` `list`/`view`/`check`, `project`
   `list`/`view`/`field-list`/`item-list`, `ssh-key list`, `gpg-key list`,
   `codespace list`, `release verify`/`verify-asset`, `attestation verify`,
   `extension list`/`search`, and the `list`/`view` actions of
@@ -174,6 +233,8 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 
 ## Rows
 
+The **Since** column names the minimum signed manifest version unless noted.
+
 | Row | Class | Since |
 | --- | --- | --- |
 | `issue view`, `issue list`, `pr view`, `pr list`, `pr diff`, `pr checks`, `run view`, `run list`, `repo clone`, `repo view` | MECHANICAL | v1 |
@@ -188,6 +249,13 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 | `pr merge`, `release create` | ADMINISTRATION | v1 |
 | `repo edit`, `run delete` | ADMINISTRATION | v9 |
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
+| `api` POST `/repos/*/*/actions/runs/*/approve` | ADMINISTRATION (fork-run safety check) | v30 |
+| `secret list` (repository scope, names and update dates only) | ADMINISTRATION (operator read) | v30 |
+| `api` PUT `/repos/*/*/environments/*` | ADMINISTRATION | v30 |
+| `api` POST `/repos/*/*/environments/*/deployment-branch-policies` | ADMINISTRATION | v30 |
+| `secret set NAME --env ENV` (repository scope, value from stdin) | ADMINISTRATION | v30 |
+| `variable set NAME` (repository or repository environment scope) | ADMINISTRATION | v30 |
+| `variable list` (repository or repository environment scope) | MECHANICAL | v30 |
 | `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
 | `repo rename`, `repo create` | ADMINISTRATION-AS-OPERATOR | v19 |
 | `workflow disable`, `workflow enable` | ADMINISTRATION-AS-OPERATOR | v19 |
@@ -218,6 +286,55 @@ envelope with `python3 scripts/prepare-gh-shim-v15.py /path/to/v13-envelope.json
 the script prints its SHA-256 and defaults to that private ceremony directory.
 An optional second argument selects another output path. Verify the printed hash
 before signing, and do not re-serialize the payload after signing.
+
+Fork-run approval takes an explicit `repos/OWNER/REPO/actions/runs/ID/approve`
+endpoint and `--method POST` (or `-X POST`), with no other flags. It requires
+`GH_SHIM_BYPASS=operator` and a signed v30 or newer manifest declaring the row,
+even for repositories without a bot binding. All requests target `github.com`.
+Before auditing or sending the POST, the shim reads the run and checks the
+workflow file in the head repository at the run's exact head commit. The run
+must be awaiting approval (`action_required`) for `pull_request`,
+`pull_request_review`, or `pull_request_review_comment`.
+
+Each job must name only listed GitHub-hosted runner labels: `ubuntu-latest`,
+`ubuntu-24.04`, `ubuntu-22.04`, `windows-latest`, `windows-2025`, `windows-2022`,
+`macos-latest`, `macos-26`, `macos-15`, or `macos-14`. Self-hosted and unknown
+labels, expressions, runner groups, reusable workflow calls, and unreadable or
+uninspectable workflows refuse before the POST. Use the operator's normal diff
+review in addition to this runner check.
+
+`secret list` is an audited operator read: it requires `GH_SHIM_BYPASS=operator`
+and a signed v30 or newer manifest declaring the row. It never returns secret
+values. Select a repository with `-R OWNER/REPO` or let the shim use `GH_REPO`
+or the current checkout's GitHub origin. The `--app` choices are `actions`,
+`dependabot`, and `codespaces`; `--json` accepts `name` and `updatedAt`.
+Organization, user, and environment scopes are refused.
+
+Deployment environment writes require the signed v30 rows and the audited
+operator bypass, even for unbound repositories. PUT an environment or POST a
+deployment branch/tag policy by naming an explicit GitHub repository and one
+environment path segment. Supply the API body as `--input -` or as `-f`/`-F`
+fields, not both. File-based input and extra options are refused. Field-free
+GETs and previously declared operations keep their existing routing. An
+undeclared write to an environment or its subresources, or `secret delete`
+with an environment selector, cannot use the generic unbound bypass.
+
+For `secret set NAME --env ENV`, select the repository with `-R OWNER/REPO`
+or use the current repository. Pipe or redirect the value into stdin;
+interactive input, `--body`/`-b`, `--env-file`, and other scopes and options
+are refused. The shim sends stdin directly to upstream gh and suppresses its
+output; the exit status still reports success or failure. The audit identifies
+the repository, environment, and secret name, not the value.
+
+`variable set NAME` is an audited operator action. Supply a nonempty `--body`
+or `-b` value, or pass the value on stdin from a pipe or file. `variable list`
+is a read and does not need the operator bypass or add an audit line. Both
+require a signed v30 or newer manifest, a GitHub repository (use `-R OWNER/REPO`
+or the current repository), and may use `--env ENV`. Organization and user
+scopes, bulk files, and `variable delete` are not admitted by these rows.
+The `variable set` audit records the repository, optional environment, and
+variable name, not the value. These commands are available in the main session,
+not in shells launched for delegated workers.
 
 Every row is declared for `macos` and `linux`: the schema requires a non-empty
 `platform` list on tuples and API rules alike, so no row is OS-neutral.

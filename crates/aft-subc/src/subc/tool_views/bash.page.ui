@@ -5,7 +5,7 @@
 <CodeBlock codeString={input.command} />
 
 {(view.completion.endReason ?? view.record.endReason) == "timed_out" ? <ToolText text="Timed out" tone="danger" />
- : (view.completion.endReason ?? view.record.endReason) == "killed" ? <ToolText text="Stopped" tone="danger" />
+ : (view.completion.endReason ?? view.record.endReason) == "killed" ? <ToolText text="Stopped" tone="muted" />
  : (view.completion.exitCode ?? view.record.exitCode) != null ? <ToolText text={"Exit " + Text(view.completion.exitCode ?? view.record.exitCode)} tone={(view.completion.exitCode ?? view.record.exitCode) == 0 ? "muted" : "danger"} />
  : view.record.phase == "background_started" && view.completion == null ? <ToolText text="In background" tone="muted" />
  : view.call.phase == "unanswered" ? <ToolText text="Not run" tone="muted" />

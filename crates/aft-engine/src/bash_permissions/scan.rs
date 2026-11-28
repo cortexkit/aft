@@ -296,9 +296,9 @@ pub(crate) struct DirectoryTarget {
 /// invalid. Shell behavior the check cannot follow continues to run as before.
 /// Follow reachable outer-shell folder and physical-mode alternatives, keeping
 /// successful and failed commands separate so `&&` and `||` stay correlated.
-/// `known_directory` identifies existing directories copied to the runner. Treat
-/// valid initial `cd` changes as successful, but stop trusting the snapshot after
-/// any non-`cd` command. Keep tracking cwd independently of snapshot trust.
+/// Treat a valid `cd` to a directory in the checkout snapshot as successful until a command
+/// could modify the copied directories or affect how `cd` resolves paths. Keep
+/// tracking cwd even when the `known_directory` probe can no longer prove success.
 /// Before a command after `;` or a newline, use an unknown cwd if a speculative
 /// `cd` failure would leave a different folder than success. Directory changes
 /// inside child shells never replace the outer shell's folder.
@@ -325,6 +325,7 @@ pub(super) fn walk_shell_commands(
     struct Targets<'a> {
         directories: Vec<DirectoryTarget>,
         on_command: &'a mut dyn FnMut(Node<'_>, Option<&Path>),
+        inherited_home: Option<PathBuf>,
     }
     impl std::ops::Deref for Targets<'_> {
         type Target = Vec<DirectoryTarget>;
@@ -338,10 +339,27 @@ pub(super) fn walk_shell_commands(
         }
     }
 
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    struct ShellOptions {
+        physical: Option<bool>,
+        inherited_home: bool,
+    }
+    impl ShellOptions {
+        fn join(self, other: Self) -> Self {
+            Self {
+                physical: if self.physical == other.physical {
+                    self.physical
+                } else {
+                    None
+                },
+                inherited_home: self.inherited_home && other.inherited_home,
+            }
+        }
+    }
     #[derive(Clone, PartialEq, Eq)]
     struct ShellState {
         cwd: PathBuf,
-        physical: Option<bool>,
+        options: ShellOptions,
         snapshot_unchanged: bool,
         // A possible failure after another command, not a missing snapshot folder.
         uncertain_cd_failure: bool,
@@ -349,8 +367,8 @@ pub(super) fn walk_shell_commands(
     #[derive(Clone)]
     enum Paths {
         Known(Vec<ShellState>),
-        // The folder is unknown, but its default cd mode may still be known.
-        Unknown(Option<bool>),
+        // The folder is unknown, but the shell options may still be known.
+        Unknown(ShellOptions),
     }
     impl Paths {
         fn empty() -> Self {
@@ -359,7 +377,10 @@ pub(super) fn walk_shell_commands(
         fn one(cwd: PathBuf, physical: bool) -> Self {
             Self::Known(vec![ShellState {
                 cwd,
-                physical: Some(physical),
+                options: ShellOptions {
+                    physical: Some(physical),
+                    inherited_home: true,
+                },
                 snapshot_unchanged: true,
                 uncertain_cd_failure: false,
             }])
@@ -367,36 +388,29 @@ pub(super) fn walk_shell_commands(
         fn is_empty(&self) -> bool {
             matches!(self, Self::Known(paths) if paths.is_empty())
         }
-        fn mode(&self) -> Option<bool> {
+        fn options(&self) -> ShellOptions {
             match self {
-                Self::Unknown(mode) => *mode,
-                Self::Known(states) => {
-                    let first = states.first()?.physical;
-                    if states.iter().all(|state| state.physical == first) {
-                        first
-                    } else {
-                        None
-                    }
-                }
+                Self::Unknown(options) => *options,
+                Self::Known(states) => states
+                    .iter()
+                    .map(|state| state.options)
+                    .reduce(ShellOptions::join)
+                    .unwrap_or_default(),
             }
         }
         fn insert(&mut self, state: ShellState) {
             match self {
-                Self::Unknown(mode) => {
-                    if *mode != state.physical {
-                        *mode = None;
-                    }
+                Self::Unknown(options) => {
+                    *options = options.join(state.options);
                 }
                 Self::Known(paths) if !paths.contains(&state) => {
                     // Too many possible shell states make the set unknown; never discard
                     // just the extra folder and keep pretending the set is complete.
                     if paths.len() >= MAX_CWD_PATHS {
-                        let mode = paths
+                        let options = paths
                             .iter()
-                            .all(|path| path.physical == state.physical)
-                            .then_some(state.physical)
-                            .flatten();
-                        *self = Self::Unknown(mode);
+                            .fold(state.options, |options, path| options.join(path.options));
+                        *self = Self::Unknown(options);
                     } else {
                         paths.push(state);
                     }
@@ -409,7 +423,7 @@ pub(super) fn walk_shell_commands(
                 return other;
             }
             match other {
-                Self::Unknown(mode) => Self::Unknown(if self.mode() == mode { mode } else { None }),
+                Self::Unknown(options) => Self::Unknown(self.options().join(options)),
                 Self::Known(paths) => {
                     for path in paths {
                         self.insert(path);
@@ -418,18 +432,27 @@ pub(super) fn walk_shell_commands(
                 }
             }
         }
-        fn with_physical(self, physical: Option<bool>) -> Self {
+        fn map_options(self, mut update: impl FnMut(&mut ShellOptions)) -> Self {
             match self {
-                Self::Unknown(_) => Self::Unknown(physical),
+                Self::Unknown(mut options) => {
+                    update(&mut options);
+                    Self::Unknown(options)
+                }
                 Self::Known(states) => {
                     let mut result = Self::empty();
                     for mut state in states {
-                        state.physical = physical;
+                        update(&mut state.options);
                         result.insert(state);
                     }
                     result
                 }
             }
+        }
+        fn forget_home(self) -> Self {
+            self.map_options(|options| options.inherited_home = false)
+        }
+        fn with_physical(self, physical: Option<bool>) -> Self {
+            self.map_options(|options| options.physical = physical)
         }
         fn snapshot_unchanged(&self) -> bool {
             match self {
@@ -469,16 +492,34 @@ pub(super) fn walk_shell_commands(
                 failure: paths,
             }
         }
+        fn followed_by(self, condition: Condition, evaluate: impl FnOnce(Paths) -> Self) -> Self {
+            match condition {
+                Condition::And => {
+                    let right = evaluate(self.success);
+                    Self {
+                        success: right.success,
+                        failure: self.failure.union(right.failure),
+                    }
+                }
+                Condition::Or => {
+                    let right = evaluate(self.failure);
+                    Self {
+                        success: self.success.union(right.success),
+                        failure: right.failure,
+                    }
+                }
+            }
+        }
         fn all(self) -> Paths {
             let mut paths = self.success.union(self.failure);
-            let mode = paths.mode();
+            let options = paths.options();
             if let Paths::Known(states) = &mut paths {
                 let uncertain_failure = states.iter().any(|state| state.uncertain_cd_failure);
                 let different_folders = states
                     .first()
                     .is_some_and(|first| states.iter().any(|state| state.cwd != first.cwd));
                 if uncertain_failure && different_folders {
-                    return Paths::Unknown(mode);
+                    return Paths::Unknown(options);
                 }
                 for state in states {
                     state.uncertain_cd_failure = false;
@@ -487,10 +528,15 @@ pub(super) fn walk_shell_commands(
             paths
         }
     }
-    enum Operator {
-        Sequence,
+    #[derive(Clone, Copy)]
+    enum Condition {
         And,
         Or,
+    }
+    enum ChainPart<'tree> {
+        Operand { node: Node<'tree>, redirected: bool },
+        Pipe,
+        Condition(Condition),
     }
     enum SetModeChange {
         Unchanged,
@@ -534,19 +580,19 @@ pub(super) fn walk_shell_commands(
             && !negative_index
             && (options_ended || !word.starts_with('-'))
     }
-    /// Non-literal arguments while parsing `set` options may change physical mode.
-    fn set_mode_change(parts: &[Part]) -> SetModeChange {
+    /// Return the physical-mode change and whether the arguments are only known options.
+    fn set_options(parts: &[Part]) -> (SetModeChange, bool) {
         let mut change = SetModeChange::Unchanged;
         let mut args = parts.iter().skip(1);
         while let Some(part) = args.next() {
             let Some(word) = literal_word(&part.text) else {
-                return SetModeChange::Unknown;
+                return (SetModeChange::Unknown, false);
             };
             if matches!(word.as_str(), "--" | "-" | "+") {
-                break;
+                return (change, false);
             }
             if !word.starts_with(['-', '+']) {
-                break;
+                return (change, false);
             }
             let enabled = word.starts_with('-');
             let mut flags = word[1..].chars().peekable();
@@ -555,13 +601,13 @@ pub(super) fn walk_shell_commands(
                     'P' => change = SetModeChange::Set(enabled),
                     'o' => {
                         if flags.peek().is_some() {
-                            return SetModeChange::Unknown;
+                            return (SetModeChange::Unknown, false);
                         }
                         let Some(option) = args.next() else {
-                            return change;
+                            return (change, true);
                         };
                         let Some(option) = literal_word(&option.text) else {
-                            return SetModeChange::Unknown;
+                            return (SetModeChange::Unknown, false);
                         };
                         if option == "physical" {
                             change = SetModeChange::Set(enabled);
@@ -593,20 +639,21 @@ pub(super) fn walk_shell_commands(
                                 | "vi"
                                 | "xtrace"
                         ) {
-                            return SetModeChange::Unknown;
+                            return (SetModeChange::Unknown, false);
                         }
                     }
                     flag if "abefhkmnptuvxBCEHT".contains(flag) => {}
-                    _ => return SetModeChange::Unknown,
+                    _ => return (SetModeChange::Unknown, false),
                 }
             }
         }
-        change
+        (change, parts.len() > 1)
     }
     fn resolve_target(
         head: &str,
         parts: &[Part],
         cwd: Option<&Path>,
+        inherited_home: Option<&Path>,
         default_physical: bool,
     ) -> Option<(DirectoryTarget, PathBuf)> {
         let mut physical = default_physical;
@@ -643,18 +690,29 @@ pub(super) fn walk_shell_commands(
             options = false;
         }
         let raw = operand?;
-        // The runner's home is not the local account's home. Quoted or escaped
-        // tildes remain ordinary path text, but home expansion is unknown.
-        if raw == "~" || raw.starts_with("~/") {
-            return None;
-        }
-        let text = literal_word(raw)
-            .filter(|text| text != "-" && !(head == "pushd" && text.starts_with('+')))?;
-        let literal_absolute = Path::new(&text).is_absolute();
-        let joined = if literal_absolute {
-            PathBuf::from(text)
+        let (joined, literal_absolute) = if raw == "~" || raw.starts_with("~/") {
+            // Inspect the caller's intended local path without rewriting the
+            // command. Only the unquoted tilde is special; the suffix must
+            // still parse as literal shell text.
+            let text = literal_word(&format!("\\{raw}"))?;
+            let suffix = text[1..].trim_start_matches('/');
+            let home = inherited_home?;
+            let mut path = home.to_path_buf();
+            if !suffix.is_empty() {
+                // The slash after `~` belongs to HOME even if the remaining
+                // text starts with another slash or a drive prefix.
+                path.as_mut_os_string().push("/");
+                path.as_mut_os_string().push(suffix);
+            }
+            (path, false)
         } else {
-            cwd?.join(text)
+            let text = literal_word(raw)
+                .filter(|text| text != "-" && !(head == "pushd" && text.starts_with('+')))?;
+            if Path::new(&text).is_absolute() {
+                (PathBuf::from(text), true)
+            } else {
+                (cwd?.join(text), false)
+            }
         };
         let (path, next_cwd) = if physical {
             let resolved = crate::system_temp::resolve_with_existing_ancestors(&joined);
@@ -688,19 +746,23 @@ pub(super) fn walk_shell_commands(
             // Stack rotation or an unmodeled stack edit cannot establish a
             // successful cwd. Failure still leaves the incoming folder intact.
             return Flow {
-                success: Paths::Unknown(incoming.mode()),
+                success: Paths::Unknown(incoming.options()),
                 failure: incoming,
             };
         }
         let mut success = Paths::empty();
         let mut failure = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
-        let mut resolve = |cwd, mode, snapshot_unchanged| {
-            let resolved = match mode {
-                Some(physical) => resolve_target(head, parts, cwd, physical)
+        let inherited_home = targets
+            .inherited_home
+            .as_deref()
+            .filter(|_| incoming.options().inherited_home);
+        let mut resolve = |cwd, options: ShellOptions, snapshot_unchanged| {
+            let resolved = match options.physical {
+                Some(physical) => resolve_target(head, parts, cwd, inherited_home, physical)
                     .map(|(target, next_cwd)| (target, Some(next_cwd))),
-                None => resolve_target(head, parts, cwd, false)
-                    .zip(resolve_target(head, parts, cwd, true))
+                None => resolve_target(head, parts, cwd, inherited_home, false)
+                    .zip(resolve_target(head, parts, cwd, inherited_home, true))
                     .map(|((mut logical, logical_cwd), (physical, physical_cwd))| {
                         if logical.path != physical.path {
                             logical.alternate_path = Some(physical.path);
@@ -721,19 +783,19 @@ pub(super) fn walk_shell_commands(
                 if let Some(next_cwd) = next_cwd {
                     success.insert(ShellState {
                         cwd: next_cwd,
-                        physical: mode,
+                        options,
                         snapshot_unchanged,
                         uncertain_cd_failure: false,
                     });
                 } else {
-                    success = Paths::Unknown(None);
+                    success = success.clone().union(Paths::Unknown(options));
                 }
                 if !emitted.contains(&target) {
                     emitted.push(target);
                 }
                 known_success
             } else {
-                success = success.clone().union(Paths::Unknown(mode));
+                success = success.clone().union(Paths::Unknown(options));
                 false
             }
         };
@@ -742,7 +804,7 @@ pub(super) fn walk_shell_commands(
                 for state in paths {
                     if !resolve(
                         Some(state.cwd.as_path()),
-                        state.physical,
+                        state.options,
                         state.snapshot_unchanged,
                     ) {
                         let mut unchanged = state.clone();
@@ -751,8 +813,8 @@ pub(super) fn walk_shell_commands(
                     }
                 }
             }
-            Paths::Unknown(mode) => {
-                if !resolve(None, *mode, false) {
+            Paths::Unknown(options) => {
+                if !resolve(None, *options, false) {
                     failure = incoming.clone();
                 }
             }
@@ -791,6 +853,153 @@ pub(super) fn walk_shell_commands(
         }
         found
     }
+    fn collect_chain<'tree>(node: Node<'tree>, parts: &mut Vec<ChainPart<'tree>>) {
+        match node.kind() {
+            "list" | "pipeline" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "|" | "|&" => parts.push(ChainPart::Pipe),
+                        "&&" => parts.push(ChainPart::Condition(Condition::And)),
+                        "||" => parts.push(ChainPart::Condition(Condition::Or)),
+                        "comment" => {}
+                        _ if child.is_named() => collect_chain(child, parts),
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            "redirected_statement" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let first = parts.len();
+                    collect_chain(body, parts);
+                    if let Some(ChainPart::Operand { redirected, .. }) = parts[first..].last_mut() {
+                        *redirected = true;
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+        parts.push(ChainPart::Operand {
+            node,
+            redirected: false,
+        });
+    }
+    fn evaluate_chain(
+        node: Node<'_>,
+        source: &str,
+        incoming: Paths,
+        targets: &mut Targets<'_>,
+        known_directory: &dyn Fn(&Path) -> bool,
+    ) -> Flow {
+        // A redirection can make tree-sitter group an AND-OR list as a pipeline
+        // stage or redirection body. Recover shell precedence before isolating
+        // pipeline stages; explicit shell groups stay opaque to this pass.
+        let mut parts = Vec::new();
+        collect_chain(node, &mut parts);
+        let mut flow = Flow::success(incoming);
+        let mut connector = Condition::And;
+        for segment in parts.split_inclusive(|part| matches!(part, ChainPart::Condition(_))) {
+            let (pipeline, next) = match segment.split_last() {
+                Some((ChainPart::Condition(condition), rest)) => (rest, *condition),
+                _ => (segment, Condition::And),
+            };
+            flow = flow.followed_by(connector, |entry| {
+                evaluate_pipeline(pipeline, source, entry, targets, known_directory)
+            });
+            connector = next;
+        }
+        flow
+    }
+    fn evaluate_pipeline(
+        parts: &[ChainPart<'_>],
+        source: &str,
+        incoming: Paths,
+        targets: &mut Targets<'_>,
+        known_directory: &dyn Fn(&Path) -> bool,
+    ) -> Flow {
+        let isolated = parts.iter().any(|part| matches!(part, ChainPart::Pipe));
+        for part in parts {
+            let ChainPart::Operand { node, redirected } = part else {
+                continue;
+            };
+            let entry = if *redirected {
+                incoming.clone().invalidate_snapshot()
+            } else {
+                incoming.clone()
+            };
+            let inner = evaluate(*node, source, entry.clone(), targets, known_directory);
+            if !isolated {
+                return if *redirected {
+                    // A failed redirection prevents this operand from running.
+                    Flow {
+                        success: inner.success,
+                        failure: inner.failure.union(entry),
+                    }
+                } else {
+                    inner
+                };
+            }
+        }
+        Flow::either(incoming.invalidate_snapshot())
+    }
+    fn keeps_loop_cwd(node: Node<'_>, source: &str) -> bool {
+        match node.kind() {
+            "command" => command_parts(source, node)
+                .first()
+                .and_then(|part| literal_word(&part.text))
+                .is_some_and(|head| {
+                    !matches!(
+                        head.as_str(),
+                        "cd" | "pushd"
+                            | "popd"
+                            | "source"
+                            | "."
+                            | "eval"
+                            | "set"
+                            | "shopt"
+                            | "builtin"
+                            | "command"
+                            | "exec"
+                            | "trap"
+                    )
+                }),
+            "do_group" | "list" | "pipeline" => {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor);
+                children.all(|child| keeps_loop_cwd(child, source))
+            }
+            "redirected_statement" => node
+                .child_by_field_name("body")
+                .is_none_or(|body| keeps_loop_cwd(body, source)),
+            "subshell" | "comment" => true,
+            _ => false,
+        }
+    }
+    fn assigns_home(node: Node<'_>, source: &str) -> bool {
+        node.kind() == "variable_assignment"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(source, name) == "HOME")
+    }
+    fn changes_home(node: Node<'_>, source: &str) -> bool {
+        match node.kind() {
+            "variable_assignment" => assigns_home(node, source),
+            "command" | "declaration_command" | "unset_command" => {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor);
+                if node.kind() == "unset_command" {
+                    children.any(|child| {
+                        literal_word(node_text(source, child)).as_deref() == Some("HOME")
+                    })
+                } else {
+                    children.any(|child| assigns_home(child, source))
+                }
+            }
+            _ => false,
+        }
+    }
     fn evaluate(
         node: Node<'_>,
         source: &str,
@@ -806,32 +1015,58 @@ pub(super) fn walk_shell_commands(
                 let _ = evaluate_sequence(node, source, incoming.clone(), targets, known_directory);
                 return Flow::either(incoming.invalidate_snapshot());
             }
-            "pipeline" => {
+            "list" | "pipeline" => {
+                return evaluate_chain(node, source, incoming, targets, known_directory);
+            }
+            "for_statement" => {
+                if let Some(body) = node
+                    .child_by_field_name("body")
+                    .filter(|body| keeps_loop_cwd(*body, source))
+                {
+                    // A loop may skip or repeat its body. Preserve cwd only
+                    // when an iteration has no outer-shell directory effects.
+                    let incoming = incoming.invalidate_snapshot();
+                    let mut cursor = node.walk();
+                    for value in node.children_by_field_name("value", &mut cursor) {
+                        inspect_substitutions(value, source, &incoming, targets, known_directory);
+                    }
+                    let incoming = if node
+                        .child_by_field_name("variable")
+                        .is_some_and(|name| node_text(source, name) == "HOME")
+                    {
+                        incoming.forget_home()
+                    } else {
+                        incoming
+                    };
+                    let iteration =
+                        evaluate(body, source, incoming.clone(), targets, known_directory);
+                    return Flow::either(if iteration.all().options().inherited_home {
+                        incoming
+                    } else {
+                        incoming.forget_home()
+                    });
+                }
                 inspect_independent_children(
                     node,
                     source,
-                    incoming.clone(),
+                    Paths::Unknown(ShellOptions::default()),
                     targets,
                     known_directory,
                 );
-                return Flow::either(incoming.invalidate_snapshot());
+                return Flow::either(Paths::Unknown(ShellOptions::default()));
             }
             "function_definition" => return Flow::success(incoming.invalidate_snapshot()),
-            "if_statement"
-            | "for_statement"
-            | "c_style_for_statement"
-            | "while_statement"
-            | "case_statement" => {
+            "if_statement" | "c_style_for_statement" | "while_statement" | "case_statement" => {
                 // Unsupported control flow loses cwd precision; independently
                 // resolvable targets remain inspectable without choosing a branch.
                 inspect_independent_children(
                     node,
                     source,
-                    Paths::Unknown(None),
+                    Paths::Unknown(ShellOptions::default()),
                     targets,
                     known_directory,
                 );
-                return Flow::either(Paths::Unknown(None));
+                return Flow::either(Paths::Unknown(ShellOptions::default()));
             }
             "negated_command" => {
                 if let Some(body) = node.named_child(0) {
@@ -844,27 +1079,15 @@ pub(super) fn walk_shell_commands(
                 return Flow::either(incoming);
             }
             "redirected_statement" => {
-                let incoming = incoming.invalidate_snapshot();
-                let mut cursor = node.walk();
-                let body = node.child_by_field_name("body").or_else(|| {
-                    node.named_children(&mut cursor)
-                        .find(|child| !child.kind().contains("redirect"))
-                });
-                let inner = body
-                    .map(|body| evaluate(body, source, incoming.clone(), targets, known_directory))
-                    .unwrap_or_else(|| Flow::either(incoming.clone()));
-                if body.is_none() {
-                    let cwd = match &incoming {
-                        Paths::Known(states) if states.len() == 1 => Some(states[0].cwd.as_path()),
-                        _ => None,
-                    };
-                    (targets.on_command)(node, cwd);
+                if node.child_by_field_name("body").is_some() {
+                    return evaluate_chain(node, source, incoming, targets, known_directory);
                 }
-                // Redirection can fail before the body changes directory.
-                return Flow {
-                    success: inner.success,
-                    failure: inner.failure.union(incoming),
+                let cwd = match &incoming {
+                    Paths::Known(states) if states.len() == 1 => Some(states[0].cwd.as_path()),
+                    _ => None,
                 };
+                (targets.on_command)(node, cwd);
+                return Flow::either(incoming.invalidate_snapshot());
             }
             "command" => {
                 let cwd = match &incoming {
@@ -877,9 +1100,25 @@ pub(super) fn walk_shell_commands(
                 (targets.on_command)(node, cwd);
                 let has_substitution =
                     inspect_substitutions(node, source, &incoming, targets, known_directory);
+                let incoming = if changes_home(node, source) {
+                    incoming.forget_home()
+                } else {
+                    incoming
+                };
                 let parts = command_parts(source, node);
                 let head = parts.first().and_then(|part| literal_word(&part.text));
-                let incoming = if head.as_deref() == Some("cd") && !has_substitution {
+                let set = (head.as_deref() == Some("set")).then(|| set_options(&parts));
+                let command_has_setup = || {
+                    let mut cursor = node.walk();
+                    let found = node.named_children(&mut cursor).any(|child| {
+                        child.kind().contains("redirect") || child.kind() == "variable_assignment"
+                    });
+                    found
+                };
+                let preserves_snapshot = head.as_deref() == Some("cd")
+                    || (matches!(set, Some((SetModeChange::Unchanged, true)))
+                        && !command_has_setup());
+                let incoming = if preserves_snapshot && !has_substitution {
                     incoming
                 } else {
                     incoming.invalidate_snapshot()
@@ -889,12 +1128,14 @@ pub(super) fn walk_shell_commands(
                         directory_change(head, &parts, incoming, targets, known_directory)
                     }
                     Some("popd") => Flow {
-                        success: Paths::Unknown(incoming.mode()),
+                        success: Paths::Unknown(incoming.options()),
                         failure: incoming,
                     },
-                    Some("source" | "." | "eval") | None => Flow::either(Paths::Unknown(None)),
+                    Some("source" | "." | "eval") | None => {
+                        Flow::either(Paths::Unknown(ShellOptions::default()))
+                    }
                     Some("set") => {
-                        let flow = match set_mode_change(&parts) {
+                        let flow = match set.unwrap().0 {
                             SetModeChange::Unchanged => Flow::success(incoming.clone()),
                             SetModeChange::Set(physical) => {
                                 Flow::success(incoming.clone().with_physical(Some(physical)))
@@ -933,7 +1174,15 @@ pub(super) fn walk_shell_commands(
             }
             _ => {}
         }
-        evaluate_sequence(node, source, incoming, targets, known_directory)
+        let flow = evaluate_sequence(node, source, incoming, targets, known_directory);
+        if changes_home(node, source) {
+            Flow {
+                success: flow.success.forget_home(),
+                failure: flow.failure.forget_home(),
+            }
+        } else {
+            flow
+        }
     }
     fn evaluate_sequence(
         node: Node<'_>,
@@ -943,17 +1192,17 @@ pub(super) fn walk_shell_commands(
         known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
         let mut flow: Option<Flow> = None;
-        let mut operator = Operator::Sequence;
+        let mut condition = None;
         let mut asynchronous_entry = incoming.clone();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
                 "&&" => {
-                    operator = Operator::And;
+                    condition = Some(Condition::And);
                     continue;
                 }
                 "||" => {
-                    operator = Operator::Or;
+                    condition = Some(Condition::Or);
                     continue;
                 }
                 "&" => {
@@ -971,7 +1220,7 @@ pub(super) fn walk_shell_commands(
                         };
                         Flow::success(entry)
                     });
-                    operator = Operator::Sequence;
+                    condition = None;
                     continue;
                 }
                 "comment" => continue,
@@ -980,8 +1229,8 @@ pub(super) fn walk_shell_commands(
             }
             flow = Some(match flow.take() {
                 None => evaluate(child, source, incoming.clone(), targets, known_directory),
-                Some(left) => match operator {
-                    Operator::Sequence => {
+                Some(left) => match condition.take() {
+                    None => {
                         asynchronous_entry = left.all();
                         evaluate(
                             child,
@@ -991,23 +1240,12 @@ pub(super) fn walk_shell_commands(
                             known_directory,
                         )
                     }
-                    Operator::And => {
-                        let right = evaluate(child, source, left.success, targets, known_directory);
-                        Flow {
-                            success: right.success,
-                            failure: left.failure.union(right.failure),
-                        }
-                    }
-                    Operator::Or => {
-                        let right = evaluate(child, source, left.failure, targets, known_directory);
-                        Flow {
-                            success: left.success.union(right.success),
-                            failure: right.failure,
-                        }
-                    }
+                    Some(condition) => left.followed_by(condition, |entry| {
+                        evaluate(child, source, entry, targets, known_directory)
+                    }),
                 },
             });
-            operator = Operator::Sequence;
+            condition = None;
         }
         flow.unwrap_or_else(|| Flow::either(incoming))
     }
@@ -1015,6 +1253,9 @@ pub(super) fn walk_shell_commands(
     let mut targets = Targets {
         directories: Vec::new(),
         on_command,
+        // Match local shell path interpretation. A bash request cannot
+        // override HOME through its env argument.
+        inherited_home: std::env::home_dir().filter(|path| path.is_absolute()),
     };
     if let Some(tree) = parse_tree(command) {
         let _ = evaluate(
@@ -1641,6 +1882,11 @@ mod tests {
                 ],
             ),
             ("cd a || cd ..", vec![cwd.join("a")]),
+            ("set -eo pipefail; cd a || cd ..", vec![cwd.join("a")]),
+            (
+                "set -o physical; cd a || cd ..",
+                vec![cwd.join("a"), cwd.parent().unwrap().to_path_buf()],
+            ),
             (
                 "cd a >/not-writable || cd ..",
                 vec![cwd.join("a"), cwd.parent().unwrap().to_path_buf()],
@@ -1652,6 +1898,49 @@ mod tests {
                 .collect();
             assert_eq!(paths, expected, "{command}");
         }
+    }
+
+    #[test]
+    fn directory_targets_keep_main_shell_outside_redirected_pipeline_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(cwd.join("a")).unwrap();
+        let parent = cwd.parent().unwrap().to_path_buf();
+        for (command, expected) in [
+            ("cd a && x 2>&1 | b && cd ..", cwd.clone()),
+            ("cd a && x 2>&1 | b || cd ..", cwd.clone()),
+            ("cd a && x 2>&1 | b; cd ..", cwd.clone()),
+            ("cd a 2>&1 | b && cd ..", parent.clone()),
+            ("cd a 2>&1 | b; cd ..", parent),
+        ] {
+            let paths: Vec<_> = top_level_directory_targets(command, &cwd, &|p| p == cwd.join("a"))
+                .into_iter()
+                .map(|target| target.path)
+                .collect();
+            assert_eq!(paths, [cwd.join("a"), expected], "{command}");
+        }
+    }
+
+    #[test]
+    fn directory_targets_keep_cwd_only_for_loops_without_directory_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let targets = |command| {
+            top_level_directory_targets(command, &cwd, &|path| path == cwd.join("a"))
+                .into_iter()
+                .map(|target| target.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            targets(
+                "cd a && for c in first second; do bash run.sh \"$c\" >/dev/null; done && cd .."
+            ),
+            [cwd.join("a"), cwd.clone()]
+        );
+        assert_eq!(
+            targets("cd a && for c in first second; do cd ../b; done && cd .."),
+            [cwd.join("a")]
+        );
     }
 
     #[test]
@@ -1728,8 +2017,8 @@ mod tests {
             "pushd +1",
             "popd",
             "cd",
-            "cd ~",
-            "cd ~/nested",
+            "cd ~another_user",
+            "cd ~/nested/*",
             "cd ../*",
         ] {
             let command = format!("{prefix} && cd ..; cd '{}' && cd nested", cwd.display());
@@ -2029,6 +2318,10 @@ mod tests {
             vec![cwd.join("~/nested")]
         );
         assert_eq!(
+            directory_paths(r"cd \~/nested", &cwd),
+            vec![cwd.join("~/nested")]
+        );
+        assert_eq!(
             directory_paths(
                 "cd ../sibling\\ repo; cd '../literal*'; cd '../$literal'",
                 &cwd
@@ -2039,6 +2332,44 @@ mod tests {
                 cwd.parent().unwrap().join("$literal")
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_targets_expand_inherited_home_until_the_shell_changes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let home = std::env::home_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(directory_paths("cd ~", &cwd), [home.clone()]);
+        for command in [
+            "cd ~/fresh",
+            "cd \"$UNKNOWN\"; cd ~/fresh",
+            "pushd ~//fresh",
+            "export HOME; cd ~/fresh",
+            "unset OPENCODE_DB; cd ~/fresh",
+            "false && export HOME=/elsewhere; cd ~/fresh",
+            "(unset HOME); cd ~/fresh",
+            "echo \"$(export HOME=/elsewhere)\"; cd ~/fresh",
+            "export HOME=/elsewhere | true; cd ~/fresh",
+            "export HOME=/elsewhere & cd ~/fresh",
+        ] {
+            assert_eq!(
+                directory_paths(command, &cwd),
+                [home.join("fresh")],
+                "{command}"
+            );
+        }
+        for command in [
+            "export HOME=$(mktemp -d); cd ~/fresh",
+            "HOME=/elsewhere; cd ~/fresh",
+            "HOME=/elsewhere true; cd ~/fresh",
+            "unset HOME; cd ~/fresh",
+            "unknown && export HOME=/elsewhere; cd ~/fresh",
+            "for c in first; do HOME=/elsewhere true; done; cd ~/fresh",
+            "for HOME in /elsewhere; do true; done; cd ~/fresh",
+        ] {
+            assert!(directory_paths(command, &cwd).is_empty(), "{command}");
+        }
     }
 
     #[cfg(unix)]

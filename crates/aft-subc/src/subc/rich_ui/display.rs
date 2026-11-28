@@ -24,7 +24,10 @@ mod edit_hunks;
 mod notice_pull;
 mod store;
 use counters::{count, Counter::*};
-pub(in crate::subc) use notice_pull::stage_notice;
+pub(crate) use notice_pull::publish_awaited_notice;
+#[cfg(all(test, unix))]
+pub(in crate::subc) use notice_pull::TestAwaitedCards;
+pub(in crate::subc) use notice_pull::{stage_notice, AwaitedCards};
 
 struct Writer {
     outbox: Mutex<Outbox>,
@@ -855,6 +858,7 @@ pub(crate) fn start(connection_file: &Path, app: &Arc<crate::context::App>, stor
     }
     tokio::spawn(send_loop(connection_file.to_path_buf(), receiver));
     tokio::spawn(notice_pull::flush_pending());
+    tokio::spawn(notice_pull::restore_awaited());
     count(Started);
 }
 

@@ -797,7 +797,7 @@ The AFT sidebar and the OpenCode 2 prompt footer read their display settings fro
 
 ## Git co-authorship
 
-`git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.
+`git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` uses the committing agent's GitHub identity from Entorhinal (the agent a worker acts on behalf of for worker shells), and an explicit `"Name <email>"` value is used verbatim. Auto attribution does not require the `gh` shim or a signed list. AFT caches each identity for ten minutes and refreshes it in the background. The first shell waits up to one second; without an identity or an answer by then, it gets no trailer. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.
 
 ## Project environment in agent shells (`shell.env_provider`)
 
@@ -1066,6 +1066,22 @@ failure. Project config may lower, but never raise, the user's value
 (or the default when unset). A project's lower value limits that root's share,
 not the process budget available to other roots. The limit applies to all
 language-server kinds.
+
+`lsp.worker_rust_analyzers` limits rust-analyzer processes for worker sessions,
+including starts in progress. The default is `2`; use a nonnegative integer.
+Project config may lower the limit for its own root, but cannot raise the user
+limit or reduce the budget available to other roots. This setting applies live
+to new starts and does not stop already running analyzers. A value of `0`
+prevents new worker rust-analyzer starts; inspect reports **PARTIAL** with
+`rust_analyzer_capacity_exhausted` when it cannot start one. Head analyzers do
+not count toward this limit. The general `lsp.max_servers` limit still applies.
+
+Under the daemon, one AFT process serves every harness's sessions, so both
+limits are budgets shared by all of them and come from the top-level user
+value. A value in a `harnesses.<name>` block, like a project value, can lower
+the limit for that harness's roots but never raises the shared budget. In
+standalone mode each AFT process serves one harness, so that harness's value
+sets the process budget.
 
 TypeScript packages in one repository share a server per resolved SDK version,
 even with separate `node_modules` installs and no root `package.json`. Packages

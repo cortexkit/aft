@@ -3,8 +3,9 @@ use sha2::Digest;
 
 #[test]
 fn invalid_signed_speech_manifest_warns_without_envelope_contents() {
+    let paths = StatePaths::from_process();
     crate::gh_shim_speech::tests::assert_snapshot_warning(
-        || verified_speech_manifest(b"secret-invalid-envelope").unwrap_err(),
+        || verified_speech_manifest_at(b"secret-invalid-envelope", &paths).unwrap_err(),
         "gh_shim::verified_speech_manifest",
         "envelope_json",
         json!({"envelope_bytes": 23}),
@@ -13,7 +14,7 @@ fn invalid_signed_speech_manifest_warns_without_envelope_contents() {
     envelope.envelope_version += 1;
     let bytes = serde_json::to_vec(&envelope).unwrap();
     crate::gh_shim_speech::tests::assert_snapshot_warning(
-        || verified_speech_manifest(&bytes).unwrap_err(),
+        || verified_speech_manifest_at(&bytes, &paths).unwrap_err(),
         "gh_shim::verified_speech_manifest",
         "envelope_version",
         json!({"envelope_bytes": bytes.len()}),
@@ -53,8 +54,11 @@ fn comment_input(manifest: &Manifest, body: &Path) -> (Vec<OsString>, AgentBindi
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn frozen_body_is_replayed_under_both_signed_envelopes_without_reopening_the_file() {
+    let _lock = crate::test_env::process_env_lock();
     let manifest = super::tests::fixture_manifest();
     let dir = tempfile::tempdir().unwrap();
+    super::tests::write_fixture_pin(&StatePaths::from_root(dir.path().to_path_buf()));
+    let _state = Env::set(GH_SHIM_STATE_DIR_ENV, Some(dir.path().as_os_str()));
     let file = dir.path().join("body");
     std::fs::write(&file, "original frozen body").unwrap();
     let (args, binding) = comment_input(&manifest, &file);
@@ -94,8 +98,11 @@ fn frozen_body_is_replayed_under_both_signed_envelopes_without_reopening_the_fil
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn a_current_only_classification_cannot_expand_the_start_envelope() {
+    let _lock = crate::test_env::process_env_lock();
     let mut old = super::tests::fixture_manifest();
     let dir = tempfile::tempdir().unwrap();
+    super::tests::write_fixture_pin(&StatePaths::from_root(dir.path().to_path_buf()));
+    let _state = Env::set(GH_SHIM_STATE_DIR_ENV, Some(dir.path().as_os_str()));
     let file = dir.path().join("body");
     std::fs::write(&file, "body").unwrap();
     let (args, binding) = comment_input(&old, &file);
@@ -164,7 +171,7 @@ impl Drop for Env {
 }
 
 #[test]
-fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient() {
+fn protected_manifest_and_operator_arms_delegate_only_on_operator_disable() {
     let _lock = crate::test_env::process_env_lock();
     let manifest = super::tests::fixture_manifest();
     let dir = tempfile::tempdir().unwrap();
@@ -193,6 +200,7 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
         Some(view.as_os_str()),
     );
     let paths = StatePaths::from_root(state.clone());
+    super::tests::write_fixture_pin(&paths);
     write_version_high_water(&paths, manifest.manifest_version);
     let repo = manifest.bindings.keys().next().unwrap();
     let args: Vec<OsString> = ["issue", "comment", "7", "--repo", repo, "--body", "body"]
@@ -276,7 +284,10 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
             _ => "current_manifest_unverifiable",
         };
         assert_eq!(
-            plan.err().expect("protected preflight must refuse").reason,
+            plan.err()
+                .expect("protected preflight must refuse")
+                .refusal()
+                .reason,
             expected,
             "{mode}"
         );
@@ -289,11 +300,16 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
             },
             |_, _, _, _| Ok(None),
         );
-        assert_ne!(exit, 0, "{mode}");
-        assert!(
-            !delegated.get(),
-            "protected {mode} must not reach native gh"
-        );
+        if mode == "operator-disable" {
+            assert_eq!(exit, 0, "explicit operator disable must pass through");
+            assert!(delegated.get());
+        } else {
+            assert_ne!(exit, 0, "{mode}");
+            assert!(
+                !delegated.get(),
+                "protected {mode} must not reach native gh"
+            );
+        }
     }
     for invalid_view in ["missing", "corrupt", "wrong-ticket"] {
         match invalid_view {
@@ -575,7 +591,7 @@ fn captured_rung_refusals_distinguish_discovery_failures_from_policy() {
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn protected_restart_and_disabled_writes_refuse_without_native_delegation() {
+fn protected_writes_refuse_during_restart_but_operator_disable_passes_through() {
     let _lock = crate::test_env::process_env_lock();
     for disabled in [false, true] {
         let manifest = super::tests::fixture_manifest();
@@ -631,7 +647,10 @@ fn protected_restart_and_disabled_writes_refuse_without_native_delegation() {
             "gh-shim: gh_shim_seam_refusal: task_gh_authority_unavailable: bot writes from background commands are briefly unavailable (relay_unavailable); retry in a few seconds.".to_string()
         };
         let plan = captured_plan(&args, &fixture.paths, &target, &cwd, now);
-        let refusal = plan.err().expect("non-R3 write must not reach dispatch");
+        let refusal = plan
+            .err()
+            .expect("non-R3 write must not reach dispatch")
+            .refusal();
         assert_eq!(
             format!("gh-shim: gh_shim_seam_refusal: {}", refusal.agent_text()),
             expected
@@ -646,18 +665,57 @@ fn protected_restart_and_disabled_writes_refuse_without_native_delegation() {
             },
             |_, _, _, _| panic!("protected refusal must not reach the native probe"),
         );
-        assert_eq!(exit, REFUSAL_EXIT_STATUS);
-        assert!(!delegated.get(), "disabled={disabled}");
-        assert_eq!(
-            *lines.lock().unwrap(),
-            vec![expected],
-            "disabled={disabled}"
-        );
+        if disabled {
+            assert_eq!(exit, 0);
+            assert!(delegated.get());
+            assert!(lines.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(exit, REFUSAL_EXIT_STATUS);
+            assert!(!delegated.get());
+            assert_eq!(*lines.lock().unwrap(), vec![expected]);
+        }
     }
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
+    let _lock = crate::test_env::process_env_lock();
+    let mut manifest: Manifest = serde_json::from_str(include_str!(
+        "../../../aft/tests/fixtures/gh_shim/v10-manifest.json"
+    ))
+    .unwrap();
+    manifest.tiers.get_mut(&Tier::Admin).unwrap().push(
+        serde_json::from_value(json!({ "tuple": "run rerun", "platform": ["macos", "linux"] }))
+            .unwrap(),
+    );
+    let _fixture = RunWithFixture::new(&manifest);
+    let _provisioned = Env::set(
+        crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+        Some(OsStr::new("1")),
+    );
+    let args: Vec<OsString> = ["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    assert!(matches!(
+        classify(&args, &manifest, current_platform()),
+        Classification::Admin { .. }
+    ));
+    let (_capture, lines) = capture_refusals_for_test();
+    let exit = run_with(
+        &args,
+        |_| panic!("head write delegated without bypass"),
+        |_, _, _, _| panic!("head refusal must not need a probe"),
+    );
+    assert_eq!(exit, REFUSAL_EXIT_STATUS);
+    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one (not_governed); use a permitted operation, or ask the operator to update the policy and start the command again. This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.".to_string()]);
+}
+
+const UNDECLARED_POLICY_REFUSAL: &str = "gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub command is not declared in the signed manifest (not_governed); ask the operator to update the manifest and start the command again.";
+
+#[test]
+fn captured_policy_undeclared_command_does_not_claim_to_be_a_write() {
     let _lock = crate::test_env::process_env_lock();
     let manifest: Manifest = serde_json::from_str(include_str!(
         "../../../aft/tests/fixtures/gh_shim/v10-manifest.json"
@@ -668,18 +726,32 @@ fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
         crate::gh_shim_speech::start_view::PROVISIONED_ENV,
         Some(OsStr::new("1")),
     );
-    let args: Vec<OsString> = ["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"]
-        .into_iter()
-        .map(Into::into)
-        .collect();
-    let (_capture, lines) = capture_refusals_for_test();
-    let exit = run_with(
-        &args,
-        |_| panic!("head write delegated without bypass"),
-        |_, _, _, _| panic!("head refusal must not need a probe"),
-    );
-    assert_eq!(exit, REFUSAL_EXIT_STATUS);
-    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one (not_governed); use a permitted operation, or ask the operator to update the policy and start the command again. This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.".to_string()]);
+    for raw in [
+        &["variable", "get", "REQUIRES_CORE", "-R", "cortexkit/aft"][..],
+        &["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"][..],
+    ] {
+        let args = raw.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(matches!(
+            classify(&args, &manifest, current_platform()),
+            Classification::Unclassified
+        ));
+        let (_capture, lines) = capture_refusals_for_test();
+        assert_eq!(
+            run_with(
+                &args,
+                |_| panic!("an undeclared captured invocation must not reach native gh"),
+                |_, _, _, _| panic!(
+                    "an undeclared captured invocation must not reach the read probe"
+                ),
+            ),
+            REFUSAL_EXIT_STATUS,
+        );
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [UNDECLARED_POLICY_REFUSAL],
+            "{raw:?}"
+        );
+    }
 }
 
 #[test]
@@ -717,8 +789,7 @@ fn provisioned_worker_run_rerun_never_suggests_the_operator_bypass() {
     }
 }
 
-#[test]
-fn audited_operator_write_rechecks_manifest_before_native_delegation() {
+fn operator_write_after_manifest_loss() -> (bool, Vec<String>) {
     let _lock = crate::test_env::process_env_lock();
     let manifest = super::tests::fixture_manifest();
     let fixture = RunWithFixture::new(&manifest);
@@ -785,16 +856,27 @@ fn audited_operator_write_rechecks_manifest_before_native_delegation() {
         },
     );
     assert_eq!(lookups, 1);
-    assert_eq!(exit, 86);
+    assert_eq!(exit, REFUSAL_EXIT_STATUS);
     assert_eq!(delegated, 0);
-    // The audited operator bypass exists only where the fixture manifest
-    // governs writes (macOS, Linux). Elsewhere the write is not governed, so
-    // nothing is audited, but the missing manifest must still refuse it.
-    assert_eq!(
-        fixture.paths.bypass_audit.is_file(),
-        current_platform() != "unsupported"
-    );
-    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.".to_string()]);
+    let lines = lines.lock().unwrap().clone();
+    (fixture.paths.bypass_audit.is_file(), lines)
+}
+
+// Only the macOS and Linux manifest policy reaches the audited operator path.
+#[cfg(not(windows))]
+#[test]
+fn audited_operator_write_rechecks_manifest_before_native_delegation() {
+    let (audited, lines) = operator_write_after_manifest_loss();
+    assert!(audited);
+    assert_eq!(lines, ["gh-shim: gh_shim_manifest_unavailable: GitHub routing policy changed before the command could run. Start the command again."]);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_refuses_operator_write_when_manifest_disappears_without_auditing() {
+    let (audited, lines) = operator_write_after_manifest_loss();
+    assert!(!audited);
+    assert_eq!(lines, ["gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work."]);
 }
 
 #[test]
@@ -961,14 +1043,10 @@ fn invalid_start_views_have_exact_run_with_refusals_without_delegation() {
         // A platform the fixture manifest doesn't govern refuses before the
         // rung check, as in the preflight cases above.
         let expected = if current_platform() == "unsupported" {
-            "not_governed"
+            UNDECLARED_POLICY_REFUSAL.to_string()
         } else {
-            "not_r3"
+            exact_policy_refusal("not_r3")
         };
-        assert_eq!(
-            *lines.lock().unwrap(),
-            vec![exact_policy_refusal(expected)],
-            "{invalid}"
-        );
+        assert_eq!(*lines.lock().unwrap(), vec![expected], "{invalid}");
     }
 }

@@ -37,7 +37,7 @@ pub trait IndexHost: Send + Sync {
     fn explicit_task_artifacts(&self, session: &str, root: &Path) -> Option<Vec<PathBuf>>;
     fn note_view_load_failure(&self, plane: &'static str, error: &str);
     fn cache_unavailable_reason(&self) -> Option<String>;
-    fn artifact_identity_provisional(&self) -> bool;
+    fn artifact_identity_provisional_reason(&self) -> Option<String>;
     fn cache_dir(&self) -> PathBuf;
     fn cached_artifact_cache_key(&self, root: &Path) -> Option<String>;
     fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus>;
@@ -96,8 +96,8 @@ impl<T: IndexHost + ?Sized> IndexHost for Arc<T> {
     fn cache_unavailable_reason(&self) -> Option<String> {
         (**self).cache_unavailable_reason()
     }
-    fn artifact_identity_provisional(&self) -> bool {
-        (**self).artifact_identity_provisional()
+    fn artifact_identity_provisional_reason(&self) -> Option<String> {
+        (**self).artifact_identity_provisional_reason()
     }
     fn cache_dir(&self) -> PathBuf {
         (**self).cache_dir()

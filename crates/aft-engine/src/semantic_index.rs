@@ -10082,7 +10082,13 @@ pub fn collect_file_chunks_for_census(
         parse_resolved_source(file, &source, lang).map_err(|error| error.to_string())?;
     let symbols =
         extract_symbols_from_tree(&source, &tree, lang).map_err(|error| error.to_string())?;
-    let today = symbols_to_chunks(file, &symbols, &source, project_root);
+    let today = symbols_to_chunks_with_caps(
+        file,
+        &symbols,
+        &source,
+        project_root,
+        EmbedTextCaps::default(),
+    );
     let census = symbols_to_chunks_with_caps(file, &symbols, &source, project_root, census_caps);
     Ok((today, census))
 }
@@ -10190,23 +10196,7 @@ fn qualified_name_for_symbol(symbol: &Symbol) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("."))
 }
 
-/// Convert symbols to semantic chunks with enriched context
-#[cfg(any(test, feature = "semantic-chunk-census"))]
-fn symbols_to_chunks(
-    file: &Path,
-    symbols: &[Symbol],
-    source: &str,
-    project_root: &Path,
-) -> Vec<SemanticChunk> {
-    symbols_to_chunks_with_caps(
-        file,
-        symbols,
-        source,
-        project_root,
-        EmbedTextCaps::default(),
-    )
-}
-
+/// Convert symbols to semantic chunks with enriched context.
 pub(crate) fn symbols_to_chunks_with_caps(
     file: &Path,
     symbols: &[Symbol],
@@ -10216,8 +10206,13 @@ pub(crate) fn symbols_to_chunks_with_caps(
 ) -> Vec<SemanticChunk> {
     let line_cache = SourceLineCache::new(source);
     let mut chunks = Vec::new();
+    let is_rust = language_for_extension(file) == Some(crate::parser::LangId::Rust);
+    // Keep these Rust navigation symbols out of the corpus until search-quality tests measure their ranking impact.
+    let symbols = symbols.iter().filter(|symbol| {
+        !is_rust || !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::TypeAlias)
+    });
     let top_exports_with_signatures = symbols
-        .iter()
+        .clone()
         .filter(|symbol| {
             symbol.exported
                 && symbol.parent.is_none()
@@ -10226,9 +10221,9 @@ pub(crate) fn symbols_to_chunks_with_caps(
         .map(|symbol| (symbol.name.as_str(), symbol.signature.as_deref()))
         .collect::<Vec<_>>();
 
-    let has_only_headings = !symbols.is_empty()
+    let has_only_headings = symbols.clone().next().is_some()
         && symbols
-            .iter()
+            .clone()
             .all(|symbol| matches!(symbol.kind, SymbolKind::Heading));
     if top_exports_with_signatures.len() <= 2 && !has_only_headings {
         let top_exports = top_exports_with_signatures
@@ -10469,6 +10464,43 @@ fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    fn symbols_to_chunks(
+        file: &Path,
+        symbols: &[Symbol],
+        source: &str,
+        project_root: &Path,
+    ) -> Vec<SemanticChunk> {
+        symbols_to_chunks_with_caps(
+            file,
+            symbols,
+            source,
+            project_root,
+            EmbedTextCaps::default(),
+        )
+    }
+
+    #[test]
+    fn rust_navigation_items_preserve_the_baseline_chunks() {
+        let root = Path::new("/project");
+        let file = root.join("values.rs");
+        let declarations = "pub const LETTERS: &str = \"abc\";\npub static ALPHABET: &[u8] = b\"abc\";\npub type Alphabet =\n    &'static [u8];\n";
+        let functions = "pub fn first() -> u8 {\n    1\n}\npub fn second() -> u8 {\n    2\n}\n";
+        let source = format!("{declarations}{functions}");
+        let lang = crate::parser::LangId::Rust;
+
+        // The old parser only returned the functions, at their original lines.
+        let baseline_source = format!("{}{functions}", "\n".repeat(declarations.lines().count()));
+        let (tree, lang) = parse_resolved_source(&file, &baseline_source, lang).unwrap();
+        let baseline_symbols = extract_symbols_from_tree(&baseline_source, &tree, lang).unwrap();
+        assert_eq!(baseline_symbols.len(), 2);
+        let baseline_chunks = symbols_to_chunks(&file, &baseline_symbols, &source, root);
+        assert_eq!(baseline_chunks[0].kind, SymbolKind::FileSummary);
+        assert_eq!(baseline_chunks.len(), 3);
+        assert_eq!(
+            collect_file_chunks_from_source(root, &file, lang, &source).unwrap(),
+            baseline_chunks
+        );
+    }
 
     #[test]
     fn h_header_view_chunking_uses_snapshot_language() {

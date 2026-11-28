@@ -475,6 +475,7 @@ fn end_to_end_glob_display_files_per_directory_cap() {
 
     let fmt_ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &fmt_ctx);
+    assert_eq!(rendered.lines().next(), Some("21 files matching **/*.txt"));
     assert!(
         rendered.contains("shown 5 of 21 files (cap) · narrow: path"),
         "rendered text must contain cap trailer with exact total, got:\n{rendered}"
@@ -563,6 +564,10 @@ fn end_to_end_glob_executor_cap_renders_at_least_trailer() {
 
     let fmt_ctx = FormatContext::default();
     let rendered = format_response_with_context("glob", &resp, &fmt_ctx);
+    assert_eq!(
+        rendered.lines().next(),
+        Some("≥100 files matching **/*.txt")
+    );
     assert!(
         rendered.contains("shown 5 of ≥"),
         "rendered text must contain shown 5 of ≥..., got:\n{rendered}"

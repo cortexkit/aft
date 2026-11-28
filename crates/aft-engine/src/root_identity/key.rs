@@ -77,7 +77,7 @@ impl ArtifactCacheKeyProbeError {
             return None;
         }
         let mut reason = format!(
-            "{GIT_IDENTITY_UNAVAILABLE_REASON}: {}; indexes and views stay off until this folder's next bind",
+            "{GIT_IDENTITY_UNAVAILABLE_REASON}: {}; indexes and views are unavailable until this folder's next bind",
             self.detail
         );
         if self.detail.contains("dubious ownership") {

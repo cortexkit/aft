@@ -43,6 +43,31 @@ impl ModuleTransport {
         }
     }
 
+    pub(crate) async fn github_coauthor(self, agent_id: &str) -> Result<Option<String>, ()> {
+        #[derive(serde::Deserialize)]
+        struct GitHubIdentity {
+            coauthor_line: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Reply {
+            github_identity: Option<GitHubIdentity>,
+        }
+        let body = serde_json::to_vec(&Request::new(
+            "agent.github_identity",
+            json!({"agent_id": agent_id}),
+        ))
+        .map_err(|_| ())?;
+        let limit = Duration::from_secs(5);
+        let reply = tokio::time::timeout(limit, self.request_async(body, limit))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let reply: Reply = EntorhinalRegistry::decode(reply).map_err(|_| ())?;
+        Ok(reply
+            .github_identity
+            .and_then(|identity| identity.coauthor_line))
+    }
+
     fn request(&self, body: Vec<u8>, timeout: Duration) -> Result<Value, DoorError> {
         let this = self.clone();
         // SDK consumers run an async receive loop. A dedicated thread avoids

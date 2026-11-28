@@ -5,7 +5,13 @@ use serde_json::{json, Value};
 
 mod defaults;
 mod harness;
+mod layers;
 mod titles;
+
+#[doc(hidden)]
+pub fn settings_restart_required(path: &str) -> bool {
+    layers::user_only(path) && restart_required(path)
+}
 
 const MAP_KEY: &str = "^.+$";
 
@@ -48,15 +54,15 @@ fn annotate_cache_dir(cache_dir: &mut Value) {
             .to_owned();
         let (description, kind_description) = match Some(kind.as_str()) {
             Some("default") => (
-                "Use the same cache behavior as omitting this setting.",
+                "AFT's default place for disk caches.",
                 "Select the default cache behavior.",
             ),
             Some("main_disk") => (
-                "Put disk caches back under the storage root.",
+                "Keep disk caches inside AFT's storage folder.",
                 "Select the storage root for disk caches.",
             ),
             Some("dir") => (
-                "Use a cache parent on a separate device.",
+                "Keep disk caches in a folder you choose, for example on another drive.",
                 "Select an explicit cache parent directory.",
             ),
             other => panic!("unknown cache directory choice: {other:?}"),
@@ -67,7 +73,8 @@ fn annotate_cache_dir(cache_dir: &mut Value) {
         branch["properties"]["kind"]["description"] = json!(kind_description);
         if let Some(path) = branch["properties"].get_mut("path") {
             path["title"] = json!(titles::title("storage.cache_dir: dir.path").unwrap());
-            path["description"] = json!("Existing absolute path to the cache parent; ~ expands.");
+            path["description"] =
+                json!("Absolute path of an existing folder. ~ means your home folder.");
         }
     }
 }
@@ -109,15 +116,25 @@ fn declare(
     } else {
         default
     };
-    let description = node
+    let mut description = node
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or_else(|| leaf_description(path, parent_description))
         .to_owned();
-    node.insert("x-ck-layers".into(), json!(["user"]));
+    if layers::next_session(path) {
+        description.push(' ');
+        description.push_str(layers::NEXT_SESSION);
+        node.insert("description".into(), json!(description));
+        if let Some(text) = node.get_mut("markdownDescription") {
+            if let Some(markdown) = text.as_str() {
+                *text = json!(format!("{markdown} {}", layers::NEXT_SESSION));
+            }
+        }
+    }
+    layers::set(node, path);
     node.insert(
         "x-ck-apply".into(),
-        json!(if restart_required(path) {
+        json!(if settings_restart_required(path) {
             "module_restart"
         } else {
             "live"

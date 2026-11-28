@@ -64,6 +64,7 @@ pub(super) fn values() -> Value {
             "idle_minutes": config.lsp_idle_minutes,
             "idle_shutdown": config.lsp_idle_shutdown,
             "max_servers": config.lsp_max_servers,
+            "worker_rust_analyzers": config.lsp_worker_rust_analyzers,
             "servers": {},
             "disabled": config.disabled_lsp,
             "python": "auto",

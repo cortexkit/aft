@@ -1,11 +1,11 @@
-import { coerceOptionalInt } from "@cortexkit/aft-bridge";
+import { coerceOptionalInt, isWellFormedUnicodeString } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui/dist/components/text.js";
-import { type Static, type TSchema, Type } from "typebox";
+import { type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import { detectPiHarness } from "./harness.js";
 import { warn } from "./logger.js";
@@ -59,6 +59,13 @@ type OmpContext = ExtensionContext & {
     options?: { signal?: AbortSignal; onUpdate?: (result: AgentToolResult<unknown>) => void },
   ) => Promise<AgentToolResult<unknown>>;
 };
+
+export const OMP_FILESYSTEM_GREP = Symbol("OMP filesystem grep options");
+
+export interface OmpFilesystemGrepOptions {
+  path?: string[];
+  case?: boolean;
+}
 
 function pathEntries(value: unknown): string[] {
   if (Array.isArray(value)) return value.flatMap(pathEntries);
@@ -221,6 +228,122 @@ function filesystemArgumentError(name: string, schema: TSchema, fields: string[]
   );
 }
 
+function inertBashReady(value: unknown): boolean {
+  const ready = asRecord(value);
+  return (
+    ready !== undefined &&
+    Object.entries(ready).every(([key, field]) => {
+      if (key === "log" || key === "host") return field === undefined || field === "";
+      if (key === "port" || key === "timeout") return field === undefined || field === 0;
+      return false;
+    })
+  );
+}
+
+function hasCompetingRange(entry: Record<string, unknown>): boolean {
+  if (typeof entry.content !== "string") return false;
+  try {
+    return (
+      coerceOptionalInt(entry.startLine, "startLine", 1, Number.MAX_SAFE_INTEGER) !== undefined &&
+      coerceOptionalInt(entry.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER) !== undefined
+    );
+  } catch {
+    return false;
+  }
+}
+
+function omitInertEditDefaults(args: Record<string, unknown>): Record<string, unknown> {
+  const normalized = { ...args };
+  let changed = false;
+  for (const key of ["old_string", "new_string", "input", "replace_all"]) {
+    if (args[key] !== (key === "replace_all" ? false : "")) continue;
+    delete normalized[key];
+    changed = true;
+  }
+  if (Array.isArray(args.edits)) {
+    normalized.edits = args.edits.map((value: unknown) => {
+      const entry = asRecord(value);
+      if (
+        entry?.op !== "update" ||
+        typeof entry.oldString !== "string" ||
+        entry.oldString.length === 0 ||
+        (entry.rename !== undefined && entry.rename !== "") ||
+        (entry.diff !== undefined && entry.diff !== "")
+      ) {
+        return value;
+      }
+      const { op: _op, rename: _rename, diff: _diff, ...aftEntry } = entry;
+      changed = true;
+      return aftEntry;
+    });
+  }
+  if (!changed) return args;
+  // A full range with empty content is a deletion, not padding on a find edit.
+  // Leave the native fields in place so the mixed call is refused before prep.
+  for (const value of editEntries(args.edits)) {
+    const entry = asRecord(value);
+    if (
+      entry &&
+      typeof entry.oldString === "string" &&
+      entry.oldString.length > 0 &&
+      hasCompetingRange(entry)
+    ) {
+      return args;
+    }
+  }
+  return normalized;
+}
+
+function normalizeFilesystemArguments(name: string, params: unknown): unknown {
+  const args = asRecord(params);
+  if (!args) return params;
+  if (name === "edit") return omitInertEditDefaults(args);
+  if (name !== "bash") return params;
+  const normalized = { ...args };
+  if (args.cwd === "") delete normalized.cwd;
+  if (args.async === false) delete normalized.async;
+  if (args.name === "") delete normalized.name;
+  if (inertBashReady(args.ready)) delete normalized.ready;
+  return normalized;
+}
+
+function separateOmpGrepOptions(args: Record<string, unknown>) {
+  const normalized = { ...args };
+  if (args.gitignore === true) delete normalized.gitignore;
+  if (args.skip === null || args.skip === 0) delete normalized.skip;
+  if (Array.isArray(args.paths) && args.paths.length === 0) delete normalized.paths;
+
+  const options: OmpFilesystemGrepOptions = {};
+  if (typeof args.case === "boolean") {
+    options.case = args.case;
+    delete normalized.case;
+  }
+  if (
+    Array.isArray(args.path) &&
+    args.path.length > 0 &&
+    Array.from(args.path).every(
+      (entry) => typeof entry === "string" && entry.length > 0 && isWellFormedUnicodeString(entry),
+    )
+  ) {
+    options.path = [...args.path];
+    delete normalized.path;
+  }
+  return { normalized, options };
+}
+
+function editEntries(value: unknown): unknown[] {
+  if (typeof value === "string") {
+    // The filesystem tool also accepts JSON-encoded edits. Inspect them before
+    // its preparation can discard placeholder entries along with native keys.
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  return Array.isArray(value) ? value : [];
+}
+
 function rejectNativeOnlyArguments(name: string, schema: TSchema, params: unknown): void {
   const args = asRecord(params) ?? {};
   const nativeKeys =
@@ -233,8 +356,8 @@ function rejectNativeOnlyArguments(name: string, schema: TSchema, params: unknow
           : [];
   const fields = nativeKeys.filter((key) => args[key] !== undefined);
   if (name === "grep" && Array.isArray(args.path)) fields.push("path");
-  if (name === "edit" && Array.isArray(args.edits)) {
-    args.edits.forEach((entry, index) => {
+  if (name === "edit") {
+    editEntries(args.edits).forEach((entry, index) => {
       for (const key of ["op", "rename", "diff"]) {
         if (asRecord(entry)?.[key] !== undefined) fields.push(`edits[${index}].${key}`);
       }
@@ -289,15 +412,44 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
 ): ToolDefinition<TParams, TDetails, TState> {
   if (!router || !["read", "write", "edit", "grep", "bash"].includes(tool.name)) return tool;
   const filesystemSchema = schemaDocument(tool.parameters);
+  type PreparedArgs = Parameters<typeof tool.execute>[1];
+  function prepareFilesystem(params: unknown, normalize: boolean) {
+    const args = asRecord(params);
+    if (tool.name === "grep" && normalize && args) {
+      // Keep OMP's explicit paths out of the string-only tool schema. The grep
+      // executor uses the same permission check for each string or array target.
+      const { normalized, options } = separateOmpGrepOptions(args);
+      rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
+      const prepared = tool.prepareArguments ? tool.prepareArguments(normalized) : normalized;
+      return { prepared: prepared as PreparedArgs, grepOptions: options };
+    }
+    const normalized = normalize ? normalizeFilesystemArguments(tool.name, params) : params;
+    try {
+      rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);
+      if (tool.prepareArguments) return { prepared: tool.prepareArguments(normalized) };
+      if (tool.name === "edit" && normalized !== params) {
+        // Patch-only editing has no preparation hook to rule out incomplete edits.
+        validateFilesystemArguments(tool.name, filesystemSchema, normalized);
+      }
+      return { prepared: normalized as PreparedArgs };
+    } catch (error) {
+      // Blank native fields cannot turn an incomplete or conflicting edit into
+      // a valid one. Keep the native-field refusal when the remaining edit fails.
+      if (tool.name === "edit" && normalized !== params) {
+        rejectNativeOnlyArguments(tool.name, filesystemSchema, params);
+      }
+      throw error;
+    }
+  }
   return {
     ...tool,
     ...(tool.name === "bash" ? { readsSkillUris: true } : {}),
     parameters: ompParameters(tool.name, filesystemSchema) as TParams,
     prepareArguments(args) {
       // Native URL inputs must not undergo AFT's path/edit alias normalization.
-      if (internalTarget(tool.name, args, router)) return args as Static<TParams>;
-      rejectNativeOnlyArguments(tool.name, filesystemSchema, args);
-      return (tool.prepareArguments ? tool.prepareArguments(args) : args) as Static<TParams>;
+      if (internalTarget(tool.name, args, router)) return args as PreparedArgs;
+      const { prepared, grepOptions } = prepareFilesystem(args, true);
+      return grepOptions ? { ...prepared, ...grepOptions } : prepared;
     },
     async execute(id, params, signal, onUpdate, context) {
       const native = context as OmpContext;
@@ -315,12 +467,17 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
         });
         return delegatedResult(result, target) as AgentToolResult<TDetails>;
       }
-      rejectNativeOnlyArguments(tool.name, filesystemSchema, params);
-      const prepared = tool.prepareArguments ? tool.prepareArguments(params) : params;
+      const { prepared, grepOptions } = prepareFilesystem(params, !target);
       // The OMP schema is intentionally wider. Ordinary filesystem calls still
       // obey AFT's original schema and runtime validation (e.g. required content).
       validateFilesystemArguments(tool.name, filesystemSchema, prepared);
-      return tool.execute(id, prepared, signal, onUpdate, context);
+      return tool.execute(
+        id,
+        grepOptions ? { ...prepared, [OMP_FILESYSTEM_GREP]: grepOptions } : prepared,
+        signal,
+        onUpdate,
+        context,
+      );
     },
     renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
       const renderContext = context as RenderContextLike;

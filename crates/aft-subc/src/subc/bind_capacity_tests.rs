@@ -69,7 +69,7 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
     )
     .unwrap();
     let (lossy_tx, _lossy) = mpsc::channel(8);
-    let (reliable_tx, _reliable) = mpsc::unbounded_channel();
+    let (reliable_tx, _reliable) = push::ReliableIngress::channel(Arc::default());
     let senders = PushSenders {
         lossy_tx,
         reliable_tx,

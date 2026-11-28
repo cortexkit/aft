@@ -268,10 +268,13 @@ pub enum Script {
     /// past seq 0, so empty output stands in for the seqs before it. An
     /// attach replays the vector's records from the requested seq.
     ReturnVector(&'static str),
-    /// Like `ReturnVector`, but the terminal record reports these
-    /// checkout-relative paths as changed, as ck-motor's Linux runner does
-    /// (its list includes untracked files; it sends no separate list).
-    ReturnVectorReporting(&'static str, &'static [&'static str]),
+    /// Like `ReturnVector`, but the manifest echoes different workdir-relative
+    /// paths and the terminal record lists changes relative to the checkout.
+    ReturnVectorReporting {
+        vector: &'static str,
+        paths: &'static [&'static str],
+        changed: &'static [&'static str],
+    },
     /// Refuse the run with ck-motor's pinned final refusal for return_paths
     /// on a runner that does not copy files back.
     ReturnPathsUnsupported,
@@ -340,6 +343,49 @@ pub async fn daemon_with_clients(script: Script, claim: &str, clients: usize) ->
 }
 
 pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: usize) -> Daemon {
+    daemon_with_route_restart(script, claims, clients, None).await
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) enum RouteRestart {
+    BeforeRun,
+    AfterAccepted,
+}
+
+fn motor_route_closed(epoch: u32) -> [Frame; 2] {
+    let closing = Frame::build(
+        FrameType::Push,
+        subc_protocol::Flags(0),
+        0,
+        0,
+        0,
+        serde_json::to_vec(&json!({
+            "op":"route.closed", "module_id":"executor-picked-by-capability",
+            "channels":[40], "reason":"restart", "terminal":false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let goodbye = Frame::build(
+        FrameType::Goodbye,
+        subc_protocol::Flags(0),
+        40,
+        epoch,
+        0,
+        vec![],
+    )
+    .unwrap();
+    [closing, goodbye]
+}
+
+#[rustfmt::skip]
+pub(super) async fn daemon_with_route_restart(
+    script: Script,
+    claims: &[&str],
+    clients: usize,
+    restart: Option<RouteRestart>,
+) -> Daemon {
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -381,6 +427,9 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut producers = Vec::new();
             let mut cancelled = false;
+            let mut route_epoch = 0;
+            let mut route_closed = false;
+            let mut warming = false;
             while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
                 if let Some(reply) = aft_base::subc_fake::server_describe_reply(&frame) {
                     if subc_transport::write_frame(&mut *writer.lock().await, &reply)
@@ -413,8 +462,17 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                     negotiated_ver: PROTOCOL_VERSION, subc_ops: vec!["catalog.list".into()], subc_capabilities: vec![], storage: None, machine_id: None,
                 }).unwrap())),
                 FrameType::Request if header.channel == 0 => match body["op"].as_str() {
-                    Some("catalog.list") => replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"],
-                        "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":claims, "requires":[]}}]}))),
+                     Some("catalog.list") => {
+                         // The first capability check after route.open is a
+                         // barrier: the close is processed before exec.run sends.
+                         if matches!(restart, Some(RouteRestart::BeforeRun)) && route_epoch == 1 && !route_closed {
+                             replies.extend(motor_route_closed(route_epoch));
+                             route_closed = true;
+                             warming = true;
+                         }
+                         replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"],
+                             "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":claims, "requires":[]}}]})));
+                     },
                     Some("route.open") if matches!(script, Script::GatedRoute) => {
                         let frame = reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}));
                         let writer = writer.clone();
@@ -424,11 +482,23 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                             let _ = subc_transport::write_frame(&mut *writer.lock().await, &frame).await;
                         }));
                     },
-                    Some("route.open") => replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}))),
+                     Some("route.open") if warming => {
+                         warming = false;
+                         replies.push(reply(FrameType::Error, json!({"code":"module_warming","message":"executor is warming"})));
+                     },
+                     Some("route.open") => {
+                         route_epoch = if restart.is_some() { route_epoch + 1 } else { 1 };
+                         route_closed = false;
+                         replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":route_epoch})));
+                     },
                     _ => panic!("unexpected control request {body}"),
                 },
-                FrameType::Request => {
-                    match body["method"].as_str().unwrap() {
+                 FrameType::Request => {
+                     if restart.is_some() {
+                         assert!(!route_closed);
+                         assert_eq!(header.epoch, route_epoch);
+                     }
+                     match body["method"].as_str().unwrap() {
                         "exec.run" if matches!(script, Script::CaptureCheckout { .. }) => {
                             if matches!(script, Script::CaptureCheckout { gated: true }) {
                                 server_acceptance_gate.notified().await;
@@ -498,9 +568,9 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                             }
                             replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
                         }
-                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..) | Script::GatedReturnVector(_) | Script::MotorExpiredReplay) => {
+                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting { .. } | Script::GatedReturnVector(_) | Script::MotorExpiredReplay) => {
                             let records = match script {
-                                Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _) | Script::GatedReturnVector(name) => super::return_vector_fixture::return_vector_records(name),
+                                Script::ReturnVector(name) | Script::ReturnVectorReporting { vector: name, .. } | Script::GatedReturnVector(name) => super::return_vector_fixture::return_vector_records(name),
                                 _ => super::return_vector_fixture::motor_expired_replay(4, None),
                             };
                             if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
@@ -524,8 +594,19 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(Vec::new())))).unwrap()));
                             }
                             for mut record in records {
-                                if let (Script::ReturnVectorReporting(_, reported), StreamRecord::Terminal(terminal)) = (script, &mut record) {
-                                    terminal.workspace_changes = Some(reported.iter().map(|path| path.to_string()).collect());
+                                if let Script::ReturnVectorReporting { paths, changed, .. } = script {
+                                    match &mut record {
+                                        StreamRecord::ReturnManifest(manifest) => {
+                                            assert_eq!(manifest.files.len(), paths.len());
+                                            for (file, path) in manifest.files.iter_mut().zip(paths) {
+                                                file.path = (*path).into();
+                                            }
+                                        }
+                                        StreamRecord::Terminal(terminal) => {
+                                            terminal.workspace_changes = Some(changed.iter().map(|path| path.to_string()).collect());
+                                        }
+                                        _ => {}
+                                    }
                                 }
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
                             }
@@ -764,13 +845,19 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                                     }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
                                     if matches!(script, Script::Reported) { terminal = report_vector("all"); }
-                                    if matches!(script, Script::Utf8) {
-                                        terminal.pipestatus=Some(vec![3,0]);
-                                        terminal.workspace_changes=Some(vec!["generated.txt".into()]);
-                                    }
-                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap()));
-                                }
-                                replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                                     if matches!(script, Script::Utf8) {
+                                         terminal.pipestatus=Some(vec![3,0]);
+                                         terminal.workspace_changes=Some(vec!["generated.txt".into()]);
+                                     }
+                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap()));
+                                 }
+                                 if !attaching && matches!(restart, Some(RouteRestart::AfterAccepted)) {
+                                     route_closed = true;
+                                     warming = true;
+                                     replies.extend(motor_route_closed(route_epoch));
+                                 } else {
+                                     replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                                 }
                             }
                             }
                         },

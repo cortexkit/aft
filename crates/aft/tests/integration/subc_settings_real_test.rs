@@ -18,6 +18,8 @@ use std::{
 use subc_client_rs::{ConsumerOptions, SubcConsumer};
 use subc_protocol::manifest::ProviderRole;
 
+mod project;
+
 fn fixture_aft_binary() -> &'static Path {
     static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BINARY.get_or_init(|| {

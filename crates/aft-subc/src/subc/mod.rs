@@ -205,9 +205,12 @@ mod bind_ack_fixup_tests;
 #[cfg(test)]
 mod bind_capacity_tests;
 use a0_egress::{A0Egress, ControlCompletion};
+pub(crate) mod awaited_work;
 mod bash;
 mod bind_candidates;
 mod bind_log;
+mod bind_reply;
+use bind_reply::*;
 mod call_policy;
 pub(crate) mod call_yield;
 mod carrier_read_only;
@@ -237,6 +240,8 @@ mod drain;
 mod edge_lifecycle_tests;
 mod flow_read;
 mod fork_call;
+mod gh_shim_session;
+use gh_shim_session::speech_launch_seed;
 mod health;
 mod installed_routes;
 #[cfg(test)]
@@ -275,7 +280,7 @@ pub(crate) use secret_consent::with_secret_identity_for_test;
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
-mod bash_notice_text;
+use aft_engine::bash_background::notice_text as bash_notice_text;
 mod keepalive;
 pub(crate) mod manifest;
 mod page_collect;
@@ -934,7 +939,7 @@ impl PendingSubcResponses {
 #[derive(Clone)]
 struct PushSenders {
     lossy_tx: mpsc::Sender<LossyPushEnvelope>,
-    reliable_tx: mpsc::UnboundedSender<PushEnvelope>,
+    reliable_tx: push::ReliableIngress,
     lossy_overflow: Arc<push::LossyOverflow>,
     lossy_seq: Arc<AtomicU64>,
     fleet_status_client: FleetStatusClient,
@@ -1511,11 +1516,9 @@ pub(crate) fn project_held_ledger_result(
             } else {
                 BindTrust::Untrusted
             },
-            tool_result_body: true,
             // This is a stored terminal body, not delivery to a route. Late
             // readers and keyed replays apply their own recipient policy.
-            model_only: false,
-            output_scope: None,
+            ..wire::ToolResponsePolicy::for_retention()
         },
         None,
         source.map(|source| source.to_vec()),
@@ -1606,20 +1609,6 @@ struct PendingBind {
     /// on the frame loop, which serves every session, so they log inside this
     /// session's scope to carry the right session tag.
     session: Option<String>,
-}
-
-struct RouteBindCompletion {
-    expected_snapshot_id: Option<u64>,
-    applied_snapshot_id: Option<u64>,
-    route: RouteChannel,
-    identity: RouteIdentity,
-    bind_root_id: ProjectRootId,
-    inserted_new_actor: bool,
-    configure_response: Response,
-    diagnostics_on_edit: bool,
-    ver: u8,
-    corr: u64,
-    flags: Flags,
 }
 
 #[derive(Default)]
@@ -1745,61 +1734,6 @@ struct RouteIdentityData {
     run_owner: Option<Arc<codemode::RunOwner>>,
 }
 
-fn speech_launch_seed(
-    identity: &RouteIdentity,
-    route: RouteChannel,
-    control: Option<&Arc<readiness::DaemonControl>>,
-) -> Option<crate::gh_shim_speech::service::LaunchSeed> {
-    use crate::gh_shim_speech::model::{LaunchAuthority, RouteOrigin};
-    let lifecycle = identity.scope.clone()?;
-    let origin = |channel: RouteChannel| {
-        control.and_then(|control| {
-            Some(RouteOrigin {
-                run_nonce: crate::gh_shim_speech::service::run_nonce()?.into(),
-                connection_generation: format!("{:p}", Arc::as_ptr(control)),
-                channel: u32::from(channel.channel),
-                epoch: u64::from(channel.epoch),
-            })
-        })
-    };
-    let launch = if let Some(owner) = &identity.run_owner {
-        if matches!(owner.kind, codemode::RunKind::Worker { .. }) {
-            Err(crate::gh_shim_speech::Refusal::new(
-                crate::gh_shim_speech::Code::AuthorityUnavailable,
-                "owner_unresolved",
-            ))
-        } else {
-            owner
-                .owner_route
-                .scope
-                .clone()
-                .ok_or_else(|| {
-                    crate::gh_shim_speech::Refusal::new(
-                        crate::gh_shim_speech::Code::AuthorityUnavailable,
-                        "owner_unresolved",
-                    )
-                })
-                .and_then(|head| {
-                    LaunchAuthority::codemode(
-                        head,
-                        lifecycle.clone(),
-                        origin(route),
-                        owner.owner_route_channel.and_then(origin),
-                    )
-                })
-        }
-    } else {
-        LaunchAuthority::classic(lifecycle.clone(), origin(route))
-    };
-    Some(crate::gh_shim_speech::service::LaunchSeed {
-        launch,
-        lifecycle: Some(lifecycle),
-        session: identity.session.clone(),
-        harness: identity.harness.clone(),
-        project_root: identity.project_root.display().to_string(),
-    })
-}
-
 impl Deref for RouteIdentity {
     type Target = RouteIdentityData;
 
@@ -1820,27 +1754,7 @@ struct BgSub {
     session: String,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BgWakeState {
-    next_nudge_at: Instant,
-    nudges_sent: u32,
-}
-
-impl BgWakeState {
-    fn armed(now: Instant) -> Self {
-        Self {
-            next_nudge_at: now,
-            nudges_sent: 0,
-        }
-    }
-}
-
-type BgWakePending = HashMap<RouteChannel, BgWakeState>;
-
-// A session can be observed by multiple long-lived consumer records. Retain
-// every route so each wake uses the correlation captured by that route's BgSub.
-type BgSubsBySession =
-    HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), HashSet<RouteChannel>>;
+use push::{BgSubsBySession, BgWakePending};
 
 struct MaintenanceCompletion {
     root_id: ProjectRootId,
@@ -4557,7 +4471,7 @@ async fn connect_and_authenticate_once(
     Ok(stream)
 }
 
-use installed_routes::process_route_bind_completion;
+use installed_routes::{process_route_bind_completion, RouteBindCompletion};
 
 #[allow(clippy::too_many_arguments)]
 async fn drain_pending_route_bind_completions(
@@ -4654,7 +4568,7 @@ where
         using_registration,
     )
     .await?;
-    let gated = manage_settings && hello.gated();
+    let (gated, project_views) = hello.settings_modes(manage_settings);
     let rich_ui_proofs = hello.rich_ui;
     let hello_at = hello.at;
 
@@ -4736,7 +4650,7 @@ where
         match settings::wait_for_first_view(
             &control,
             startup_ctx.as_ref().expect("gated startup context"),
-            user_config_path.as_deref(),
+            (user_config_path.as_deref(), project_views),
             &mut reader_rx,
             &control_replies,
             &writer_tx,
@@ -4864,7 +4778,8 @@ where
     let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1024);
     let lossy_overflow = Arc::new(push::LossyOverflow::default());
     let lossy_seq = Arc::new(AtomicU64::new(0));
-    let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
+    let (reliable_tx, mut reliable_rx) =
+        push::ReliableIngress::channel(dispatch_path_metrics.completion_delivery.ingress.clone());
     let (fleet_status_client, fleet_status_task) =
         spawn_fleet_status_dial(connection_file_path, 64);
     // Serves the gh shim's bot-write relay on management routes; it dials
@@ -4873,7 +4788,7 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     consent::install_subc_transport(connection_file_path);
     let _expiry = consent::expiry::start(shared_app.clone(), storage_dir.join("aft.db"));
-    let _manifest_sync = crate::gh_shim::manifest_sync::start(connection_file_path.to_path_buf());
+    let a0 = gh_shim_session::with_refresh_worker(a0, connection_file_path, control.clone());
     let bus_worker = task_scope_runtime::start_publication_services(
         connection_file_path,
         &shared_app,
@@ -4916,6 +4831,7 @@ where
         HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels = RootChannels::default();
+    let mut settings_waits = settings::BindWaits::default();
     let mut session_identity = SessionIdentities::default();
     let mut push_buffer = PushBuffer::default();
     let mut retry_buffer: RetryBuffer = HashMap::new();
@@ -4953,23 +4869,12 @@ where
     // Arm the existing promised-wake marker before the first turn too: a lock
     // taken before the first select must be just as recoverable as a later one.
     dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
-    let notice_executor = executor.clone();
-    held_task_recovery::start(
+    held_task_recovery::start_with_notices(
         shared_app.clone(),
         executor.clone(),
         push_senders.clone(),
         storage_dir.to_path_buf(),
-        move |replayed| {
-            if replayed.is_empty() {
-                return;
-            }
-            // Each recovered task lives in its own project's registry, and an
-            // offer against a registry that doesn't hold the task does nothing,
-            // so every actor can be offered the whole set.
-            for actor in notice_executor.actor_contexts() {
-                runner_notices::offer_replayed(actor.bash_background().clone(), replayed);
-            }
-        },
+        connection_file_path.to_path_buf(),
     );
     let mut shell_detaches = tool_provider::ShellDetaches::default();
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
@@ -5077,6 +4982,21 @@ where
                 .map(|pending| pending.bind_root_id.clone()),
         );
         if tokio::time::Instant::now() >= next_drain_at {
+            push::recover_reliable_ingress(
+                &writer_tx,
+                &dispatch_path_metrics,
+                &executor,
+                &routes,
+                &root_channels,
+                &session_identity,
+                &mut retry_buffer,
+                &mut push_buffer,
+                &mut completed_tasks,
+                &bg_sub_by_session,
+                &mut bg_wake_pending,
+                &mut bg_wake_epoch,
+                lifecycle_probe.as_ref(),
+            );
             dispatch_path_metrics.mark_frame_loop_step("push::emit_bg_event_wakes", "", 0);
             push::emit_bg_event_wakes(
                 &writer_tx,
@@ -5316,15 +5236,16 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            (maybe_frame, database_waited, ledger_waited) = async {
+            (maybe_frame, database_waited, ledger_waited, project_view) = async {
                 if let Some(frame) = candidate_requests.next_ready() {
-                    return (Some(Ok(frame)), false, false);
+                    return (Some(Ok(frame)), false, false, None);
                 }
                 tokio::select! {
-                    frame = reader_rx.recv() => (frame, false, false),
-                    frame = run_scopes.next_ready(&mut run_ready_rx) => (frame.map(Ok), false, false),
-                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false),
-                    frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true),
+                    frame = reader_rx.recv() => (frame, false, false, None),
+                    frame = run_scopes.next_ready(&mut run_ready_rx) => (frame.map(Ok), false, false, None),
+                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false, None),
+                    frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true, None),
+                    (frame, view) = settings_waits.next(), if settings_waits.waiting() => (Some(Ok(frame)), false, false, Some(view)),
                 }
             } => {
                 let frame = match maybe_frame {
@@ -5355,6 +5276,17 @@ where
                     Ok(None) => continue,
                     Err(error) => break Err(error),
                 };
+                let frame = if let (Some(session), None) = (session.as_deref(), &project_view) {
+                    match settings_waits.defer(frame, session, &control, &executor, &a0.writer, &dispatch_path_metrics).await {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => continue,
+                        Err(error) => break Err(error),
+                    }
+                } else { frame };
+
+                if frame.frame.header.ty == FrameType::Goodbye {
+                    settings_waits.cancel(route_key(frame.frame.header.channel, frame.frame.header.epoch));
+                }
 
                 if !(ledger_waited && ledger_edge.is_withdrawn(&frame.frame)) && !ingress_route_should_be_processed(
                     &installed_route_epochs,
@@ -5399,9 +5331,9 @@ where
                         break Ok(ModuleLoopExit::Graceful);
                     }
                     FrameType::Goodbye => {
-                        a0.cancel(route_key(frame.header.channel, frame.header.epoch));
                         let channel = route_key(frame.header.channel, frame.header.epoch);
-                        if let Some(stamp) = routes.get(&channel).and_then(|identity| identity.scope.clone()) {
+                        a0.cancel(channel);
+                        if let Some(stamp) = routes.get(&channel).filter(|identity| !flow_read::is_head_read_route(identity)).and_then(|identity| identity.scope.clone()) {
                             scope_describes.goodbye(stamp);
                         }
                         if let Err(error) = teardown_installed_route(
@@ -5518,7 +5450,7 @@ where
                             &push_senders,
                             dispatch,
                             user_config_path.as_deref(),
-                            session.as_deref(),
+                            session.as_deref().map(|session| (session, project_view)),
                             tool_response_body_limit,
                             Some(&run_scopes),
                             storage_dir,
@@ -5531,6 +5463,13 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        // Exact-read carriers cannot use the request handlers below that bypass tool dispatch.
+                        if let Some(identity) = routes.get(&route).filter(|identity| flow_read::is_head_read_route(identity)) {
+                            if let Err(error) = flow_read::dispatch_head_read_route(&writer_tx, &dispatch_path_metrics, &decoded, identity, &routes, &executor, &active_tool_calls, Some(&control)).await {
+                                break Err(error);
+                            }
+                            continue;
+                        }
                         if let Some(identity @ ManagementIdentity { admission: ManagementAdmission::RemoteTools(binding), .. }) = management_routes.get(&route) {
                             let body = decoded.body().ok().cloned();
                             remote_calls.request(decoded.frame, body, identity, binding);
@@ -6115,9 +6054,7 @@ where
             }
             Some((root_id, frame)) = reliable_rx.recv() => {
                 dispatch_path_metrics.mark_frame_loop_step("push::drain_reliable_push_turn", "", 0);
-                // Reliable Push frames are FIFO and must-deliver, but draining an
-                // unbounded burst in one current-thread turn can starve RouteBind
-                // completions. The budget defers excess frames, never drops them.
+                // Even a bounded FIFO burst must yield to RouteBind completions.
                 let (processed, deferred) = push::drain_reliable_push_turn(
                     &writer_tx,
                     &dispatch_path_metrics,
@@ -6744,7 +6681,7 @@ where
             if !queued.begin_ack_write() {
                 continue;
             }
-            queued.project_tool_result().map_err(|error| {
+            queued.prepare_client_delivery().map_err(|error| {
                 metrics.close_shell_reply_connection(true);
                 subc_transport::FrameIoError::Io(io::Error::other(error.to_string()))
             })?;
@@ -7401,6 +7338,9 @@ async fn handle_route_bind_completion(
         &completion.bind_root_id,
         metrics,
     );
+    if completion.gh_shim_enabled {
+        a0.activate_manifest_sync();
+    }
     live_roots
         .entry(completion.bind_root_id.clone())
         .and_modify(|meta| {
@@ -7427,39 +7367,8 @@ async fn handle_route_bind_completion(
 
     debug_assert!(ack_written);
     start_post_ack_database_open(executor, &completion.bind_root_id);
-    if let Some(identity) = routes
-        .get(&route_id)
-        .filter(|identity| identity.scope.is_some())
-        .cloned()
-    {
-        let runtime = tokio::runtime::Handle::current();
-        let consent_executor = Arc::clone(executor);
-        let _ = executor.submit_async(
-            identity.root.clone(),
-            Lane::Mutating,
-            format!("scope-bind-{}", route_id.channel),
-            Box::new(move |ctx| {
-                crate::database_open::run_staged_open(
-                    ctx,
-                    crate::database_open::DatabaseOpenRunner::ConfigureTail,
-                    true,
-                );
-                match access_grants::register(&identity, ctx) {
-                    Ok(()) => {
-                        codemode_owners::save(ctx, &identity);
-                        // After a restart, asks this worker left open are sent
-                        // again under their original call keys, never withdrawn.
-                        if let Some(ctx) = consent_executor.actor_context(&identity.root) {
-                            consent::reattach(&ctx, &identity, &runtime);
-                        }
-                        Response::success("scope-bind", json!({}))
-                    }
-                    Err(error) => {
-                        Response::error("scope-bind", "grants_unavailable", error.message)
-                    }
-                }
-            }),
-        );
+    if let Some(identity) = routes.get(&route_id) {
+        persistence::register_bound_scope(executor, route_id, identity);
     }
     queue_post_bind_configure_and_completion_maintenance(&completion.bind_root_id, live_roots);
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
@@ -7603,40 +7512,6 @@ fn record_bg_runtime_from_snapshots(
     metrics.record_bg_runtime(subscriptions, wake_pending, unacked_total);
 }
 
-async fn send_cached_health_response(
-    tx: &WriterSender,
-    frame: &Frame,
-    shared_app: &App,
-    executor: &Executor,
-    pending_binds: &HashMap<RouteChannel, PendingBind>,
-    metrics: &DispatchPathMetrics,
-    health_rollup_cache: &HealthRollupCache,
-    ownership_summary: Value,
-    settings: Option<&settings::Session>,
-) -> Result<(), SubcError> {
-    let mut report = build_health_report(
-        health_rollup_cache,
-        executor,
-        pending_binds,
-        metrics,
-        shared_app,
-    );
-    settings::note_health(&mut report, settings);
-    health::with_route_ownership_summary(&mut report, ownership_summary);
-    let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(
-        frame.header.ver,
-        FrameType::Response,
-        frame.header.flags,
-        0,
-        0,
-        frame.header.corr,
-        body,
-    )
-    .map_err(SubcError::FrameBuild)?;
-    send_frame(tx, metrics, response).await
-}
-
 /// Channel-0 control requests: RouteBind plus the cached health probe.
 /// Tool-provider binds reconcile RootConfig through the executor's Mutating lane;
 /// management binds install immediately without creating project state.
@@ -7674,7 +7549,7 @@ async fn handle_control_request(
     push_senders: &PushSenders,
     dispatch: DispatchFn,
     user_config_path: Option<&Path>,
-    settings_session: Option<&settings::Session>,
+    bind_settings: Option<settings::BindSettings<'_>>,
     tool_response_body_limit: usize,
     run_scopes: Option<&run_scope::RunScopes>,
     storage_dir: &Path,
@@ -7815,11 +7690,11 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if let Err(refusal) = if project_free {
-                    Ok(())
-                } else {
-                    flow_read::admit_management(scope.as_ref())
-                } {
+                if let Err(refusal) = flow_read::admit_bind_surface(
+                    scope.as_ref(),
+                    principal_id(&principal).as_deref(),
+                    project_free,
+                ) {
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
                 }
                 if !matches!(&target, RouteTarget::ManagementSurface { module_id } | RouteTarget::ToolProvider { module_id } if module_id == "aft")
@@ -8046,6 +7921,20 @@ async fn handle_control_request(
                         .await;
                     }
                 };
+                if let Some((_, Some(Ok(project)))) = &bind_settings {
+                    if let Err(reason) =
+                        root_channels.select_project(&replacement_root, Some(project.clone()))
+                    {
+                        return send_route_bind_error(
+                            tx,
+                            frame,
+                            "config_divergence",
+                            reason,
+                            metrics,
+                        )
+                        .await;
+                    }
+                }
                 a0.supersede(route_key(route_channel, installed_epoch));
                 teardown_installed_route(
                     legacy_tx,
@@ -8152,18 +8041,30 @@ async fn handle_control_request(
                 consumer_elicitation_capable
             );
 
-            // Config is read directly from the CortexKit user and project files;
-            // wire-relayed tiers are ignored so a front cannot inject settings.
-            // The resolver selects only this bind's harness override before it
-            // applies the unchanged user/project trust boundary.
-            metrics.mark_frame_loop_wait("disk/local_config", None);
+            // Gated binds use only the daemon's effective view. Older daemons
+            // keep observing local files; neither accepts config text from the caller.
+            let (user_settings, project) =
+                match settings::select_for_bind(root_channels, &bind_root_id, bind_settings) {
+                    Ok(selected) => selected,
+                    Err((code, reason)) => {
+                        root_channels.release_if_unbound(&bind_root_id, pending_binds, None);
+                        return send_route_bind_error(tx, frame, code, reason, metrics).await;
+                    }
+                };
+            let approved = project
+                .as_ref()
+                .map(|project| &project.settings)
+                .or(user_settings);
+            if approved.is_none() {
+                metrics.mark_frame_loop_wait("disk/local_config", None);
+            }
             // Invalid harnesses still reach configure's existing typed refusal.
             let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
             let prepared_config = match active_harness.as_ref() {
                 Some(harness) => match crate::subc_config::PreparedBindConfig::read_cached(
                     &mut root_channels.config,
                     user_config_path,
-                    settings_session.map(settings::Session::user),
+                    approved,
                     Path::new(&bind_project_root),
                     bind_root_id.as_path(),
                     harness,
@@ -8257,6 +8158,9 @@ async fn handle_control_request(
                 scopes.bind(&route_identity);
             }
             let configure_session = route_identity.session.clone();
+            if let Some(project) = project {
+                root_channels.remember_project(&bind_root_id, project);
+            }
             let bind_session = configure_session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
             metrics.mark_frame_loop_wait(
@@ -8285,6 +8189,8 @@ async fn handle_control_request(
             let expected_snapshot_id = prepared_config.as_ref().map(|snapshot| snapshot.id());
             let applied_snapshot = Arc::new(AtomicU64::new(0));
             let job_snapshot = Arc::clone(&applied_snapshot);
+            let applied_gh_shim = Arc::new(AtomicBool::new(false));
+            let job_gh_shim = Arc::clone(&applied_gh_shim);
             installed_route_epochs.insert(route_channel, epoch);
             if let Some(meta) = live_roots.get_mut(&bind_root_id) {
                 meta.maintenance_queued_kinds.clear();
@@ -8316,6 +8222,7 @@ async fn handle_control_request(
                                 prepared_config.as_ref(),
                             );
                             if response.success {
+                                job_gh_shim.store(ctx.config().github.shim, Ordering::Release);
                                 output_identity.output_scope.get_or_init(|| {
                                     Arc::new(crate::output_store::OutputScope::new(
                                         ctx,
@@ -8394,6 +8301,7 @@ async fn handle_control_request(
                     bind_root_id: completion_root,
                     inserted_new_actor,
                     configure_response,
+                    gh_shim_enabled: applied_gh_shim.load(Ordering::Acquire),
                     diagnostics_on_edit,
                     ver: completion_ver,
                     corr: completion_corr,
@@ -8440,7 +8348,7 @@ async fn handle_control_request(
                     Instant::now(),
                 )
                 .summary(),
-                settings_session,
+                bind_settings.map(|(session, _)| session),
             )
             .await
         }
@@ -9249,179 +9157,6 @@ fn install_bash_compressor(ctx: &AppContext) {
             )
         },
     );
-}
-
-fn route_bind_ack_frame(ver: u8, corr: u64, flags: Flags) -> Result<Frame, SubcError> {
-    let body =
-        serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
-    Frame::build_with_version(ver, FrameType::Response, flags, 0, 0, corr, body)
-        .map_err(SubcError::FrameBuild)
-}
-
-/// Longest decode-error text a refusal carries back to the sender; serde can
-/// quote a whole body in its message.
-const DECODE_ERROR_TEXT_MAX: usize = 240;
-
-/// A serde decode error, shortened for a refusal message and a log line.
-fn brief_decode_error(error: &serde_json::Error) -> String {
-    let text = error.to_string();
-    match text.char_indices().nth(DECODE_ERROR_TEXT_MAX) {
-        Some((cut, _)) => format!("{}...", &text[..cut]),
-        None => text,
-    }
-}
-
-/// Answers a channel-0 request whose body does not decode, and keeps the
-/// module running.
-///
-/// One request AFT cannot read (for example a route bind whose scope stamp
-/// carries a field a deny-unknown-fields type does not know yet) must cost
-/// only that request. Ending the frame loop instead would drop every route on
-/// the connection, fleet-wide, until the daemon respawned the module. Only
-/// transport failures may end the loop.
-async fn refuse_undecodable_control_request(
-    tx: &WriterSender,
-    frame: &Frame,
-    error: &serde_json::Error,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    let reason = brief_decode_error(error);
-    log::warn!(
-        "subc attach: refusing channel-0 request corr={} whose body does not decode ({} bytes): {reason}",
-        frame.header.corr,
-        frame.body.len()
-    );
-    let response = build_error_frame(
-        frame.header.ver,
-        0,
-        0,
-        frame.header.corr,
-        frame.header.flags,
-        UNDECODABLE_CONTROL_REQUEST,
-        &format!("control request does not decode: {reason}"),
-    )?;
-    send_reliable_writer_frame(tx, metrics, response, "undecodable control request error").await
-}
-
-/// Error code for a channel-0 request AFT could not decode.
-pub(crate) const UNDECODABLE_CONTROL_REQUEST: &str = "undecodable_control_request";
-
-async fn send_route_bind_error(
-    tx: &WriterSender,
-    frame: &Frame,
-    code: &str,
-    message: &str,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    send_route_bind_error_parts(
-        tx,
-        frame.header.ver,
-        frame.header.corr,
-        frame.header.flags,
-        code,
-        message,
-        metrics,
-    )
-    .await
-}
-
-/// [`send_route_bind_error`] for a refusal that carries a machine-readable
-/// `detail`, such as the role versions AFT does serve.
-async fn send_route_bind_error_body(
-    tx: &WriterSender,
-    frame: &Frame,
-    refusal: &ErrorBody,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    send_route_bind_error_body_parts(
-        tx,
-        frame.header.ver,
-        frame.header.corr,
-        frame.header.flags,
-        refusal,
-        metrics,
-    )
-    .await
-}
-
-async fn send_route_bind_error_body_parts(
-    tx: &WriterSender,
-    ver: u8,
-    corr: u64,
-    flags: Flags,
-    refusal: &ErrorBody,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    let body = serde_json::to_vec(refusal).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(ver, FrameType::Error, flags, 0, 0, corr, body)
-        .map_err(SubcError::FrameBuild)?;
-    send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
-    log_route_bind_rejection(&refusal.code, &refusal.message);
-    Ok(())
-}
-
-async fn send_route_bind_error_parts(
-    tx: &WriterSender,
-    ver: u8,
-    corr: u64,
-    flags: Flags,
-    code: &str,
-    message: &str,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
-    let response = build_error_frame(ver, 0, 0, corr, flags, code, message)?;
-    send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
-    log_route_bind_rejection(code, message);
-    Ok(())
-}
-
-/// Per-message rate limit for the bind-rejection warn line. A caller that
-/// re-attaches a dead root forever turns this line into the entire readable
-/// tail of the SHARED daemon log (measured 2026-08-09: 2.08M copies, ~40/sec,
-/// 936MB log — other modules' incident lines pushed out of the tail).
-/// The line itself stays byte-identical so external counters keep matching;
-/// repeats inside the window are summarized with a suppressed count on the
-/// next emission (volume stays diagnosable, per the log-diet convention).
-fn log_route_bind_rejection(code: &str, message: &str) {
-    const WINDOW: Duration = Duration::from_secs(60);
-    static SUPPRESSED: OnceLock<StdMutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
-    let map = SUPPRESSED.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut map = match map.try_lock() {
-        Ok(map) => map,
-        // Contended: log unsuppressed rather than blocking or dropping.
-        Err(_) => {
-            log::warn!("subc attach: route bind rejected ({code}): {message}");
-            return;
-        }
-    };
-    let now = Instant::now();
-    // Bound the map: dead roots churn, and an unbounded suppression map is
-    // its own leak. Sweep expired entries once it grows past a fleet-sized
-    // number of distinct rejection messages.
-    if map.len() > 512 {
-        map.retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
-    }
-    match map.get_mut(message) {
-        Some((window_start, suppressed)) if now.duration_since(*window_start) < WINDOW => {
-            *suppressed += 1;
-        }
-        Some((window_start, suppressed)) => {
-            if *suppressed > 0 {
-                log::warn!(
-                    "subc attach: route bind rejected ({code}): {message} (repeated {}x in last 60s)",
-                    *suppressed
-                );
-            } else {
-                log::warn!("subc attach: route bind rejected ({code}): {message}");
-            }
-            *window_start = now;
-            *suppressed = 0;
-        }
-        None => {
-            log::warn!("subc attach: route bind rejected ({code}): {message}");
-            map.insert(message.to_string(), (now, 0));
-        }
-    }
 }
 
 async fn send_provider_error(
@@ -11161,7 +10896,7 @@ async fn handle_tool_call_with_capabilities(
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
                 keepalive: progress.clone(),
-                speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
+                speech_seed: speech_launch_seed(&identity, route_id, daemon_control, routes),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
                 late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -11225,7 +10960,7 @@ async fn handle_tool_call_with_capabilities(
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
             keepalive: progress.clone(),
-            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control, routes),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
             late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -11359,7 +11094,7 @@ async fn handle_tool_call_with_capabilities(
         )
         .then(|| PlainToolRun {
             progress: progress.clone(),
-            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control, routes),
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
             format_context: format_context.clone(),
@@ -11802,7 +11537,7 @@ async fn handle_tool_call_with_capabilities(
     phase_trace.mark_executor_submitted();
     let plain_run = PlainToolRun {
         progress,
-        speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
+        speech_seed: speech_launch_seed(&identity, route_id, daemon_control, routes),
         bare_name,
         arguments,
         format_context,
@@ -14668,6 +14403,7 @@ pub(crate) mod test_support {
 
     pub(super) fn completion_frame_with_session(task_id: &str, session_id: &str) -> PushFrame {
         PushFrame::BashCompleted(BashCompletedFrame {
+            ingress_missed: None,
             launching_identity: None,
             changed_files: None,
             frame_type: "bash_completed",
@@ -14713,6 +14449,7 @@ pub(crate) mod test_support {
 
     pub(super) fn pattern_match_frame(session_id: &str) -> PushFrame {
         PushFrame::BashPatternMatch(BashPatternMatchFrame {
+            durable_pending: false,
             launching_identity: None,
             batch: None,
             frame_type: "bash_pattern_match",
@@ -15979,7 +15716,7 @@ mod tests {
             HashSet::from([route]),
         )]);
         let mut bg_wake_pending =
-            BgWakePending::from([(route, BgWakeState::armed(Instant::now()))]);
+            BgWakePending::from([(route, push::BgWakeState::armed(Instant::now()))]);
         let mut bg_wake_epoch = HashMap::new();
         let mut pending_bash_asks = HashMap::new();
         let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
@@ -18865,6 +18602,7 @@ mod tests {
             bind_root_id: root.clone(),
             inserted_new_actor: false,
             expected_snapshot_id: None,
+            gh_shim_enabled: false,
             applied_snapshot_id: None,
             configure_response: Response::success("subc-bind-7", json!({})),
             diagnostics_on_edit: false,
@@ -19005,6 +18743,7 @@ mod tests {
             bind_root_id: root.clone(),
             inserted_new_actor: false,
             expected_snapshot_id: None,
+            gh_shim_enabled: false,
             applied_snapshot_id: None,
             configure_response: Response::success("subc-bind-8", json!({})),
             diagnostics_on_edit: false,

@@ -1,4 +1,40 @@
 use super::*;
+
+pub fn seed_terminal_watch_ack(
+    registry: &BgTaskRegistry,
+    dir: &tempfile::TempDir,
+) -> (String, PathBuf) {
+    // Keep the watchdog idle so the test decides when the deferred write runs.
+    registry
+        .inner
+        .watchdog_started
+        .store(true, Ordering::SeqCst);
+    let (id, task) = insert_terminal_piped_task(registry, dir, "true", "done\n", "", false);
+    let metadata = task.lock_state().unwrap().metadata.clone();
+    registry.dual_write_task(&task.paths, &metadata);
+    registry.enqueue_completion_if_needed(&metadata, Some(&task.paths), false);
+    (id, task.paths.json.clone())
+}
+
+pub fn flush_terminal_watch_acks(registry: &BgTaskRegistry) {
+    registry.flush_deferred_watch_acks();
+}
+
+pub fn terminal_watch_acks_empty(registry: &BgTaskRegistry) -> bool {
+    registry.terminal_watch_acks_empty_for_test()
+}
+
+impl BgTaskRegistry {
+    pub(crate) fn replay_live_task_for_test(&self, storage: &Path, session: &str, task: &str) {
+        let resolved =
+            crate::bash_background::persistence::resolve_task(storage, session, task).unwrap();
+        let metadata = read_task_at(&resolved).unwrap();
+        self.rehydrate_resolved_task_with_process_probe(metadata, resolved.paths, session, |_| {
+            true
+        })
+        .unwrap();
+    }
+}
 use crate::bash_background::persistence::{task_paths, write_task};
 use std::io::Write;
 

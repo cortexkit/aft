@@ -9,6 +9,7 @@ pub(crate) use scope_records::{
 pub use scope_records::{read_task_at, write_task};
 
 use crate::bash_background::TaskIdentityAuth;
+use std::collections::BTreeMap;
 #[cfg(all(test, unix))]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
@@ -361,6 +362,18 @@ pub struct PersistedCompletionPreview {
     pub bash_output_list_envelope: Option<crate::list_envelope::ListEnvelope>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(super) struct RemoteCopyWarning {
+    #[serde(rename = "copy_warning", default, skip_serializing_if = "is_false")]
+    pub(super) active: bool,
+    #[serde(
+        rename = "copy_warning_commands",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub(super) commands: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedTask {
     pub schema_version: u32,
@@ -421,6 +434,8 @@ pub struct PersistedTask {
     /// Used to detect when the OS reuses that PID for a different process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_start_time_ms: Option<u64>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub(crate) child_native_birth: Option<crate::process_identity::LinuxBirth>,
     /// AFT process responsible for publishing a local shell's launch result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) launch_owner: Option<ProcessIdentity>,
@@ -454,6 +469,8 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "is_false")]
     pub group_member_identities_truncated: bool,
     pub completion_delivered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) awaited_work: Option<super::registry::awaited_work::State>,
     #[serde(default = "default_notify_on_completion")]
     pub notify_on_completion: bool,
     #[serde(default = "default_compressed")]
@@ -677,6 +694,7 @@ impl PersistedTask {
             child_pid: None,
             pgid: None,
             child_start_time_ms: None,
+            child_native_birth: None,
             launch_owner: None,
             live_descendants: None,
             live_descendants_omitted: 0,
@@ -685,6 +703,7 @@ impl PersistedTask {
             group_member_identities: Vec::new(),
             group_member_identities_truncated: false,
             completion_delivered: !notify_on_completion,
+            awaited_work: super::registry::awaited_work::state_for_spawn(),
             notify_on_completion,
             compressed,
             completion_has_secret_placeholders,
@@ -747,12 +766,26 @@ impl PersistedTask {
         }
     }
 
+    pub(super) fn record_child_identity(&mut self, child_pid: u32) {
+        let identity = ProcessIdentity::of(child_pid);
+        self.child_start_time_ms = identity.as_ref().map(|value| value.started_at_ms);
+        self.child_native_birth = identity.and_then(|value| value.native_birth);
+    }
+
+    pub(super) fn child_identity(&self, pid: u32) -> Option<ProcessIdentity> {
+        Some(ProcessIdentity {
+            pid,
+            started_at_ms: self.child_start_time_ms?,
+            native_birth: self.child_native_birth.clone(),
+        })
+    }
+
     pub fn mark_running(&mut self, child_pid: u32, pgid: i32) {
         self.status = BgTaskStatus::Running;
         self.launch_owner = None;
         self.child_pid = Some(child_pid);
         self.pgid = Some(pgid);
-        self.child_start_time_ms = crate::process_identity::process_start_time_ms(child_pid);
+        self.record_child_identity(child_pid);
         crate::gh_shim_ticket::seal_spawn(self);
     }
 
@@ -769,7 +802,12 @@ impl PersistedTask {
         self.duration_ms = Some(finished_at.saturating_sub(self.started_at));
         self.child_pid = None;
         self.status_reason = reason;
-        self.completion_delivered = !self.notify_on_completion;
+        // Reconciliation uses the undelivered-task index. Keep awaited results
+        // in that index until the orchestrator acknowledges the decision.
+        use super::registry::awaited_work::State;
+        self.completion_delivered = matches!(self.awaited_work, Some(State::Settled))
+            || (!self.notify_on_completion
+                && (self.awaited_work.is_none() || self.has_pending_fallback_cancel()));
     }
 
     pub fn to_bash_task_row(
@@ -806,7 +844,9 @@ impl PersistedTask {
             stderr_path,
             compressed: self.compressed,
             timeout_ms: self.timeout_ms.map(|value| value as i64),
-            completion_delivered: self.completion_delivered,
+            // Keep the task in the startup index until the orchestrator
+            // confirms the fallback cancel, even if the held reply was read.
+            completion_delivered: self.completion_delivered && !self.has_pending_fallback_cancel(),
             output_bytes,
             metadata: serde_json::to_string(&metadata)?,
         })
@@ -864,6 +904,7 @@ impl From<BashTaskRow> for PersistedTask {
             child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
             pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
             child_start_time_ms: None,
+            child_native_birth: None,
             launch_owner: None,
             live_descendants: None,
             live_descendants_omitted: 0,
@@ -872,6 +913,7 @@ impl From<BashTaskRow> for PersistedTask {
             group_member_identities: Vec::new(),
             group_member_identities_truncated: false,
             completion_delivered: row.completion_delivered,
+            awaited_work: None,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,
             completion_has_secret_placeholders: None,
@@ -3198,6 +3240,50 @@ pub(crate) fn metadata_open_attempts_for_test() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_birth_fields_round_trip_in_task_json_and_sqlite_metadata() {
+        let storage = tempfile::tempdir().unwrap();
+        let (resolved, mut task) = counted_task(storage.path());
+        task.child_pid = Some(42);
+        task.child_start_time_ms = Some(12345);
+        let identity = serde_json::json!({
+            "pid": 42, "started_at_ms": 12345, "boot_id": "boot", "start_ticks": 27,
+        });
+        let mut value = serde_json::to_value(&task).unwrap();
+        value["boot_id"] = "boot".into();
+        value["start_ticks"] = 27.into();
+        value["launch_owner"] = identity.clone();
+        value["group_member_identities"] = serde_json::json!([identity]);
+        let metadata = value.to_string();
+        std::fs::write(&resolved.paths.json, &metadata).unwrap();
+
+        let mut row = task.to_bash_task_row("runner", &resolved.paths).unwrap();
+        row.metadata = metadata;
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&mut conn).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(&conn, &row).unwrap();
+        let saved =
+            crate::db::bash_tasks::get_bash_task(&conn, "runner", &task.session_id, &task.task_id)
+                .unwrap()
+                .unwrap();
+        for decoded in [read_task_at(&resolved).unwrap(), PersistedTask::from(saved)] {
+            assert_eq!(decoded.child_start_time_ms, task.child_start_time_ms);
+            let birth = decoded.child_native_birth.as_ref().unwrap();
+            assert_eq!(birth.boot_id, "boot");
+            assert_eq!(birth.start_ticks, 27);
+            let owner = decoded.launch_owner.as_ref().unwrap();
+            assert_eq!(owner.started_at_ms, 12345);
+            assert_eq!(owner.native_birth.as_ref(), Some(birth));
+            let [member] = decoded.group_member_identities.as_slice() else {
+                panic!("expected one recorded group member");
+            };
+            assert_eq!(member.pid, owner.pid);
+            assert_eq!(member.started_at_ms, owner.started_at_ms);
+            assert_eq!(member.native_birth, owner.native_birth);
+            assert_eq!(serde_json::to_value(decoded).unwrap()["start_ticks"], 27);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn refused_task_layout_creation_leaves_storage_root_untouched() {

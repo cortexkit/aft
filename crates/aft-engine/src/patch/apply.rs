@@ -3,6 +3,7 @@
 //! This ports `applyUpdateChunks` and its diagnostics from
 //! `packages/opencode-plugin/src/patch-parser.ts`.
 
+use crate::edit::LineEnding;
 use crate::patch::matcher::{
     find_nearest_miss, seek_sequence_tiered, seek_sequence_tiered_checked, NearestMiss,
     NearestMissSearch, SequenceMatch, NEAREST_MISS_MAX_FILE_BYTES,
@@ -118,35 +119,13 @@ fn render_nearest_miss(lines: &[&str], pattern: &[&str], file_size_bytes: usize)
     }
 }
 
-fn dominant_line_ending(content: &str) -> &'static str {
-    let bytes = content.as_bytes();
-    let mut newline_count = 0usize;
-    let mut crlf_count = 0usize;
-
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            newline_count += 1;
-            if index > 0 && bytes[index - 1] == b'\r' {
-                crlf_count += 1;
-            }
-        }
-    }
-
-    // Mixed files use their majority convention; ties and files without newlines use LF.
-    if crlf_count > newline_count - crlf_count {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
-
 /// Apply parsed update chunks to original file content, returning the patched text or an error string.
 pub fn apply_update_chunks(
     original_content: &str,
     file_path: &str,
     chunks: &[UpdateFileChunk],
 ) -> Result<String, String> {
-    let line_ending = dominant_line_ending(original_content);
+    let line_ending = LineEnding::dominant(original_content).as_str();
     // Remember at split time whether the file ended with a newline. The join below
     // must restore the terminator sentinel from this flag: once the lines are in a
     // buffer, a real trailing empty line (a file ending in two newlines) is
@@ -716,7 +695,7 @@ mod tests {
 
     #[test]
     fn crlf_with_two_terminal_newlines_preserves_majority_convention() {
-        // The CRLF normalization (dominant_line_ending) must compose with the
+        // The dominant line ending must compose with the
         // tracked terminator: both terminal newlines survive, both as CRLF.
         let result = apply_update_chunks(
             "alpha\r\n\r\n",

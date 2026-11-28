@@ -23,6 +23,171 @@ pub(in crate::subc) async fn stage_notice(record: PullRecord) {
     }
 }
 
+#[derive(Clone, Default)]
+pub(in crate::subc) enum AwaitedCards {
+    #[default]
+    Module,
+    #[cfg(all(test, unix))]
+    Test(std::sync::Arc<TestAwaitedCards>),
+}
+
+impl AwaitedCards {
+    fn writer(&self) -> Option<&Writer> {
+        match self {
+            Self::Module => SENDER.get(),
+            #[cfg(all(test, unix))]
+            Self::Test(test) => Some(&test.writer),
+        }
+    }
+
+    pub(in crate::subc) async fn commit(&self, record: PullRecord) -> Option<String> {
+        let writer = self.writer()?;
+        let id = record.id.clone();
+        if prepare_for_display(writer, record).await.is_some() {
+            #[cfg(all(test, unix))]
+            if let Self::Test(test) = self {
+                if test.pause_rename.load(std::sync::atomic::Ordering::Acquire) {
+                    *test.staged_id.lock() = Some(id.clone());
+                    test.rename_pending.notify_one();
+                    test.allow_rename.notified().await;
+                }
+            }
+            if writer.store.commit_awaited_notice(id.clone()).await == Ok(true) {
+                return Some(id);
+            }
+        }
+        let cards = self.clone();
+        tokio::spawn(async move { cards.discard(id).await });
+        None
+    }
+
+    pub(in crate::subc) async fn discard(&self, id: String) {
+        let Some(writer) = self.writer() else { return };
+        let _ = writer.store.discard_unlinked_notice(id).await;
+        #[cfg(all(test, unix))]
+        if let Self::Test(test) = self {
+            test.discarded.notify_one();
+        }
+    }
+
+    pub(in crate::subc) fn announce(self, id: String) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let Some(writer) = self.writer() else { return };
+            match writer.store.activate_awaited_notice(id.clone()).await {
+                Ok(()) => crate::late_result_bus::display_committed(),
+                Err(error) => log::warn!("could not activate awaited record {id}: {error}"),
+            }
+        })
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(in crate::subc) struct TestAwaitedCards {
+    writer: Writer,
+    pub(in crate::subc) pause_rename: std::sync::atomic::AtomicBool,
+    pub(in crate::subc) rename_pending: tokio::sync::Notify,
+    pub(in crate::subc) allow_rename: tokio::sync::Notify,
+    pub(in crate::subc) discarded: tokio::sync::Notify,
+    pub(in crate::subc) staged_id: parking_lot::Mutex<Option<String>>,
+}
+
+#[cfg(all(test, unix))]
+impl TestAwaitedCards {
+    pub(in crate::subc) fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            writer: super::tests::test_writer(path),
+            pause_rename: Default::default(),
+            rename_pending: Default::default(),
+            allow_rename: Default::default(),
+            discarded: Default::default(),
+            staged_id: Default::default(),
+        }
+    }
+
+    pub(in crate::subc) async fn read(&self, id: String) -> Option<Vec<u8>> {
+        self.writer
+            .store
+            .read(id, crate::db::display_records::now_ms())
+            .await
+            .ok()
+    }
+}
+
+async fn prepare_for_display(writer: &Writer, record: PullRecord) -> Option<String> {
+    let PullRecord { id, bytes } = record;
+    let stored = writer
+        .store
+        .prepare_awaited_notice(id.clone(), bytes)
+        .await
+        .ok()?;
+    stored.then_some(id)
+}
+
+#[cfg(test)]
+async fn stage_for_display(
+    writer: &Writer,
+    record: PullRecord,
+    budget: Duration,
+) -> Option<String> {
+    let id = tokio::time::timeout(budget, prepare_for_display(writer, record))
+        .await
+        .ok()??;
+    writer
+        .store
+        .commit_awaited_notice(id.clone())
+        .await
+        .ok()?
+        .then_some(())?;
+    writer
+        .store
+        .activate_awaited_notice(id.clone())
+        .await
+        .ok()?;
+    Some(id)
+}
+
+pub(super) async fn restore_awaited() {
+    let writer = SENDER.get().expect("display writer started");
+    match writer.store.restore_awaited_count().await {
+        Ok(count) if count > 0 => crate::late_result_bus::display_committed(),
+        Ok(_) => {}
+        Err(error) => log::warn!("could not restore pending awaited display records: {error}"),
+    }
+}
+
+pub(crate) async fn publish_awaited_notice<F>(
+    publish: impl FnOnce(String) -> F,
+) -> Result<Option<String>, &'static str>
+where
+    F: std::future::Future<Output = Result<(), &'static str>>,
+{
+    let Some(writer) = SENDER.get() else {
+        return Ok(None);
+    };
+    publish_awaited_with(writer, publish).await
+}
+
+async fn publish_awaited_with<F>(
+    writer: &Writer,
+    publish: impl FnOnce(String) -> F,
+) -> Result<Option<String>, &'static str>
+where
+    F: std::future::Future<Output = Result<(), &'static str>>,
+{
+    let Some(id) = writer.store.pending_awaited_notice().await? else {
+        return Ok(None);
+    };
+    if let Err(error) = publish(id.clone()).await {
+        writer.store.defer_awaited_notice(id);
+        return Err(error);
+    }
+    if let Err(error) = writer.store.acknowledged_awaited_notice(id.clone()).await {
+        writer.store.defer_awaited_notice(id);
+        return Err(error);
+    }
+    Ok(Some(id))
+}
+
 async fn stage_after_views(
     writer: &Writer,
     record: PullRecord,

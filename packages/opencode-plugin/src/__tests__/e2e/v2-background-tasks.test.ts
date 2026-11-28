@@ -19,11 +19,21 @@ test.skipIf(!hostBinary || process.platform === "win32")(
       script: {
         "start waiting": {
           name: "shell",
-          arguments: { command: waiting, background: true, timeout: 45_000 },
+          arguments: {
+            command: waiting,
+            description: "Start long background task",
+            background: true,
+            timeout: 45_000,
+          },
         },
         "start finishing": {
           name: "shell",
-          arguments: { command: finishing, background: true, timeout: 45_000 },
+          arguments: {
+            command: finishing,
+            description: "Start short background task",
+            background: true,
+            timeout: 45_000,
+          },
         },
       },
     });

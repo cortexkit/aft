@@ -129,6 +129,127 @@ fn maintenance_recovery_skips_ordinary_drains_but_replays_configure_tail_after_b
 }
 
 #[test]
+fn reliable_ingress_overflow_recovers_attached_and_detached_runner_completions_once() {
+    let (_dir, root) = test_root("ingress-overflow-attached");
+    let (_runner_dir, runner_root) = test_root("ingress-overflow-runner");
+    let storage = tempfile::tempdir().unwrap();
+    let runner_storage = tempfile::tempdir().unwrap();
+    let owner = tests::caller_route(&root, "direct", "opencode");
+    let runner = tests::caller_route(&runner_root, "reserved:thalamus-harness", "opencode2");
+    let runner_task = "bash-00000000000a0910";
+    let executor = Executor::new();
+    let app = App::default_shared();
+    let metrics = DispatchPathMetrics::new();
+    let (ingress, mut receiver) =
+        ReliableIngress::channel(metrics.completion_delivery.ingress.clone());
+    let capacity = receiver.max_capacity();
+    assert_eq!(capacity, 256);
+    for index in 0..capacity {
+        ingress.send((root.clone(), completion_frame(&format!("filler-{index}"))));
+    }
+    for (root, owner, storage, task) in [
+        (&root, &owner, storage.path(), TASK),
+        (&runner_root, &runner, runner_storage.path(), runner_task),
+    ] {
+        persisted_completion_at(storage, root, owner, task, None);
+        let actor = Arc::new(AppContext::from_app(app.clone(), Config::default()));
+        let registry = actor.bash_background();
+        registry.replay_session(storage, SESSION).unwrap();
+        let _owner = crate::bash_background::task_identity_scope(Some(owner.task_identity()));
+        let completion = registry
+            .pending_completions_for_session(SESSION)
+            .pop()
+            .unwrap();
+        assert_eq!(completion.task_id, task);
+        ingress.send((root.clone(), completion.into_push_frame()));
+        executor.register_actor(root.clone(), actor);
+    }
+    assert_eq!(receiver.len(), capacity);
+    let warning = crate::protocol::ConfigureWarningsFrame::new("overload", vec![]);
+    ingress.send((root.clone(), PushFrame::ConfigureWarnings(warning)));
+    let mut watch =
+        crate::protocol::BashPatternMatchFrame::task_exit(TASK, SESSION, "exited", "exited");
+    watch.durable_pending = true;
+    ingress.send((root.clone(), PushFrame::BashPatternMatch(watch)));
+    for index in 0..capacity {
+        let (_, frame) = receiver.try_recv().unwrap();
+        assert_eq!(
+            completed_task_id(&frame),
+            Some(format!("filler-{index}").as_str())
+        );
+    }
+    assert!(receiver.try_recv().is_err());
+
+    let channel = route_key(3, 1);
+    let subscriptions = HashMap::from([(
+        (root.clone(), owner.task_identity()),
+        HashSet::from([channel]),
+    )]);
+    let routes = HashMap::from([(channel, owner)]);
+    let channels = HashMap::from([(root.clone(), HashSet::from([channel]))]);
+    let capture = super::super::runner_notices::test_endpoint::capture(runner_task, false);
+    let (writer, mut frames) = mpsc::channel(16);
+    let mut wakes = BgWakePending::new();
+    let mut wake_epochs = HashMap::new();
+    let mut retry = RetryBuffer::new();
+    let mut buffered = PushBuffer::default();
+    let mut completed = CompletedTaskIds::default();
+    let mut tick = || {
+        recover_reliable_ingress(
+            &writer,
+            &metrics,
+            &executor,
+            &routes,
+            &channels,
+            &SessionIdentities::default(),
+            &mut retry,
+            &mut buffered,
+            &mut completed,
+            &subscriptions,
+            &mut wakes,
+            &mut wake_epochs,
+            None,
+        )
+    };
+    assert!(frames.try_recv().is_err());
+    assert!(capture.receiver.try_recv().is_err());
+    tick();
+    tick();
+    let pushed = frames.try_recv().unwrap();
+    assert_eq!(push_frame_task_id(&pushed).as_deref(), Some(TASK));
+    assert!(frames.try_recv().is_err());
+    let runner_notice = capture
+        .receiver
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(
+        runner_notice.request["params"]["send_id"],
+        format!("aft:bash:{runner_task}")
+    );
+    let paths = crate::bash_background::persistence::resolve_task(
+        runner_storage.path(),
+        SESSION,
+        runner_task,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !read_task_at(&paths).unwrap().completion_delivered {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    tick();
+    assert_eq!(read_task_at(&paths).unwrap().runner_completion_offers, 1);
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+    assert!(capture.receiver.try_recv().is_err());
+    assert!(frames.try_recv().is_err());
+    assert!(wakes.contains_key(&channel));
+    assert_eq!(wake_epochs.values().copied().collect::<Vec<_>>(), [2]);
+    let health = metrics.snapshot(&HashMap::new());
+    assert_eq!(health["reliable_push"]["ingress_overflowed_total"], 4);
+    assert_eq!(health["reliable_push"]["ingress_unrecoverable_total"], 1);
+}
+
+#[test]
 fn plugin_completion_churn_recovers_from_registry_once_per_connection() {
     let (_dir, root) = test_root("opencode2-completion-churn");
     let storage = tempfile::tempdir().unwrap();

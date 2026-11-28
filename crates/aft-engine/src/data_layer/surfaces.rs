@@ -33,6 +33,7 @@ use super::runtime::{DataCheckout, DataFailure};
 use crate::context::AppContext;
 use crate::data_layer::host::IndexHost;
 use crate::data_layer::status::{SemanticFillHealth, SemanticHealthComponentSnapshot};
+use crate::feature_status::cause::GIT_IDENTITY_UNAVAILABLE;
 use crate::memory::MemoryEstimate;
 use aft_store::family::NewerFormat;
 
@@ -93,12 +94,14 @@ pub enum DataCheckoutProbe {
 }
 
 /// Why a root's checkout is never bound in the data layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Withheld {
     /// The root is a filesystem, volume or drive root.
     TooBroad,
     /// The root is the home folder.
     Home,
+    /// Git could not identify the repository that owns the index store.
+    GitIdentity(String),
     /// The text and call-graph indexes are both switched off.
     IndexesOff,
 }
@@ -214,6 +217,16 @@ impl DataStoreReport {
             disk_measurement: None,
             meaning: None,
         }
+    }
+
+    pub(crate) fn meaning_health(
+        &self,
+        backend_available: bool,
+    ) -> Option<SemanticHealthComponentSnapshot> {
+        let meaning = self.meaning.as_ref()?;
+        // A Git identity failure prevents meaning search before it can reach the backend.
+        (backend_available || matches!(meaning.plane, MeaningPlane::GitIdentityUnavailable(_)))
+            .then(|| meaning.health())
     }
 
     /// The status tool's `search_index` object.
@@ -597,6 +610,30 @@ fn report_inner(ctx: &dyn IndexHost, cached_only: bool) -> Option<DataStoreRepor
         DataCheckoutProbe::Withheld(Withheld::Home) => {
             DataStoreReport::both(PlaneReport::because(UNAVAILABLE, reason::HOME_ROOT, None))
         }
+        DataCheckoutProbe::Withheld(Withheld::GitIdentity(detail)) => {
+            let config = ctx.config();
+            let plane = |enabled| {
+                if enabled {
+                    PlaneReport::because(
+                        UNAVAILABLE,
+                        GIT_IDENTITY_UNAVAILABLE,
+                        Some(detail.clone()),
+                    )
+                } else {
+                    PlaneReport::of(OFF)
+                }
+            };
+            DataStoreReport {
+                callgraph: plane(config.indexes.callgraph),
+                meaning: config.indexes.semantic.then(|| MeaningReport {
+                    plane: MeaningPlane::GitIdentityUnavailable(detail.clone()),
+                    filling: false,
+                    waiting: false,
+                    times: Default::default(),
+                }),
+                ..DataStoreReport::both(plane(config.indexes.trigram))
+            }
+        }
         DataCheckoutProbe::Withheld(Withheld::IndexesOff) => {
             DataStoreReport::both(PlaneReport::of(OFF))
         }
@@ -715,6 +752,8 @@ pub(crate) enum MeaningPlane {
     },
     /// No fill could start, with why.
     Failed(String),
+    /// Git could not identify the repository that owns the index store.
+    GitIdentityUnavailable(String),
     Disabled,
     Ready,
 }
@@ -810,6 +849,10 @@ impl MeaningReport {
                     .to_json()
             }
             MeaningPlane::Failed(error) => json!({ "status": "failed", "error": error }),
+            MeaningPlane::GitIdentityUnavailable(error) => {
+                PlaneReport::because(UNAVAILABLE, GIT_IDENTITY_UNAVAILABLE, Some(error.clone()))
+                    .to_json()
+            }
             MeaningPlane::Disabled => json!({ "status": "disabled" }),
             MeaningPlane::Ready => json!({ "status": READY }),
         };
@@ -894,6 +937,10 @@ impl MeaningReport {
             }
             MeaningPlane::Failed(error) => {
                 health.status = "degraded";
+                health.reason = Some(error.clone());
+            }
+            MeaningPlane::GitIdentityUnavailable(error) => {
+                health.status = UNAVAILABLE;
                 health.reason = Some(error.clone());
             }
             MeaningPlane::Disabled => health.status = "disabled",
@@ -1355,7 +1402,13 @@ fn memory_estimate_with(ctx: &dyn IndexHost, reuse_dirty: bool) -> Option<DataLa
                 .as_ref()
                 .map(|snapshot| Arc::as_ptr(snapshot) as usize);
             let walk = || {
-                let mut seen = aft_store::heap::Seen::new();
+                let started =
+                    (reuse_dirty && log::log_enabled!(log::Level::Warn)).then(Instant::now);
+                let mut seen = if started.is_some() {
+                    aft_store::heap::Seen::counting_map_set_entries()
+                } else {
+                    aft_store::heap::Seen::new()
+                };
                 // aft_inspect's dead-code scan may hold the same snapshot the
                 // checkout's dead-code memo holds; the root's
                 // `callgraph_projection` plane counts it then.
@@ -1364,6 +1417,18 @@ fn memory_estimate_with(ctx: &dyn IndexHost, reuse_dirty: bool) -> Option<DataLa
                 }
                 let memory = checkout.checkout().memory(&mut seen);
                 let meaning = checkout.meaning_memory(&mut seen);
+                if let Some(started) = started {
+                    let elapsed = started.elapsed();
+                    if elapsed > Duration::from_millis(250) {
+                        log::warn!(
+                            "health rollup slow checkout memory walk: root={} map_set_entries_visited={} elapsed_ms={} locked_parts={}",
+                            checkout.root().display(),
+                            seen.map_set_entries_visited(),
+                            elapsed.as_millis(),
+                            seen.contended(),
+                        );
+                    }
+                }
                 checkout_estimate(memory, meaning, seen.contended())
             };
             if reuse_dirty {
@@ -1564,7 +1629,12 @@ fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bo
             payload["semantic_index"]["status"].as_str(),
             Some("paused" | "backend_unavailable")
         );
-        let mut semantic = if backend_down && meaning["reason"] != reason::DISK_RESERVE {
+        let backend_is_primary = backend_down
+            && !matches!(
+                meaning["reason"].as_str(),
+                Some(reason::DISK_RESERVE | GIT_IDENTITY_UNAVAILABLE)
+            );
+        let mut semantic = if backend_is_primary {
             let mut semantic = payload["semantic_index"].clone();
             if let (Some(semantic), Some(meaning)) = (semantic.as_object_mut(), meaning.as_object())
             {
@@ -1685,10 +1755,15 @@ pub fn zoom_callgraph_field(ctx: &dyn IndexHost) -> Option<Option<Value>> {
         BUILDING => "callgraph_building",
         _ => "callgraph_unavailable",
     };
+    let reason = if plane.reason == Some(GIT_IDENTITY_UNAVAILABLE) {
+        plane.error.as_deref()
+    } else {
+        plane.reason
+    };
     Some(Some(json!({
         "status": "unavailable",
         "code": code,
-        "index": { "status": plane.status, "reason": plane.reason },
+        "index": { "status": plane.status, "reason": reason },
     })))
 }
 
@@ -1732,8 +1807,10 @@ fn warm_state(plane: &PlaneReport, files: Option<usize>, indexed: Option<usize>)
         _ => {
             let reason = plane.reason.unwrap_or(plane.status);
             WarmState::Failed(match &plane.error {
-                // A refusal's message already starts with its code.
-                Some(error) if error.starts_with(reason) => error.clone(),
+                // Refusal and Git identity messages already include their code.
+                Some(error) if reason == GIT_IDENTITY_UNAVAILABLE || error.starts_with(reason) => {
+                    error.clone()
+                }
                 Some(error) => format!("{reason}: {error}"),
                 None => reason.to_string(),
             })
@@ -1914,6 +1991,11 @@ pub fn fill_root(
 pub fn warm_meaning(ctx: &dyn IndexHost) -> Option<WarmState> {
     use super::meaning_query::DataSemantic;
     use crate::data_layer::status::SemanticIndexStatus;
+    if ctx.config().indexes.semantic {
+        if let Some(reason) = crate::feature_status::git_identity_unavailable_reason(ctx) {
+            return Some(WarmState::Failed(reason));
+        }
+    }
     if !ctx.data_layer_serves_meaning() {
         return None;
     }
@@ -2045,6 +2127,31 @@ pub(crate) mod tests {
         let checkout = ctx.data_checkout().unwrap();
         assert!(checkout.view().is_some());
         assert!(!checkout.checkout().needs_build());
+    }
+
+    #[test]
+    fn git_withheld_meaning_reports_unavailable_even_without_other_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = context_with(&root, storage.path(), |config| {
+            config.indexes.trigram = false;
+            config.indexes.callgraph = false;
+            config.indexes.semantic = true;
+        });
+        let reason = format!(
+            "{}: fatal: detected dubious ownership",
+            crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON
+        );
+        ctx.set_degraded_reasons(vec![reason.clone()]);
+        assert!(ctx.data_checkout().is_none());
+        let report = report(&ctx).unwrap();
+        assert_eq!(report.text.status, OFF);
+        assert_eq!(report.callgraph.status, OFF);
+        let health = report.meaning_health(false).unwrap();
+        assert_eq!(health.status, UNAVAILABLE);
+        assert_eq!(health.reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(warm_meaning(&ctx), Some(WarmState::Failed(reason)));
     }
 
     #[test]

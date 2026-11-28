@@ -1,0 +1,3 @@
+export const endReason = view.completion.endReason ?? view.record.endReason
+
+<ToolHeader icon="terminal" title={$BASH_TITLE} truncate="middle" failed={endReason != "killed" && (endReason == "timed_out" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true)} />

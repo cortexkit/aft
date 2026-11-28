@@ -63,10 +63,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
 cortexkit-persona = "=0.3.0"
-cortexkit-role-tool-provider = "=0.15.18"
+cortexkit-role-tool-provider = "=0.15.21"
 cortexkit-role-llm-runner = "=0.8.53"
-cortexkit-role-tool-display = "=0.1.14"
+cortexkit-role-tool-display = "=0.1.15"
 cortexkit-role-agent-data = "=0.3.3"
+cortexkit-role-agent-orchestrator = "=0.2.0"
+async-trait = "0.1"
 cortexkit-role-user-commands = "=0.1.4"
 cortexkit-project-identity = "=0.1.5"
 jsonschema = { version = "0.33", default-features = false }
@@ -75,7 +77,7 @@ subc-protocol = "=0.37.4"
 subc-control = "=0.42.2"
 subc-transport = "=0.18.0"
 subc-client-rs = "=0.41.4"
-subc-config = "=0.1.4"
+subc-config = "=0.1.12"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.
@@ -109,8 +111,9 @@ aft-engine = { path = "../aft-engine", version = "=0.68.1", features = ["test-su
 aft-base = { path = "../aft-base", version = "0.68.1", features = ["test-support"] }
 aft-db = { path = "../aft-db", version = "0.68.1", features = ["test-support"] }
 cortexkit-test-support = "=0.1.14"
-cortexkit-role-tool-provider = { version = "=0.15.18", features = ["test-vectors"] }
+cortexkit-role-tool-provider = { version = "=0.15.21", features = ["test-vectors"] }
 cortexkit-role-agent-data = { version = "=0.3.3", features = ["test-vectors"] }
+cortexkit-role-agent-orchestrator = { version = "=0.2.0", features = ["test-vectors"] }
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"

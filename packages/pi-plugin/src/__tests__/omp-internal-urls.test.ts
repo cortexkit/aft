@@ -1,6 +1,9 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { Value } from "typebox/value";
@@ -39,10 +42,21 @@ const router = {
   },
 };
 
-function setup(harness: "omp" | "pi" = "omp", withRouter = true, hashline = false) {
+function setup(
+  harness: "omp" | "pi" = "omp",
+  withRouter = true,
+  hashline = false,
+  cwd?: string,
+  restrictToProjectRoot = false,
+) {
   const { api, tools } = makeMockApi();
   const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "AFT", output: "AFT" }));
-  const config = { disabled_tools: [], bash: true, github: { read: true, write: true } };
+  const config = {
+    disabled_tools: [],
+    bash: true,
+    github: { read: true, write: true },
+    restrict_to_project_root: restrictToProjectRoot,
+  };
   const ctx = makePluginContext(bridge, {
     config,
     hashlineEffective: hashline,
@@ -54,7 +68,7 @@ function setup(harness: "omp" | "pi" = "omp", withRouter = true, hashline = fals
     content: [{ type: "text", text: "native status" }],
     details: { proc: { status: "killed" }, bg_completions: {}, diff: {} },
   };
-  const extCtx = Object.assign(makeExtContext(), {
+  const extCtx = Object.assign(makeExtContext(cwd), {
     invokeTool: async (params: unknown) => {
       invocations.push(params);
       return nativeResult;
@@ -65,7 +79,82 @@ function setup(harness: "omp" | "pi" = "omp", withRouter = true, hashline = fals
   return { tools, calls, invocations, extCtx, nativeResult };
 }
 
+async function withFilesystemTool(
+  name: "bash" | "edit" | "grep",
+  run: (fixture: ReturnType<typeof setup> & { root: string }) => Promise<void>,
+) {
+  const root = mkdtempSync(join(homedir(), `aft-omp-${name}-`));
+  try {
+    mkdirSync(join(root, "src"));
+    mkdirSync(join(root, "tests"));
+    const file = join(root, "src/example.ts");
+    writeFileSync(file, "before\n");
+    await run({ ...setup("omp", true, false, root, name === "grep"), root });
+    expect(readFileSync(file, "utf8")).toBe("before\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 describe("OMP internal URL hand-back", () => {
+  test("bash filesystem route drops inert native defaults in preparation and direct execution", async () => {
+    await withFilesystemTool("bash", async (s) => {
+      const tool = s.tools.get("bash")!;
+      const { prepareArguments } = tool as unknown as {
+        prepareArguments(args: unknown): Record<string, unknown>;
+      };
+      const control = {
+        command: "pwd",
+        description: "Show the working directory",
+        workdir: ".",
+        timeout: 500,
+      };
+      const padded = {
+        ...control,
+        cwd: "",
+        async: false,
+        name: "",
+        ready: { log: "", port: 0, host: "", timeout: 0 },
+      };
+      expect(Value.Check(tool.parameters as TSchema, padded)).toBe(true);
+      expect(prepareArguments({ ...control, ready: {} })).toEqual(control);
+      const prepared = prepareArguments(padded);
+      expect(prepared).toEqual(control);
+      await executeTool(tool, prepared, s.extCtx);
+      await executeTool(tool, padded, s.extCtx);
+      expect(s.calls).toHaveLength(2);
+      for (const { command, params } of s.calls) {
+        expect(command).toBe("bash");
+        expect(params).toMatchObject(control);
+        expect(params).not.toHaveProperty("cwd");
+        expect(params.background).toBe(false);
+      }
+
+      for (const [field, value] of [
+        ["cwd", "src"],
+        ["async", true],
+        ["name", "service"],
+        ["ready", { log: "listening" }],
+        ["ready", { port: 8080 }],
+        ["ready", { host: "localhost" }],
+        ["ready", { timeout: 500 }],
+      ] as const) {
+        const active = { ...padded, [field]: value };
+        const refusal = `bash: invalid AFT filesystem arguments: ${field}.`;
+        expect(() => prepareArguments(active)).toThrow(refusal);
+        await expect(executeTool(tool, active, s.extCtx)).rejects.toThrow(refusal);
+      }
+      expect(s.calls).toHaveLength(2);
+      expect(s.invocations).toHaveLength(0);
+
+      const native = { ...padded, cwd: "local://" };
+      expect(prepareArguments(native)).toBe(native);
+      await executeTool(tool, native, s.extCtx);
+      expect(s.invocations[0]).toBe(native);
+      expect(s.calls).toHaveLength(2);
+    });
+  });
+
   test("routing predicate delegates read without preparing or copying parameters", async () => {
     const s = setup();
     const params = { path: "agent://worker", offset: 0, opaque: "keep" };
@@ -131,7 +220,12 @@ describe("OMP internal URL hand-back", () => {
   test("bash delegates native cwd and AFT workdir URLs", async () => {
     const s = setup();
     for (const key of ["cwd", "workdir"]) {
-      const params = { command: "pwd", [key]: "skill://sample", timeout: 0.5 };
+      const params = {
+        command: "pwd",
+        description: "Print the current working directory",
+        [key]: "skill://sample",
+        timeout: 0.5,
+      };
       expect(Value.Check(s.tools.get("bash")!.parameters as TSchema, params)).toBe(true);
       await executeTool(s.tools.get("bash")!, params, s.extCtx);
       expect(s.invocations.at(-1)).toBe(params);
@@ -171,9 +265,9 @@ describe("OMP internal URL hand-back", () => {
       ["write", { path: "src/index.ts", content: "text" }],
       ["edit", { path: "src/index.ts", appendContent: "text" }],
       ["grep", { path: "src", pattern: "text" }],
-      ["bash", { command: "curl https://example.com" }],
-      ["bash", { command: "curl http://example.com" }],
-      ["bash", { command: "cat file:///tmp/x" }],
+      ["bash", { command: "curl https://example.com", description: "Read the example HTTPS page" }],
+      ["bash", { command: "curl http://example.com", description: "Read the example HTTP page" }],
+      ["bash", { command: "cat file:///tmp/x", description: "Read the example file URI" }],
     ] as const)
       await executeTool(s.tools.get(name)!, params, s.extCtx);
     expect(s.invocations).toHaveLength(0);
@@ -234,6 +328,7 @@ describe("OMP internal URL hand-back", () => {
     expect(
       Value.Check(s.tools.get("bash")!.parameters as TSchema, {
         command: "pwd",
+        description: "Start the example shell service",
         cwd: "local://",
         timeout: 0.5,
         pty: true,
@@ -268,8 +363,15 @@ describe("OMP internal URL hand-back", () => {
       executeTool(s.tools.get("edit")!, { path: "x", edits: [] }, s.extCtx),
     ).rejects.toThrow();
     await expect(
-      executeTool(s.tools.get("bash")!, { command: "true", timeout: 0.5 }, s.extCtx),
+      executeTool(
+        s.tools.get("bash")!,
+        { command: "true", description: "Check shell timeout argument validation", timeout: 0.5 },
+        s.extCtx,
+      ),
     ).rejects.toThrow();
+    await expect(executeTool(s.tools.get("bash")!, { command: "true" }, s.extCtx)).rejects.toThrow(
+      /invalid AFT filesystem arguments: description/,
+    );
     expect(s.calls).toHaveLength(0);
   });
 
@@ -323,19 +425,98 @@ describe("OMP internal URL hand-back", () => {
     expect(s.calls).toHaveLength(0);
   });
 
-  test("grep filesystem errors name native arguments and the AFT form", async () => {
-    const s = setup();
-    await expect(
-      executeTool(
-        s.tools.get("grep")!,
-        { path: "src", pattern: "x", case: false, gitignore: false, skip: null },
+  test("edit filesystem route drops inert native defaults from an AFT batch", async () => {
+    await withFilesystemTool("edit", async (s) => {
+      const tool = s.tools.get("edit")!;
+      const { prepareArguments } = tool as unknown as {
+        prepareArguments(args: unknown): Record<string, unknown>;
+      };
+      const control = {
+        path: "src/example.ts",
+        edits: [{ oldString: "before", newString: "after" }],
+      };
+      const entry = { ...control.edits[0], op: "update", rename: "", diff: "" };
+      const defaults = { input: "", old_string: "", new_string: "", replace_all: false };
+      const padded = { ...control, edits: [entry], ...defaults };
+      expect(Value.Check(tool.parameters as TSchema, padded)).toBe(true);
+      const prepared = prepareArguments(padded);
+      expect(prepared).toEqual(control);
+      await executeTool(tool, prepared, s.extCtx);
+      await executeTool(tool, padded, s.extCtx);
+      expect(s.calls.map(({ params }) => params.arguments)).toEqual([control, control]);
+
+      const native = { ...padded, path: "local://fixture" };
+      expect(prepareArguments(native)).toBe(native);
+      await executeTool(tool, native, s.extCtx);
+      expect(s.invocations[0]).toBe(native);
+      expect(s.calls).toHaveLength(2);
+
+      const deletion = {
+        ...control,
+        edits: [
+          { oldString: "before", newString: "" },
+          { startLine: 2, endLine: 2, content: "" },
+        ],
+      };
+      await executeTool(
+        tool,
+        { ...deletion, ...defaults, edits: [{ ...entry, newString: "" }, deletion.edits[1]] },
         s.extCtx,
-      ),
-    ).rejects.toThrow(/case.*gitignore.*skip.*offset/);
-    await expect(
-      executeTool(s.tools.get("grep")!, { path: ["src"], pattern: "x" }, s.extCtx),
-    ).rejects.toThrow(/path.*string path/);
-    expect(s.calls).toHaveLength(0);
+      );
+      expect(s.calls[2]?.params.arguments).toEqual(deletion);
+
+      for (const active of [
+        { ...padded, input: "native input" },
+        { ...padded, old_string: "native match", new_string: "" },
+        { ...padded, new_string: "replacement" },
+        { ...padded, replace_all: true },
+        { ...padded, edits: [{ ...entry, rename: "other.ts" }] },
+        { ...padded, edits: [{ ...entry, diff: "patch" }] },
+        { ...padded, edits: [{ ...entry, op: "create" }] },
+        { ...padded, edits: [{ ...entry, op: "delete" }] },
+        { ...padded, appendContent: "append", edits: '[{"oldString":"","op":"delete"}]' },
+        { ...padded, edits: [{ ...entry, oldString: "" }] },
+        { ...padded, edits: [{ ...entry, startLine: 1, endLine: 1, content: "" }] },
+        {
+          ...control,
+          ...defaults,
+          edits: [{ ...control.edits[0], startLine: 1, endLine: 2, content: "" }],
+        },
+        { ...padded, appendContent: "another AFT mode" },
+        { path: control.path, ...defaults },
+      ]) {
+        const refusal = /edit: invalid AFT filesystem arguments: .*only for OMP internal URLs/;
+        expect(() => prepareArguments(active)).toThrow(refusal);
+        await expect(executeTool(tool, active, s.extCtx)).rejects.toThrow(refusal);
+      }
+      expect(s.calls).toHaveLength(3);
+      expect(s.invocations).toHaveLength(1);
+    });
+  });
+
+  test("grep filesystem errors name native arguments and the AFT form", async () => {
+    await withFilesystemTool("grep", async (s) => {
+      const tool = s.tools.get("grep")!;
+      const { prepareArguments } = tool as unknown as {
+        prepareArguments(args: unknown): Record<string, unknown>;
+      };
+      for (const [field, value] of [
+        ["gitignore", false],
+        ["skip", 2],
+        ["paths", ["src"]],
+        ["path", []],
+        ["path", ["src", ""]],
+        ["path", ["src", 42]],
+        ["case", "false"],
+      ] as const) {
+        const params = { path: "src", pattern: "x", case: false, skip: null, [field]: value };
+        const refusal = `grep: invalid AFT filesystem arguments: ${field}.`;
+        expect(() => prepareArguments(params)).toThrow(refusal);
+        await expect(executeTool(tool, params, s.extCtx)).rejects.toThrow(refusal);
+      }
+      expect(s.calls).toHaveLength(0);
+      expect(s.invocations).toHaveLength(0);
+    });
   });
 
   test("bash filesystem errors name native arguments and the AFT form", async () => {
@@ -343,15 +524,85 @@ describe("OMP internal URL hand-back", () => {
     await expect(
       executeTool(
         s.tools.get("bash")!,
-        { command: "pwd", cwd: "src", async: true, name: "service", ready: { port: 3000 } },
+        {
+          command: "pwd",
+          description: "Print the current working directory",
+          cwd: "src",
+          async: true,
+          name: "service",
+          ready: { port: 3000 },
+        },
         s.extCtx,
       ),
     ).rejects.toThrow(/cwd.*async.*name.*ready.*workdir/);
     await expect(
-      executeTool(s.tools.get("bash")!, { command: "pwd", timeout: "0.5" }, s.extCtx),
+      executeTool(
+        s.tools.get("bash")!,
+        { command: "pwd", description: "Print the current working directory", timeout: "0.5" },
+        s.extCtx,
+      ),
     ).rejects.toThrow(/timeout.*integer milliseconds/);
-    await executeTool(s.tools.get("bash")!, { command: "pwd", timeout: "500" }, s.extCtx);
+    await executeTool(
+      s.tools.get("bash")!,
+      { command: "pwd", description: "Print the current working directory", timeout: "500" },
+      s.extCtx,
+    );
     expect(s.calls).toHaveLength(1);
+  });
+
+  test("grep filesystem route accepts explicit paths and forwards the case flag", async () => {
+    await withFilesystemTool("grep", async (s) => {
+      const tool = s.tools.get("grep")!;
+      const { prepareArguments } = tool as unknown as {
+        prepareArguments(args: unknown): Record<string, unknown>;
+      };
+      const padded = {
+        pattern: "example",
+        path: ["src", "tests"],
+        case: false,
+        gitignore: true,
+        paths: [],
+        skip: null,
+      };
+      expect(Value.Check(tool.parameters as TSchema, padded)).toBe(true);
+      await executeTool(tool, prepareArguments(padded), s.extCtx);
+      await executeTool(tool, padded, s.extCtx);
+      const expected = {
+        pattern: "example",
+        path: [join(s.root, "src"), join(s.root, "tests")],
+        case_sensitive: false,
+      };
+      expect(s.calls.map(({ params }) => params.arguments)).toEqual([expected, expected]);
+
+      const native = { ...padded, path: ["src", "local://fixture"] };
+      expect(prepareArguments(native)).toBe(native);
+      await executeTool(tool, native, s.extCtx);
+      expect(s.invocations[0]).toBe(native);
+      expect(s.calls).toHaveLength(2);
+
+      mkdirSync(join(s.root, "src with spaces"));
+      await executeTool(
+        tool,
+        { ...padded, path: ["src with spaces", "missing tests"], case: true, skip: 0 },
+        s.extCtx,
+      );
+      expect(s.calls[2]?.params.arguments).toEqual({
+        pattern: "example",
+        path: [join(s.root, "src with spaces"), "missing tests"],
+        case_sensitive: true,
+      });
+
+      const { approval } = tool as unknown as { approval(args: unknown): string };
+      expect(approval(prepareArguments(padded))).toBe("read");
+      const outside = { ...padded, path: ["src", "../outside with spaces", "tests"] };
+      expect(approval(prepareArguments(outside))).toBe("exec");
+      await expect(executeTool(tool, outside, s.extCtx)).rejects.toThrow(
+        /outside with spaces.*outside the project root/,
+      );
+      expect(s.calls.slice(3).map(({ command, params }) => [command, params.path])).toEqual([
+        ["bash_artifact_owned", join(s.root, "../outside with spaces")],
+      ]);
+    });
   });
 
   test("URL arguments without invokeTool render as normal AFT output", async () => {

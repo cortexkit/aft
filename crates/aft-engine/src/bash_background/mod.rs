@@ -13,6 +13,8 @@ mod gc_memo;
 mod memory_limit;
 #[cfg(feature = "test-support")]
 pub(crate) use memory_limit::MemoryPolicy as MemoryPolicyForTest;
+#[doc(hidden)]
+pub mod notice_text;
 pub mod output;
 pub mod persistence;
 pub mod process;
@@ -20,6 +22,7 @@ pub(crate) mod pty_input;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
+pub use registry::awaited_work::{AwaitedSpawn, OpenOutcome};
 #[doc(hidden)]
 pub mod runner_notice_scheduler;
 #[doc(hidden)]
@@ -1585,6 +1588,7 @@ pub fn spawn_with_secrets(
             project_root,
             pty_rows,
             pty_cols,
+            config.bash.linux_scope,
         )
     } else {
         ctx.bash_background().spawn_with_shell_in_slot_typed(

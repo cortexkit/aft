@@ -194,6 +194,13 @@ impl LspManager {
     /// Idle reapers use this so a hung Shutdown handshake cannot stall the
     /// daemon loop or hold the manager mutex.
     pub fn spawn_idle_lsp_reap(clients: Vec<(ServerKey, LspClient)>) {
+        Self::spawn_idle_lsp_reap_with_lease(clients, None);
+    }
+
+    pub(super) fn spawn_idle_lsp_reap_with_lease(
+        clients: Vec<(ServerKey, LspClient)>,
+        lease: Option<Arc<()>>,
+    ) {
         if clients.is_empty() {
             return;
         }
@@ -205,6 +212,7 @@ impl LspManager {
                         Self::log_shutdown_error(&key, &err);
                     }
                 }
+                drop(lease);
             });
         if let Err(err) = spawn_result {
             slog_error!("failed to spawn idle LSP reap thread: {err}");

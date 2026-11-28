@@ -131,12 +131,16 @@ pub(crate) fn render_report_with_cap(paths: &[ReturnedPath], cap: u64) -> String
 pub(crate) const LOCAL_RUN_NOTE: &str =
     "return_paths: the command ran on this machine, so its files are already where it wrote them; nothing was copied back";
 
-/// Check the shape of the requested paths before anything else happens.
-/// Each is a file path relative to the command's workdir, without `..`,
-/// listed once, and there are at most [`MAX_RETURN_PATHS`]. Whether each
-/// resolves inside the project is checked separately against the filesystem.
+/// Validate workdir-relative file paths before submission. Cancel dot components
+/// in paths with `..` so that they name the same file on the runner and locally.
+/// Check these paths against the checkout lexically; symlinks are checked separately.
 #[doc(hidden)]
-pub fn check_requested_paths(paths: &[String]) -> Result<(), String> {
+pub fn check_requested_paths(
+    paths: &[String],
+    workdir: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    use crate::path_identity::lexical_normalize;
     use std::path::{Component, Path};
     if paths.len() > MAX_RETURN_PATHS {
         return Err(format!(
@@ -144,7 +148,7 @@ pub fn check_requested_paths(paths: &[String]) -> Result<(), String> {
             paths.len()
         ));
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut checked = Vec::with_capacity(paths.len());
     for path in paths {
         let shown = path.escape_default();
         if path.trim().is_empty() {
@@ -161,24 +165,43 @@ pub fn check_requested_paths(paths: &[String]) -> Result<(), String> {
         }
         if parsed
             .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+            .any(|component| matches!(component, Component::Prefix(_)))
         {
             return Err(format!("return_paths path {shown} must not use .."));
         }
-        if path.ends_with(['/', '\\'])
-            || !parsed
-                .components()
-                .any(|component| matches!(component, Component::Normal(_)))
-        {
+        let has_parent = parsed.components().any(|part| part == Component::ParentDir);
+        let normalized = if has_parent {
+            let relative = lexical_normalize(parsed);
+            let mut base = workdir.to_path_buf();
+            // Pop leading parents explicitly: normalizing an absolute join
+            // would silently discard steps above the filesystem root.
+            let mut suffix = relative.as_path();
+            while let Ok(rest) = suffix.strip_prefix("..") {
+                if !base.pop() {
+                    return Err(format!("return_paths path {shown} must not use .."));
+                }
+                suffix = rest;
+            }
+            if !base.join(suffix).starts_with(root) {
+                return Err(format!("return_paths path {shown} must not use .."));
+            }
+            Some(relative)
+        } else {
+            None
+        };
+        if path.ends_with(['/', '\\']) || parsed.file_name().is_none() {
             return Err(format!(
                 "return_paths path {shown} names a directory; list the files to copy back"
             ));
         }
-        if !seen.insert(path.as_str()) {
+        let path =
+            normalized.map_or_else(|| path.clone(), |path| path.to_string_lossy().into_owned());
+        if checked.contains(&path) {
             return Err(format!("return_paths lists {shown} twice"));
         }
+        checked.push(path);
     }
-    Ok(())
+    Ok(checked)
 }
 
 /// Where a returned path's file goes, as resolved before any of it is written.
@@ -370,10 +393,11 @@ mod receiver {
     };
     use crate::bash_background::persistence::PinnedDir;
     use crate::exec_remote::types::{
-        ReturnAssembler, ReturnChunk, ReturnManifest, ReturnManifestOutcome,
+        returned_file_mode, ReturnAssembler, ReturnChunk, ReturnManifest, ReturnManifestOutcome,
         ReturnPathsFailureCause,
     };
     use sha2::Digest;
+    use std::cell::OnceCell;
     use std::ffi::{CString, OsStr, OsString};
     use std::fs;
     use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -408,6 +432,9 @@ mod receiver {
         checkout_root: Option<PathBuf>,
         /// The task's private control folder, where received bytes are staged.
         private: Arc<PinnedDir>,
+        /// Permissions allowed by file creation in the private folder, or a
+        /// cached failure so later files don't try the probe again.
+        allowed_mode: OnceCell<Option<u32>>,
         /// `None` once a stream check failed; every path is then discarded.
         assembler: Option<ReturnAssembler>,
         stream_error: Option<String>,
@@ -448,6 +475,7 @@ mod receiver {
                 root: fs::canonicalize(project_root)?,
                 checkout_root: checkout_root.map(Path::to_path_buf),
                 private,
+                allowed_mode: OnceCell::new(),
                 stream_error: None,
                 replay_gap: None,
                 created_dirs: Vec::new(),
@@ -471,6 +499,7 @@ mod receiver {
         /// refused the first one, discarding anything already staged.
         pub(crate) fn reset(&mut self) {
             self.settle();
+            self.allowed_mode.take();
             self.assembler = Some(ReturnAssembler::new(&self.paths, self.cap_bytes));
             self.stream_error = None;
             self.replay_gap = None;
@@ -600,15 +629,21 @@ mod receiver {
                 }
             };
             let mut report = Vec::with_capacity(self.paths.len());
-            for (index, entry) in verified.into_iter().enumerate() {
+            // Verification checked the manifest's paths in request order, but
+            // the verified entries carry only the outcome, not the mode flag.
+            for (index, (entry, manifest_entry)) in
+                verified.into_iter().zip(&manifest.files).enumerate()
+            {
                 let outcome = match entry.outcome {
                     ReturnManifestOutcome::Returned { size, .. } => {
                         match self.write_errors[index].take() {
                             Some(reason) => ReturnOutcome::NotReturned { reason },
-                            None => match self.place(index, size, record) {
-                                Ok(()) => ReturnOutcome::Returned { bytes: size },
-                                Err(reason) => ReturnOutcome::NotReturned { reason },
-                            },
+                            None => {
+                                match self.place(index, size, manifest_entry.executable(), record) {
+                                    Ok(()) => ReturnOutcome::Returned { bytes: size },
+                                    Err(reason) => ReturnOutcome::NotReturned { reason },
+                                }
+                            }
                         }
                     }
                     ReturnManifestOutcome::Failed { cause, .. } => ReturnOutcome::NotReturned {
@@ -714,10 +749,11 @@ mod receiver {
         fn checkout_path(&self, index: usize) -> Option<String> {
             let checkout = self.checkout_root.as_deref()?;
             let cwd = fs::canonicalize(&self.cwd).unwrap_or_else(|_| self.cwd.clone());
-            let relative = cwd.strip_prefix(checkout).ok()?;
+            let destination =
+                crate::path_identity::lexical_normalize(&cwd.join(&self.paths[index]));
+            let relative = destination.strip_prefix(checkout).ok()?;
             let parts: Vec<String> = relative
                 .components()
-                .chain(Path::new(&self.paths[index]).components())
                 .filter_map(|component| match component {
                     Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
                     _ => None,
@@ -749,12 +785,13 @@ mod receiver {
             &mut self,
             index: usize,
             size: u64,
+            executable: Option<bool>,
             record: &mut Recorder<'_>,
         ) -> Result<(), NotReturned> {
             // A zero-byte file has no chunks, so it has no staging file yet.
             self.stage(index, record)?;
             let staged = self.staged[index].take().unwrap();
-            let result = self.place_staged(index, size, &staged, record);
+            let result = self.place_staged(index, size, executable, &staged, record);
             // Renamed away on success; otherwise removed here.
             let _ = unlink_at(self.private.as_raw_fd(), &staged.name);
             result
@@ -764,6 +801,7 @@ mod receiver {
             &mut self,
             index: usize,
             size: u64,
+            executable: Option<bool>,
             staged: &Staged,
             record: &mut Recorder<'_>,
         ) -> Result<(), NotReturned> {
@@ -792,11 +830,20 @@ mod receiver {
             {
                 return Err(NotReturned::NotRegular);
             }
-            // Keep an existing file's permissions; a new file gets the usual
-            // owner-writable, world-readable mode instead of the staging 0600.
-            let mode = existing
+            // Without a flag, keep an existing file's permissions or give a
+            // new file the usual 0644 instead of the staging 0600.
+            let legacy_mode = existing
                 .as_ref()
                 .map_or(0o644, |entry| u32::from(entry.st_mode) & 0o7777);
+            let mode = executable.map_or(legacy_mode, |executable| {
+                self.flagged_mode(
+                    index,
+                    executable,
+                    &directory_path.join(&name),
+                    legacy_mode,
+                    record,
+                )
+            });
             let directory_stat = fstat(directory.as_raw_fd()).map_err(local)?;
             let placed = if directory_stat.st_dev == staged_stat.st_dev && !copy_for_test() {
                 staged
@@ -830,6 +877,57 @@ mod receiver {
             }
         }
 
+        fn flagged_mode(
+            &self,
+            index: usize,
+            executable: bool,
+            destination: &Path,
+            legacy_mode: u32,
+            record: &mut Recorder<'_>,
+        ) -> u32 {
+            let mode = returned_file_mode(Some(executable), destination)
+                .expect("an explicitly reported executable flag has a mode");
+            // A symlink can hide a .git component in either spelling. Strip
+            // execute bits there even if probing the umask failed.
+            let requested = self.cwd.join(&self.paths[index]);
+            let in_git = [requested.as_path(), destination]
+                .into_iter()
+                .any(|path| returned_file_mode(Some(true), path) == Some(0o666));
+            let allowed = *self.allowed_mode.get_or_init(|| match self.probe_mode(record) {
+                Ok(mode) => Some(mode),
+                Err(error) => {
+                    log::warn!(
+                        "could not probe returned-file creation mode for {}: {error}; keeping legacy permissions",
+                        self.task_id
+                    );
+                    None
+                }
+            });
+            let mode = allowed.map_or(legacy_mode, |allowed| mode & allowed);
+            if in_git {
+                mode & !0o111
+            } else {
+                mode
+            }
+        }
+
+        fn probe_mode(&self, record: &mut Recorder<'_>) -> io::Result<u32> {
+            // chmod ignores umask. Let the kernel apply it to an empty file
+            // in the private folder without changing this process's umask.
+            let name = OsString::from(staging_name(&self.task_id, self.paths.len()));
+            record(&StagingRecord {
+                files: vec![self.private.path().join(&name)],
+                dirs: Vec::new(),
+            })?;
+            let directory = self.private.as_raw_fd();
+            let file = create_exclusive_at(directory, &name, 0o777)?;
+            let mode = file
+                .metadata()
+                .map(|metadata| metadata.permissions().mode());
+            unlink_at(directory, &name)?;
+            mode
+        }
+
         /// Copy the staged bytes to the destination on another filesystem and
         /// publish them in one step: write a recorded temp file, created
         /// exclusively through the destination directory's handle without
@@ -860,7 +958,8 @@ mod receiver {
                 dirs: Vec::new(),
             })
             .map_err(local)?;
-            let mut out = create_exclusive_at(directory.as_raw_fd(), &temp).map_err(local)?;
+            let mut out =
+                create_exclusive_at(directory.as_raw_fd(), &temp, 0o600).map_err(local)?;
             let written = fstat(out.as_raw_fd()).map_err(local)?;
             let published = (|| {
                 let mut source = staged.file.try_clone()?;
@@ -1166,7 +1265,11 @@ mod receiver {
         Ok(())
     }
 
-    fn create_exclusive_at(directory: RawFd, name: &OsStr) -> io::Result<fs::File> {
+    fn create_exclusive_at(
+        directory: RawFd,
+        name: &OsStr,
+        mode: libc::c_uint,
+    ) -> io::Result<fs::File> {
         let name = c_name(name)?;
         // SAFETY: `directory` is an open directory and `name` outlives the call.
         let fd = unsafe {
@@ -1174,7 +1277,7 @@ mod receiver {
                 directory,
                 name.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600 as libc::c_uint,
+                mode,
             )
         };
         if fd < 0 {

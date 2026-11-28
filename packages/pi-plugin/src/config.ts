@@ -305,6 +305,7 @@ export interface BackupConfig {
 export interface LspConfig {
   /** Process-wide server limit, including starts; default 8. Projects may only lower it. */
   max_servers?: number;
+  worker_rust_analyzers?: number;
   /** Minutes since the last AFT tool call on that repository; default 60. */
   idle_minutes?: number;
   idle_shutdown?: boolean;
@@ -800,6 +801,7 @@ const LspServerEntrySchema = z.object({
 
 const LspConfigSchema = z.object({
   max_servers: z.number().int().nonnegative().optional(),
+  worker_rust_analyzers: z.number().int().nonnegative().optional(),
   idle_minutes: z
     .number()
     .int()
@@ -1374,6 +1376,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.lsp?.idle_shutdown !== undefined)
     overrides.lsp_idle_shutdown = config.lsp.idle_shutdown;
   if (config.lsp?.max_servers !== undefined) overrides.lsp_max_servers = config.lsp.max_servers;
+  if (config.lsp?.worker_rust_analyzers !== undefined) {
+    overrides.lsp_worker_rust_analyzers = config.lsp.worker_rust_analyzers;
+  }
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
   if (rerank !== undefined) overrides.search = { rerank };
@@ -1833,6 +1838,12 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
   const projectSafe: LspConfig = {};
   if (override?.max_servers !== undefined && override.max_servers <= (base?.max_servers ?? 8)) {
     projectSafe.max_servers = override.max_servers;
+  }
+  if (
+    override?.worker_rust_analyzers !== undefined &&
+    override.worker_rust_analyzers <= (base?.worker_rust_analyzers ?? 2)
+  ) {
+    projectSafe.worker_rust_analyzers = override.worker_rust_analyzers;
   }
   if (override?.python !== undefined) projectSafe.python = override.python;
   if (override?.diagnostics_on_edit !== undefined) {

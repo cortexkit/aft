@@ -27,7 +27,7 @@ import type {
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { type Static, type TSchema, Type } from "typebox";
+import { type TSchema, Type } from "typebox";
 
 import { forwardPendingBashWaitDetach } from "../bash-wait-detach.js";
 import { ingestBgCompletions } from "../bg-notifications.js";
@@ -76,14 +76,15 @@ export function withPathAliasPreparation<
   TState = unknown,
 >(tool: ToolDefinition<TParams, TDetails, TState>): ToolDefinition<TParams, TDetails, TState> {
   const existing = tool.prepareArguments;
-  const prepare = (args: unknown): Static<TParams> => {
+  type PreparedArgs = Parameters<typeof tool.execute>[1];
+  const prepare = (args: unknown): PreparedArgs => {
     const isEditTool = tool.name === "edit" || tool.name === "aft_edit";
     // Apply the same canonical edit handling to `aft_edit` and bare `edit` so
     // both registrations accept the same request shapes.
     const prepared = isEditTool
       ? prepareCanonicalEditArguments("edit", args)
       : prepareCanonicalPathArguments(tool.name, args);
-    return (existing ? existing(prepared) : prepared) as Static<TParams>;
+    return existing ? existing(prepared) : (prepared as PreparedArgs);
   };
   return {
     ...tool,

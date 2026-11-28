@@ -11,6 +11,8 @@ const LINUX_WATCHER_KIND: &str =
 const LINUX_CGROUP_KIND: &str = "Linux cgroup v2 memory.max";
 #[cfg(unix)]
 const PID_BUDGET: usize = 4096;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const UNKNOWN_SAMPLE_LIMIT: u8 = 3;
 
 #[cfg(all(test, target_os = "linux"))]
 #[derive(Clone)]
@@ -224,6 +226,8 @@ pub(crate) struct Monitor {
     last_sample: Option<Instant>,
     exceeded: bool,
     accounting_failed: bool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    unknown_samples: u8,
     #[cfg(target_os = "linux")]
     holder: Option<ScopeHolder>,
     #[cfg(target_os = "linux")]
@@ -263,6 +267,8 @@ impl Monitor {
             last_sample: None,
             exceeded: false,
             accounting_failed: false,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            unknown_samples: 0,
             #[cfg(target_os = "linux")]
             holder,
             #[cfg(target_os = "linux")]
@@ -328,6 +334,8 @@ impl Monitor {
             last_sample: None,
             exceeded: false,
             accounting_failed: false,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            unknown_samples: 0,
             #[cfg(target_os = "linux")]
             holder: None,
             #[cfg(target_os = "linux")]
@@ -357,22 +365,10 @@ impl Monitor {
         #[cfg(target_os = "linux")]
         let over = match &self.policy.cgroup {
             Some(path) => linux::oom(path).unwrap_or(false),
-            None => match group_bytes(pgid) {
-                Some(bytes) => bytes > self.policy.mib * 1024 * 1024,
-                None => {
-                    self.accounting_failed = true;
-                    true
-                }
-            },
+            None => self.fallback_sample_exceeded(group_bytes(pgid)),
         };
         #[cfg(target_os = "macos")]
-        let over = match group_bytes(pgid) {
-            Some(bytes) => bytes > self.policy.mib * 1024 * 1024,
-            None => {
-                self.accounting_failed = true;
-                true
-            }
-        };
+        let over = self.fallback_sample_exceeded(group_bytes(pgid));
         #[cfg(windows)]
         let over = self.job.exceeded();
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -380,6 +376,19 @@ impl Monitor {
         let _ = pgid;
         self.exceeded = over;
         over
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fallback_sample_exceeded(&mut self, bytes: Option<u64>) -> bool {
+        if let Some(bytes) = bytes {
+            self.unknown_samples = 0;
+            bytes > self.policy.mib * 1024 * 1024
+        } else {
+            // A transient scan failure is not evidence that the command exceeded the cap.
+            self.unknown_samples = self.unknown_samples.saturating_add(1);
+            self.accounting_failed = self.unknown_samples >= UNKNOWN_SAMPLE_LIMIT;
+            self.accounting_failed
+        }
     }
 
     pub(super) fn exceeded_at_exit(&mut self, pgid: i32, task_id: &str, sigkill: bool) -> bool {
@@ -477,6 +486,7 @@ impl Monitor {
             last_sample: None,
             exceeded: false,
             accounting_failed: false,
+            unknown_samples: 0,
             holder: None,
             exit_oom_sampled: false,
             retired_cgroup: None,
@@ -890,35 +900,45 @@ fn group_bytes(pgid: i32) -> Option<u64> {
     {
         return Some(0);
     }
+    linux_group_bytes(std::path::Path::new("/proc"), pgid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_gone_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_group_bytes(proc_dir: &std::path::Path, pgid: i32) -> Option<u64> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
     let mut sum = 0_u64;
     // Bound all work, not just matching members. Reaching the budget fails closed.
-    for (index, entry) in std::fs::read_dir("/proc").ok()?.enumerate() {
+    for (index, entry) in std::fs::read_dir(proc_dir).ok()?.enumerate() {
         if index >= PID_BUDGET {
             return None;
         }
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
-        };
-        let Some((_, rest)) = stat.rsplit_once(") ") else {
-            continue;
-        };
-        let fields: Vec<_> = rest.split_whitespace().collect();
-        if fields.get(2).and_then(|value| value.parse::<i32>().ok()) != Some(pgid) {
+        let entry = entry.ok()?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
             continue;
         }
-        let rss = fields
-            .get(21)
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        sum = sum.saturating_add(
-            rss.saturating_mul(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64),
-        );
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if process_gone_error(&error) => continue,
+            Err(_) => return None,
+        };
+        // The command name may contain non-UTF-8 bytes or parentheses; parse only the fields after it.
+        let end_of_comm = stat.windows(2).rposition(|bytes| bytes == b") ")?;
+        let mut fields = std::str::from_utf8(&stat[end_of_comm + 2..])
+            .ok()?
+            .split_ascii_whitespace();
+        if fields.nth(2)?.parse::<i32>().ok()? != pgid {
+            continue;
+        }
+        let rss = fields.nth(18)?.parse::<u64>().ok()?;
+        sum = sum.saturating_add(rss.saturating_mul(page_size as u64));
     }
     Some(sum)
 }
@@ -941,8 +961,21 @@ fn group_pids(pgid: i32) -> Option<Vec<u32>> {
             ),
             None => (std::ptr::null_mut(), 0),
         };
-        unsafe { proc_listpgrppids(pgid as u32, pointer, size) }
+        macos_group_pid_count(|| unsafe { proc_listpgrppids(pgid as u32, pointer, size) })
     })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_group_pid_count(read: impl FnOnce() -> i32) -> i32 {
+    // libproc can return zero for both an empty group and a syscall error.
+    let errno = unsafe { libc::__error() };
+    unsafe { *errno = 0 };
+    let count = read();
+    if count == 0 && unsafe { *errno } != 0 {
+        -1
+    } else {
+        count
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -976,7 +1009,7 @@ fn group_pids_with(mut read: impl FnMut(Option<&mut [u32]>) -> i32) -> Option<Ve
 
 #[cfg(target_os = "macos")]
 fn missing_group_after_error() -> Option<Vec<u32>> {
-    (std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)).then(Vec::new)
+    process_gone_error(&std::io::Error::last_os_error()).then(Vec::new)
 }
 
 #[cfg(target_os = "macos")]
@@ -997,6 +1030,11 @@ fn group_bytes(pgid: i32) -> Option<u64> {
         } == 0
         {
             sum = sum.saturating_add(usage.ri_phys_footprint);
+        } else if !process_gone_error(&std::io::Error::last_os_error())
+            && !(unsafe { libc::kill(pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+        {
+            return None;
         }
     }
     Some(sum)
@@ -1034,6 +1072,53 @@ mod agent_text_tests {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn memory_limit_fallback_rejects_incomplete_rss_but_skips_gone_and_outside_processes() {
+        let proc = tempfile::tempdir().unwrap();
+        let stat = |pid: u32, contents: &[u8]| {
+            let path = proc.path().join(pid.to_string());
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("stat"), contents).unwrap();
+        };
+        let mut member = b"1 (nested ) name \xff)".to_vec();
+        member.extend(format!(" S 1 42{} 5", " 0".repeat(18)).bytes());
+        stat(1, &member);
+        std::fs::create_dir(proc.path().join("2")).unwrap(); // Gone before stat was read.
+        stat(3, b"3 (other group) S 1 41");
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        assert_eq!(linux_group_bytes(proc.path(), 42), Some(5 * page_size));
+
+        stat(4, b"4 (missing RSS) S 1 42");
+        assert_eq!(linux_group_bytes(proc.path(), 42), None);
+        stat(4, b"4 (unknown group) S 1 invalid");
+        assert_eq!(linux_group_bytes(proc.path(), 42), None);
+        let broken_stat = proc.path().join("4/stat");
+        std::fs::remove_file(&broken_stat).unwrap();
+        std::fs::create_dir(&broken_stat).unwrap();
+        assert_eq!(linux_group_bytes(proc.path(), 42), None);
+    }
+
+    #[test]
+    fn memory_limit_fallback_requires_three_consecutive_unknown_samples() {
+        let policy = MemoryPolicy {
+            mib: 64,
+            kind: "test enforcement".into(),
+            cgroup: None,
+        };
+        let mut monitor = Monitor::recover(policy, "test").unwrap().unwrap();
+        assert!(!monitor.fallback_sample_exceeded(None));
+        assert!(!monitor.fallback_sample_exceeded(Some(0)));
+        assert!(!monitor.fallback_sample_exceeded(None));
+        assert!(!monitor.fallback_sample_exceeded(None));
+        assert!(monitor.fallback_sample_exceeded(None));
+        assert_eq!(monitor.reason(), monitor.policy.accounting_failure_reason());
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
     use super::*;
@@ -1047,7 +1132,21 @@ mod macos_tests {
 
     #[test]
     fn memory_limit_zero_sizing_query_is_an_empty_group() {
-        assert_eq!(group_pids_with(|_| 0), Some(Vec::new()));
+        assert_eq!(
+            group_pids_with(|_| macos_group_pid_count(|| 0)),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn memory_limit_zero_with_errno_is_not_an_empty_group() {
+        let group = group_pids_with(|_| {
+            macos_group_pid_count(|| {
+                unsafe { *libc::__error() = libc::EACCES };
+                0
+            })
+        });
+        assert_eq!(group, None);
     }
 
     #[test]

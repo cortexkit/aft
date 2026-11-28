@@ -879,8 +879,8 @@ impl RemotePreStartRefusal {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemoteTask {
-    #[serde(default, skip_serializing_if = "super::is_false")]
-    pub(super) copy_warning: bool,
+    #[serde(flatten)]
+    pub(super) copy_warning: super::super::persistence::RemoteCopyWarning,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<KeyedSubmission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1392,15 +1392,14 @@ impl TaskSink {
         // the manifest attaches again from the first chunk to stage afresh.
         super::return_files::remove_recorded_staging(&remote.return_staging, &task.task_id);
         let returns = if !remote.return_paths.is_empty() && remote.returned_files.is_none() {
+            let (_, checkout) = return_paths_workdir(&workdir);
+            let checkout = checkout.as_deref();
             Some(super::return_files::ReturnReceiver::new(
                 remote.return_paths.clone(),
                 remote.return_max_bytes,
                 &workdir,
-                &return_paths_root(project_root.as_deref().unwrap_or(&workdir), &workdir),
-                worktree_root_containing(&workdir, exec::DirectoryKind::WorkingDirectory)
-                    .ok()
-                    .flatten()
-                    .as_deref(),
+                checkout.or(project_root.as_deref()).unwrap_or(&workdir),
+                checkout,
                 // Staged bytes live in the task's private control folder,
                 // which sandboxed commands cannot write.
                 resolve_task_layout(&task.paths.session_dir, &task.task_id)?
@@ -1975,7 +1974,7 @@ impl OutputSink for TaskSink {
         r.job_id = Some(accepted.job_id);
         r.queue_position = Some(accepted.queue_position);
         r.accepted = true;
-        r.copy_warning |= self.task.runon_copy_warning.load(Ordering::Acquire);
+        runon_capture::store_warning(&self.task, r);
         r.accepted_platform = accepted.platform.clone();
         r.granted_network = accepted.network == Some(Network::Outbound);
         if accepted.env_not_forwarded.is_some() {
@@ -2168,9 +2167,9 @@ impl OutputSink for TaskSink {
                     .map(|mut returns| returns.without_manifest())
             })
             .flatten();
-        let copy_warning = self.task.runon_copy_warning.load(Ordering::Acquire);
+        let task = Arc::clone(&self.task);
         self.commit(|r| {
-            r.copy_warning |= copy_warning;
+            runon_capture::store_warning(&task, r);
             let resubmit_refusal = r.submission.as_ref().is_some_and(|s| s.resuming)
                 && matches!(verdict, Verdict::RunLocally { .. });
             // A keyed refusal belongs to this call, not to the existing job.
@@ -2792,7 +2791,7 @@ impl BgTaskRegistry {
         metadata.status = BgTaskStatus::Running;
         metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
-            copy_warning: false,
+            copy_warning: Default::default(),
             submission: None,
             requested_platform: launch.requested_platform.clone(),
             accepted_platform: None,
@@ -3183,13 +3182,10 @@ impl BgTaskRegistry {
                     remote.harness.clone(),
                     remote.session.clone(),
                 );
-                *client = match client.reopen_route(identity.clone()).await {
-                    Ok(reconnected) => reconnected,
-                    Err(error) => match &remote.connection_file {
-                        Some(path) => ExecRemoteClient::connect(path, identity).await?,
-                        None => return Err(error),
-                    },
-                };
+                if let Err(error) = client.reopen_route().await {
+                    let path = remote.connection_file.as_ref().ok_or(error)?;
+                    *client = ExecRemoteClient::connect(path, identity).await?;
+                }
                 timings.enter("supports_submission_key");
                 if !client.supports_submission_key().await? {
                     return Err(exec::Error::Protocol(
@@ -3712,7 +3708,7 @@ impl BgTaskRegistry {
         } else {
             let point = remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?;
             match self
-                .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+                .attach_remote(&mut client, point, &remote, &task, &mut recovery)
                 .await?
             {
                 Attached::Stream(stream) => stream,
@@ -3763,7 +3759,7 @@ impl BgTaskRegistry {
                         return Ok(());
                     }
                     stream = match self
-                        .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+                        .attach_remote(&mut client, point, &remote, &task, &mut recovery)
                         .await?
                     {
                         Attached::Stream(stream) => stream,
@@ -4063,7 +4059,7 @@ impl BgTaskRegistry {
                     // Use the same bounded attach path as an AFT restart.
                     recovery.pause(point.job_id).await?;
                     stream = match self
-                        .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+                        .attach_remote(&mut client, point, &remote, &task, &mut recovery)
                         .await?
                     {
                         Attached::Stream(stream) => stream,
@@ -4365,6 +4361,9 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         retry.resubmits += 1;
+        timings.limit_admission(Duration::from_millis(
+            retry.deadline_ms.saturating_sub(draining_now_ms(root)),
+        ));
         match resubmit(client, task, &request, root, timings).await {
             Err(exec::Error::CancelledBeforeCapture) => {
                 self.cancel_draining_retry(task);
@@ -4384,27 +4383,26 @@ impl BgTaskRegistry {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn attach_remote(
         &self,
         client: &mut ExecRemoteClient,
         point: ResumePoint,
         remote: &RemoteTask,
-        _root: &Path,
         task: &Arc<BgTask>,
         recovery: &mut ReattachBudget,
     ) -> Result<Attached, String> {
         point.attach_request().map_err(|e| e.to_string())?;
         loop {
-            let cancel = task
-                .state
-                .lock()
-                .map_err(|_| "task lock poisoned")?
-                .metadata
-                .remote
-                .as_ref()
-                .is_some_and(|r| r.cancel_requested);
-            let cancel = cancel && recovery.cancel_acknowledged != Some(point.job_id);
+            let cancel = {
+                let state = task.state.lock().map_err(|_| "task lock poisoned")?;
+                let Some(remote) = state.metadata.remote.as_ref() else {
+                    return Err("remote record absent".into());
+                };
+                if remote.owner_pause_cancel.is_some() && !remote.cancel_pending {
+                    return Ok(Attached::OwnerPauseSettled);
+                }
+                remote.cancel_requested && recovery.cancel_acknowledged != Some(point.job_id)
+            };
             let mut cancel_acknowledged = false;
             recovery.attach_attempts = recovery.attach_attempts.saturating_add(1);
             let attempt = recovery
@@ -4420,7 +4418,8 @@ impl BgTaskRegistry {
                             return Ok(Attached::OwnerPauseSettled);
                         }
                     }
-                    client.attach(point.clone()).await.map(Attached::Stream)
+                    let stream = client.attach_once(point.clone()).await?;
+                    Ok(Attached::Stream(stream))
                 })
                 .await;
             if cancel_acknowledged {
@@ -4438,20 +4437,17 @@ impl BgTaskRegistry {
                     remote.harness.clone(),
                     remote.session.clone(),
                 );
-                let reconnected = recovery
+                let _ = recovery
                     .wait(point.job_id, async {
                         // The SDK reconnects its transport, but the old provider
                         // route stays closed. Reuse that connection when possible;
                         // reread the connection file if the daemon itself changed.
-                        match client.reopen_route(identity.clone()).await {
-                            Ok(reconnected) => Ok(reconnected),
-                            Err(_) => ExecRemoteClient::connect(path, identity).await,
+                        if client.reopen_route().await.is_err() {
+                            *client = ExecRemoteClient::connect(path, identity).await?;
                         }
+                        Ok::<_, exec::Error>(())
                     })
                     .await?;
-                if let Ok(reconnected) = reconnected {
-                    *client = reconnected;
-                }
             }
         }
     }
@@ -4631,7 +4627,7 @@ impl BgTaskRegistry {
                 return;
             }
             if let Some(remote) = state.metadata.remote.as_mut() {
-                remote.copy_warning |= task.runon_copy_warning.load(Ordering::Acquire);
+                runon_capture::store_warning(task, remote);
             }
             reason = remote_oom_kill(&state.metadata)
                 .map(|oom| oom.message())
@@ -5567,30 +5563,12 @@ fn build_remote_request(
 }
 
 #[cfg(unix)]
-/// Use the same checkout boundary for submission checks and returned writes
-/// as the runner's workspace key. Non-git workdirs retain the project boundary;
-/// request construction separately refuses workdirs it cannot snapshot.
-pub fn return_paths_root(project_root: &Path, workdir: &Path) -> PathBuf {
-    worktree_root_containing(workdir, exec::DirectoryKind::WorkingDirectory)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| project_root.to_path_buf())
-}
-
+#[path = "remote/checkout.rs"]
+mod checkout;
 #[cfg(unix)]
-pub(crate) fn worktree_root_containing(
-    path: &Path,
-    kind: exec::DirectoryKind,
-) -> Result<Option<PathBuf>, exec::Error> {
-    let path = kind.canonicalize(path)?;
-    for ancestor in path.ancestors() {
-        let git_marker = ancestor.join(".git");
-        if git_marker.is_file() || git_marker.is_dir() {
-            return kind.canonicalize(ancestor).map(Some);
-        }
-    }
-    Ok(None)
-}
+pub use checkout::return_paths_workdir;
+#[cfg(unix)]
+pub(crate) use checkout::worktree_root_containing;
 
 /// The refusal for a runon workdir the runner cannot snapshot. It names the
 /// workdir and this session's checkout so the caller can see which path to

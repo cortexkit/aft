@@ -250,6 +250,7 @@ const LspServerEntrySchema = z.object({
 const LspConfigSchema = z.object({
   /** Process-wide server limit, including starts; projects may only lower it. */
   max_servers: z.number().int().nonnegative().optional(),
+  worker_rust_analyzers: z.number().int().nonnegative().optional(),
   /** Minutes since the last AFT tool call on that repository; default 60. */
   idle_minutes: z
     .number()
@@ -1092,6 +1093,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.lsp?.idle_shutdown !== undefined)
     overrides.lsp_idle_shutdown = config.lsp.idle_shutdown;
   if (config.lsp?.max_servers !== undefined) overrides.lsp_max_servers = config.lsp.max_servers;
+  if (config.lsp?.worker_rust_analyzers !== undefined) {
+    overrides.lsp_worker_rust_analyzers = config.lsp.worker_rust_analyzers;
+  }
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
   if (rerank !== undefined) overrides.search = { rerank };
@@ -1733,6 +1737,12 @@ function mergeLspConfig(
     overrideLsp.max_servers <= (baseLsp?.max_servers ?? 8)
   ) {
     projectLsp.max_servers = overrideLsp.max_servers;
+  }
+  if (
+    overrideLsp?.worker_rust_analyzers !== undefined &&
+    overrideLsp.worker_rust_analyzers <= (baseLsp?.worker_rust_analyzers ?? 2)
+  ) {
+    projectLsp.worker_rust_analyzers = overrideLsp.worker_rust_analyzers;
   }
   if (overrideLsp?.python !== undefined) projectLsp.python = overrideLsp.python;
   if (overrideLsp?.diagnostics_on_edit !== undefined) {

@@ -2,6 +2,31 @@ use super::*;
 
 impl AppContext {
     #[doc(hidden)]
+    pub fn lsp_diagnostics_activity(&self) -> impl Drop {
+        crate::lsp::manager::DiagnosticsActivityGuard::begin(&self.lsp_diagnostics_activity)
+    }
+
+    /// Start one language server for inspect, holding the LSP manager lock only to
+    /// reserve the server and to publish it; the spawn and `initialize`
+    /// handshake run unlocked (see
+    /// [`crate::lsp::manager::start_applicable_server_unlocked`]).
+    pub fn lsp_start_applicable_server_until(
+        &self,
+        snapshot: &crate::lsp::manager::ApplicableServerSnapshot,
+        server: &crate::lsp::roots::ServerKey,
+        config: &Config,
+        deadline: Instant,
+    ) -> crate::lsp::manager::ApplicableServerStartOutcomes {
+        crate::lsp::manager::start_applicable_server_unlocked(
+            &self.lsp_manager,
+            snapshot,
+            server,
+            config,
+            deadline,
+        )
+    }
+
+    #[doc(hidden)]
     pub fn current_lsp_observations(
         &self,
         mut snapshots: Vec<crate::alert_state::AcceptedDiagnosticSnapshot>,

@@ -21,6 +21,12 @@ use crate::executor::BindBlockerSnapshot;
 #[path = "health/allocator.rs"]
 mod allocator;
 use allocator::CachedAllocatorObservation;
+#[path = "health/contention.rs"]
+mod contention;
+use contention::{
+    root_health_rollup_state, scheduler_contention_degraded, RootContention,
+    EXECUTOR_SCHEDULER_CONTENTION_DETAIL,
+};
 #[path = "health/demand.rs"]
 mod demand;
 pub(super) mod index_planes;
@@ -29,15 +35,15 @@ use index_planes::data_store_failure_reason;
 mod legacy_root;
 #[path = "health/reply_tracking.rs"]
 mod reply_tracking;
+#[path = "health/rollup_timing.rs"]
+mod rollup_timing;
 mod root_evidence;
 pub(super) use reply_tracking::bash_watch_warning_wait_ms;
 use reply_tracking::UnansweredTool;
+use rollup_timing::RollupStepTimer;
 use root_evidence::{
     health_failure_evidence, health_failure_field, health_nondefault, root_findings_evidence,
 };
-
-const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
-    "executor scheduler state could not be snapshotted without contention";
 
 /// Why the idle reaper kept an existing, unbound root that is past its idle
 /// TTL. Deleted roots are counted separately in the census's `blockers`.
@@ -1289,8 +1295,6 @@ impl DispatchPathMetrics {
             .map(|bind| duration_millis_u64(now.saturating_duration_since(bind.started_at)))
             .max();
         let last_tick_age_ms = duration_millis_u64(self.frame_loop_progress_age());
-        let mut reliable_push = self.watch_delivery.health();
-        reliable_push["completions"] = self.completion_delivery.health();
         json!({
             "frame_loop": {
                 "last_tick_age_ms": last_tick_age_ms,
@@ -1307,7 +1311,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
-            "reliable_push": reliable_push,
+            "reliable_push": self.completion_delivery.push_health(&self.watch_delivery),
             "tool_call_presets": self.tool_call_preset_snapshot(),
             "scope_background_tasks": self.scope_background_tasks.snapshot(),
             "completion_channels": {
@@ -2887,6 +2891,7 @@ pub(super) struct HealthRollupCache {
     // dropping its payload outside the lock makes blocking readers cheap.
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
+    root_contention: std::sync::Mutex<RootContention>,
     index_plane_outages: index_planes::IndexPlaneOutageTracker,
     allocator: std::sync::Mutex<Option<CachedAllocatorObservation>>,
     allocator_requested: AtomicBool,
@@ -2957,6 +2962,7 @@ impl HealthRollupCache {
             root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
+            root_contention: std::sync::Mutex::new(RootContention::default()),
             index_plane_outages: Default::default(),
             allocator: std::sync::Mutex::new(None),
             allocator_requested: AtomicBool::new(false),
@@ -4279,53 +4285,6 @@ macro_rules! rollup_mark {
     };
 }
 
-struct RollupStepTimer {
-    started: Instant,
-    previous: Instant,
-    steps: std::collections::BTreeMap<&'static str, (Duration, u64)>,
-    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-    cpu: rollup_bench::Timer,
-}
-
-impl RollupStepTimer {
-    fn new() -> Self {
-        let started = Instant::now();
-        Self {
-            started,
-            previous: started,
-            steps: Default::default(),
-            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-            cpu: rollup_bench::Timer::new(),
-        }
-    }
-
-    fn mark(&mut self, step: &'static str) {
-        let now = Instant::now();
-        let entry = self.steps.entry(step).or_default();
-        entry.0 += now.duration_since(self.previous);
-        entry.1 += 1;
-        self.previous = now;
-        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-        self.cpu.mark(step);
-    }
-
-    fn metrics(&self) -> Value {
-        // Elapsed time includes scheduler waits; the offline benchmark also
-        // measures thread CPU so host contention is distinguishable from work.
-        let steps = self
-            .steps
-            .iter()
-            .map(|(step, (elapsed, calls))| {
-                (
-                    (*step).to_owned(),
-                    json!({"elapsed_ms": elapsed.as_secs_f64() * 1000.0, "calls": calls}),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
-        json!({"elapsed_ms": self.started.elapsed().as_secs_f64() * 1000.0, "steps": steps})
-    }
-}
-
 /// Storage roots resolved once per rollup tick. Every context in one tick
 /// that names the same configured storage and cache roots resolves to the
 /// same directories, so resolving once per distinct configuration keeps a
@@ -4592,7 +4551,16 @@ fn build_health_diagnostic_rollup_from_actors(
         });
     }
 
-    let busy_roots = candidates.iter().filter(|candidate| candidate.busy).count();
+    let root_snapshots = candidates
+        .iter()
+        .map(|candidate| (candidate.root_label.as_str(), candidate.busy))
+        .collect::<Vec<_>>();
+    let busy_roots = root_snapshots.iter().filter(|(_, busy)| *busy).count();
+    let degraded_busy_roots = cache
+        .root_contention
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .observe(&root_snapshots, cache.now_ms());
     let disk_reserve_detail = candidates
         .iter()
         .flat_map(|candidate| candidate.health.view_storage_reserve.values())
@@ -4815,6 +4783,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let (status, detail) = with_data_store_failures(
         root_health_rollup_state(
             busy_roots,
+            degraded_busy_roots,
             standing_refusals,
             warming_roots,
             disk_reserve_detail,
@@ -4887,9 +4856,7 @@ fn build_health_diagnostic_rollup_from_actors(
     });
     rollup_mark!(timer, "metrics JSON assembly");
     let tick = timer.metrics();
-    if log::log_enabled!(log::Level::Debug) && cache.step_log_due() {
-        log::debug!("health rollup tick: {tick}");
-    }
+    rollup_timing::log_tick(root_count, &tick, || cache.step_log_due());
     // Keep detailed timing outside the size-budgeted health reply: adding it
     // there would displace root diagnostics. The uncapped census retains the
     // timing of the rollup that measured it.
@@ -5023,37 +4990,6 @@ fn with_data_store_failures(
     )
 }
 
-fn root_health_rollup_state(
-    busy_roots: usize,
-    standing_refusals: usize,
-    warming_roots: usize,
-    disk_reserve_detail: Option<String>,
-) -> (HealthStatus, Option<String>) {
-    let status = if busy_roots > 0 || standing_refusals > 0 || disk_reserve_detail.is_some() {
-        HealthStatus::Degraded
-    } else {
-        HealthStatus::Ok
-    };
-    let detail = if busy_roots > 0 {
-        Some(format!(
-            "{busy_roots} root actor(s) could not be snapshotted without contention"
-        ))
-    } else if standing_refusals > 0 {
-        Some(format!(
-            "{standing_refusals} standing root(s) refused current resolved-path identity"
-        ))
-    } else if disk_reserve_detail.is_some() {
-        disk_reserve_detail
-    } else if warming_roots > 0 {
-        Some(format!(
-            "{warming_roots} root(s) warming background indexes (serving normally)"
-        ))
-    } else {
-        None
-    };
-    (status, detail)
-}
-
 fn render_cold_build_limiter_census(
     limiter: crate::cold_build_limiter::ColdBuildLimiterCensus,
 ) -> Value {
@@ -5162,6 +5098,7 @@ fn assemble_health_report(
     // A contended refresh, now or at the last rollup, leaves the retained
     // census in place and reports it as stale.
     let scheduler_busy = executor.try_actor_count().is_none() || cache.census_contended(&rollup);
+    let scheduler_degraded = scheduler_busy && scheduler_contention_degraded(snapshot_age_ms);
     let stale_reason = if scheduler_busy {
         Some("executor_contended")
     } else {
@@ -5368,7 +5305,7 @@ fn assemble_health_report(
         (None, warning) => warning,
     };
     HealthReport {
-        status: if scheduler_busy || watch_gap_unresolved {
+        status: if scheduler_degraded || watch_gap_unresolved {
             HealthStatus::Degraded
         } else {
             rollup.status.clone()
@@ -6048,8 +5985,9 @@ mod tests {
             let group = &metrics["root_groups"][0];
             assert_eq!(group["count"], count);
             assert_eq!(group["callgraph_store"]["status"], "building");
-            assert_eq!(group["examples"].as_array().unwrap().len(), 3);
-            assert_eq!(group["examples_omitted"], count - 3);
+            let examples = group["examples"].as_array().unwrap().len();
+            assert!((1..=count.min(3)).contains(&examples));
+            assert_eq!(group["examples_omitted"], count - examples);
             let once = metrics.clone();
             budget_health_metrics(&mut metrics);
             assert_eq!(metrics, once);
@@ -7016,7 +6954,7 @@ mod tests {
         };
         // Warming alone is ok; a root whose data store failed is not warming.
         let (status, detail) =
-            with_data_store_failures(root_health_rollup_state(0, 0, 1, None), &one);
+            with_data_store_failures(root_health_rollup_state(0, 0, 0, 1, None), &one);
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
@@ -7027,7 +6965,7 @@ mod tests {
         );
         // A fleet already degraded for another reason keeps that reason.
         let (status, detail) =
-            with_data_store_failures(root_health_rollup_state(2, 0, 0, None), &one);
+            with_data_store_failures(root_health_rollup_state(2, 2, 0, 0, None), &one);
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
@@ -7036,7 +6974,7 @@ mod tests {
         // No failure: unchanged.
         assert_eq!(
             with_data_store_failures(
-                root_health_rollup_state(0, 0, 0, None),
+                root_health_rollup_state(0, 0, 0, 0, None),
                 &DataStoreFailedRoots::default()
             ),
             (HealthStatus::Ok, None)
@@ -7093,7 +7031,7 @@ mod tests {
         ));
         assert_eq!(data_store_failure_reason(&store), None);
         let failed = DataStoreFailedRoots::collect([(root_path.as_str(), &store)]);
-        let state = root_health_rollup_state(0, 0, 1, None);
+        let state = root_health_rollup_state(0, 0, 0, 1, None);
         assert_eq!(with_data_store_failures(state.clone(), &failed), state);
         let mut root = json!({"project_root": root_path, "data_store": store});
         assert!(abbreviate_health_root(&mut root));
@@ -7163,7 +7101,7 @@ mod tests {
             })
         );
         let (status, detail) =
-            with_data_store_failures(root_health_rollup_state(0, 0, 0, None), &failed);
+            with_data_store_failures(root_health_rollup_state(0, 0, 0, 0, None), &failed);
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
@@ -7208,7 +7146,7 @@ mod tests {
                 DataStoreFailedRoots::collect(paths.iter().map(|path| (path.as_str(), &bind)));
             assert_eq!(failed.named.len(), 5);
             let (_, detail) =
-                with_data_store_failures(root_health_rollup_state(0, 0, 0, None), &failed);
+                with_data_store_failures(root_health_rollup_state(0, 0, 0, 0, None), &failed);
             let detail = detail.expect("a degraded detail");
             let added = detail.len() - base(paths.len()).len();
             assert!(
@@ -7526,6 +7464,7 @@ mod tests {
     }
     use super::super::test_support::{test_ctx, test_root};
     use super::super::{Lane, Response};
+    use super::contention::SNAPSHOT_CONTENTION_DEGRADED_AFTER;
     use super::*;
 
     #[test]
@@ -8821,7 +8760,7 @@ mod tests {
     }
 
     #[test]
-    fn health_contention_preserves_census_and_timestamp_with_age() {
+    fn health_contention_waits_for_three_refresh_intervals_and_recovers() {
         let (_dir, executor, cache, app) = contended_health_fixture();
         let good = cache.snapshot().0;
         assert_eq!(good.metrics["lsp_children"]["spawned"], 1);
@@ -8849,7 +8788,7 @@ mod tests {
             &DispatchPathMetrics::new(),
             &app,
         );
-        assert_eq!(report.status, HealthStatus::Degraded);
+        assert_eq!(report.status, HealthStatus::Ok);
         // Indexing that other tests run in this process can prefix the detail
         // ("<indexing>; <contention>"), so require the contention text, not
         // an exact detail.
@@ -8868,6 +8807,121 @@ mod tests {
         assert_eq!(metrics["age_ms"], 300);
         assert_eq!(metrics["snapshot_age_ms"], 300);
         assert_eq!(metrics["runtime"]["spawned_lsp_children"], 1);
+
+        let degraded_at_ms = 1_000 + SNAPSHOT_CONTENTION_DEGRADED_AFTER.as_millis() as u64;
+        cache.clock_ms.store(degraded_at_ms - 1, Ordering::Relaxed);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Ok);
+
+        cache.clock_ms.store(degraded_at_ms, Ordering::Relaxed);
+        executor.hold_state_lock_for_test(|| {
+            cache.refresh(&executor, &app);
+        });
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert!(report
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL)));
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["generated_at_ms"], 1_000);
+        assert_eq!(metrics["stale"], true);
+        assert_eq!(metrics["stale_reason"], "executor_contended");
+        assert_eq!(metrics["age_ms"], degraded_at_ms - 1_000);
+
+        let recovered_at_ms = degraded_at_ms + 1_000;
+        cache.clock_ms.store(recovered_at_ms, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Ok);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["generated_at_ms"], recovered_at_ms);
+        assert_eq!(metrics["stale"], false);
+        assert_eq!(metrics["stale_reason"], Value::Null);
+        assert_eq!(metrics["age_ms"], 0);
+    }
+
+    #[test]
+    fn root_actor_contention_waits_for_three_refresh_intervals_and_recovers() {
+        let (_dir, executor, cache, app) = contended_health_fixture();
+        let actors = executor.actor_entries();
+        let ctx = Arc::clone(&actors[0].1);
+        let dispatch = DispatchPathMetrics::new();
+        let interval_ms = demand::BACKGROUND_INTERVAL.as_millis() as u64;
+        let threshold_ms = SNAPSHOT_CONTENTION_DEGRADED_AFTER.as_millis() as u64;
+        assert_eq!(threshold_ms, 3 * interval_ms);
+        let contention_detail = "1 root actor(s) could not be snapshotted without contention";
+        let contended_report = |now_ms: u64| {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            ctx.hold_health_snapshot_lock_for_test(|| {
+                cache.refresh_for_test(&executor, &app);
+            });
+            build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
+        };
+
+        for now_ms in [1_000 + interval_ms, 1_000 + 2 * interval_ms] {
+            let report = contended_report(now_ms);
+            assert_eq!(report.status, HealthStatus::Ok, "{report:?}");
+            assert!(
+                report
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(contention_detail)),
+                "{:?}",
+                report.detail
+            );
+            let metrics = report.metrics.unwrap();
+            assert_eq!(metrics["generated_at_ms"], now_ms);
+            assert_eq!(metrics["stale"], false);
+            assert_eq!(metrics["stale_reason"], Value::Null);
+            assert_eq!(metrics["age_ms"], 0);
+        }
+
+        let degraded_at_ms = 1_000 + threshold_ms;
+        let report = contended_report(degraded_at_ms);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert!(report
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(contention_detail)));
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["stale"], false);
+        assert_eq!(metrics["stale_reason"], Value::Null);
+
+        let recovered_at_ms = degraded_at_ms + interval_ms;
+        cache.clock_ms.store(recovered_at_ms, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app);
+        assert_eq!(report.status, HealthStatus::Ok);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["generated_at_ms"], recovered_at_ms);
+        assert_eq!(metrics["stale"], false);
+        assert_eq!(metrics["stale_reason"], Value::Null);
+
+        let report = contended_report(recovered_at_ms + interval_ms);
+        assert_eq!(
+            report.status,
+            HealthStatus::Ok,
+            "a new miss after recovery starts a new grace period"
+        );
     }
 
     #[test]
@@ -8979,7 +9033,7 @@ mod tests {
         let liveness = executor.dispatch_loop_liveness();
         assert!(liveness.has_pending_work());
         let contended = report();
-        assert_eq!(contended.status, HealthStatus::Degraded);
+        assert_eq!(contended.status, HealthStatus::Ok);
         let metrics = contended.metrics.unwrap();
         assert_eq!(metrics["generated_at_ms"], 1_900);
         assert_eq!(metrics["stale_reason"], "executor_contended");

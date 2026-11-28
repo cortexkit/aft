@@ -206,7 +206,10 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
   test("foreground simple command returns output and exit code", async () => {
     const { h, bash, bridgeCalls } = await pluginHarness();
 
-    const result = await callBash(bash, h, { command: "echo hello" });
+    const result = await callBash(bash, h, {
+      command: "echo hello",
+      description: "Print a greeting",
+    });
 
     // The line after the output names the finished task.
     expect(result.output).toMatch(/^hello\n\[task bash-[0-9a-f]+\]$/);
@@ -223,6 +226,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const result = await callBash(bash, h, {
       command: "printf 'line1\\r\\nline2\\r\\nline3\\r\\n'",
+      description: "Print lines with CRLF endings",
       compressed: false,
     });
 
@@ -234,7 +238,10 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
   test("foreground non-zero exit is a successful tool response", async () => {
     const { h, bash, bridgeCalls } = await pluginHarness();
 
-    const result = await callBash(bash, h, { command: "false" });
+    const result = await callBash(bash, h, {
+      command: "false",
+      description: "Return a failing exit status",
+    });
 
     expect(result.output).toMatch(/^\n\[exit code: 1\]\n\[task bash-[0-9a-f]+\]$/);
     expect(result.details.exit_code).toBe(1);
@@ -251,7 +258,10 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     // A terminal result wins over promotion even after the deadline. Keep the
     // command alive long enough for the engine to poll on a loaded runner.
-    const result = await callBash(bash, h, { command: "sleep 5 && echo late" });
+    const result = await callBash(bash, h, {
+      command: "sleep 5 && echo late",
+      description: "Print output after a delay",
+    });
 
     expect(result.output).toContain("promoted to background");
     // Server text rounds 25 ms to 0s, unlike the default wait of several seconds.
@@ -268,6 +278,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const result = await callBash(bash, h, {
       command: "sleep 0.2 && echo waited",
+      description: "Wait briefly and print a marker",
       wait: true,
       timeout: 5_000,
     });
@@ -287,6 +298,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const result = await callBash(bash, h, {
       command: "sleep 0.2 && echo background-done",
+      description: "Print a background completion marker",
       background: true,
     });
 
@@ -300,7 +312,11 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const subdir = h.path("subdir");
     await mkdir(subdir);
 
-    const result = await callBash(bash, h, { command: "pwd", workdir: subdir });
+    const result = await callBash(bash, h, {
+      command: "pwd",
+      description: "Print the working directory",
+      workdir: subdir,
+    });
 
     const [cwd, taskLine] = result.output.trim().split("\n");
     expect(cwd).toBe(await realpath(subdir));
@@ -311,7 +327,11 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
   test("foreground timeout returns timed-out process exit without throwing", async () => {
     const h = await harness();
 
-    const response = await bridgeBashToTerminal(h, { command: "sleep 5", timeout: 1 });
+    const response = await bridgeBashToTerminal(h, {
+      command: "sleep 5",
+      description: "Wait past the command timeout",
+      timeout: 1,
+    });
 
     expect(response.success).toBe(true);
     expect(response.status).toBe("timed_out");
@@ -323,7 +343,11 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const filePath = h.path("notes.txt");
     await writeFile(filePath, "alpha\nbeta\n", "utf8");
 
-    const response = await h.bridge.send("bash", { command: `cat ${filePath}`, compressed: false });
+    const response = await h.bridge.send("bash", {
+      command: `cat ${filePath}`,
+      description: "Read the test file",
+      compressed: false,
+    });
 
     expect(response.id).toBeDefined();
     expect(response.id).not.toBe("bash_rewrite");
@@ -342,6 +366,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const response = await h.bridge.send("bash", {
       command: `grep -r needle ${h.path("src")}`,
+      description: "Search test files for the needle",
       compressed: false,
     });
 
@@ -362,6 +387,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const response = await bridgeBashToTerminal(h, {
       command: `cat ${filePath}`,
+      description: "Read the test file",
       compressed: false,
     });
 
@@ -375,6 +401,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const response = await bridgeBashToTerminal(h, {
       command: "printf '\\033[31mred\\033[0m\\nred\\nred\\nred\\nred\\n'",
+      description: "Print repeated colored lines",
     });
 
     expect(response.success).toBe(true);
@@ -386,6 +413,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const response = await bridgeBashToTerminal(h, {
       command: "printf '\\033[31mred\\033[0m\\nred\\nred\\nred\\nred\\n'",
+      description: "Print repeated colored lines without compression",
       compressed: false,
     });
 
@@ -400,6 +428,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const response = await h.bridge.send("bash", {
       command: "sleep 1 && echo done",
+      description: "Print a delayed completion marker",
       background: true,
     });
 
@@ -415,6 +444,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const h = await harness({ background: true });
     const spawned = await h.bridge.send("bash", {
       command: "sleep 0.3 && echo done",
+      description: "Print a background completion marker",
       background: true,
     });
     const taskId = String(spawned.task_id);
@@ -430,7 +460,11 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
   test("Pi bash_status tool reports running and appends anti-polling reminder", async () => {
     const { h, bash, bashStatus } = await pluginHarness({ experimental_bash_background: true });
-    const spawned = await callBash(bash, h, { command: "sleep 2 && echo done", background: true });
+    const spawned = await callBash(bash, h, {
+      command: "sleep 2 && echo done",
+      description: "Print a delayed background marker",
+      background: true,
+    });
     const taskId = String(spawned.details.task_id);
 
     const status = await callTaskTool<BashStatusDetails>(bashStatus, h, taskId);
@@ -452,6 +486,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const { h, bash, bashStatus } = await pluginHarness({ experimental_bash_background: true });
     const spawned = await callBash(bash, h, {
       command: "sleep 0.2 && echo pi-done",
+      description: "Print the Pi completion marker",
       background: true,
     });
     const taskId = String(spawned.details.task_id);
@@ -471,6 +506,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const longOutput = "x".repeat(260);
     const spawned = await callBash(bash, h, {
       command: `printf '${longOutput}'`,
+      description: "Print a long output preview",
       background: true,
     });
     const taskId = String(spawned.details.task_id);
@@ -482,7 +518,11 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
   test("bash_kill terminates a running task", async () => {
     const h = await harness({ background: true });
-    const spawned = await h.bridge.send("bash", { command: "sleep 60", background: true });
+    const spawned = await h.bridge.send("bash", {
+      command: "sleep 60",
+      description: "Start a task to terminate",
+      background: true,
+    });
     const taskId = String(spawned.task_id);
 
     const killed = await h.bridge.send("bash_kill", { task_id: taskId });
@@ -497,7 +537,11 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const { h, bash, bashStatus, bashKill } = await pluginHarness({
       experimental_bash_background: true,
     });
-    const spawned = await callBash(bash, h, { command: "sleep 60", background: true });
+    const spawned = await callBash(bash, h, {
+      command: "sleep 60",
+      description: "Start a task to terminate",
+      background: true,
+    });
     const taskId = String(spawned.details.task_id);
 
     const killed = await callTaskTool<BashKillDetails>(bashKill, h, taskId);
@@ -514,7 +558,11 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const { h, bash, bashStatus, bashKill } = await pluginHarness({
       experimental_bash_background: true,
     });
-    const spawned = await callBash(bash, h, { command: "echo already-done", background: true });
+    const spawned = await callBash(bash, h, {
+      command: "echo already-done",
+      description: "Print an immediate completion marker",
+      background: true,
+    });
     const taskId = String(spawned.details.task_id);
 
     await waitForToolStatus(h, bashStatus, taskId, "completed");
@@ -527,11 +575,18 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
   test("background completions are no longer appended by the bash adapter", async () => {
     const { h, pool, bash } = await pluginHarness({ experimental_bash_background: true });
     const pluginBridge = pool.getBridge(h.tempDir);
-    const spawned = await pluginBridge.send("bash", { command: "echo bg-done", background: true });
+    const spawned = await pluginBridge.send("bash", {
+      command: "echo bg-done",
+      description: "Print a background completion marker",
+      background: true,
+    });
     const taskId = String(spawned.task_id);
     await waitForStatus(pluginBridge, taskId, "completed");
 
-    const result = await callBash(bash, h, { command: "echo foreground" });
+    const result = await callBash(bash, h, {
+      command: "echo foreground",
+      description: "Print the foreground marker",
+    });
 
     expect(result.output).toContain("foreground\n");
     expect(result.output).not.toContain("Background task");
@@ -550,7 +605,11 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const { h, bash, bashWatch, bashKill } = await pluginHarness({
       experimental_bash_background: true,
     });
-    const spawned = await callBash(bash, h, { command: "sleep 30", background: true });
+    const spawned = await callBash(bash, h, {
+      command: "sleep 30",
+      description: "Start a long task to watch",
+      background: true,
+    });
     const taskId = String(spawned.details.task_id);
 
     const realNow = Date.now;

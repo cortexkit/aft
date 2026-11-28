@@ -1,4 +1,5 @@
 import {
+  BASH_DESCRIPTION,
   BASH_HOST_FALLBACK_REFUSAL,
   BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
@@ -495,12 +496,7 @@ export function createBashTool(
       .describe(
         "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
       ),
-    description: z
-      .string()
-      .optional()
-      .describe(
-        "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
-      ),
+    description: z.string().describe(BASH_DESCRIPTION),
     ...waitArg,
     ...sandboxArg,
     ...backgroundFlagArg,

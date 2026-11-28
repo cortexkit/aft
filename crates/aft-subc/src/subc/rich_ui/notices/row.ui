@@ -1,3 +1,3 @@
-<ToolHeader icon="terminal" title={title} failed={failed} />
+<ToolHeader icon="terminal" title={title} failed={failed && !stopped} />
 
 <ToolText text={summary} tone="muted" maxLines={1} />

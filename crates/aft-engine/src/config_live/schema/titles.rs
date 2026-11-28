@@ -97,6 +97,7 @@ pub(super) fn title(path: &str) -> Option<&'static str> {
         "lsp.idle_minutes" => Some("Idle shutdown (minutes)"),
         "lsp.idle_shutdown" => Some("Shut down idle servers"),
         "lsp.max_servers" => Some("Maximum running servers"),
+        "lsp.worker_rust_analyzers" => Some("Maximum worker rust-analyzers"),
         "lsp.servers" => Some("Custom language servers"),
         "lsp.disabled" => Some("Disabled built-in servers"),
         "lsp.python" => Some("Python language server"),

@@ -286,20 +286,19 @@ fn resolve_zoom_file(
                     "zoom: 'ref' reads repository files; a URL has no git revision",
                 ));
             }
-            ctx.validate_read_path(&req.id, req.session(), Path::new(file))?;
+            ctx.validate_revision_read_path(&req.id, req.session(), Path::new(file))?;
             revision.materialize(req, ctx, Path::new(file), file)?
         }
-        None => resolve_file_or_url(req, ctx, file)?,
+        None => resolve_file_or_url(req, ctx, file).map_err(|response| {
+            if response.data["code"] == "path_not_found" {
+                zoom_file_not_found(&req.id, file)
+            } else {
+                response
+            }
+        })?,
     };
     if !path.exists() {
-        return Err(Response::error(
-            &req.id,
-            "file_not_found",
-            deterministic_zoom_refusal(
-                format!("file not found: {file}"),
-                "Set `target` to an existing file path or a reachable HTTP/HTTPS URL.",
-            ),
-        ));
+        return Err(zoom_file_not_found(&req.id, file));
     }
 
     #[cfg(test)]
@@ -316,6 +315,17 @@ fn resolve_zoom_file(
     })?;
     crate::run_tool_call::read_trace::note_file(source.len() as u64);
     Ok((path, source))
+}
+
+fn zoom_file_not_found(id: &str, file: &str) -> Response {
+    Response::error(
+        id,
+        "file_not_found",
+        deterministic_zoom_refusal(
+            format!("file not found: {file}"),
+            "Set `target` to an existing file path or a reachable HTTP/HTTPS URL.",
+        ),
+    )
 }
 
 fn zoom_one_target_response(

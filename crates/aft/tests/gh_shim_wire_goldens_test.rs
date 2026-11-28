@@ -799,12 +799,12 @@ fn write_signed_manifest(state_dir: &Path, now: u64) {
     let envelope = json!({
         "artifact_id": "gh-routing-manifest",
         "envelope_version": 2,
-        "key_id": "gh-routing-dev-test-key-v1",
+        "key_id": "21fe31dfa154a261",
         "fetched_at_unix_secs": now,
         "signature": base64::engine::general_purpose::STANDARD.encode(key.sign(&manifest_bytes).as_ref()),
         "manifest_bytes": String::from_utf8(manifest_bytes).expect("manifest is UTF-8"),
     });
-    fs::create_dir_all(state_dir).expect("create shim state directory");
+    crate::test_helpers::write_gh_fixture_pin(state_dir, &key, now);
     fs::write(
         state_dir.join("gh-routing-manifest.json"),
         serde_json::to_vec(&envelope).expect("serialize envelope"),
@@ -933,6 +933,7 @@ fn run_shim(verb: &Verb, reply: &HolderReply) -> Run {
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("AFT_GH_SHIM_STATE_DIR", &state_dir)
+        .env("AFT_GH_SHIM_TRUST_ANCHOR", crate::test_helpers::gh_fixture_anchor())
         .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)
@@ -1305,6 +1306,7 @@ fn run_targeting(
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("AFT_GH_SHIM_STATE_DIR", &state_dir)
+        .env("AFT_GH_SHIM_TRUST_ANCHOR", crate::test_helpers::gh_fixture_anchor())
         .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)
@@ -1923,12 +1925,12 @@ fn write_signed_manifest_bytes(state_dir: &Path, manifest_bytes: &[u8], now: u64
     let envelope = json!({
         "artifact_id": "gh-routing-manifest",
         "envelope_version": 2,
-        "key_id": "gh-routing-dev-test-key-v1",
+        "key_id": "21fe31dfa154a261",
         "fetched_at_unix_secs": now,
         "signature": base64::engine::general_purpose::STANDARD.encode(key.sign(manifest_bytes).as_ref()),
         "manifest_bytes": std::str::from_utf8(manifest_bytes).expect("manifest is UTF-8"),
     });
-    fs::create_dir_all(state_dir).expect("create shim state directory");
+    crate::test_helpers::write_gh_fixture_pin(state_dir, &key, now);
     fs::write(
         state_dir.join("gh-routing-manifest.json"),
         serde_json::to_vec(&envelope).expect("serialize envelope"),
@@ -2078,6 +2080,10 @@ fn run_row_with_options(
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("AFT_GH_SHIM_STATE_DIR", &state_dir)
+        .env(
+            "AFT_GH_SHIM_TRUST_ANCHOR",
+            crate::test_helpers::gh_fixture_anchor(),
+        )
         .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)

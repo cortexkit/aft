@@ -156,6 +156,14 @@ impl ConfigLiveState {
         self.sources.lock().clone()
     }
 
+    #[doc(hidden)]
+    pub fn daemon_managed(&self) -> bool {
+        self.sources
+            .lock()
+            .as_ref()
+            .is_some_and(|sources| sources.approved_user.is_some())
+    }
+
     pub fn last_outcome(&self) -> Option<ReloadOutcome> {
         self.last_outcome.lock().clone()
     }
@@ -384,11 +392,60 @@ pub fn reload_config_now(ctx: &AppContext) -> ReloadOutcome {
 }
 
 #[doc(hidden)]
-pub fn reload_approved_user(ctx: &AppContext) -> ReloadOutcome {
+pub fn reload_daemon_settings(
+    ctx: &AppContext,
+    changed: &crate::subc_config::ApprovedUser,
+) -> ReloadOutcome {
     let _reload = ctx.config_live().reload_lock.lock();
+    let Some(source) = ctx
+        .config_live()
+        .sources()
+        .and_then(|sources| sources.approved_user)
+    else {
+        return ReloadOutcome::NotConfigured;
+    };
+    if ctx.subc_unbound_quiesced() {
+        return ReloadOutcome::NotConfigured;
+    }
+    // A project's cap limits its own language servers, not the shared pool.
+    let user_lsp_limits = source.user_lsp_limits();
+    let published = ctx.config_unpinned();
+    if (
+        published.lsp_user_max_servers,
+        published.lsp_user_worker_rust_analyzers,
+    ) != user_lsp_limits
+    {
+        ctx.update_config(|config| {
+            (
+                config.lsp_user_max_servers,
+                config.lsp_user_worker_rust_analyzers,
+            ) = user_lsp_limits;
+        });
+    }
+    if !source.uses(changed) {
+        return ReloadOutcome::NotConfigured;
+    }
     let outcome = reload_config_inner_with(ctx, true);
     *ctx.config_live().last_outcome.lock() = Some(outcome.clone());
     outcome
+}
+
+#[doc(hidden)]
+pub fn managed_index_update(
+    ctx: &AppContext,
+    changed: &crate::subc_config::ApprovedUser,
+) -> Option<crate::config::IndexesConfig> {
+    let source = ctx.config_live().sources()?.approved_user?;
+    if !source.uses(changed) {
+        return None;
+    }
+    let published = ctx.config_unpinned();
+    let resolved = crate::config_resolve::resolve_config_for_harness(
+        &[source.snapshot()],
+        published.harness.as_ref(),
+    );
+    let indexes = resolved.config.indexes;
+    (resolved.errors.is_empty() && indexes != published.indexes).then_some(indexes)
 }
 
 fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
@@ -507,6 +564,12 @@ fn reload_config_inner_with(ctx: &AppContext, approved_only: bool) -> ReloadOutc
                 format!("configuration rejected: {}", diagnostics.errors.join(", ")),
             );
         }
+        if let Some(settings) = &sources.approved_user {
+            (
+                candidate.lsp_user_max_servers,
+                candidate.lsp_user_worker_rust_analyzers,
+            ) = settings.user_lsp_limits();
+        }
         let dropped: Vec<String> = diagnostics
             .dropped
             .iter()
@@ -534,7 +597,21 @@ fn reload_config_inner_with(ctx: &AppContext, approved_only: bool) -> ReloadOutc
         } else {
             Vec::new()
         };
-        let live = apply_live_config(&published, &candidate, &sources.connected);
+        let mut live = apply_live_config(&published, &candidate, &sources.connected);
+        if sources.approved_user.is_some()
+            && published.experimental_bash_compress != candidate.experimental_bash_compress
+        {
+            live.next.experimental_bash_compress = candidate.experimental_bash_compress;
+            live.applied.push("bash.compress");
+            live.deferred.retain(|key| *key != "bash.compress");
+        }
+        if sources.approved_user.is_some()
+            && published.experimental_lsp_ty != candidate.experimental_lsp_ty
+        {
+            live.next.experimental_lsp_ty = candidate.experimental_lsp_ty;
+            live.applied.push("experimental.lsp_ty");
+            live.deferred.retain(|key| *key != "experimental.lsp_ty");
+        }
         if live.applied.is_empty() {
             break (live.applied, live.deferred, dropped, held);
         }
@@ -599,6 +676,10 @@ fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'stati
     if candidate.lsp_max_servers > floor.lsp_max_servers {
         candidate.lsp_max_servers = floor.lsp_max_servers;
         held.push("lsp.max_servers");
+    }
+    if candidate.lsp_worker_rust_analyzers > floor.lsp_worker_rust_analyzers {
+        candidate.lsp_worker_rust_analyzers = floor.lsp_worker_rust_analyzers;
+        held.push("lsp.worker_rust_analyzers");
     }
     if candidate.lsp_idle_minutes > floor.lsp_idle_minutes {
         candidate.lsp_idle_minutes = floor.lsp_idle_minutes;
@@ -728,6 +809,9 @@ pub fn reload_log_line(
 /// Call the setters that copy a changed live key into a component that keeps
 /// its own copy.
 fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
+    if before.experimental_bash_compress != after.experimental_bash_compress {
+        ctx.sync_bash_compress_flag();
+    }
     if before.formatter != after.formatter || before.checker != after.checker {
         crate::format::clear_tool_cache_for_root(after.project_root.as_deref());
     }
@@ -808,7 +892,6 @@ macro_rules! restart_settings {
         $field!("semantic.max_input_tokens", semantic.max_input_tokens);
         $field!("semantic.max_files", semantic.max_files);
         $field!("subc.connection_file", semantic.subc_connection_file);
-        $field!("github.shim", github.shim);
         $field!("github.read", github.read);
         $field!("github.write", github.write);
         $field!("gh_shim.binary_path", gh_shim.binary_path);
@@ -891,6 +974,8 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("lsp.idle_shutdown", lsp_idle_shutdown);
     live!("lsp.max_servers", lsp_max_servers);
     live!("lsp.max_servers", lsp_user_max_servers);
+    live!("lsp.worker_rust_analyzers", lsp_worker_rust_analyzers);
+    live!("lsp.worker_rust_analyzers", lsp_user_worker_rust_analyzers);
     live!("backup.max_file_size", backup.max_file_size);
     // Sandbox: every spawn reads the snapshot its request pinned.
     live!("sandbox.profile.worker", sandbox.profile.worker);
@@ -938,6 +1023,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("search.rerank", search.rerank);
     // Integrations.
     live!("git.co_author", git.co_author);
+    live!("github.shim", github.shim);
     // The user switch and project refusal apply to the next call, even if
     // the caller still holds a catalog that offered runon. A later catalog
     // fetch reflects the new switch; the runner default waits for reconnect.
@@ -1025,6 +1111,8 @@ fn classification_is_exhaustive(config: &Config) {
         lsp_idle_shutdown: _,
         lsp_max_servers: _,
         lsp_user_max_servers: _,
+        lsp_worker_rust_analyzers: _,
+        lsp_user_worker_rust_analyzers: _,
         url_fetch_allow_private: _,
         disabled_tools: _,
         idle,

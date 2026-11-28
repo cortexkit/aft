@@ -100,7 +100,8 @@ impl ExternalSearch {
         config.indexes.semantic = session.indexes.semantic;
         config.indexes.callgraph = false;
         config.semantic = session.semantic.clone();
-        let engine = crate::context::AppContext::new(
+        let engine = crate::context::AppContext::with_app_and_provider(
+            ctx.app(),
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         );

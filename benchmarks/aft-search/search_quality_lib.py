@@ -864,13 +864,38 @@ def validate_pattern_counts(descriptor: Mapping[str, Any]) -> None:
                     raise InputFault(f"malformed_descriptor:{count_field}.{side}:not_nonnegative_integer")
 
 
-def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], *, schema_blobs: tuple[bytes | None, bytes | None] | None = None, notes: list[str] | None = None) -> tuple[dict[str, Any], bool]:
+def validate_order_changes(descriptor: Mapping[str, Any], manifest: Mapping[str, Any] | None) -> None:
+    if "order_changes" not in descriptor:
+        return
+    slice_class = descriptor.get("slice_class")
+    neutral_ranking = (
+        slice_class == "ranking" and descriptor.get("kind") == "ranking"
+        and descriptor.get("targeted_mechanism") == "none"
+    )
+    if slice_class != "engine_unwired" and not neutral_ranking:
+        raise InputFault("malformed_descriptor:order_changes:requires_strict_row_comparison")
+    entries = descriptor["order_changes"]
+    if not isinstance(entries, Mapping) or not entries:
+        raise InputFault("malformed_descriptor:order_changes:not_a_nonempty_map")
+    included = set(included_manifest_ids(manifest)) if manifest is not None else None
+    for episode_id, reason in entries.items():
+        if not isinstance(episode_id, str):
+            raise InputFault("malformed_descriptor:order_changes:episode_id")
+        episode_number(episode_id)
+        if included is not None and episode_id not in included:
+            raise InputFault(f"malformed_descriptor:order_changes:unknown_episode:{episode_id}")
+        if not isinstance(reason, str) or not reason.strip() or reason.splitlines() != [reason]:
+            raise InputFault(f"malformed_descriptor:order_changes.{episode_id}:reason_must_be_one_line")
+
+
+def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], *, schema_blobs: tuple[bytes | None, bytes | None] | None = None, notes: list[str] | None = None, manifest: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
     derived = derive_slice_class(list(diff_paths), schema_blobs=schema_blobs, notes=notes)
     missing_ranking = descriptor is None and derived == "ranking"
     if descriptor is None:
         return {"slice_class": derived, "targeted_mechanism": "none", "kind": "harness", "fixtures": ["harness-goldens"]}, missing_ranking
     validate_presentation_rows(descriptor)
     validate_pattern_counts(descriptor)
+    validate_order_changes(descriptor, manifest)
     declared = descriptor.get("slice_class")
     if declared == "engine_unwired":
         if derived != "ranking":
@@ -892,7 +917,7 @@ def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequenc
     target = descriptor.get("targeted_mechanism")
     if derived == "ranking":
         if target == "none":
-            if descriptor.get("kind") != "paging":
+            if descriptor.get("kind") != "paging" and "order_changes" not in descriptor:
                 raise InputFault("malformed_descriptor:latency_only_ranking")
         elif target not in MECHANISMS:
             raise InputFault("malformed_descriptor:targeted_mechanism")
@@ -1104,6 +1129,10 @@ def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str,
     difference = _first_value_difference(old_score, new_score)
     if difference:
         return f"real_query.{difference}"
+    return _strict_family_or_parity_difference(reference, score, diff_paths)
+
+
+def _strict_family_or_parity_difference(reference: Mapping[str, Any], score: Mapping[str, Any], diff_paths: Sequence[str]) -> str | None:
     for family in ("exact_recall", "concept_recall"):
         row = _first_family_difference(reference, score, family)
         if row:
@@ -1112,6 +1141,65 @@ def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str,
         if path == TOOL_CALL_PARITY_FIXTURE_SOURCE or path.startswith(TOOL_CALL_PARITY_FIXTURE_PREFIX):
             return f"tool_call_parity.{path}"
     return None
+
+
+def _check_order_metrics(before: Mapping[str, Any], after: Mapping[str, Any], episode_id: str, prefix: str = "") -> None:
+    old = _metric_block(before.get("metrics"), f"reference:{episode_id}:{prefix}metrics")
+    new = _metric_block(after.get("metrics"), f"score:{episode_id}:{prefix}metrics")
+    for metric in METRICS:
+        if new[metric] < old[metric]:
+            raise InputFault(f"order_change_metric_decreased:{episode_id}:{prefix}{metric}")
+
+
+def _mask_rank_fields(before: Mapping[str, Any], after: dict[str, Any], fields: tuple[str, ...], episode_id: str) -> bool:
+    changed = False
+    for field in fields:
+        if field not in before and field not in after:
+            continue
+        value = after.get(field)
+        if field == "retrieval_depth":
+            valid = type(value) is int and value >= 0
+        else:
+            valid = isinstance(value, list) and all(isinstance(path, str) for path in value)
+        if field not in before or not valid:
+            raise InputFault(f"malformed_order_change:{episode_id}:{field}")
+        changed |= canonical_json(before[field]) != canonical_json(value)
+        after[field] = before[field]
+    return changed
+
+
+def _mask_order_changes(reference: Mapping[str, Any], score: Mapping[str, Any], declarations: Mapping[str, str]) -> dict[str, Any]:
+    """Undo only declared rank, depth and score transitions for the exact compare."""
+    old_rows = {row["episode_id"]: row for row in reference["rows"]}
+    new_rows = {row["episode_id"]: row for row in score["rows"]}
+    masked_rows = {}
+    for episode_id in declarations:
+        before, after = old_rows.get(episode_id), new_rows.get(episode_id)
+        if before is None or after is None:
+            side = "reference" if before is None else "score"
+            raise InputFault(f"order_changes:{episode_id}:missing_{side}_row")
+        masked = dict(after)
+        changed = _mask_rank_fields(before, masked, ("ranked_paths", "page_zero_ranked_paths", "retrieval_depth"), episode_id)
+        _check_order_metrics(before, after, episode_id)
+        masked["metrics"] = before["metrics"]
+        old_prose, new_prose = before.get("prose_only"), after.get("prose_only")
+        if isinstance(old_prose, Mapping) and isinstance(new_prose, Mapping):
+            prose = dict(new_prose)
+            changed |= _mask_rank_fields(old_prose, prose, ("ranked_paths",), episode_id)
+            _check_order_metrics(old_prose, new_prose, episode_id, "prose_only.")
+            prose["metrics"] = old_prose["metrics"]
+            masked["prose_only"] = prose
+            if "paired_mrr_delta" in before and "paired_mrr_delta" in after:
+                delta = after["metrics"]["mrr_at_10"] - new_prose["metrics"]["mrr_at_10"]
+                if after["paired_mrr_delta"] != delta:
+                    raise InputFault(f"malformed_order_change:{episode_id}:paired_mrr_delta")
+                if delta < before["paired_mrr_delta"]:
+                    raise InputFault(f"order_change_metric_decreased:{episode_id}:paired_mrr_delta")
+                masked["paired_mrr_delta"] = before["paired_mrr_delta"]
+        if not changed:
+            raise InputFault(f"declared_order_change_did_not_occur:{episode_id}")
+        masked_rows[episode_id] = masked
+    return dict(score, rows=[masked_rows.get(row["episode_id"], row) for row in score["rows"]])
 
 
 SPLIT_ROWS_NOT_APPLICABLE_REASON = (
@@ -1521,7 +1609,7 @@ def validate_candidate_page_invariance(
 def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], read_answer: Callable[[str], str | None] = read_pinned_answer, *, schema_blobs: tuple[bytes | None, bytes | None] | None = None) -> GateResult:
     notes: list[str] = []
     try:
-        resolved, missing = resolve_descriptor(descriptor, diff_paths, schema_blobs=schema_blobs, notes=notes)
+        resolved, missing = resolve_descriptor(descriptor, diff_paths, schema_blobs=schema_blobs, notes=notes, manifest=manifest)
         not_applicable = semantic_building_rows_not_applicable(score)
         if not_applicable:
             skip_summary = not_applicable
@@ -1532,15 +1620,36 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
                 f"semantic_building_rows_skipped:{','.join(skip_summary['rows'])}:{skip_summary['reason']}"
             )
         validate_candidate_page_invariance(reference, score, str(resolved["slice_class"]))
-        if resolved["slice_class"] == "engine_unwired":
+        order_changes = resolved.get("order_changes")
+        if order_changes:
+            validate_scored_population(manifest, score)
+            masked = _mask_order_changes(reference, score, order_changes)
+            presentation = resolved.get("presentation_rows", {})
+            counts = resolved.get("pattern_counts", {})
+            difference = _declared_row_difference(reference, masked, presentation, counts)
+            if not difference:
+                difference = _strict_family_or_parity_difference(reference, score, diff_paths)
+            if difference:
+                raise InputFault(f"order_changes_mismatch:row={difference}")
+            # Do not take aggregate values from a replay that can change rows.
+            # The strict comparison above ensures only allowed rows contribute changes.
+            reference = _project_real_query_population(reference, set())
+            score = _project_real_query_population(score, set())
+            if resolved["slice_class"] == "engine_unwired":
+                masked = _project_real_query_population(masked, set())
+                difference = _engine_unwired_difference(reference, masked, diff_paths, presentation, counts)
+                if difference:
+                    raise InputFault(f"engine_unwired_mismatch:row={difference}")
+        elif resolved["slice_class"] == "engine_unwired":
             difference = _engine_unwired_difference(reference, score, diff_paths, resolved.get("presentation_rows"), resolved.get("pattern_counts"))
             if difference:
                 raise InputFault(f"engine_unwired_mismatch:row={difference}")
-        if resolved["slice_class"] == "ranking" and resolved["targeted_mechanism"] == "none":
+        elif resolved["slice_class"] == "ranking" and resolved["targeted_mechanism"] == "none":
             difference = _engine_unwired_difference(reference, score, diff_paths)
             if difference:
                 raise InputFault(f"latency_only_ranking_mismatch:row={difference}")
-        validate_scored_population(manifest, score)
+        if not order_changes:
+            validate_scored_population(manifest, score)
         validate_profile_score(score)
         reasons = evaluate_predicate(reference, score, resolved, missing_ranking_descriptor=missing)
         if resolved["slice_class"] == "ranking" and not missing:

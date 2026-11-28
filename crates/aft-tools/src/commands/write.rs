@@ -52,9 +52,21 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let path = match ctx.validate_path(&req.id, Path::new(file)) {
         Ok(path) => path,
+        Err(resp)
+            if resp.data["code"] == "path_outside_root"
+                && ctx.is_restricted_dangling_write_target(&req.id, Path::new(file)) =>
+        {
+            return dangling_symlink_error(&req.id, file);
+        }
         Err(resp) => return resp,
     };
-    let existed = path.exists();
+    let metadata = path.metadata();
+    let existed = metadata.is_ok();
+    if metadata.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        && path.is_symlink()
+    {
+        return dangling_symlink_error(&req.id, file);
+    }
 
     // Capture pre-write content when the file exists so we can detect no-op
     // writes (file content byte-identical to original) and emit honest
@@ -273,6 +285,16 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         edit::render_edit_diff(&mut result, &req.params, file, original, final_content);
     }
     Response::success(&req.id, result)
+}
+
+fn dangling_symlink_error(req_id: &str, file: &str) -> Response {
+    Response::error(
+        req_id,
+        "dangling_symlink",
+        format!(
+            "Cannot write through dangling symlink '{file}'. Write to the target path instead."
+        ),
+    )
 }
 
 #[cfg(test)]

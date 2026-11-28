@@ -9,3 +9,6 @@ mod read_only;
 
 #[path = "runon_capture_tests.rs"]
 mod runon_capture_tests;
+
+#[path = "return_paths_tests.rs"]
+mod return_paths_tests;

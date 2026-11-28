@@ -12,6 +12,7 @@ pub(super) struct ReadHolder {
     pub binds: HashMap<String, ScopeStamp>,
     pub calls: Vec<Value>,
     pub dials: Vec<Value>,
+    pub manifest_dials: usize,
     pub hold_reads: Option<Arc<tokio::sync::Notify>>,
     pub results: VecDeque<Value>,
 }
@@ -73,6 +74,11 @@ async fn connection(mut stream: TcpStream, holder: Arc<Mutex<ReadHolder>>) {
             FrameType::Request => {
                 let body: Value = serde_json::from_slice(&frame.body).unwrap();
                 if header.channel == 0 && body["op"] == "route.open" {
+                    if body["target"]
+                        == json!({"kind":"management_surface","module_id":"claustrum"})
+                    {
+                        holder.lock().unwrap().manifest_dials += 1;
+                    }
                     let selector = &body["scope"];
                     let plexus = body["target"]
                         == serde_json::to_value(RouteTarget::ToolProvider {
@@ -160,6 +166,15 @@ async fn connection(mut stream: TcpStream, holder: Arc<Mutex<ReadHolder>>) {
     }
 }
 
+pub(super) const TRUST_ANCHOR: &str = r#"{"key_id":"21fe31dfa154a261","public_key_hex":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","generation":1}"#;
+
+pub(super) fn policy_root_reply() -> Value {
+    let mut pin: Value = serde_json::from_str(TRUST_ANCHOR).unwrap();
+    let generation = pin.as_object_mut().unwrap().remove("generation").unwrap();
+    pin["retired_key_ids"] = json!([]);
+    json!({"op":"policy_root.get","pin":pin,"generation":generation})
+}
+
 pub(super) fn configure(base: &Path, command: &mut Command) {
     use base64::Engine;
     use ring::signature::Ed25519KeyPair;
@@ -188,7 +203,7 @@ pub(super) fn configure(base: &Path, command: &mut Command) {
     manifest["issued_at_unix_secs"] = json!(now);
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let key = Ed25519KeyPair::from_seed_unchecked(&SEED).unwrap();
-    let envelope = json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"gh-routing-dev-test-key-v1","fetched_at_unix_secs":now,
+    let envelope = json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"21fe31dfa154a261","fetched_at_unix_secs":now,
         "signature":base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),"manifest_bytes":String::from_utf8(bytes).unwrap()});
     std::fs::write(
         state.join("gh-routing-manifest.json"),

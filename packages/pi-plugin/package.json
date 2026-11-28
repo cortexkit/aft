@@ -39,11 +39,11 @@
     "@cortexkit/aft-win32-x64": "0.68.1"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.2",
-    "@earendil-works/pi-ai": "^0.80.2",
-    "@earendil-works/pi-tui": "0.80.2",
+    "@earendil-works/pi-coding-agent": "1.7.0",
+    "@earendil-works/pi-ai": "1.7.0",
+    "@earendil-works/pi-tui": "1.7.0",
     "@types/node": "^22.0.0",
-    "typebox": "1.1.38",
+    "typebox": "1.3.27",
     "typescript": "^5.8.0"
   },
   "peerDependencies": {

@@ -89,7 +89,7 @@ fn pin(
 }
 
 fn request(name: &str, preset: &str, args: Value, key: &str, pin: String) -> Value {
-    json!({"op":"tool.call", "name":name, "preset":preset, "arguments":args, "call_key":key, "schema_pin":pin})
+    json!({"op":"tool.call", "name":name, "preset":preset, "arguments":crate::subc::bash_selector_tests::shell_fixture_arguments(name, args), "call_key":key, "schema_pin":pin})
 }
 
 fn reply(frame: Frame) -> Value {
@@ -563,7 +563,7 @@ fn remote_pins_match_runon_variant_without_widening_base_arguments() {
             serde_json::from_value(request(
                 "bash",
                 "worker",
-                json!({"command":"not-dispatched", "runon":"linux"}),
+                json!({"command":"not-dispatched", "description":"Validate the remote pin", "runon":"linux"}),
                 "pin-only",
                 pin("bash", CatalogPreset::Head, offer_runon, false, None),
             ))

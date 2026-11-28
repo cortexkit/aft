@@ -13,6 +13,7 @@ use lsp_types::{
 };
 
 use super::event_ingress::{EventIngress, EventReceiver, EVENT_CAP};
+use super::typescript_temp::typescript_server_temp_dir;
 use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
@@ -99,8 +100,11 @@ mod provider_pulls;
 mod rust_compiler_retry;
 mod shutdown;
 mod watched_overflow;
+mod worker_analyzer;
 mod workspace_pulls;
 use memory::DiagnosticMergeCache;
+pub use worker_analyzer::start_applicable_server_unlocked;
+pub(crate) use worker_analyzer::{DiagnosticsActivity, DiagnosticsActivityGuard};
 
 use background_document_pulls::{run_background_document_pulls, ClosedDocumentPulls};
 
@@ -1016,6 +1020,8 @@ type ShutdownResult = (Option<ServerKey>, u32, Result<(), LspError>);
 
 pub struct LspManager {
     capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
+    worker_analyzer_root: super::client::WorkerAnalyzerRoot,
+    pub(crate) diagnostics_activity: Arc<parking_lot::Mutex<DiagnosticsActivity>>,
     capacity_slots: HashMap<ServerKey, Arc<()>>,
     #[cfg(any(test, feature = "test-support"))]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1306,6 +1312,7 @@ struct StartFailure {
 pub(crate) struct ServerCapacity {
     slots: Vec<std::sync::Weak<()>>,
     managers: Vec<std::sync::Weak<parking_lot::Mutex<LspManager>>>,
+    worker_reap: Weak<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1373,6 +1380,8 @@ impl LspManager {
             super::pending_changes::PendingLspChangeQueue::new(event_tx.clone());
         Self {
             capacity: Arc::default(),
+            worker_analyzer_root: Default::default(),
+            diagnostics_activity: Arc::default(),
             capacity_slots: HashMap::new(),
             #[cfg(any(test, feature = "test-support"))]
             spawn_hook: None,
@@ -1441,22 +1450,6 @@ impl LspManager {
     #[doc(hidden)]
     pub fn set_retry_clock(&mut self, clock: RetryClock) {
         self.retry_clock = clock;
-    }
-
-    pub(crate) fn enable_background_document_pulls(
-        &mut self,
-        owner: Weak<parking_lot::Mutex<LspManager>>,
-    ) {
-        self.startup_owner = owner.clone();
-        self.capacity.lock().managers.push(owner.clone());
-        self.background_pull_owner = owner;
-    }
-
-    pub(crate) fn set_server_capacity(
-        &mut self,
-        capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
-    ) {
-        self.capacity = capacity;
     }
 
     fn queue_background_document_pull(&mut self, key: &ServerKey, file: &Path) {
@@ -2136,7 +2129,16 @@ impl LspManager {
         file: &Path,
         config: &Config,
     ) -> ServerAttemptResult {
-        match self.begin_file_server_start(def, key, file, config) {
+        let start = self.begin_file_server_start(def, key, file, config);
+        self.launch_file_server_start(key, start)
+    }
+
+    fn launch_file_server_start(
+        &self,
+        key: &ServerKey,
+        start: FileServerStart,
+    ) -> ServerAttemptResult {
+        match start {
             FileServerStart::Running => ServerAttemptResult::Ok {
                 server_key: key.clone(),
             },
@@ -6908,6 +6910,8 @@ impl LspManager {
 
         Ok(PreparedSpawn {
             start_signal: None,
+            worker_permit: None,
+            worker_admission: self.worker_analyzer_admission(config),
             #[cfg(any(test, feature = "test-support"))]
             spawn_hook: self.spawn_hook.clone(),
             #[cfg(test)]
@@ -7840,6 +7844,8 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
 /// Everything needed to spawn and initialize one language server, gathered
 /// from `LspManager` state so the slow part can run without the manager lock.
 struct PreparedSpawn {
+    worker_permit: Option<super::client::RustAnalyzerPermit>,
+    worker_admission: super::client::WorkerAnalyzerAdmission,
     start_signal: Option<Arc<StartSignal>>,
     #[cfg(any(test, feature = "test-support"))]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -7887,52 +7893,6 @@ enum SpawnFailure {
         report: Box<ServerExitReport>,
         durability: FailureDurability,
     },
-}
-
-pub(crate) struct TypeScriptTempDir(PathBuf);
-
-impl TypeScriptTempDir {
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TypeScriptTempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn typescript_server_temp_dir(
-    kind: &ServerKind,
-    storage_root: &Path,
-    env: &mut HashMap<String, String>,
-) -> std::io::Result<Option<TypeScriptTempDir>> {
-    if !matches!(kind, ServerKind::TypeScript(_)) {
-        return Ok(None);
-    }
-    let parent = storage_root.join("lsp-tmp");
-    crate::private_storage::create_dir_all(&parent)?;
-    let mut random = [0u8; 16];
-    getrandom::fill(&mut random).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let path = parent.join(format!("typescript-{:032x}", u128::from_le_bytes(random)));
-    // A private, randomly named directory is created atomically; an existing
-    // path is never reused, including remnants of an abruptly stopped AFT.
-    crate::private_storage::create_dir(&path)?;
-    let directory = TypeScriptTempDir(path);
-    let path = directory.path().to_str().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "TypeScript temp path is not UTF-8",
-        )
-    })?;
-    // typescript-language-server creates a per-UID folder with a racy
-    // existsSync/mkdirSync pair during macOS startup. Different SDK versions
-    // can start together for one root, so even a per-workspace TMPDIR collides.
-    for key in ["TMPDIR", "TMP", "TEMP"] {
-        env.insert(key.into(), path.into());
-    }
-    Ok(Some(directory))
 }
 
 impl PreparedSpawn {
@@ -8018,20 +7978,29 @@ impl PreparedSpawn {
                     error: LspError::Io(error),
                 },
             )?;
-        let mut client = match LspClient::spawn_with_reclaim_root(
-            self.kind.clone(),
-            self.root.clone(),
-            &self.binary,
-            &self.args,
-            &self.env,
-            LspEventSender::Managed {
-                sender: self.event_tx,
-                instance: self.instance,
-            },
-            self.child_registry,
-            Some(&self.reclaim_root),
-            worker,
-        ) {
+        let permit = match self.worker_permit.take() {
+            Some(permit) => Ok(Some(permit)),
+            None if worker => super::client::rust_analyzer_capacity()
+                .acquire(&self.worker_admission)
+                .map(Some),
+            None => Ok(None),
+        };
+        let mut client = match permit.and_then(|permit| {
+            LspClient::spawn_with_worker_permit(
+                self.kind.clone(),
+                self.root.clone(),
+                &self.binary,
+                &self.args,
+                &self.env,
+                LspEventSender::Managed {
+                    sender: self.event_tx,
+                    instance: self.instance,
+                },
+                self.child_registry,
+                Some(&self.reclaim_root),
+                permit,
+            )
+        }) {
             Ok(client) => client,
             Err(err) => {
                 let exit_log_line = format!(
@@ -8047,7 +8016,8 @@ impl PreparedSpawn {
                 });
             }
         };
-        client._typescript_temp_dir = typescript_temp_dir;
+        client._typescript_temp_dir =
+            typescript_temp_dir.inspect(|dir| dir.record_server(client.child_pid()));
         #[cfg(test)]
         if let Some(hook) = &self.spawned_hook {
             hook(client.child_pid());
@@ -8073,7 +8043,7 @@ impl PreparedSpawn {
                 .rust_worker_policy
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            if let Err(error) = client.enable_rust_worker_policy() {
+            if let Err(error) = client.enable_rust_worker_policy(&self.worker_admission) {
                 return Err(SpawnFailure::NotStarted {
                     exit_log_line: format!(
                         "worker analyzer admission refused before initialize: {error}"
@@ -8528,97 +8498,6 @@ where
     signals
         .iter()
         .all(|signal| wait_for_startup_outcome(&lock, signal, deadline).is_some())
-}
-
-/// Start or join one producer's reserved startup without holding the manager
-/// mutex across process creation, initialization, or waiting for completion.
-/// The request deadline limits waiting, not the worker's initialize handshake.
-pub fn start_applicable_server_unlocked(
-    manager: &Arc<parking_lot::Mutex<LspManager>>,
-    snapshot: &ApplicableServerSnapshot,
-    server: &ServerKey,
-    config: &Config,
-    deadline: Instant,
-) -> ApplicableServerStartOutcomes {
-    let mut outcomes = ApplicableServerStartOutcomes {
-        failures: snapshot
-            .producer_failures
-            .iter()
-            .filter(|f| f.server_key == *server)
-            .cloned()
-            .collect(),
-        ..ApplicableServerStartOutcomes::default()
-    };
-    let Some(candidate) = snapshot.candidates.iter().find(|c| c.key == *server) else {
-        return outcomes;
-    };
-    let mut retried_abandoned = false;
-    let result = loop {
-        if Instant::now() >= deadline {
-            outcomes.deadline_exceeded = Some(server.clone());
-            return outcomes;
-        }
-        let (initial, signal) = {
-            let mut lsp = manager.lock();
-            lsp.startup_owner = Arc::downgrade(manager);
-            let result = lsp.start_server(
-                &candidate.definition,
-                server,
-                &candidate.source_file,
-                config,
-            );
-            let signal = lsp.starting.get(server).map(|r| Arc::clone(&r.signal));
-            (result, signal)
-        };
-        let abandoned_before_join = signal.as_ref().is_some_and(|signal| {
-            signal
-                .request_deadline_exceeded
-                .load(std::sync::atomic::Ordering::Acquire)
-        });
-        let result = if let (ServerAttemptResult::InProgress { .. }, Some(signal)) =
-            (&initial, signal)
-        {
-            wait_for_startup_outcome(|| manager.lock(), &signal, deadline).unwrap_or_else(|| {
-                signal
-                    .request_deadline_exceeded
-                    .store(true, std::sync::atomic::Ordering::Release);
-                initial
-            })
-        } else {
-            initial
-        };
-        // A new request can overlap cleanup of an earlier timed-out request.
-        // Observe its result, then retry once with the new request's budget and
-        // configuration instead of returning that abandoned attempt's failure.
-        if abandoned_before_join
-            && !retried_abandoned
-            && matches!(
-                result,
-                ServerAttemptResult::SpawnFailed { .. }
-                    | ServerAttemptResult::BinaryNotInstalled { .. }
-            )
-            && Instant::now() < deadline
-        {
-            let lsp = manager.lock();
-            if !lsp.is_quiesced() && lsp.failure_to_replay(server).is_none() {
-                retried_abandoned = true;
-                continue;
-            }
-        }
-        break result;
-    };
-    match result {
-        ServerAttemptResult::Ok { server_key } => outcomes.successful.push(server_key),
-        ServerAttemptResult::InProgress { server_key } => {
-            outcomes.in_progress.push(server_key.clone());
-            outcomes.deadline_exceeded = Some(server_key);
-        }
-        result => outcomes.failures.push(ApplicableServerFailure {
-            server_key: server.clone(),
-            result,
-        }),
-    }
-    outcomes
 }
 
 /// Wake waiters if a startup worker unwinds before publishing a result.
@@ -10074,7 +9953,11 @@ mod transient_retry_tests {
             .unwrap();
         let error = LspError::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
-            super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 2 },
+            super::super::client::RustAnalyzerCapacityExhausted {
+                cap: 2,
+                current: 2,
+                project_limited: false,
+            },
         ));
         let failure = manager.absorb_spawn_failure(SpawnFailure::NotStarted {
             error,
@@ -10496,7 +10379,11 @@ mod transient_retry_tests {
         let failure = || {
             let error = LspError::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 3 },
+                super::super::client::RustAnalyzerCapacityExhausted {
+                    cap: 2,
+                    current: 3,
+                    project_limited: false,
+                },
             ));
             let durability = process_start_durability(&error);
             assert_eq!(durability, FailureDurability::Capacity);

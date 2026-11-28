@@ -1992,7 +1992,7 @@ fn codemode_call_runs_with_head_principal_and_run_route_finds_its_ledger_row() {
                 "name": "bash",
                 "preset": "head",
                 "call_key": &shell_key,
-                "arguments": {"command": "echo ledger-shell", "timeout": 5000},
+                "arguments": {"command": "echo ledger-shell", "description":"Run the ledger fixture", "timeout": 5000},
             });
             send_frame(
                 &mut daemon.stream,
@@ -2124,7 +2124,7 @@ fn codemode_withdraw_kills_a_running_shell_call_on_the_head_root() {
                 "name": "bash",
                 "preset": "head",
                 "call_key": &shell_key,
-                "arguments": {"command": command, "timeout": 30000},
+                "arguments": {"command": command, "description":"Run the withdraw fixture", "timeout": 30000},
             });
             send_frame(
                 &mut daemon.stream,

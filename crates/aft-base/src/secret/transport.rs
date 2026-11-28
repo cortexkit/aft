@@ -11,6 +11,7 @@ use subc_client_rs::{
 };
 use subc_protocol::scope::{ScopeSelector, ScopeStamp};
 use subc_protocol::{BindIdentity, RouteTarget};
+use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use super::vault::SecretUseTransport;
@@ -20,6 +21,9 @@ pub(super) mod diagnostics;
 use diagnostics::{Failure, Stage};
 
 const UNAVAILABLE: &str = "secret.use transport unavailable";
+// One command's proxy admits at most 32 concurrent requests. Allow one such
+// burst to wait for the serial connection, not an accumulating backlog.
+const QUEUED_WORK_CAPACITY: usize = 32;
 static CONNECTION_FILE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
 pub fn install_connection_file(path: &std::path::Path) {
@@ -51,7 +55,7 @@ pub struct SubcSecretUseTransport {
     connection_file: PathBuf,
     identity: BindIdentity,
     timeout: Duration,
-    worker: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<Work>>>,
+    worker: Arc<OnceLock<mpsc::Sender<Work>>>,
     #[cfg(any(test, feature = "test-support"))]
     test_principal: Option<ConsumerIdentity>,
 }
@@ -251,7 +255,8 @@ impl SubcSecretUseTransport {
         consumer: &subc_client_rs::SubcConsumer,
         params: Value,
         test_principal: Option<ConsumerIdentity>,
-    ) -> Result<Zeroizing<Vec<u8>>, Failure> {
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, Failure> {
         let target = &params["target"];
         if target["scheme"] != "https"
             || target
@@ -267,6 +272,9 @@ impl SubcSecretUseTransport {
         let scope = ScopeSelector::new(stamp.owner, stamp.scope_ref, Some(stamp.scope_epoch));
         let body = serde_json::to_vec(&json!({"method": "secret.use", "params": params}))
             .map_err(|_| Failure::local(Stage::Encode))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
         let route = open_vault_route(
             consumer,
             config.identity.clone(),
@@ -276,6 +284,9 @@ impl SubcSecretUseTransport {
         )
         .await
         .map_err(|error| Failure::call(Stage::RouteOpen, &error).under_scope(kind, &scope))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
         let reply = consumer
             .request(
                 &route,
@@ -286,7 +297,7 @@ impl SubcSecretUseTransport {
                 },
             )
             .await;
-        match reply {
+        let result = match reply {
             Ok(bytes) => {
                 let bytes = Zeroizing::new(bytes);
                 Ok(bytes)
@@ -312,7 +323,8 @@ impl SubcSecretUseTransport {
                 }
             }
             Err(error) => Err(Failure::call(Stage::Request, &error)),
-        }
+        };
+        result.map(Some)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -331,7 +343,7 @@ impl SubcSecretUseTransport {
         test_principal: Option<ConsumerIdentity>,
     ) -> Result<Zeroizing<Vec<u8>>, Failure> {
         let sender = self.worker.get_or_init(|| {
-            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (sender, receiver) = mpsc::channel(QUEUED_WORK_CAPACITY);
             let config = ConnectionConfig {
                 connection_file: self.connection_file.clone(),
                 identity: self.identity.clone(),
@@ -349,39 +361,48 @@ impl SubcSecretUseTransport {
         });
         let (reply, answer) = std::sync::mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
+        let deadline = tokio::time::Instant::now() + self.timeout;
         sender
-            .send(Work {
+            .try_send(Work {
                 params,
                 test_principal,
-                deadline: tokio::time::Instant::now() + self.timeout,
+                deadline,
                 reply,
                 failure: Arc::clone(&failure),
             })
-            .map_err(|_| Failure::local(Stage::Worker))?;
-        answer.recv_timeout(self.timeout).unwrap_or_else(|error| {
-            // The worker can be closing a failed connection when the caller's
-            // deadline expires. Preserve that failure and log only at the caller,
-            // so cleanup and deadline races never emit two warnings for one call.
-            Err(failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .unwrap_or_else(|| {
-                    Failure::local(match error {
-                        std::sync::mpsc::RecvTimeoutError::Timeout => Stage::Deadline,
-                        std::sync::mpsc::RecvTimeoutError::Disconnected => Stage::Worker,
-                    })
-                }))
-        })
+            .map_err(|error| {
+                Failure::local(match error {
+                    mpsc::error::TrySendError::Full(_) => Stage::Busy,
+                    mpsc::error::TrySendError::Closed(_) => Stage::Worker,
+                })
+            })?;
+        answer
+            .recv_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_else(|error| {
+                // The worker can be closing a failed connection when the caller's
+                // deadline expires. Preserve that failure and log only at the caller,
+                // so cleanup and deadline races never emit two warnings for one call.
+                Err(failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Failure::local(match error {
+                            std::sync::mpsc::RecvTimeoutError::Timeout => Stage::Deadline,
+                            std::sync::mpsc::RecvTimeoutError::Disconnected => Stage::Worker,
+                        })
+                    }))
+            })
     }
 
-    async fn serve(
-        config: ConnectionConfig,
-        mut receiver: tokio::sync::mpsc::UnboundedReceiver<Work>,
-    ) {
+    async fn serve(config: ConnectionConfig, mut receiver: mpsc::Receiver<Work>) {
         let mut consumer = None;
         while let Some(work) = receiver.recv().await {
             let result = tokio::time::timeout_at(work.deadline, async {
+                // timeout_at may poll the job before reporting an elapsed timer.
+                if tokio::time::Instant::now() >= work.deadline {
+                    return Ok(None);
+                }
                 if consumer.is_none() {
                     consumer = Some(
                         crate::fleet_status::connect_subc_consumer(
@@ -393,16 +414,29 @@ impl SubcSecretUseTransport {
                         .map_err(|error| Failure::connect(&error))?,
                     );
                 }
+                if tokio::time::Instant::now() >= work.deadline {
+                    return Ok(None);
+                }
                 Self::send(
                     &config,
                     consumer.as_ref().expect("connected consumer"),
                     work.params,
                     work.test_principal,
+                    work.deadline,
                 )
                 .await
             })
             .await
             .unwrap_or_else(|_| Err(Failure::local(Stage::Deadline)));
+            let result = match result {
+                Ok(Some(bytes)) => Ok(bytes),
+                Ok(None) => {
+                    // No request ran, so an existing connection is still usable.
+                    let _ = work.reply.send(Err(Failure::local(Stage::Deadline)));
+                    continue;
+                }
+                Err(error) => Err(error),
+            };
             if let Err(error) = &result {
                 *work
                     .failure

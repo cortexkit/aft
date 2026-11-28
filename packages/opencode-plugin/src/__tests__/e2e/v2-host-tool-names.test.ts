@@ -38,9 +38,18 @@ async function checkHost(label: string, removeBuiltins: boolean) {
     files: { "probe.txt": "rewrite-probe-line\n" },
     permissions: [{ action: "shell", resource: "echo forbidden*", effect: "deny" }],
     script: {
-      "run the rewrite probe": { name: "shell", arguments: { command: REWRITE } },
-      "run the forbidden probe": { name: "shell", arguments: { command: FORBIDDEN } },
-      "run the waiting probe": { name: "shell", arguments: { command: WAITING, wait: true } },
+      "run the rewrite probe": {
+        name: "shell",
+        arguments: { command: REWRITE, description: "Read the rewrite probe file" },
+      },
+      "run the forbidden probe": {
+        name: "shell",
+        arguments: { command: FORBIDDEN, description: "Run the forbidden probe" },
+      },
+      "run the waiting probe": {
+        name: "shell",
+        arguments: { command: WAITING, description: "Wait for the probe command", wait: true },
+      },
     },
   });
   try {

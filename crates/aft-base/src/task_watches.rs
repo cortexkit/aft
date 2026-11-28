@@ -73,6 +73,8 @@ impl WatchPattern {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PatternMatch {
+    #[serde(skip)]
+    pub durable_pending: bool,
     pub watch_id: String,
     pub task_id: String,
     pub match_text: String,
@@ -90,6 +92,7 @@ pub struct PatternMatch {
 
 impl PatternMatch {
     pub fn copy_delivery_identity(&mut self, persisted: &Self) {
+        self.durable_pending = persisted.durable_pending;
         if let (Some(live), Some(saved)) = (self.batch.as_mut(), persisted.batch.as_ref()) {
             self.match_offset = persisted.match_offset;
             live.pending_id = saved.pending_id.clone();
@@ -162,6 +165,7 @@ impl WatchRegistry {
                 self.matched_tasks.insert(task_id.to_string());
             }
             found.push(PatternMatch {
+                durable_pending: false,
                 watch_id: watch.watch_id.clone(),
                 task_id: task_id.to_string(),
                 match_text: "matching lines".to_string(),
@@ -506,6 +510,7 @@ impl WatchRegistry {
                 };
                 matches.push((
                     PatternMatch {
+                        durable_pending: false,
                         watch_id: watch.watch_id.clone(),
                         task_id: watch.task_id.clone(),
                         match_text,

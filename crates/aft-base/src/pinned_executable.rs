@@ -128,9 +128,13 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     let start = crate::process_identity::process_start_time_ms(pid)
         .ok_or_else(|| io::Error::other("cannot determine executable pin owner start time"))?;
     let directory = run.join(format!("aft-pinned-{pid}-{start}"));
+    #[cfg(target_os = "linux")]
+    let owner = publish_owner_directory(&directory)?;
+    #[cfg(not(target_os = "linux"))]
     crate::private_storage::create_dir(&directory)?;
 
     let result = (|| {
+        #[cfg(not(target_os = "linux"))]
         let owner = owner_lock(&directory)?;
         #[cfg(target_os = "linux")]
         let (executable, pin_identity) = image_key.pin(&run, &source_file)?;
@@ -183,8 +187,7 @@ fn cleanup(run: &Path) -> io::Result<()> {
             None => crate::fs_lock::process_alive(pid),
         };
         if !alive {
-            // The kernel lease is authoritative even if another PID namespace
-            // or a changed boot-clock conversion reports a different owner.
+            // A held lease vetoes removal, even across PID namespaces.
             let lease_path = entry.path().join(OWNER_LOCK);
             let lease = if lease_path.try_exists()? {
                 let mut options = crate::private_storage::options();
@@ -201,11 +204,20 @@ fn cleanup(run: &Path) -> io::Result<()> {
                 }
                 Some(file)
             } else {
+                #[cfg(target_os = "linux")]
+                if crate::process_identity::probe_process(pid).0
+                    != crate::process_identity::ProcessLiveness::Gone
+                {
+                    // A live PID's mismatching epoch may just be a clock step.
+                    continue;
+                }
                 None
             };
-            // Windows cannot unlink an open lock file. The owner is already
-            // dead and pin names are never reused, so release before removal.
+            // Windows cannot unlink an open lock file.
+            #[cfg(not(target_os = "linux"))]
             drop(lease);
+            #[cfg(target_os = "linux")]
+            let _lease = lease;
             match std::fs::remove_dir_all(entry.path()) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -226,6 +238,26 @@ fn owner_lock(directory: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
+#[cfg(target_os = "linux")]
+fn publish_owner_directory(directory: &Path) -> io::Result<std::fs::File> {
+    let run_path = directory.parent().expect("pin owner directory in run");
+    let staging = tempfile::Builder::new()
+        .prefix(".pin-")
+        .tempdir_in(run_path)?;
+    let lease = owner_lock(staging.path())?;
+    // Cleanup only recognizes published names. Make the locked directory
+    // visible under its final name in one step, without replacing an owner.
+    let run = crate::pinned_dir::PinnedDir::open(run_path)?;
+    let source = staging
+        .path()
+        .file_name()
+        .expect("staging directory in run");
+    let target = directory.file_name().expect("pin owner directory in run");
+    let entry = run.repair_entry_for_rename(source)?;
+    run.repair_rename_entry_to(source, &entry, &run, target)?;
+    Ok(lease)
+}
+
 impl PinnedExecutable {
     fn path(&self) -> io::Result<PathBuf> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -243,7 +275,12 @@ impl PinnedExecutable {
             "startup executable pin missing; restoring {}",
             self.executable.display()
         );
+        #[cfg(not(target_os = "linux"))]
         crate::private_storage::create_dir_all(&self.directory)?;
+        #[cfg(target_os = "linux")]
+        if !self.directory.try_exists()? {
+            state.owner = Some(publish_owner_directory(&self.directory)?);
+        }
         if !self.directory.join(OWNER_LOCK).try_exists()? {
             state.owner = Some(owner_lock(&self.directory)?);
         }
@@ -711,6 +748,7 @@ pub mod tests {
             std::fs::create_dir(directory).unwrap();
             std::fs::write(directory.join("aft"), b"image").unwrap();
         }
+        drop(owner_lock(&reused).unwrap());
         cleanup(run).unwrap();
         assert!(live.join("aft").exists());
         assert!(!reused.exists(), "a reused PID must not retain an old pin");
@@ -743,6 +781,36 @@ pub mod tests {
         );
         cleanup(storage.path()).unwrap();
         assert!(!directory.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn clock_step_preserves_live_executable_pin_without_exclusive_lease() {
+        use crate::process_identity::{process_start_time_ms, with_linux_boot_time_for_test};
+        let storage = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let start = with_linux_boot_time_for_test(100, || process_start_time_ms(pid).unwrap());
+        let legacy = storage.path().join(format!("aft-pinned-{pid}-{start}"));
+        std::fs::create_dir(&legacy).unwrap();
+        let published = storage
+            .path()
+            .join(format!("aft-pinned-{pid}-{}", start - 1));
+        let lease = publish_owner_directory(&published).unwrap();
+        assert!(published.join(OWNER_LOCK).is_file());
+
+        with_linux_boot_time_for_test(200, || {
+            assert_ne!(process_start_time_ms(pid), Some(start));
+            cleanup(storage.path()).unwrap();
+            assert!(
+                legacy.is_dir(),
+                "a live PID with no lease needs more than a clock mismatch"
+            );
+            assert!(published.is_dir(), "the published lease blocks cleanup");
+            drop(lease);
+            cleanup(storage.path()).unwrap();
+            assert!(legacy.is_dir());
+            assert!(!published.exists(), "exclusive lease permits cleanup");
+        });
     }
 
     #[test]

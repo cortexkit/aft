@@ -5,7 +5,8 @@
     "parameters": {
       "type": "object",
       "required": [
-        "command"
+        "command",
+        "description"
       ],
       "properties": {
         "command": {
@@ -31,7 +32,7 @@
         },
         "description": {
           "type": "string",
-          "description": "Human-readable description shown in UI logs. Helps users understand what the command does without reading shell syntax."
+          "description": "Human-readable description shown in UI (5-10 words)"
         },
         "wait": {
           "type": "boolean",

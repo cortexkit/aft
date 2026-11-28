@@ -5,6 +5,7 @@ use subc_protocol::session::{HealthReport, HealthStatus, MODULE_CONTROL_OP_HEALT
 /// control failure.
 const FIRST_VIEW_RETRY_MIN: Duration = Duration::from_secs(1);
 const FIRST_VIEW_RETRY_MAX: Duration = Duration::from_secs(30);
+const PROJECT_SETTINGS_CAPABILITY: &str = "config.settings.projects/v1";
 
 pub(in crate::subc) struct LegacySettings {
     _watch: Option<crate::config_live::ConfigFileWatch>,
@@ -33,12 +34,23 @@ pub(in crate::subc) struct Hello {
 }
 
 impl Hello {
-    pub(in crate::subc) fn gated(&self) -> bool {
-        self.ack.as_ref().is_some_and(|ack| {
-            ack.subc_capabilities
-                .iter()
-                .any(|cap| cap == CONFIG_GATE_CAPABILITY)
-        })
+    pub(in crate::subc) fn settings_modes(&self, manage_settings: bool) -> (bool, bool) {
+        let supports = |name| {
+            self.ack
+                .as_ref()
+                .is_some_and(|ack| ack.subc_capabilities.iter().any(|cap| cap == name))
+        };
+        let gated = manage_settings && supports(CONFIG_GATE_CAPABILITY);
+        let project_views = gated && supports(PROJECT_SETTINGS_CAPABILITY);
+        if gated {
+            let mode = if project_views {
+                "user and project views"
+            } else {
+                "user view only"
+            };
+            crate::slog_info!("subc attach: daemon settings mode: {mode}");
+        }
+        (gated, project_views)
     }
 }
 
@@ -127,20 +139,29 @@ pub(in crate::subc) async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 pub(in crate::subc) async fn wait_for_first_view(
     control: &readiness::DaemonControl,
     ctx: &Arc<AppContext>,
-    user_path: Option<&Path>,
+    (user_path, project_views): (Option<&Path>, bool),
     reader: &mut mpsc::Receiver<Result<DecodedFrame, SubcError>>,
     replies: &readiness::PendingControlReplies,
     writer: &WriterSender,
     metrics: &DispatchPathMetrics,
 ) -> Result<Result<Arc<Session>, ModuleLoopExit>, SubcError> {
     let declaration = declaration(user_path);
-    drive_first_view(control, ctx, declaration, reader, replies, writer, metrics).await
+    drive_first_view(
+        control,
+        ctx,
+        (declaration, project_views),
+        reader,
+        replies,
+        writer,
+        metrics,
+    )
+    .await
 }
 
 pub(super) async fn drive_first_view(
     control: &readiness::DaemonControl,
     ctx: &Arc<AppContext>,
-    declaration: Option<(ConfigDeclareRequest, Schema)>,
+    (declaration, project_views): (Option<(ConfigDeclareRequest, Schema)>, bool),
     reader: &mut mpsc::Receiver<Result<DecodedFrame, SubcError>>,
     replies: &readiness::PendingControlReplies,
     writer: &WriterSender,
@@ -214,7 +235,12 @@ pub(super) async fn drive_first_view(
             .map_err(|_| "settings_catalog_unavailable")?
             .map_err(|_| "settings_catalog_unavailable")?;
             report(control, &view, Ok(())).await?;
-            Ok::<_, &'static str>(Arc::new(Session::new(schema.clone(), tier, view)))
+            Ok::<_, &'static str>(Arc::new(Session::new(
+                schema.clone(),
+                tier,
+                view,
+                project_views,
+            )))
         };
         tokio::pin!(fetch);
         let mut changed = false;
@@ -222,7 +248,7 @@ pub(super) async fn drive_first_view(
             tokio::select! {
                 outcome = &mut fetch => match outcome {
                     Ok(session) => {
-                        if changed { session.hint.notify_one(); }
+                        if changed { session.notify_user_changed(); }
                         return Ok(Ok(session));
                     }
                     Err(error) => { log::warn!("settings startup waiting: {error}"); reason = error; break; }

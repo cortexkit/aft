@@ -108,6 +108,7 @@ mod tests {
             )
             .unwrap();
         let mut first = PatternMatch {
+            durable_pending: false,
             task_id: task.task_id().to_owned(),
             watch_id: watch.clone(),
             match_text: "READY first".into(),

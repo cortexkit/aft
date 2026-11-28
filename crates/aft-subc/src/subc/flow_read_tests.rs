@@ -43,7 +43,19 @@ fn identity(root: &Path, scope: Value, principal: &str) -> RouteIdentity {
 fn stamp() -> Value {
     json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"flow-read/call", "scope_epoch":7,"kind":"ephemeral", "owner_authorized":true,
         "expires_at_ms":crate::db::call_ledger::now_ms() + 60000,
-        "parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"head","scope_epoch":7}})
+        "parent": head_selector()})
+}
+
+fn head_selector() -> Value {
+    json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"head","scope_epoch":7})
+}
+
+fn head_stamp() -> Value {
+    let mut scope = head_selector();
+    scope["kind"] = json!("head");
+    scope["owner_authorized"] = json!(true);
+    scope["attributes"] = json!({"agent_id":"head-agent"});
+    scope
 }
 
 #[test]
@@ -89,7 +101,7 @@ fn flow_read_owner_authorized() {
 }
 #[test]
 fn flow_read_kind() {
-    check(|s| s["kind"] = json!("head"), "reserved:basal", "kind");
+    check(|s| s["kind"] = json!("worker"), "reserved:basal", "kind");
 }
 #[test]
 fn flow_read_prefix() {
@@ -144,12 +156,7 @@ fn flow_read_management_route_refused() {
 }
 
 fn head(root: &Path) -> RouteIdentity {
-    let mut scope = stamp();
-    scope["kind"] = json!("head");
-    scope["ref"] = json!("head");
-    scope["parent"] = Value::Null;
-    scope["expires_at_ms"] = Value::Null;
-    identity(root, scope, "reserved:broca")
+    identity(root, head_stamp(), "reserved:broca")
 }
 fn reply(stamp: &ScopeStamp, status: ScopeStatus) -> ModuleControlResponseToModule {
     ModuleControlResponseToModule::ScopeDescribe {
@@ -329,10 +336,14 @@ async fn flow_read_daemon_parent_confirmation() {
     std::fs::create_dir_all(&basal_root).unwrap();
     std::fs::write(root.join("script"), b"abc").unwrap();
     std::fs::write(basal_root.join("script"), b"wrong").unwrap();
+    std::fs::write(dir.path().join("outside"), b"outside").unwrap();
+    let protected = root.join("protected");
+    std::fs::write(&protected, b"protected").unwrap();
     let parent = head(&root);
     let mut config = Config::default();
     config.project_root = Some(root);
     config.storage_dir = Some(dir.path().join("store"));
+    config.sandbox.read_deny.push(protected);
     let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
@@ -343,89 +354,52 @@ async fn flow_read_daemon_parent_confirmation() {
     access_grants::register(&parent, &ctx).unwrap();
     let executor = Arc::new(Executor::new());
     executor.register_actor(parent.root.clone(), ctx);
-    for (status, refusal) in [
-        (Some(ScopeStatus::Live), None),
-        (Some(ScopeStatus::NotLive), Some("Route not admitted: parent: the daemon reports the parent scope is not live.")),
-        (Some(ScopeStatus::Ended), Some("Route not admitted: parent: the daemon reports the parent scope ended.")),
-        (None, Some("Route not admitted: parent: the daemon scope.describe request for the parent scope failed.")),
+    let not_admitted = "file_read_exact_route_not_admitted";
+    let access_denied = Some((
+        "file_read_exact_access_denied",
+        "Access denied by the parent head's policy.",
+    ));
+    for (path, status, refusal) in [
+        ("script", Some(ScopeStatus::Live), None),
+        ("../outside", Some(ScopeStatus::Live), access_denied),
+        ("protected", Some(ScopeStatus::Live), access_denied),
+        ("missing", Some(ScopeStatus::Live), Some(("file_read_exact_not_found", "File not found."))),
+        ("script", Some(ScopeStatus::NotLive), Some((not_admitted, "Route not admitted: parent: the daemon reports the parent scope is not live."))),
+        ("script", Some(ScopeStatus::Ended), Some((not_admitted, "Route not admitted: parent: the daemon reports the parent scope ended."))),
+        ("script", None, Some((not_admitted, "Route not admitted: parent: the daemon scope.describe request for the parent scope failed."))),
     ] {
-        let child = identity(&basal_root, stamp(), "reserved:basal");
-        let child_scope = child.scope.as_ref().unwrap();
-        assert_eq!(child_scope.kind, ScopeKind::Ephemeral);
-        assert!(child_scope.parent.is_some());
-        assert!(child_scope.attributes.flow_id.is_none());
+      for scope in [stamp(), head_stamp()] {
+        let child = identity(&basal_root, scope, "reserved:basal");
         let routes = HashMap::from([
-            (route_key(41, 1), child.clone()),
+            (route_key(41, 1), child),
             (route_key(42, 1), parent.clone()),
         ]);
-        let (writer, mut output) = mpsc::channel(8);
         let (control_tx, mut requests) = mpsc::channel(8);
         let pending = readiness::PendingControlReplies::default();
-        let metrics = Arc::new(DispatchPathMetrics::new());
         let control = Arc::new(readiness::DaemonControl::new(
             control_tx,
-            metrics.clone(),
+            Arc::new(DispatchPathMetrics::new()),
             PROTOCOL_VERSION,
             vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
             vec![],
             pending.clone(),
             HELLO_CORR + 1,
         ));
-        let body = json!({"op":"file.read_exact","path":"script"});
-        let frame = Frame::build(
-            FrameType::Request,
-            control_flags(),
-            41,
-            1,
-            1,
-            serde_json::to_vec(&body).unwrap(),
-        )
-        .unwrap();
-        let active = Arc::default();
-        let (bash, _) = mpsc::channel(8);
-        let (touch, _) = mpsc::channel(8);
-        let (entries, _) = mpsc::unbounded_channel();
-        handle_tool_call(
-            &writer,
-            &frame,
-            Some(Ok(body)),
-            None,
-            PhaseTrace::new(Instant::now()),
+        let mut output = wire_request(
             &routes,
-            &HashMap::new(),
-            &ReclaimedRoutes::default(),
-            &mut HashMap::new(),
+            json!({"op":"file.read_exact","path":path}),
             &executor,
-            &active,
-            &Arc::new(PendingDeferredSetups::default()),
-            &Arc::new(Notify::new()),
-            &PersistentCancelSignal::new(),
-            &bash,
-            &touch,
-            &metrics,
-            &mut HashMap::new(),
-            &mut HashMap::new(),
-            &mut 1,
-            &mut HashMap::new(),
-            &mut HashMap::new(),
-            &mut HashMap::new(),
-            &mut HashMap::new(),
-            |_, _| panic!("flow-read must not dispatch a general tool"),
-            &DeferredResponseSender { entries, wake: Default::default() },
-            false,
-            2 * 1024 * 1024,
-            &drain::ModuleDrainWindow::default(),
             Some(&control),
         )
-        .await
-        .unwrap();
+        .await;
         let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
             .await
             .unwrap()
             .unwrap();
         let query: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(query["op"], "scope.describe");
-        assert_eq!(query["ref"], "head");
+        assert_eq!(query["owner"], head_selector()["owner"]);
+        assert_eq!(query["ref"], head_selector()["ref"]);
         let (ty, response) = match &status {
             Some(status) => (
                 FrameType::Response,
@@ -447,22 +421,19 @@ async fn flow_read_daemon_parent_confirmation() {
             )
             .unwrap()
         ));
-        let answer = tokio::time::timeout(Duration::from_secs(5), output.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let body: Value = serde_json::from_slice(&answer.body).unwrap();
-        if let Some(refusal) = refusal {
-            assert_eq!(answer.header.ty, FrameType::Error);
-            assert_eq!(body["code"], "file_read_exact_route_not_admitted");
+        let (ty, body) = wire_reply(&mut output).await;
+        if let Some((code, refusal)) = refusal {
+            assert_eq!(ty, FrameType::Error);
+            assert_eq!(body["code"], code);
             assert_eq!(body["message"], refusal);
         } else {
-            assert_eq!(answer.header.ty, FrameType::Response);
+            assert_eq!(ty, FrameType::Response);
             assert_eq!(
                 body,
                 json!({"bytes_base64":"YWJj", "size":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"})
             );
         }
+      }
     }
 }
 
@@ -505,8 +476,13 @@ async fn flow_read_missing_daemon_control() {
     );
 }
 
-async fn wire(identity: RouteIdentity, body: Value) -> Value {
-    let (writer, mut replies) = mpsc::channel(8);
+async fn wire_request(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    body: Value,
+    executor: &Arc<Executor>,
+    control: Option<&Arc<readiness::DaemonControl>>,
+) -> mpsc::Receiver<WriterFrame> {
+    let (writer, replies) = mpsc::channel(8);
     let (bash, _) = mpsc::channel(8);
     let (touch, _) = mpsc::channel(8);
     let (entries, _) = mpsc::unbounded_channel();
@@ -519,18 +495,17 @@ async fn wire(identity: RouteIdentity, body: Value) -> Value {
         serde_json::to_vec(&body).unwrap(),
     )
     .unwrap();
-    let routes = HashMap::from([(route_key(41, 1), identity)]);
     handle_tool_call(
         &writer,
         &frame,
         None,
         None,
         PhaseTrace::new(Instant::now()),
-        &routes,
+        routes,
         &HashMap::new(),
         &ReclaimedRoutes::default(),
         &mut HashMap::new(),
-        &Arc::new(Executor::new()),
+        executor,
         &Arc::default(),
         &Arc::new(PendingDeferredSetups::default()),
         &Arc::new(Notify::new()),
@@ -553,13 +528,30 @@ async fn wire(identity: RouteIdentity, body: Value) -> Value {
         false,
         2 * 1024 * 1024,
         &drain::ModuleDrainWindow::default(),
-        None,
+        control,
     )
     .await
     .unwrap();
-    let answer = replies.recv().await.unwrap();
-    assert_eq!(answer.header.ty, FrameType::Error);
-    serde_json::from_slice(&answer.body).unwrap()
+    replies
+}
+
+async fn wire_reply(replies: &mut mpsc::Receiver<WriterFrame>) -> (FrameType, Value) {
+    let answer = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .expect("flow operation must answer")
+        .unwrap();
+    (
+        answer.header.ty,
+        serde_json::from_slice(&answer.body).unwrap(),
+    )
+}
+
+async fn wire(identity: RouteIdentity, body: Value) -> Value {
+    let routes = HashMap::from([(route_key(41, 1), identity)]);
+    let mut replies = wire_request(&routes, body, &Arc::new(Executor::new()), None).await;
+    let (ty, body) = wire_reply(&mut replies).await;
+    assert_eq!(ty, FrameType::Error);
+    body
 }
 
 #[tokio::test]
@@ -573,11 +565,166 @@ async fn flow_read_other_operations_refused() {
         json!({"name":"read","arguments":{"path":"x"}}),
         json!({"op":"unknown"}),
     ] {
-        let result = wire(identity(dir.path(), stamp(), "reserved:basal"), op).await;
-        assert_eq!(result["code"], "file_read_exact_route_not_admitted");
-        assert_eq!(result["message"], "Route not admitted: operation.");
+        for scope in [stamp(), head_stamp()] {
+            let result = wire(identity(dir.path(), scope, "reserved:basal"), op.clone()).await;
+            assert_eq!(result["code"], "file_read_exact_route_not_admitted");
+            assert_eq!(result["message"], "Route not admitted: operation.");
+        }
+    }
+    let result = wire(
+        identity(dir.path(), head_stamp(), "reserved:basal"),
+        json!({"op":super::super::perf_sweep::OPERATION}),
+    )
+    .await;
+    assert_eq!(result["code"], "file_read_exact_route_not_admitted");
+    assert_eq!(result["message"], "Route not admitted: operation.");
+}
+
+#[tokio::test]
+async fn flow_read_head_stamp_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut worker = head_stamp();
+    worker["kind"] = json!("worker");
+    let mut ephemeral = head_stamp();
+    ephemeral["kind"] = json!("ephemeral");
+    let mut unauthorized = head_stamp();
+    unauthorized["owner_authorized"] = json!(false);
+    let mut other_owner = head_stamp();
+    other_owner["owner"]["module_id"] = json!("other");
+    let mut expired = head_stamp();
+    expired["expires_at_ms"] = json!(1);
+    for (scope, principal, reason) in [
+        (head_stamp(), "reserved:broca", "principal"),
+        (worker, "reserved:basal", "kind"),
+        (ephemeral, "reserved:basal", "scope_ref"),
+        (unauthorized, "reserved:basal", "owner"),
+        (other_owner, "reserved:basal", "owner"),
+        (expired, "reserved:basal", "expiry"),
+    ] {
+        let answer = wire(
+            identity(dir.path(), scope, principal),
+            json!({"op":"file.read_exact","path":"script"}),
+        )
+        .await;
+        assert_eq!(answer["code"], "file_read_exact_route_not_admitted");
+        assert_eq!(answer["message"], format!("Route not admitted: {reason}."));
     }
 }
+
+#[tokio::test]
+async fn flow_read_head_stamp_requires_own_open_route_at_stamped_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let carrier = identity(dir.path(), head_stamp(), "reserved:basal");
+    let mut other_epoch = head_stamp();
+    other_epoch["scope_epoch"] = json!(8);
+    let routes = HashMap::from([
+        (route_key(41, 1), carrier.clone()),
+        (route_key(42, 1), carrier),
+        (
+            route_key(43, 1),
+            identity(dir.path(), other_epoch, "reserved:broca"),
+        ),
+    ]);
+    let mut replies = wire_request(
+        &routes,
+        json!({"op":"file.read_exact","path":"script"}),
+        &Arc::new(Executor::new()),
+        None,
+    )
+    .await;
+    let (ty, answer) = wire_reply(&mut replies).await;
+    assert_eq!(ty, FrameType::Error);
+    assert_eq!(answer["code"], "file_read_exact_route_not_admitted");
+    assert_eq!(answer["message"], "Route not admitted: parent: no open AFT route for the parent head scope head at epoch 7 (the head must have an AFT route open at the epoch core stamped); open routes for that owner and scope reference have epochs [8].");
+}
+
+#[test]
+fn flow_read_head_stamp_cannot_bind_management_or_project_free() {
+    let stamp = serde_json::from_value(head_stamp()).unwrap();
+    for project_free in [false, true] {
+        let error =
+            admit_bind_surface(Some(&stamp), Some("reserved:basal"), project_free).unwrap_err();
+        assert_eq!(error.code, "file_read_exact_route_not_admitted");
+        assert_eq!(error.message, "Route not admitted: operation.");
+        assert!(admit_bind_surface(Some(&stamp), Some("reserved:broca"), project_free).is_ok());
+    }
+}
+
+#[test]
+fn flow_read_head_stamp_bind_preserves_scope_state() {
+    use super::super::scope_workdir_tests::{bind_observed_with_scope_setup, ScopeSetup};
+    use crate::db::access_asks;
+    use rusqlite::types::Value as SqlValue;
+
+    let snapshot = |ctx: &AppContext| {
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        ["access_scopes", "codemode_owners", "access_asks"].map(|table| {
+            let mut query = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2, 3, 4"))
+                .unwrap();
+            let columns = query.column_count();
+            query
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, SqlValue>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = ProjectRootId::from_path(dir.path())
+        .unwrap()
+        .into_path_buf();
+    let head_root = root.join("head-root");
+    std::fs::create_dir(&head_root).unwrap();
+    let head = head(&head_root);
+    let before = std::cell::OnceCell::new();
+    bind_observed_with_scope_setup(
+        &root,
+        Some(serde_json::from_value(head_stamp()).unwrap()),
+        &root,
+        Some(ScopeSetup {
+            principal: Principal::Reserved {
+                module_id: "basal".into(),
+            },
+            seed: &|carrier, ctx| {
+                let scope = access_grants::scope_key(&head);
+                assert_eq!(scope, access_grants::scope_key(carrier));
+                ctx.set_db(Arc::new(StdMutex::new(
+                    crate::db::open(&ctx.storage_dir().join("aft.db")).unwrap(),
+                )));
+                access_grants::register(&head, ctx).unwrap();
+                codemode_owners::save(ctx, &head);
+                access_asks::open_permission(
+                    &ctx.db().unwrap().lock().unwrap(),
+                    &access_asks::AskKey {
+                        scope,
+                        args_hash: "head-ask".into(),
+                    },
+                    "head-consent-call",
+                    &head_selector(),
+                    &json!({"tool":"bash"}),
+                    &access_asks::Permission::Shell {
+                        command: "pwd".into(),
+                        cwd: head_root.clone(),
+                        permissions: vec![],
+                    },
+                    1,
+                )
+                .unwrap();
+                let rows = snapshot(ctx);
+                assert!(rows.iter().all(|table| table.len() == 1));
+                before.set(rows).unwrap();
+            },
+        }),
+        |_, _, ctx| assert_eq!(&snapshot(ctx), before.get().unwrap()),
+    );
+}
+
 #[tokio::test]
 async fn flow_read_normal_route_refused() {
     let dir = tempfile::tempdir().unwrap();

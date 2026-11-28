@@ -2,6 +2,7 @@
 //! the same notice twice. Runner sessions do not acknowledge AFT push frames.
 
 mod bash_requests;
+pub(super) use bash_requests::notice_send_id;
 pub(crate) mod notice_templates;
 
 use super::*;
@@ -1933,6 +1934,9 @@ fn offer(
             let Some(metadata) = registry.notice_metadata(&task_id) else {
                 return Next::Done;
             };
+            if reminder_elapsed_ms.is_some() && (metadata.is_terminal() || metadata.completion_delivered) {
+                return Next::Done;
+            }
             if completion && metadata.completion_delivered {
                 receipt.applied();
                 return Next::Done;
@@ -2073,8 +2077,17 @@ fn offer(
                     }
                     let send_request = |request: &SendRequest| {
                         let send = || runtime.block_on(async {
+                            let stale_reminder = || reminder_elapsed_ms.is_some() && registry.notice_metadata(&task_id)
+                                .is_none_or(|latest| latest.is_terminal() || latest.completion_delivered);
+                            // Preparing the request and staging its display can both race with a kill.
+                            if stale_reminder() {
+                                return Outcome::Accepted;
+                            }
                             if let Some(record) = super::rich_ui::notices::for_send(&registry, &frame, &metadata, &address.module, &address.identity.session, &request.send_id, timestamp) {
                                 super::rich_ui::display::stage_notice(record).await;
+                                if stale_reminder() {
+                                    return Outcome::Accepted;
+                                }
                             }
                             send(&path, &address, request, delivery_order).await
                         });

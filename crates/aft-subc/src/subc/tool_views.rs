@@ -48,6 +48,33 @@ pub(crate) static SHIPPED: LazyLock<BTreeMap<String, Shipped>> = LazyLock::new(|
             *pin
         );
         current::append(entry);
+        if entry.tool.name == "bash" {
+            current::append_bash_row(entry);
+        }
+    }
+    let bash_tail = shipped
+        .values()
+        .find(|entry| entry.tool.name == "bash" && entry.tool.semantics == BASH_SEMANTICS)
+        .expect("shipped bash tail view");
+    let manifest = bash_tail.history.last().unwrap().clone();
+    for tool in versions::current_pin_tools().filter(|tool| tool.name == "bash") {
+        let pin = SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+            .encode()
+            .expect("current bash schema pin");
+        shipped.entry(pin).or_insert_with(|| Shipped {
+            tool: Definition {
+                name: tool.name.clone(),
+                semantics: tool.semantics,
+                input_schema: tool.input_schema.clone(),
+            },
+            history: vec![manifest.clone()],
+        });
+    }
+    for entry in shipped
+        .values_mut()
+        .filter(|entry| entry.tool.name == "bash")
+    {
+        current::append_bash_neutral_stop(entry);
     }
     shipped
 });
@@ -101,17 +128,13 @@ fn versioned_source_for<'a>(
     pin: &ToolMajorPin,
     current: impl Iterator<Item = &'a CatalogTool>,
 ) -> Option<(&'static Shipped, &'a Value)> {
-    let mut current = current
-        .filter(|tool| {
-            tool.name == pin.tool
-                && tool
-                    .version
-                    .is_some_and(|version| version.major == pin.major)
-        })
-        .peekable();
-    current.peek()?;
-
-    if let Some(tool) = current.find(|tool| tool.schema_digest == pin.schema_digest) {
+    if let Some(tool) = current.into_iter().find(|tool| {
+        tool.name == pin.tool
+            && tool.schema_digest == pin.schema_digest
+            && tool
+                .version
+                .is_some_and(|version| version.major == pin.major)
+    }) {
         let legacy = SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
             .encode()
             .ok()?;
@@ -371,16 +394,19 @@ mod tests {
                 crate::subc::rich_ui::records::files_schema()
             };
             if has_bash_tail(pin) {
-                assert_eq!(view.template_revision, 3);
+                assert_eq!(view.template_revision, 5);
                 schema.revision = 2;
                 schema.completion_fields.insert(
                     "tail".into(),
                     cortexkit_role_tool_display::FieldKind::TextLines,
                 );
-            } else if matches!(entry.tool.name.as_str(), "edit" | "write" | "apply_patch") {
+            } else if matches!(
+                entry.tool.name.as_str(),
+                "bash" | "edit" | "write" | "apply_patch"
+            ) {
                 assert_eq!(view.template_revision, 6);
             } else {
-                assert_eq!(view.template_revision, 4);
+                assert_eq!(view.template_revision, 5);
             }
             assert_eq!(view.record_schema, schema);
             assert!(view.check_pin(pin).unwrap());
@@ -388,17 +414,23 @@ mod tests {
                 serde_json::to_value(view.tool.as_ref().unwrap()).unwrap(),
                 json!({"name":entry.tool.name,"input_schema":entry.tool.input_schema,"semantics":entry.tool.semantics})
             );
-            let published = &entry.history[entry.history.len() - 2];
+            let published = entry.history.iter().rev().nth(1).expect("prior revision");
             assert_eq!(published.template_revision + 1, view.template_revision);
             assert_eq!(published.record_schema, view.record_schema);
             for (slot, profile) in [("row", "tool_row"), ("page", "tool_page")] {
                 let template = &view.template[slot];
                 let mut prior = published.template[slot].clone();
-                assert_eq!(
-                    prior["catalog"]["digest"],
-                    "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
-                );
-                prior["catalog"]["digest"] = json!(current::CATALOG_DIGEST);
+                if entry.tool.name == "bash" {
+                    assert_eq!(prior["catalog"]["digest"], current::CATALOG_DIGEST);
+                    assert_ne!(prior["source"], template["source"]);
+                    prior["source"] = template["source"].clone();
+                } else {
+                    assert_eq!(
+                        prior["catalog"]["digest"],
+                        "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+                    );
+                    prior["catalog"]["digest"] = json!(current::CATALOG_DIGEST);
+                }
                 assert_eq!(*template, prior);
                 assert_eq!(template["schema"], "occipital.template/1");
                 assert_eq!(template["profile"], profile);
@@ -465,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_catalog_serves_a_new_tail_pin_without_changing_the_old_record_schema() {
+    fn bash_catalog_redeclares_both_majors_without_changing_record_schemas() {
         use crate::subc::tool_provider::{tools_for_session, CatalogPreset};
 
         // The canonical template hashes include the declared catalog digest.
@@ -493,19 +525,45 @@ mod tests {
             .values()
             .next()
             .unwrap()["recordSchema"];
-        for remote in [false, true] {
+        for (remote, old_digest) in [
+            (
+                false,
+                "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+            ),
+            (
+                true,
+                "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
+            ),
+        ] {
             let bash = tools_for_session(CatalogPreset::Head, &[], true, remote, false)
                 .into_iter()
                 .find(|tool| tool.name == "bash")
                 .unwrap();
             assert_eq!(bash.semantics, 3);
-            let pin = SchemaPin::new("bash", &bash.schema_digest, bash.semantics)
+            let new_major = bash.schema_pin().encode().unwrap();
+            let old_major = ToolMajorPin::new("bash", old_digest, 1).encode().unwrap();
+            let pin = SchemaPin::new("bash", old_digest, BASH_SEMANTICS)
                 .encode()
                 .unwrap();
-            let old = SchemaPin::new("bash", &bash.schema_digest, 2)
-                .encode()
-                .unwrap();
-            let reply = answer(json!({"pins":[pin,old]})).unwrap();
+            let old = SchemaPin::new("bash", old_digest, 2).encode().unwrap();
+            let reply = answer(json!({"pins":[pin,old,new_major,old_major]})).unwrap();
+            assert!(new_major.ends_with(":2"));
+            assert_ne!(bash.schema_digest, old_digest);
+            for major in [&new_major, &old_major] {
+                assert_eq!(
+                    reply["views"][major]["record_schema"],
+                    reply["views"][&pin]["record_schema"]
+                );
+                assert_eq!(
+                    reply["views"][major]["template"],
+                    reply["views"][&pin]["template"]
+                );
+                assert!(view(major).unwrap().check_pin(major).unwrap());
+            }
+            assert_eq!(
+                reply["views"][&new_major]["tool"]["input_schema"]["required"],
+                json!(["command", "description"])
+            );
             assert_eq!(
                 reply["views"][&old]["record_schema"],
                 serde_json::to_value(&base[&old].history[0].record_schema).unwrap(),
@@ -522,14 +580,14 @@ mod tests {
             assert_template_digests(&SHIPPED[&old].history[1].template, legacy_template_digests);
             assert_template_digests(&SHIPPED[&pin].history[0].template, tail_template_digests);
             assert_template_digests(
-                &reply["views"][&old]["template"],
+                &SHIPPED[&old].history[2].template,
                 [
                     current_row,
                     "fa4592e03878999977e09fc5a181b4d2b2317a3443b7e592d1b86c5b04eb7324",
                 ],
             );
             assert_template_digests(
-                &reply["views"][&pin]["template"],
+                &SHIPPED[&pin].history[1].template,
                 [
                     current_row,
                     "a697eb2d225a8c13069b63ed0b599ae7bc5fad276e5f585ecc8d8ab56d2f298a",

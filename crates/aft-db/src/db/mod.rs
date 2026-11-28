@@ -712,6 +712,7 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
         apply_pragmas_with_timeout(&conn, TOOL_RETRY_BUSY_WAIT)?;
         run_migrations(&mut conn)?;
         ensure_additive_indexes(&conn)?;
+        call_ledger::ensure_first_reply_held(&conn)?;
         display_records::install(&conn)?;
         codemode_owners::install(&conn)?;
         clear_stored_compression_commands(&mut conn)?;
@@ -747,6 +748,7 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
             )?;
             run_migrations(&mut conn)?;
             ensure_additive_indexes(&conn)?;
+            call_ledger::ensure_first_reply_held(&conn)?;
             display_records::install(&conn)?;
             codemode_owners::install(&conn)?;
             clear_stored_compression_commands(&mut conn)?;

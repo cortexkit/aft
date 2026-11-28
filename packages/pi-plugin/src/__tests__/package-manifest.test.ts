@@ -52,29 +52,35 @@ describe("package manifest", () => {
     expect(manifest.files).toContain("THIRD-PARTY-NOTICES.txt");
     const notices = readFileSync(join(import.meta.dir, "../../THIRD-PARTY-NOTICES.txt"), "utf8");
     expect(notices).toContain(`${name} ${version}`);
+    expect(notices).toContain("Copyright (c) 2026 Earendil Inc.");
     expect(notices).toContain("Copyright (c) 2025 Mario Zechner");
   });
 
-  test("the bundle guard detects static imports, re-exports, dynamic imports and require helpers", () => {
-    expect(
-      bundledTuiSpecifiers(`
-        // node_modules/@earendil-works/pi-tui/dist/utils.js
-        import { Text } from '@earendil-works/pi-tui';
-        export { TUI } from '@oh-my-pi/pi-tui';
-        import(\`@oh-my-pi/pi-tui/text/width\`);
-        __require('@earendil-works/pi-tui/dist/index.js');
-        require('@earendil-works/pi-coding-agent');
-      `),
-    ).toEqual([
-      "@earendil-works/pi-tui",
-      "@oh-my-pi/pi-tui",
-      "@oh-my-pi/pi-tui/text/width",
-      "@earendil-works/pi-tui/dist/index.js",
-    ]);
+  test.each([
+    "@earendil-works/pi-tui",
+    "@earendil-works/pi-tui/viewport",
+    "@oh-my-pi/pi-tui",
+  ])("the bundle guard rejects each module load form for %s", (specifier) => {
+    for (const source of [
+      `import '${specifier}';`,
+      `export { TUI } from '${specifier}';`,
+      `import(\`${specifier}\`);`,
+      `require('${specifier}');`,
+      `__require('${specifier}');`,
+      `__require2('${specifier}');`,
+    ]) {
+      expect(bundledTuiSpecifiers(source)).toEqual([specifier]);
+    }
+  });
+
+  test("the bundle guard ignores TUI branding keys and other non-specifier strings", () => {
     expect(
       bundledTuiSpecifiers(`
         // import '@earendil-works/pi-tui'
-        let manifest = { devDependencies: { '@earendil-works/pi-tui': '0.80.2' } };
+        const brand = Symbol.for('@earendil-works/pi-tui/viewport');
+        const packageName = '@earendil-works/pi-tui';
+        console.log('@earendil-works/pi-tui');
+        require('@earendil-works/pi-coding-agent');
       `),
     ).toEqual([]);
   });

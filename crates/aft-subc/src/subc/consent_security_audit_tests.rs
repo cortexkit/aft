@@ -693,7 +693,7 @@ async fn audit_keyed_reply(
         1,
         9499,
         serde_json::to_vec(
-            &json!({"name":name,"preset":"head","arguments":arguments,"call_key":call_key}),
+            &json!({"name":name,"preset":"head","arguments":crate::subc::bash_selector_tests::shell_fixture_arguments(name, arguments),"call_key":call_key}),
         )
         .unwrap(),
     )

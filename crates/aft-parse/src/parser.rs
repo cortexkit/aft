@@ -36,6 +36,7 @@ pub use reusable::reusable_parser_pools_memory;
 #[cfg(any(test, feature = "test-support"))]
 pub use reusable::{parse_source_with_parser_deadline, REUSABLE_PARSERS};
 pub mod todo_markers;
+mod typescript;
 
 const MAX_REEXPORT_DEPTH: usize = 10;
 
@@ -48,118 +49,6 @@ const MAX_REEXPORT_DEPTH: usize = 10;
 pub const MAX_SIGNATURE_BYTES: usize = 1024;
 
 // --- Query patterns embedded at compile time ---
-
-const TS_QUERY: &str = r#"
-;; function declarations
-(function_declaration
-  name: (identifier) @fn.name) @fn.def
-
-;; function-like values assigned to const/let/var
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @arrow.name
-    value: (arrow_function) @arrow.body) @arrow.decl) @arrow.def
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @arrow.name
-    value: (function_expression) @arrow.body) @arrow.decl) @arrow.def
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @arrow.name
-    value: (generator_function) @arrow.body) @arrow.decl) @arrow.def
-
-;; anonymous default exports
-(export_statement
-  value: (function_expression) @default.body) @default.def
-(export_statement
-  value: (generator_function) @default.body) @default.def
-(export_statement
-  value: (class) @default.body) @default.def
-
-;; class declarations
-(class_declaration
-  name: (type_identifier) @class.name) @class.def
-
-;; method definitions inside classes
-(class_declaration
-  name: (type_identifier) @method.class_name
-  body: (class_body
-    (method_definition
-      name: (property_identifier) @method.name) @method.def))
-
-;; callable fields inside classes
-(class_declaration
-  name: (type_identifier) @class_property.class_name
-  body: (class_body
-    (public_field_definition
-      name: (_) @class_property.name
-      value: (arrow_function) @class_property.value) @class_property.def))
-(class_declaration
-  name: (type_identifier) @class_property.class_name
-  body: (class_body
-    (public_field_definition
-      name: (_) @class_property.name
-      value: (function_expression) @class_property.value) @class_property.def))
-
-;; interface declarations and callable members
-(interface_declaration
-  name: (type_identifier) @interface.name) @interface.def
-(interface_declaration
-  name: (type_identifier) @interface_member.interface_name
-  body: (interface_body
-    (method_signature
-      name: (_) @interface_member.name) @interface_member.def))
-(interface_declaration
-  name: (type_identifier) @interface_property.interface_name
-  body: (interface_body
-    (property_signature
-      name: (_) @interface_property.name) @interface_property.def))
-
-;; callable object-literal properties
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (arrow_function) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (function_expression) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (generator_function) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (method_definition
-        name: (_) @object_property.name) @object_property.def)))
-
-;; enum declarations
-(enum_declaration
-  name: (identifier) @enum.name) @enum.def
-
-;; type alias declarations
-(type_alias_declaration
-  name: (type_identifier) @type_alias.name) @type_alias.def
-
-;; top-level const/let variable declarations
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @var.name) @var.decl) @var.def
-
-;; export statement wrappers (top-level only)
-(export_statement) @export.stmt
-"#;
 
 const JS_QUERY: &str = r#"
 ;; function declarations
@@ -859,7 +748,7 @@ fn markdown_line_block_bound(line: &[u8]) -> usize {
 /// Returns the query pattern string for a given LangId, if implemented.
 fn query_for(lang: LangId) -> Option<&'static str> {
     match lang {
-        LangId::TypeScript | LangId::Tsx => Some(TS_QUERY),
+        LangId::TypeScript | LangId::Tsx => Some(typescript::QUERY),
         LangId::JavaScript => Some(JS_QUERY),
         LangId::Python => Some(PY_QUERY),
         LangId::Rust => None,
@@ -3033,10 +2922,9 @@ fn extract_ts_symbols<'tree>(
     let lang = LangId::TypeScript;
     let capture_names = query.capture_names();
 
-    let ExportIndex {
-        ranges: export_ranges,
-        names: exported_names,
-    } = collect_exports(source, root, nav);
+    let exported_names = typescript::named_exports(source, *root);
+    let is_exported =
+        |declaration, name| typescript::is_exported(declaration, name, &exported_names, nav);
 
     let mut symbols = Vec::new();
     let mut variable_names = VariableNameIndex::default();
@@ -3132,13 +3020,14 @@ fn extract_ts_symbols<'tree>(
 
         // Function declaration
         if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Function,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
@@ -3146,13 +3035,14 @@ fn extract_ts_symbols<'tree>(
         // Arrow/function expression declarator
         if let (Some(name_node), Some(def_node)) = (arrow_name_node, arrow_def_node) {
             let range_node = arrow_decl_node.unwrap_or(def_node);
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Function,
                 range: node_range_with_decorators_with(&range_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
@@ -3164,13 +3054,14 @@ fn extract_ts_symbols<'tree>(
 
         // Class declaration
         if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Class,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
@@ -3211,13 +3102,14 @@ fn extract_ts_symbols<'tree>(
 
         // Interface declaration
         if let (Some(name_node), Some(def_node)) = (interface_name_node, interface_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Interface,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
@@ -3298,38 +3190,52 @@ fn extract_ts_symbols<'tree>(
 
         // Enum declaration
         if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::Enum,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
 
         // Type alias
         if let (Some(name_node), Some(def_node)) = (type_alias_name_node, type_alias_def_node) {
+            let name = node_text(source, &name_node);
             symbols.push(Symbol {
-                name: node_text(source, &name_node).to_string(),
+                name: name.to_string(),
                 kind: SymbolKind::TypeAlias,
                 range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
-                exported: is_exported(&def_node, &export_ranges),
+                exported: is_exported(def_node, name),
                 parent: None,
             });
         }
 
         // Top-level const/let variable declaration (not arrow functions — those are handled above)
         if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            let range_node = var_decl_node.unwrap_or(def_node);
+            if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
+                typescript::push_pattern_symbols(
+                    &mut symbols,
+                    source,
+                    name_node,
+                    range_node,
+                    def_node,
+                    &exported_names,
+                    nav,
+                );
+                continue;
+            }
             // Only include module-scope variables (parent is program/export_statement, not inside a function)
             let is_top_level = nav
                 .parent(def_node)
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
-            let range_node = var_decl_node.unwrap_or(def_node);
             let is_function_like = if range_node.kind() == "variable_declarator" {
                 variable_declarator_has_function_value(&range_node)
             } else {
@@ -3343,14 +3249,12 @@ fn extract_ts_symbols<'tree>(
                     range: node_range_with_decorators_with(&range_node, source, lang, nav),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
-                    exported: is_exported(&def_node, &export_ranges),
+                    exported: is_exported(def_node, name),
                     parent: None,
                 });
             }
         }
     }
-
-    mark_named_exports(&mut symbols, &exported_names);
 
     // Deduplicate: methods can appear as both class and method captures
     dedup_symbols(&mut symbols);
@@ -4123,7 +4027,7 @@ fn rust_impl_parent_name(impl_target: &str) -> String {
 
 test_support_visibility! {
 /// Extract symbols from Rust source without compiling a tree-sitter query.
-/// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
+/// Includes functions, types, constants, statics, and associated items.
 ///
 /// tree-sitter parses the body of a `macro_rules!` arm and of an item-position
 /// macro invocation as an opaque token tree, so items written there would be
@@ -4214,6 +4118,14 @@ fn parse_rust_macro_body(source: &str, body: tree_sitter::Range) -> Option<Tree>
     })
 }
 
+fn rust_value_or_type_kind(kind: &str) -> Option<SymbolKind> {
+    match kind {
+        "const_item" | "static_item" => Some(SymbolKind::Variable),
+        "type_item" | "associated_type" => Some(SymbolKind::TypeAlias),
+        _ => None,
+    }
+}
+
 /// Walk one Rust syntax tree, appending its symbols and queueing the bodies of
 /// item-position macros for a separate parse.
 fn extract_rs_symbols_from_root<'tree>(
@@ -4241,13 +4153,14 @@ fn extract_rs_symbols_from_root<'tree>(
 
     // Inside a `macro_rules!` template an item may be named by a metavariable
     // such as `$name`. That is a placeholder filled in per invocation, not a
-    // symbol anyone can look up, so such items are left out.
+    // symbol anyone can look up. Likewise, `const _` has no lookup name.
     let symbol_name = |node: &Node<'_>| -> Option<String> {
         let name_node = node.child_by_field_name("name")?;
-        if name_node.kind() == "metavariable" {
+        let name = node_text(source, &name_node);
+        if name_node.kind() == "metavariable" || name == "_" {
             return None;
         }
-        Some(node_text(source, &name_node).to_string())
+        Some(name.to_string())
     };
 
     let item_symbol = |node: Node<'tree>, kind: SymbolKind| -> Option<Symbol> {
@@ -4307,17 +4220,10 @@ fn extract_rs_symbols_from_root<'tree>(
                     declaration_list_owner.is_some_and(|owner| nav.kind(owner) != "mod_item");
 
                 if !in_non_module_declaration_list {
-                    if let Some(name) = symbol_name(&node) {
-                        let scope_chain = rust_mod_scope_chain(&node, source, nav);
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::Function,
-                            range: node_range_with_decorators_with(&node, source, lang, nav),
-                            signature: Some(extract_signature(source, &node)),
-                            scope_chain: scope_chain.clone(),
-                            exported: is_pub(&node),
-                            parent: scope_chain.last().cloned(),
-                        });
+                    if let Some(mut symbol) = item_symbol(node, SymbolKind::Function) {
+                        symbol.scope_chain = rust_mod_scope_chain(&node, source, nav);
+                        symbol.parent = symbol.scope_chain.last().cloned();
+                        symbols.push(symbol);
                     }
                 }
             }
@@ -4337,75 +4243,58 @@ fn extract_rs_symbols_from_root<'tree>(
                 }
             }
             "impl_item" => {
-                let mut type_names = Vec::new();
                 let mut child_cursor = node.walk();
-                if child_cursor.goto_first_child() {
-                    loop {
-                        let child = child_cursor.node();
-                        if child.kind() == "type_identifier" || child.kind() == "generic_type" {
-                            type_names.push(node_text(source, &child).to_string());
-                        }
-                        if !child_cursor.goto_next_sibling() {
-                            break;
-                        }
-                    }
-                }
-
-                let scope_name = if type_names.len() >= 2 {
-                    format!("{} for {}", type_names[0], type_names[1])
-                } else {
-                    type_names.first().cloned().unwrap_or_default()
+                let type_names: Vec<_> = node
+                    .children(&mut child_cursor)
+                    .filter(|child| matches!(child.kind(), "type_identifier" | "generic_type"))
+                    .map(|child| node_text(source, &child))
+                    .collect();
+                let scope_name = match type_names.as_slice() {
+                    [trait_name, target, ..] => Some(format!("{trait_name} for {target}")),
+                    [target] => Some(target.to_string()),
+                    [] => None,
                 };
-                let parent_name = type_names
-                    .last()
-                    .map(|name| rust_impl_parent_name(name))
-                    .unwrap_or_default();
+                let parent_name = type_names.last().map(|name| rust_impl_parent_name(name));
 
-                let mut child_cursor = node.walk();
-                if child_cursor.goto_first_child() {
-                    loop {
-                        let child = child_cursor.node();
-                        if child.kind() == "declaration_list" {
-                            let mut method_cursor = child.walk();
-                            if method_cursor.goto_first_child() {
-                                loop {
-                                    let method = method_cursor.node();
-                                    if method.kind() == "function_item" {
-                                        if let Some(name) = symbol_name(&method) {
-                                            symbols.push(Symbol {
-                                                name,
-                                                kind: SymbolKind::Method,
-                                                range: node_range_with_decorators_with(
-                                                    &method, source, lang, nav,
-                                                ),
-                                                signature: Some(extract_signature(source, &method)),
-                                                scope_chain: if scope_name.is_empty() {
-                                                    Vec::new()
-                                                } else {
-                                                    vec![scope_name.clone()]
-                                                },
-                                                exported: is_pub(&method),
-                                                parent: if parent_name.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(parent_name.clone())
-                                                },
-                                            });
-                                        }
-                                    }
-                                    if !method_cursor.goto_next_sibling() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if !child_cursor.goto_next_sibling() {
-                            break;
+                if let Some(body) = node.child_by_field_name("body") {
+                    for item in body.named_children(&mut body.walk()) {
+                        let kind = match item.kind() {
+                            "function_item" => Some(SymbolKind::Method),
+                            kind => rust_value_or_type_kind(kind),
+                        };
+                        if let Some(mut symbol) = kind.and_then(|kind| item_symbol(item, kind)) {
+                            symbol.scope_chain = scope_name.iter().cloned().collect();
+                            symbol.parent = parent_name.clone();
+                            symbols.push(symbol);
                         }
                     }
                 }
             }
-            _ => {}
+            _ => {
+                if let Some(kind) = rust_value_or_type_kind(kind) {
+                    let parent = nav.parent(node);
+                    let scope_chain = match parent.map(|parent| nav.kind(parent)) {
+                        Some("source_file") => Some(Vec::new()),
+                        Some("declaration_list") => parent.and_then(|parent| {
+                            let owner = nav.parent(parent)?;
+                            match nav.kind(owner) {
+                                "mod_item" => Some(rust_mod_scope_chain(&node, source, nav)),
+                                "trait_item" => Some(vec![symbol_name(&owner)?]),
+                                // The impl arm collects its own children with the method scope.
+                                _ => None,
+                            }
+                        }),
+                        _ => None,
+                    };
+                    if let Some(scope_chain) = scope_chain {
+                        if let Some(mut symbol) = item_symbol(node, kind) {
+                            symbol.parent = scope_chain.last().cloned();
+                            symbol.scope_chain = scope_chain;
+                            symbols.push(symbol);
+                        }
+                    }
+                }
+            }
         }
         true
     });

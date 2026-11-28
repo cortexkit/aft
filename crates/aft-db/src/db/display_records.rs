@@ -27,6 +27,7 @@ CREATE INDEX IF NOT EXISTS idx_display_records_expiry ON display_records (
 "#;
 
 const EXPIRY: &str = "CASE WHEN wake_acked_at_ms IS NULL THEN announced_at_ms + 86400000 ELSE wake_acked_at_ms + 600000 END";
+pub const AWAITED_NOTICE_PREFIX: &str = "notice:awaited:";
 
 pub(super) fn install(conn: &Connection) -> rusqlite::Result<()> {
     // This optional delivery cache is outside the numbered schema: no older
@@ -176,6 +177,112 @@ pub fn read(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<Option
         |row| row.get(0),
     )
     .optional()
+}
+
+/// Keep the original record and its publication receipt on a replay of the
+/// same shell result. The record key is already fixed for that event.
+pub fn persist_awaited_notice(
+    conn: &Connection,
+    id: &str,
+    bytes: &[u8],
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    if read(conn, id, now_ms)?.is_some() {
+        return Ok(true);
+    }
+    persist(conn, id, bytes, now_ms)
+}
+
+pub fn prepare_awaited_notice(
+    conn: &Connection,
+    id: &str,
+    bytes: &[u8],
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    if read(conn, id, now_ms)?.is_some() {
+        return Ok(true);
+    }
+    // A late database job may commit after the caller's card deadline. Store
+    // it under a draft ID so the publisher cannot announce it unless the
+    // orchestrator request links to the card.
+    persist_awaited_notice(conn, &format!("draft:{id}"), bytes, now_ms)
+}
+
+pub fn commit_awaited_notice(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<bool> {
+    if !available(conn)? {
+        return Ok(false);
+    }
+    if read(conn, id, now_ms)?.is_some() {
+        return Ok(true);
+    }
+    // A zero announcement timestamp marks a readable card that does not yet
+    // have a pointer in an orchestrator request. It is not a pending wake.
+    Ok(conn.execute(
+        &format!(
+            "UPDATE display_records SET record_id=?1, announced_at_ms=0, wake_acked_at_ms=?3
+            WHERE record_id=?2 AND {EXPIRY} >= ?3
+              AND NOT EXISTS (SELECT 1 FROM display_records WHERE record_id=?1)"
+        ),
+        params![id, format!("draft:{id}"), now_ms],
+    )? == 1)
+}
+
+pub fn activate_awaited_notice(conn: &Connection, id: &str, now_ms: i64) -> rusqlite::Result<()> {
+    if available(conn)? {
+        conn.execute(
+            "UPDATE display_records SET announced_at_ms=?2, wake_acked_at_ms=NULL
+            WHERE record_id=?1 AND announced_at_ms=0",
+            params![id, now_ms],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn discard_unlinked_notice(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    if available(conn)? {
+        conn.execute("DELETE FROM display_records WHERE record_id=?1 OR (record_id=?2 AND announced_at_ms=0)",
+            params![format!("draft:{id}"), id])?;
+    }
+    Ok(())
+}
+
+/// Only linked notices use the persistent queue. Selecting one row by its key
+/// prefix avoids loading display bodies or replaying legacy announcements.
+pub fn pending_awaited_notice(
+    conn: &Connection,
+    now_ms: i64,
+    deferred: &[String],
+) -> rusqlite::Result<Option<String>> {
+    if !available(conn)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT record_id FROM display_records
+         WHERE record_id >= ?1 AND record_id < 'notice:awaited;'
+           AND wake_acked_at_ms IS NULL AND announced_at_ms + 86400000 >= ?2
+           AND record_id NOT IN (SELECT value FROM json_each(?3))
+         ORDER BY record_id LIMIT 1",
+        params![
+            AWAITED_NOTICE_PREFIX,
+            now_ms,
+            serde_json::to_string(deferred).expect("record ids are serializable")
+        ],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+pub fn count_pending_awaited_notices(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
+    if !available(conn)? {
+        return Ok(0);
+    }
+    conn.query_row(
+        "SELECT count(*) FROM display_records
+         WHERE record_id >= ?1 AND record_id < 'notice:awaited;'
+           AND wake_acked_at_ms IS NULL AND announced_at_ms + 86400000 >= ?2",
+        params![AWAITED_NOTICE_PREFIX, now_ms],
+        |row| row.get(0),
+    )
 }
 
 #[cfg(test)]

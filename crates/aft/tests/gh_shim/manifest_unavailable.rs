@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 
 const UNAVAILABLE: &str = "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.\n";
+const UNPINNED: &str = "gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this shell has no usable pinned policy root. Start a new shell. If the problem persists, ask the operator to check the daemon and run `ck policy-root set` if no root is pinned. Known safe commands still work.\n";
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -55,6 +56,10 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_STATE_HOME", &self.state_home)
             .env("AFT_GH_SHIM_STATE_DIR", &self.state)
+            .env(
+                "AFT_GH_SHIM_TRUST_ANCHOR",
+                crate::test_helpers::gh_fixture_anchor(),
+            )
             .env("AFT_STORAGE_DIR", self._root.path().join("storage"))
             .env("PATH", &self.bin)
             .env("GH_REPO", "cortexkit/aft")
@@ -76,6 +81,12 @@ impl Fixture {
         let connection = self._root.path().join("connection.json");
         daemon.write_connection_file(&connection);
         write_user_config(&self.config, &connection, Some(true));
+    }
+
+    fn disable_shim(&self) {
+        let directory = self.config.join("cortexkit");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("aft.jsonc"), r#"{"github":{"shim":false}}"#).unwrap();
     }
 
     fn assert_passthrough(&self, args: &[&str], bypass: bool) {
@@ -156,6 +167,7 @@ impl Fixture {
 #[test]
 fn gh_shim_manifest_unavailable_invalid_without_cache() {
     let fixture = Fixture::new();
+    write_fresh_manifest(&fixture.state_home, unix_seconds());
     fixture.high_water();
     fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
     assert!(!fixture.state.join("last-valid-manifest.json").exists());
@@ -166,7 +178,159 @@ fn gh_shim_manifest_unavailable_invalid_without_cache() {
 fn gh_shim_manifest_unavailable_initially_dormant_provisioned() {
     let fixture = Fixture::new();
     fixture.high_water();
-    fixture.assert_unavailable();
+    fixture.assert_refused(
+        &["issue", "comment", "1", "--body", "offline"],
+        false,
+        UNPINNED,
+    );
+}
+
+#[test]
+fn gh_shim_launch_marker_blocks_writes_before_a_pin_is_available() {
+    let fixture = Fixture::new();
+    let write = ["issue", "comment", "1", "--body", "not native"];
+    let output = fixture
+        .command(&write, false)
+        .env("AFT_GH_SHIM_ENABLED", "1")
+        .env_remove("AFT_GH_SHIM_TRUST_ANCHOR")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    assert_eq!(output.stderr, UNPINNED.as_bytes());
+    assert!(!fixture.record.exists());
+    fixture.assert_passthrough(&write, false);
+}
+
+#[test]
+fn gh_shim_generation_record_alone_blocks_writes() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.state.join("trust-root-generation.json"),
+        "untrusted history",
+    )
+    .unwrap();
+    fixture.assert_refused(
+        &["issue", "comment", "1", "--body", "not native"],
+        false,
+        UNPINNED,
+    );
+    fixture.assert_passthrough(&["issue", "view", "1"], false);
+}
+
+#[test]
+fn gh_shim_final_policy_check_runs_after_the_native_ticket_lookup() {
+    let fixture = Fixture::new();
+    fixture.activate();
+    fs::remove_file(&fixture.record).unwrap();
+    let manifest = fixture.state.join("gh-routing-manifest.json");
+    let daemon = SlowTestDaemon::spawn_removing_during_session_lookup(manifest.clone());
+    fixture.connect_daemon(&daemon);
+    let output = fixture
+        .command(
+            &[
+                "issue",
+                "comment",
+                "1",
+                "--body",
+                "not native",
+                "-R",
+                "outside/unbound",
+            ],
+            true,
+        )
+        .env("AFT_GH_SHIM_TICKET", "synthetic-head-ticket")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .unwrap();
+    assert!(
+        !manifest.exists(),
+        "the fake daemon did not receive the lookup: {output:?}"
+    );
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    assert_eq!(output.stderr, b"gh-shim: gh_shim_manifest_unavailable: GitHub routing policy changed before the command could run. Start the command again.\n");
+    assert!(!fixture.record.exists());
+}
+
+fn assert_old_anchor_after_recorded_transition(current: Option<&str>) {
+    let fixture = Fixture::new();
+    fixture.activate();
+    let policy_marker = fixture.state.join("trust-root-generation.json");
+    let old_key = "21fe31dfa154a261";
+    let args = [
+        "issue",
+        "comment",
+        "1",
+        "--body",
+        "not native",
+        "-R",
+        "outside/unbound",
+    ];
+    let run = || {
+        fixture
+            .command(&args, true)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .output()
+            .unwrap()
+    };
+    // The cached trust file and the shell anchor both carry generation 1.
+    // A benign rollback of the daemon generation does not retire its key.
+    fs::write(
+        &policy_marker,
+        serde_json::to_vec(
+            &json!({"generation": 2, "current_key_id": old_key, "previous_key_ids": []}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let allowed = run();
+    assert_eq!(allowed.status.code(), Some(73), "{allowed:?}");
+    fs::remove_file(&fixture.record).unwrap();
+
+    // Model a durable history update followed by a failed root-file update.
+    fs::write(
+        &policy_marker,
+        serde_json::to_vec(
+            &json!({"generation": 2, "current_key_id": current, "previous_key_ids": [old_key]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run();
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    assert_eq!(output.stderr, UNPINNED.as_bytes());
+    assert!(!fixture.record.exists());
+}
+
+#[test]
+fn gh_shim_recorded_rotation_refuses_an_old_anchor_after_partial_publication() {
+    assert_old_anchor_after_recorded_transition(Some("0123456789abcdef"));
+}
+
+#[test]
+fn gh_shim_recorded_clear_refuses_an_old_anchor_after_partial_publication() {
+    assert_old_anchor_after_recorded_transition(None);
+}
+
+#[test]
+fn gh_shim_recorded_retirement_refuses_an_old_anchor_even_if_current_key_matches() {
+    assert_old_anchor_after_recorded_transition(Some("21fe31dfa154a261"));
+}
+
+#[test]
+fn gh_shim_manifest_unavailable_pin_removed_after_acceptance_refuses_writes() {
+    let fixture = Fixture::new();
+    fixture.activate();
+    fs::remove_file(fixture.state.join("trust-root.json")).unwrap();
+    for bypass in [false, true] {
+        fixture.assert_refused(
+            &["issue", "comment", "1", "--body", "offline"],
+            bypass,
+            UNPINNED,
+        );
+        fixture.assert_passthrough(&["pr", "view", "1"], bypass);
+    }
 }
 
 #[test]
@@ -178,7 +342,14 @@ fn gh_shim_manifest_unavailable_unreadable() {
     // A symlink loop makes the read fail even when the test runner is root.
     std::os::unix::fs::symlink("gh-routing-manifest.json", &manifest).unwrap();
     assert!(fs::read(manifest).is_err());
-    fixture.assert_unavailable();
+    for bypass in [false, true] {
+        fixture.assert_refused(
+            &["issue", "comment", "1", "--body", "offline"],
+            bypass,
+            "gh-shim: gh_shim_manifest_regressed: the manifest artifact fails validation; issue comment is refused until the manifest is repaired\n",
+        );
+        fixture.assert_passthrough(&["pr", "view", "1"], bypass);
+    }
 }
 
 #[test]
@@ -260,38 +431,47 @@ fn gh_shim_manifest_unavailable_uninspectable_provisioning_records() {
 }
 
 #[test]
-fn gh_shim_manifest_unavailable_unprovisioned_passthrough_is_unchanged() {
+fn gh_shim_manifest_unavailable_standalone_passes_writes_only_without_artifacts() {
     let fixture = Fixture::new();
-    for invalid in [false, true] {
-        if invalid {
-            fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
-        }
+    assert!(!fixture.state.join("trust-root.json").exists());
+    let write = ["issue", "comment", "1", "--body", "offline"];
+    for bypass in [false, true] {
+        fixture.assert_passthrough(&write, bypass);
+    }
+    for artifact in ["gh-routing-manifest.json", "trust-root.json"] {
+        let artifact = fixture.state.join(artifact);
+        fs::write(&artifact, "{invalid").unwrap();
         for bypass in [false, true] {
-            fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], bypass);
+            // A malformed pin is invalid rather than missing.
+            let refusal = if artifact.ends_with("trust-root.json") {
+                UNAVAILABLE
+            } else {
+                UNPINNED
+            };
+            fixture.assert_refused(&write, bypass, refusal);
             fixture.assert_passthrough(&["pr", "view", "1"], bypass);
         }
+        fs::remove_file(artifact).unwrap();
     }
 }
 
 #[test]
-fn gh_shim_manifest_unavailable_fresh_with_write_relay_refuses_writes_but_passes_reads() {
+fn gh_shim_manifest_unavailable_write_relay_does_not_replace_manifest_history() {
     let fixture = Fixture::new();
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig::default());
     fixture.connect_daemon(&daemon);
 
+    let write = ["issue", "comment", "1", "--body", "offline"];
     for bypass in [false, true] {
+        fixture.assert_passthrough(&write, bypass);
+    }
+
+    fixture.high_water();
+    for bypass in [false, true] {
+        fixture.assert_refused(&write, bypass, UNPINNED);
         fixture.assert_passthrough(&["issue", "view", "1"], bypass);
     }
-    assert_eq!(daemon.catalog_requests(), 0, "reads need no catalog lookup");
-
-    for bypass in [false, true] {
-        fixture.assert_refused(
-            &["issue", "comment", "1", "--body", "offline"],
-            bypass,
-            UNAVAILABLE,
-        );
-    }
-    assert_eq!(daemon.catalog_requests(), 2);
+    assert_eq!(daemon.catalog_requests(), 0);
 }
 
 #[test]
@@ -303,11 +483,11 @@ fn gh_shim_manifest_unavailable_fresh_with_read_only_relay_passes_writes() {
     for bypass in [false, true] {
         fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], bypass);
     }
-    assert_eq!(daemon.catalog_requests(), 2, "one catalog lookup per write");
+    assert_eq!(daemon.catalog_requests(), 0);
 }
 
 #[test]
-fn gh_shim_manifest_unavailable_fresh_with_catalog_timeout_refuses_writes() {
+fn gh_shim_manifest_unavailable_without_history_does_not_query_slow_catalog() {
     let fixture = Fixture::new();
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
         catalog_delay: Duration::from_secs(30),
@@ -315,16 +495,134 @@ fn gh_shim_manifest_unavailable_fresh_with_catalog_timeout_refuses_writes() {
     });
     fixture.connect_daemon(&daemon);
 
-    fixture.assert_refused(
-        &["issue", "comment", "1", "--body", "offline"],
-        true,
-        UNAVAILABLE,
-    );
-    assert_eq!(
-        daemon.catalog_requests(),
-        1,
-        "timeout must reach the catalog"
-    );
+    fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], true);
+    assert_eq!(daemon.catalog_requests(), 0);
+}
+
+#[test]
+fn gh_shim_live_off_delegates_when_a_provisioned_manifest_is_missing_or_invalid() {
+    let fixture = Fixture::new();
+    fixture.high_water();
+    let write = ["issue", "comment", "1", "--body", "offline"];
+    fixture.assert_refused(&write, false, UNPINNED);
+
+    fixture.disable_shim();
+    for invalid in [false, true] {
+        if invalid {
+            fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
+        }
+        for bypass in [false, true] {
+            fixture.assert_passthrough(&write, bypass);
+            fixture.assert_passthrough(&["auth", "status"], bypass);
+        }
+    }
+}
+
+#[test]
+fn gh_shim_live_off_delegates_when_the_manifest_has_regressed() {
+    let fixture = Fixture::new();
+    fixture.activate();
+    fs::write(fixture.state.join("gh-routing-manifest.json"), "{invalid").unwrap();
+    fixture.disable_shim();
+    for bypass in [false, true] {
+        fixture.assert_passthrough(&["issue", "comment", "1", "--body", "offline"], bypass);
+        fixture.assert_passthrough(&["pr", "merge", "1"], bypass);
+    }
+}
+
+#[test]
+fn gh_shim_live_off_skips_captured_and_worker_shim_policies() {
+    let fixture = Fixture::new();
+    fixture.high_water();
+    fixture.disable_shim();
+    let write = ["issue", "comment", "1", "--body", "offline"];
+    for policy in ["AFT_GH_SPEECH_PROVISIONED", "AFT_GH_WORKER_WRITE_POLICY"] {
+        let output = fixture
+            .command(&write, false)
+            .env(policy, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{policy}: {output:?}");
+        assert!(output.stderr.is_empty(), "{policy}: {output:?}");
+    }
+}
+
+#[test]
+fn gh_shim_live_off_does_not_bypass_native_worker_guard() {
+    let fixture = Fixture::new();
+    fixture.high_water();
+    fixture.disable_shim();
+    let output = fixture
+        .command(&["issue", "comment", "1", "--body", "offline"], false)
+        .env("AFT_GH_SHIM_WORKER", "1")
+        .env("AFT_GH_WORKER_WRITE_POLICY", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("gh_shim_worker_native_gh"));
+    assert!(!fixture.record.exists());
+}
+
+#[test]
+fn gh_shim_live_off_affects_new_children_but_not_an_already_launched_child() {
+    use aft::config::Config;
+    use std::io::Write;
+    use std::process::{Child, Stdio};
+
+    let fixture = Fixture::new();
+    fixture.high_water();
+    let storage = fixture._root.path().join("storage");
+    let mut enabled = Config::default();
+    enabled.github.shim = true;
+    enabled.git.co_author = "auto".into();
+    enabled.gh_shim.binary_path = Some(aft_binary());
+    let spawn = |config: &Config| {
+        let mut env = fixture
+            .command(&[], false)
+            .get_envs()
+            .map(|(key, val)| {
+                (
+                    key.to_str().unwrap().to_owned(),
+                    val.unwrap().to_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        aft::agent_child_env::inject(config, &storage, &mut env, None).unwrap();
+        Command::new("/bin/sh")
+            .env_clear()
+            .envs(env)
+            .env("AFT_STORAGE_DIR", &storage)
+            .env("AFT_GH_SHIM_STATE_DIR", &fixture.state)
+            .arg("-c")
+            .arg("read -r go || exit; printf '%s\\n' \"${AFT_GH_SHIM_ENABLED-unset}\"; exec gh issue comment 1 --body offline")
+            .current_dir(&fixture.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let finish = |mut child: Child| {
+        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let old_child = spawn(&enabled);
+    fixture.disable_shim();
+    let mut candidate = enabled.clone();
+    candidate.github.shim = false;
+    let live = aft::config_live::apply_live_config(&enabled, &candidate, &enabled);
+    let new = finish(spawn(&live.next));
+    assert_eq!(new.status.code(), Some(73), "{new:?}");
+    assert_eq!(new.stdout, b"unset\n");
+    assert!(new.stderr.is_empty(), "{new:?}");
+    fs::remove_file(&fixture.record).unwrap();
+
+    let old = finish(old_child);
+    assert_eq!(old.status.code(), Some(86), "{old:?}");
+    assert_eq!(old.stdout, b"1\n");
+    assert_eq!(old.stderr, UNPINNED.as_bytes());
+    assert!(!fixture.record.exists());
 }
 
 #[test]

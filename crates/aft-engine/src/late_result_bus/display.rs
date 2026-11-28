@@ -204,6 +204,17 @@ pub(crate) async fn publish_one(publisher: &(impl ReadyPublisher + Sync), hooks:
         return;
     };
     let Some((id, pull_bytes)) = (hooks.take_due_read)() else {
+        if notice_reader().ok().flatten().is_some() {
+            match (hooks.publish_awaited)(Box::new(|id| {
+                Box::pin(async move { publisher.ready(&id, body(&id)?).await })
+            }))
+            .await
+            {
+                Ok(Some(id)) => completed(hooks, &id, Ok(())),
+                Ok(None) => {}
+                Err(error) => completed(hooks, "", Err(error)),
+            }
+        }
         return;
     };
     let result = announce(

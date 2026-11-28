@@ -1576,7 +1576,7 @@ fn describe_session_agent_mismatch(
     let handle = load_check(paths)
         .filter(|check| check.manifest_version == manifest.manifest_version)
         .and_then(|check| check.handles.get(&binding.repo).cloned())
-        .filter(|handle| super::valid_github_login(handle));
+        .filter(|handle| valid_github_login(handle));
     let identity = handle
         .map(|handle| format!("{handle} ({agent})"))
         .unwrap_or_else(|| agent.clone());
@@ -1587,6 +1587,17 @@ fn describe_session_agent_mismatch(
             binding.repo
         ),
     }
+}
+
+fn valid_github_login(login: &str) -> bool {
+    let core = login.strip_suffix("[bot]").unwrap_or(login);
+    !core.is_empty()
+        && core.len() <= 100
+        && !core.starts_with('-')
+        && !core.ends_with('-')
+        && core
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 #[cfg(test)]

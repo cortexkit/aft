@@ -1,6 +1,6 @@
 //! Best-effort attribution of agent shell roots over the supervised connection.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,6 +9,50 @@ use std::time::Duration;
 use subc_client_rs::{AgentCommandFinished, AgentCommandRoot, AgentCommandsError};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+use crate::process_identity::{LinuxBirth, ProcessIdentity};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedRoot {
+    #[serde(flatten)]
+    root: AgentCommandRoot,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    native_birth: Option<LinuxBirth>,
+}
+
+impl SavedRoot {
+    fn is_current(&self) -> bool {
+        root_identity(self.root.pid).is_some_and(|current| {
+            current.same_process(&ProcessIdentity {
+                pid: self.root.pid,
+                started_at_ms: self.root.start_time_ms,
+                native_birth: self.native_birth.clone(),
+            })
+        })
+    }
+}
+
+fn root_identity(pid: u32) -> Option<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::process_identity::{linux_start_time_ms, read_boot_time_secs};
+        let ticks = subc_os::start_time(pid)?;
+        Some(ProcessIdentity {
+            pid,
+            // Declarations to the daemon use a fresh epoch conversion at launch.
+            // Restored roots still send their original epoch, not this reading.
+            started_at_ms: linux_start_time_ms(ticks, read_boot_time_secs()?)?,
+            native_birth: LinuxBirth::from_start_ticks(ticks),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(ProcessIdentity::from_epoch(
+            pid,
+            subc_os::process_start_time_ms(pid)?,
+        ))
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Batch {
@@ -26,7 +70,7 @@ enum Event {
 
 #[derive(Default)]
 struct State {
-    live: BTreeSet<AgentCommandRoot>,
+    live: BTreeMap<AgentCommandRoot, Option<LinuxBirth>>,
     adopted: BTreeSet<AgentCommandRoot>,
     events: VecDeque<(u64, Event)>,
     sequence: u64,
@@ -57,31 +101,32 @@ impl Declarations {
         let path = storage.join("agent-command-roots.json");
         let roots = std::fs::read(&path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Vec<AgentCommandRoot>>(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<Vec<SavedRoot>>(&bytes).ok())
             .unwrap_or_default();
         self.state.lock().unwrap_or_else(|e| e.into_inner()).storage = Some(path);
         for root in roots {
-            if subc_os::process_start_time_ms(root.pid) == Some(root.start_time_ms) {
+            if root.is_current() {
                 self.restored(root);
             }
         }
     }
 
-    fn started(&self, root: AgentCommandRoot) {
+    fn started(&self, root: AgentCommandRoot, native_birth: Option<LinuxBirth>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.live.insert(root);
+        state.live.insert(root, native_birth);
         state.adopted.remove(&root);
         state.push(Event::Started(root));
         drop(state);
         self.changed.notify_one();
     }
 
-    fn restored(&self, root: AgentCommandRoot) {
+    fn restored(&self, saved: SavedRoot) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.live.insert(root) {
+        let std::collections::btree_map::Entry::Vacant(entry) = state.live.entry(saved.root) else {
             return;
-        }
-        state.adopted.insert(root);
+        };
+        entry.insert(saved.native_birth);
+        state.adopted.insert(saved.root);
         state.push(Event::Restored);
         drop(state);
         self.changed.notify_one();
@@ -89,7 +134,7 @@ impl Declarations {
 
     fn finished(&self, root: AgentCommandRoot, cpu_ms: Option<u64>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.live.remove(&root) {
+        if state.live.remove(&root).is_none() {
             return;
         }
         state.adopted.remove(&root);
@@ -117,7 +162,7 @@ impl Declarations {
             }
         }
         if known {
-            batch.known = Some(state.live.iter().copied().collect());
+            batch.known = Some(state.live.keys().copied().collect());
         }
         batch
     }
@@ -216,17 +261,22 @@ impl Declarations {
     fn prune_exited(&self) {
         // Only adopted roots need liveness polling. An owned child's waiter must
         // publish its CPU before a missing process-table entry can erase it.
-        let roots: Vec<_> = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .adopted
-            .iter()
-            .copied()
-            .collect();
+        let roots: Vec<_> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .adopted
+                .iter()
+                .filter_map(|root| {
+                    state.live.get(root).map(|birth| SavedRoot {
+                        root: *root,
+                        native_birth: birth.clone(),
+                    })
+                })
+                .collect()
+        };
         for root in roots {
-            if subc_os::process_start_time_ms(root.pid) != Some(root.start_time_ms) {
-                self.finished(root, None);
+            if !root.is_current() {
+                self.finished(root.root, None);
             }
         }
     }
@@ -239,7 +289,14 @@ impl Declarations {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 state.storage.clone(),
-                state.live.iter().copied().collect::<Vec<_>>(),
+                state
+                    .live
+                    .iter()
+                    .map(|(root, birth)| SavedRoot {
+                        root: *root,
+                        native_birth: birth.clone(),
+                    })
+                    .collect::<Vec<_>>(),
             )
         };
         if let Some(path) = path {
@@ -310,11 +367,12 @@ pub fn started(pid: u32) -> Option<AgentCommandRoot> {
     {
         return None;
     }
+    let identity = root_identity(pid)?;
     let root = AgentCommandRoot {
         pid,
-        start_time_ms: subc_os::process_start_time_ms(pid)?,
+        start_time_ms: identity.started_at_ms,
     };
-    declarations().started(root);
+    declarations().started(root, identity.native_birth);
     Some(root)
 }
 
@@ -531,6 +589,79 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn clock_step_restores_agent_command_root_and_sends_original_epoch() {
+        use crate::process_identity::with_linux_boot_time_for_test;
+        let directory = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pid = std::process::id();
+        let saved = with_linux_boot_time_for_test(100, || root_identity(pid).unwrap());
+        let root = AgentCommandRoot {
+            pid,
+            start_time_ms: saved.started_at_ms,
+        };
+        let legacy = AgentCommandRoot {
+            start_time_ms: root.start_time_ms + 1,
+            ..root
+        };
+        let first = Declarations::default();
+        first.load(directory.path());
+        first.started(root, saved.native_birth);
+        first.started(legacy, None);
+        rt.block_on(first.persist());
+
+        let bytes = std::fs::read(directory.path().join("agent-command-roots.json")).unwrap();
+        let rollback: Vec<AgentCommandRoot> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rollback, vec![root, legacy]);
+        let saved: Vec<SavedRoot> = serde_json::from_slice(&bytes).unwrap();
+        assert!(saved[0].native_birth.is_some());
+        assert!(saved[1].native_birth.is_none());
+
+        with_linux_boot_time_for_test(200, || {
+            rt.block_on(async {
+                assert_ne!(
+                    root_identity(pid).unwrap().started_at_ms,
+                    root.start_time_ms
+                );
+                let replay = Arc::new(Declarations::default());
+                replay.load(directory.path());
+                let (connection, mut rx) = sender(&replay);
+                let (batch, reply) = receive_after_persist(&mut rx, "clock-step replay").await;
+                assert_eq!(batch.known, Some(vec![root]));
+                assert!(batch.started.is_empty());
+                assert!(batch.finished.is_empty());
+                reply.send(Ok(())).unwrap();
+                connection.stop().await;
+
+                replay
+                    .state
+                    .lock()
+                    .unwrap()
+                    .live
+                    .get_mut(&root)
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .start_ticks += 1;
+                replay.prune_exited();
+                let finished = replay.batch(true);
+                assert!(finished.known.unwrap().is_empty());
+                assert_eq!(
+                    finished.finished,
+                    vec![AgentCommandFinished {
+                        pid,
+                        start_time_ms: root.start_time_ms,
+                        cpu_ms: None,
+                    }]
+                );
+            })
+        });
+    }
+
+    #[test]
     fn agent_commands_reused_pid_finishes_only_the_original_kernel_identity() {
         let hub = Declarations::default();
         let old = root(42);
@@ -538,8 +669,8 @@ mod tests {
             start_time_ms: old.start_time_ms + 1,
             ..old
         };
-        hub.started(old);
-        hub.started(new);
+        hub.started(old, None);
+        hub.started(new, None);
         hub.finished(old, Some(250));
         let batch = hub.batch(true);
         assert_eq!(batch.known, Some(vec![new]));
@@ -564,8 +695,8 @@ mod tests {
         let hub = Arc::new(Declarations::default());
         let live = root(42);
         let ended = root(43);
-        hub.started(live);
-        hub.started(ended);
+        hub.started(live, None);
+        hub.started(ended, None);
         hub.finished(ended, Some(250));
         let (connection, mut rx) = sender(&hub);
         let (batch, reply) = receive(&mut rx).await;
@@ -600,7 +731,7 @@ mod tests {
     async fn agent_commands_busy_retries_the_same_roots_before_later_finishes() {
         let hub = Arc::new(Declarations::default());
         let live = root(42);
-        hub.started(live);
+        hub.started(live, None);
         let (_connection, mut rx) = sender(&hub);
         let (first, reply) = receive(&mut rx).await;
         reply
@@ -628,7 +759,7 @@ mod tests {
         let (_, reply) = receive(&mut rx).await;
         reply.send(Err(AgentCommandsError::Unsupported)).unwrap();
         tokio::task::yield_now().await;
-        hub.started(root(42));
+        hub.started(root(42), None);
         assert!(rx.recv().await.is_none());
         assert!(hub.state.lock().unwrap().events.is_empty());
     }
@@ -636,7 +767,7 @@ mod tests {
     #[tokio::test]
     async fn agent_commands_reconnect_cancels_the_stale_connection_and_keeps_unacked_roots() {
         let hub = Arc::new(Declarations::default());
-        hub.started(root(42));
+        hub.started(root(42), None);
         let (_old, mut first) = sender(&hub);
         let (_, old_reply) = receive(&mut first).await;
         let (_current, mut current) = sender(&hub);
@@ -655,7 +786,7 @@ mod tests {
         let root = current_root();
         let first = Arc::new(Declarations::default());
         first.load(storage.path());
-        first.started(root);
+        first.started(root, None);
         let (connection, mut rx) = sender(&first);
         let (_, reply) = receive_after_persist(&mut rx, "first send before restart").await;
         let saved: Vec<AgentCommandRoot> = serde_json::from_slice(
@@ -692,7 +823,7 @@ mod tests {
                 let root = current_root();
                 let first = Arc::new(Declarations::default());
                 first.load(storage.path());
-                first.started(root);
+                first.started(root, None);
                 assert_slow_write_blocks_send(&first, root, "first send before restart").await;
 
                 let recovered = Arc::new(Declarations::default());
@@ -755,7 +886,10 @@ mod tests {
             start_time_ms: subc_os::process_start_time_ms(child.id()).unwrap(),
         };
         let hub = Arc::new(Declarations::default());
-        hub.restored(root);
+        hub.restored(SavedRoot {
+            root,
+            native_birth: None,
+        });
         let (_connection, mut rx) = sender(&hub);
         let (batch, reply) = receive(&mut rx).await;
         assert_eq!(batch.known, Some(vec![root]));

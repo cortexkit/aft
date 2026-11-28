@@ -384,7 +384,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "OutlineFileDiscovery, OutlineDirectoryDiscovery, directory_walk_incomplete, outline_many_files, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
             },
         ],
     },
@@ -431,7 +431,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming, test_verdict, cap_test_verdict, bounded_failure_sections",
+            predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming, test_verdict, cap_test_verdict, cap_required_lines, bounded_failure_sections",
         }],
     },
     SurfaceEntry { requires: None, command: "bash", mode: "changed_files", list_id: "bash.changed_files", unit: Unit::Files, narrow: &[], reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "render" }, ReasonEntry { reason: Reason::TimeLimit, kind: ReasonKind::Bounding, predicate_name: "render" }] },
@@ -449,6 +449,18 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    ExclusionEntry {
+        file: "commands/inspect.rs",
+        enclosing_item: "assert_timeout, walk_with_expired_phase_deadline_reports_real_truncation",
+        location_or_primitive: "walk_truncated",
+        reason: "The deadline tests assert whether an inspect reply discloses an incomplete walk; neither assertion cuts a result list.",
+    },
+    ExclusionEntry {
+        file: "commands/read/opened_checks.rs",
+        enclosing_item: "authorized",
+        location_or_primitive: ".take()",
+        reason: "A test hook takes its one pending callback so it runs once; it does not cut file content or a result list.",
+    },
     ExclusionEntry {
         file: "access_policy/linked_worktree.rs",
         enclosing_item: "nearest_common_dir, read_pointer",
@@ -767,6 +779,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "read_bounded_line, room, push",
         location_or_primitive: "MAX_LINE_BYTES / MAX_RETAINED_BYTES / MAX_RETAINED_ITEMS / MAX_HELD_BYTES / MAX_HELD_ITEMS",
         reason: "transport admission and allocation bounds, not result-list cuts; oversized frames and excess held requests receive explicit errors, retained input keeps its budget charge across queue moves",
+    },
+    ExclusionEntry {
+        file: "subc/wire.rs",
+        enclosing_item: "prepare_client_delivery, build_legacy_tool_response_frame",
+        location_or_primitive: "CLIENT_REPLY_BODY_LIMIT",
+        reason: "bounds encoded reply bytes, not a particular result list; oversized replies keep existing status and recovery fields in a transport fallback",
     },
     ExclusionEntry {
         file: "cli/sandbox_launch/landlock_backend.rs",

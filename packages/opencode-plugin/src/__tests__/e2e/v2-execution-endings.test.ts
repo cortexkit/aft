@@ -43,7 +43,11 @@ for (const cause of ["provider", "overflow", "tool", "parent-stop", "shutdown"] 
           const marker = join(host.project, "started");
           script["You are a subagent spawned by another session.\nHold"] = {
             name: "shell",
-            arguments: { command: `echo started > '${marker}'; sleep 40`, wait: true },
+            arguments: {
+              command: `echo started > '${marker}'; sleep 40`,
+              description: "Write the start marker and wait",
+              wait: true,
+            },
           };
           script.launch = {
             name: "subagent",

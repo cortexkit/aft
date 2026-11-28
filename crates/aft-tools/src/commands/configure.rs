@@ -890,6 +890,7 @@ fn configs_equal_including_runtime_only_fields(previous: &Config, next: &Config)
         && previous.foreground_wait_window_ms == next.foreground_wait_window_ms
         && previous.diagnostics_on_edit == next.diagnostics_on_edit
         && previous.lsp_user_max_servers == next.lsp_user_max_servers
+        && previous.lsp_user_worker_rust_analyzers == next.lsp_user_worker_rust_analyzers
         && previous.semantic.subc_connection_file == next.semantic.subc_connection_file
         && previous.semantic.route_project_root == next.semantic.route_project_root
         && previous.semantic.route_harness == next.semantic.route_harness
@@ -2202,6 +2203,7 @@ fn configure_warm_key(
     root_too_broad: bool,
     is_worktree_bridge: bool,
     shared_artifacts_read_only: bool,
+    identity_provisional: bool,
 ) -> String {
     // Keys a live config reload may change are left out: they select no
     // artifact, so a connect after a live edit must not reload artifacts
@@ -2211,7 +2213,7 @@ fn configure_warm_key(
     semantic.query_timeout_ms = 0;
     semantic.query_instruction.clear();
     format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}",
+        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={};identity_provisional={}",
         canonical_root,
         (config.cache_storage_dir(), config.cache_epoch),
         root_too_broad,
@@ -2223,6 +2225,7 @@ fn configure_warm_key(
         semantic,
         false,
         config.indexes.callgraph,
+        identity_provisional,
     )
 }
 
@@ -2466,13 +2469,35 @@ pub fn handle_cache_recovery(
     handle_configure_prepared(req, ctx, Some(prepared))
 }
 
+/// Reconcile the existing session's managed indexes without changing its
+/// bind-time settings or restarting its route.
+#[doc(hidden)]
+pub fn apply_managed_indexes(ctx: &AppContext, settings: &crate::subc_config::ApprovedUser) {
+    let Some((request, generation)) = ctx.retained_configure_request() else {
+        return;
+    };
+    let Some(indexes) = crate::config_live::managed_index_update(ctx, settings) else {
+        return;
+    };
+    if ctx.connect_generation() != generation || ctx.subc_unbound_quiesced() {
+        return;
+    }
+    let published = ctx.config_unpinned();
+    let response = configure_prepared(&request, ctx, Some(&published), Some(indexes));
+    if response.success {
+        crate::data_layer::runtime::rebind_configured(ctx);
+    } else {
+        log::warn!("could not reconcile the project's managed indexes");
+    }
+}
+
 fn handle_configure_prepared(
     req: &RawRequest,
     ctx: &AppContext,
     prepared: Option<&Config>,
 ) -> Response {
     register_runtime_hooks();
-    let response = configure_prepared(req, ctx, prepared);
+    let response = configure_prepared(req, ctx, prepared, None);
     if response.success {
         // The rebind's rescan runs in the configure tail, after this reply;
         // marking it now keeps a query sent at once from answering without it.
@@ -2481,7 +2506,12 @@ fn handle_configure_prepared(
     response
 }
 
-fn configure_prepared(req: &RawRequest, ctx: &AppContext, prepared: Option<&Config>) -> Response {
+fn configure_prepared(
+    req: &RawRequest,
+    ctx: &AppContext,
+    prepared: Option<&Config>,
+    managed_indexes: Option<crate::config::IndexesConfig>,
+) -> Response {
     // The configuration active before a connect, kept only to recognise a
     // refused connect that left it in place.
     let active_before = prepared.is_none().then(|| ctx.config_unpinned());
@@ -2494,7 +2524,7 @@ fn configure_prepared(req: &RawRequest, ctx: &AppContext, prepared: Option<&Conf
     // overrides, and follows installs the file watcher may not report, so the
     // memoized TypeScript server choices are recomputed.
     crate::lsp::typescript_project::clear_typescript_selection();
-    let response = handle_configure_inner(req, ctx, prepared);
+    let response = handle_configure_inner(req, ctx, prepared, managed_indexes);
     crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.
@@ -2516,6 +2546,7 @@ fn handle_configure_inner(
     req: &RawRequest,
     ctx: &AppContext,
     prepared: Option<&Config>,
+    managed_indexes: Option<crate::config::IndexesConfig>,
 ) -> Response {
     let prefix_started_at = Instant::now();
     if let Some(cancelled) = configure_cancelled(&req.id) {
@@ -2585,6 +2616,10 @@ fn handle_configure_inner(
     let previous_canonical_cache_root = ctx.canonical_cache_root_opt();
     wait_on_configure_semantic_snapshot_gate_for_test(&req.id);
     let mut next_config = previous_config.as_ref().clone();
+    let reconciling_indexes = managed_indexes.is_some();
+    if let Some(indexes) = managed_indexes {
+        next_config.indexes = indexes;
+    }
     next_config.project_root = Some(root_path.clone());
     next_config.harness = Some(harness.clone());
 
@@ -2661,6 +2696,14 @@ fn handle_configure_inner(
                 config_diagnostics.errors.join(", ")
             ),
         );
+    }
+    if let Some(snapshot) = bind_config
+        .as_ref()
+        .filter(|snapshot| snapshot.daemon_managed())
+    {
+        next_config.lsp_user_max_servers = snapshot.resolved().lsp_user_max_servers;
+        next_config.lsp_user_worker_rust_analyzers =
+            snapshot.resolved().lsp_user_worker_rust_analyzers;
     }
     ctx.begin_configure_ack_step("source_tracking");
     if !recovery {
@@ -3125,6 +3168,7 @@ fn handle_configure_inner(
         root_too_broad,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
+        false,
     );
     if ctx.configure_generation() > 0
         && !root_too_broad
@@ -3318,6 +3362,7 @@ fn handle_configure_inner(
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    let was_identity_provisional = ctx.artifact_identity_provisional();
     let mut identity_provisional = false;
     let project_key = match project_key_result {
         Some(Ok(Some(key))) => Some(key),
@@ -3325,6 +3370,10 @@ fn handle_configure_inner(
             identity_provisional = true;
             degraded_reasons
                 .push(crate::root_identity::key::PROVISIONAL_IDENTITY_REASON.to_string());
+            // A busy database still triggers the background retry that resolves the root's artifact identity.
+            next_config.indexes.trigram = false;
+            next_config.indexes.semantic = false;
+            next_config.indexes.callgraph = false;
             None
         }
         Some(Err(error)) => {
@@ -3347,17 +3396,6 @@ fn handle_configure_inner(
         }
         None => None,
     };
-    if identity_provisional {
-        // An unreadable legacy identity pin in aft.db or a failed Git probe
-        // leaves the identity unsettled. Serve tools that do not need indexes,
-        // but write no artifacts, ownership or retention records under a key
-        // the next bind may replace. A busy aft.db is retried in the
-        // background (`crate::provisional_identity_retry`); a failed Git probe
-        // waits for the next bind.
-        next_config.indexes.trigram = false;
-        next_config.indexes.semantic = false;
-        next_config.indexes.callgraph = false;
-    }
     drop(cache_key_profile);
     let project_key = project_key.unwrap_or_default();
     ctx.begin_configure_ack_phase("storage_capability_probe");
@@ -3533,8 +3571,10 @@ fn handle_configure_inner(
         root_too_broad,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
+        identity_provisional,
     );
     let semantic_build_inputs_changed = project_root_changed
+        || was_identity_provisional != identity_provisional
         || previous_config.indexes.semantic != next_config.indexes.semantic
         || semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic)
         || previous_config.semantic.max_files != next_config.semantic.max_files
@@ -3573,6 +3613,7 @@ fn handle_configure_inner(
             // The cold-seed gate holds Tier-2 work until a semantic build
             // finishes; a root that will not build must not hold it.
             if cache_available
+                && !identity_provisional
                 && next_config.indexes.semantic
                 && !ctx.shared_artifacts_read_only()
                 && !root_too_broad
@@ -3726,7 +3767,8 @@ fn handle_configure_inner(
     // On a normal project this finishes in <1 s and pushes a
     // `ConfigureWarningsFrame` for the plugin to surface; on a huge directory
     // it may take seconds-to-minutes, but configure itself returns now.
-    let warnings_pending = !root_too_broad && ctx.progress_sender_handle().is_some();
+    let warnings_pending =
+        !reconciling_indexes && !root_too_broad && ctx.progress_sender_handle().is_some();
     if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
         let session_id_for_bg = log_ctx::current_session();
@@ -4602,6 +4644,8 @@ fn run_configure_maintenance_unit_inner(
                         storage_dir.display(),
                         err
                     );
+                } else {
+                    aft_engine::interrupted_storage::schedule_sweeps(&storage_dir);
                 }
                 ctx.backup().lock().set_storage_dir_for_harness(
                     storage_dir.clone(),
@@ -6799,7 +6843,8 @@ mod tests {
     #[test]
     fn warm_key_ignores_keys_a_live_config_reload_may_change() {
         let root = std::path::Path::new("/warm-key-root");
-        let key = |config: &Config| super::configure_warm_key(root, config, false, false, false);
+        let key =
+            |config: &Config| super::configure_warm_key(root, config, false, false, false, false);
         let base = Config::default();
 
         let mut live = base.clone();
@@ -7565,10 +7610,10 @@ mod tests {
             "direct tools must remain usable: {response:?}"
         );
         assert!(ctx.artifact_identity_provisional());
-        assert!(!ctx.config().indexes.trigram);
+        assert!(ctx.config().indexes.trigram);
         assert!(!ctx.config().indexes.semantic);
         assert!(!ctx.config().indexes.callgraph);
-        assert!(!false);
+        assert!(ctx.data_checkout().is_none());
         let reason = ctx.artifact_identity_provisional_reason().unwrap();
         assert!(reason.contains("git_identity_unavailable"), "{reason}");
         assert!(reason.contains("Too many open files"), "{reason}");
@@ -7581,6 +7626,7 @@ mod tests {
         assert!(!storage.join("index").join(&path_key).exists());
         assert!(!storage.join("semantic").join(&path_key).exists());
         assert!(!storage.join("callgraph").join(&path_key).exists());
+        assert!(!storage.join("data").exists());
     }
 
     /// Hold aft.db in an exclusive transaction. In rollback-journal mode this
@@ -7945,6 +7991,8 @@ mod tests {
 
     #[test]
     fn dubious_ownership_identity_does_not_retry_in_the_background() {
+        use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+
         let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
@@ -7977,7 +8025,19 @@ mod tests {
                 );
             },
         );
-        assert!(!ctx.config().indexes.trigram);
+        assert!(ctx.config().indexes.trigram);
+        assert!(ctx.data_checkout().is_none());
+        let snapshot = ctx.try_build_status_push_snapshot().unwrap();
+        assert_eq!(snapshot["search_index"]["status"], "unavailable");
+        assert_eq!(
+            snapshot["search_index"]["reason"],
+            "git_identity_unavailable"
+        );
+        assert!(snapshot["search_index"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("dubious ownership")));
+        assert_eq!(snapshot["semantic_index"]["status"], "disabled");
+        assert_eq!(snapshot["callgraph_store"]["status"], "off");
     }
 
     #[test]

@@ -9,10 +9,31 @@ use crate::{
 };
 use subc_client_rs::config::*;
 
+mod projects;
 mod review;
 mod startup;
 #[cfg(test)]
 mod tests;
+pub(super) use projects::{BindWaits, Project, ProjectBind};
+pub(super) type BindSettings<'a> = (&'a Session, Option<ProjectBind>);
+
+pub(super) fn select_for_bind<'a>(
+    roots: &RootChannels,
+    root: &ProjectRootId,
+    bind: Option<BindSettings<'a>>,
+) -> Result<(Option<&'a ApprovedUser>, Option<Arc<Project>>), (&'static str, &'static str)> {
+    let Some((session, project)) = bind else {
+        return Ok((None, None));
+    };
+    let project = project.transpose().map_err(|reason| {
+        log::warn!("project settings bind refused: {reason}");
+        ("actor_not_ready", "module is warming")
+    })?;
+    let selected = roots
+        .select_project(root, project)
+        .map_err(|reason| ("config_divergence", reason))?;
+    Ok((Some(session.user()), selected))
+}
 pub(super) use startup::{
     initialize_storage, initialize_task_cleanup, legacy_catalog, negotiate, wait_for_first_view,
     LegacySettings,
@@ -44,12 +65,15 @@ async fn request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     control: &readiness::DaemonControl,
     body: &T,
 ) -> Result<R, &'static str> {
-    match tokio::time::timeout(CONFIG_TIMEOUT, control.config_request(body)).await {
-        Ok(Ok(reply)) => Ok(reply),
-        Ok(Err(readiness::ControlError::Refused { code, .. })) if code == "config_gated" => {
+    match request_reply(control, body).await {
+        Ok(reply) => Ok(reply),
+        Err(readiness::ControlError::Refused { code, .. }) if code == "config_gated" => {
             Err("no_approved_config")
         }
-        Ok(Err(readiness::ControlError::Refused { code, .. })) => {
+        Err(readiness::ControlError::Refused { code, .. }) if code == "unknown_project" => {
+            Err("unknown_project")
+        }
+        Err(readiness::ControlError::Refused { code, .. }) => {
             log::warn!("daemon refused settings control request ({code})");
             Err("settings_request_failed")
         }
@@ -57,14 +81,27 @@ async fn request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     }
 }
 
+async fn request_reply<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+    control: &readiness::DaemonControl,
+    body: &T,
+) -> Result<R, readiness::ControlError> {
+    tokio::time::timeout(CONFIG_TIMEOUT, control.config_request(body))
+        .await
+        .unwrap_or(Err(readiness::ControlError::Timeout))
+}
+
 fn view_from_reply(reply: ConfigGetReply) -> Result<ConfigView, &'static str> {
+    project_view(reply, None)
+}
+
+fn project_view(reply: ConfigGetReply, project: Option<&str>) -> Result<ConfigView, &'static str> {
     let catchup = reply.declaration_pending.is_some();
     let pending = reply.pending.is_some();
     if catchup && pending {
         return Err("invalid_settings_view");
     }
     let mut view = reply.pending.or(reply.active).ok_or("no_approved_config")?;
-    if view.project_id.is_some()
+    if view.project_id.as_deref() != project
         || view
             .layers
             .iter()
@@ -150,11 +187,9 @@ async fn report(
             Ok(()) => (ConfigApplyResult::Ack, vec![]),
             Err(reason) => (ConfigApplyResult::Nack, vec![reason.into()]),
         };
-        let _: ConfigAppliedReply = request(
-            control,
-            &ConfigAppliedRequest::new(view.generation, attempt, result, reasons),
-        )
-        .await?;
+        let mut input = ConfigAppliedRequest::new(view.generation, attempt, result, reasons);
+        input.project_id.clone_from(&view.project_id);
+        let _: ConfigAppliedReply = request(control, &input).await?;
     }
     Ok(())
 }
@@ -164,18 +199,26 @@ pub(super) struct Session {
     user: ApprovedUser,
     view: tokio::sync::Mutex<ConfigView>,
     hint: Notify,
+    user_changed: AtomicBool,
+    project_hints: parking_lot::Mutex<HashSet<String>>,
+    projects: projects::Projects,
+    project_views: bool,
     pending: AtomicBool,
     ready: AtomicBool,
 }
 
 impl Session {
-    fn new(schema: Arc<Schema>, user: ConfigTier, view: ConfigView) -> Self {
+    fn new(schema: Arc<Schema>, user: ConfigTier, view: ConfigView, project_views: bool) -> Self {
         Self {
             schema,
             user: ApprovedUser::new(user),
             pending: AtomicBool::new(view.declaration_pending.is_some()),
             view: tokio::sync::Mutex::new(view),
             hint: Notify::new(),
+            user_changed: AtomicBool::new(false),
+            project_hints: Default::default(),
+            projects: Default::default(),
+            project_views,
             ready: AtomicBool::new(false),
         }
     }
@@ -193,6 +236,11 @@ impl Session {
         self.pending.load(Ordering::Acquire)
     }
 
+    fn notify_user_changed(&self) {
+        self.user_changed.store(true, Ordering::Release);
+        self.hint.notify_one();
+    }
+
     pub(super) async fn run(
         &self,
         control: Arc<readiness::DaemonControl>,
@@ -200,8 +248,16 @@ impl Session {
     ) {
         loop {
             self.hint.notified().await;
-            if let Err(reason) = self.refresh(&control, &executor).await {
-                log::warn!("settings refresh refused: {reason}");
+            if self.user_changed.swap(false, Ordering::AcqRel) {
+                if let Err(reason) = self.refresh(&control, &executor).await {
+                    log::warn!("settings refresh refused: {reason}");
+                }
+            }
+            let projects = std::mem::take(&mut *self.project_hints.lock());
+            for id in projects {
+                if let Some(project) = self.projects.existing(&id) {
+                    projects::refresh_changed(project, &control, &executor).await;
+                }
             }
         }
     }
@@ -217,29 +273,27 @@ impl Session {
         if next.generation < current.generation {
             return Ok(());
         }
-        let executor = Arc::clone(executor);
         let user = self.user.clone();
         let candidate = next.clone();
         let result = tokio::task::spawn_blocking(move || {
             let (tier, config) = resolve_user(&candidate)?;
             let old = crate::config_resolve::resolve_config(&[user.snapshot()]).config;
-            if !crate::config_live::apply_live_config(&old, &config, &old)
+            if crate::config_live::apply_live_config(&old, &config, &old)
                 .deferred
-                .is_empty()
+                .into_iter()
+                .any(crate::config_live::schema::settings_restart_required)
             {
                 return Err("settings_require_restart");
             }
             aft_store::sync::set_macos_full_sync(config.durability.macos_full_sync);
             crate::memory::profile::publish(config.memory);
             user.replace(tier);
-            for ctx in executor.actor_contexts() {
-                crate::config_live::reload_approved_user(&ctx);
-            }
             Ok(())
         })
         .await
         .unwrap_or(Err("settings_apply_failed"));
         if result.is_ok() {
+            projects::reload_roots(executor, &self.user).await;
             self.pending
                 .store(next.declaration_pending.is_some(), Ordering::Release);
             *current = next.clone();
@@ -254,8 +308,15 @@ impl Session {
         writer: &WriterSender,
         metrics: &DispatchPathMetrics,
     ) -> Result<bool, SubcError> {
-        if is_changed(frame) {
-            self.hint.notify_one();
+        if let Some(change) = changed(frame) {
+            if let Some(project) = change.project_id {
+                if self.project_views && self.projects.existing(&project).is_some() {
+                    self.project_hints.lock().insert(project);
+                    self.hint.notify_one();
+                }
+            } else {
+                self.notify_user_changed();
+            }
             return Ok(true);
         }
         if let Some(frame) = review::response(&self.schema, frame).await? {
@@ -287,10 +348,16 @@ pub(super) fn note_health(
 }
 
 fn is_changed(frame: &Frame) -> bool {
-    frame.header.ty == FrameType::Push
-        && frame.header.channel == 0
-        && frame.header.epoch == 0
-        && frame.header.corr == 0
-        && serde_json::from_slice::<ConfigChanged>(&frame.body)
-            .is_ok_and(|hint| hint.project_id.is_none())
+    changed(frame).is_some_and(|hint| hint.project_id.is_none())
+}
+
+fn changed(frame: &Frame) -> Option<ConfigChanged> {
+    if frame.header.ty != FrameType::Push
+        || frame.header.channel != 0
+        || frame.header.epoch != 0
+        || frame.header.corr != 0
+    {
+        return None;
+    }
+    serde_json::from_slice(&frame.body).ok()
 }

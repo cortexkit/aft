@@ -73,8 +73,11 @@ const ImportParams = Type.Object({
     Type.String({ description: "Named import to remove; omit to remove entire import" }),
   ),
   typeOnly: Type.Optional(Type.Boolean({ description: "Type-only import (TS only)" })),
+  // Pi's StringEnum returns plain JSON; Type.Optional needs a TypeBox schema
+  // here to keep its optional marker out of the serialized tool parameters.
   validate: Type.Optional(
-    StringEnum(["syntax", "full"] as const, {
+    Type.String({
+      enum: ["syntax", "full"],
       description: "Post-edit validation level (default: syntax)",
     }),
   ),

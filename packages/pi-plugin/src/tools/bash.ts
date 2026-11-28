@@ -1,5 +1,6 @@
 import {
   type AftProjectTransport,
+  BASH_DESCRIPTION,
   BASH_HOST_FALLBACK_REFUSAL,
   BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
@@ -315,9 +316,11 @@ function bashParamsForConfig(
     runon?: boolean;
   },
   companions: RegisteredCompanions,
+  isPowerShell: boolean,
 ): typeof BashParams {
   return Type.Object({
     ...BashBaseParams,
+    ...(isPowerShell ? {} : { description: Type.String({ description: BASH_DESCRIPTION }) }),
     // Replaces the base `timeout` in place (the key keeps its position).
     ...(features.background ? BashBackgroundTimeoutParam : {}),
     ...(features.background ? BashWaitParam : {}),
@@ -818,6 +821,7 @@ export function registerBashTool(
           runon: remoteRuns(),
         },
         companions,
+        isPowerShell,
       );
     },
     async execute(_toolCallId, params: Static<typeof BashParams>, signal, onUpdate, extCtx) {

@@ -178,6 +178,7 @@ use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
 use crate::data_layer::ignore_rules as gitignore_state;
+mod cache_recovery;
 #[path = "context_executor.rs"]
 mod executor_adapter;
 #[path = "context_index_host.rs"]
@@ -1950,6 +1951,13 @@ pub enum WorkerSearchTool {
     AstGrepSearch,
 }
 
+#[derive(Clone, Copy)]
+enum ReadPathPurpose {
+    File,
+    Search(WorkerSearchTool),
+    Revision,
+}
+
 /// Per-context memo for the configured project root used by containment checks.
 ///
 /// `resolved_root` is the bare output from `fs::canonicalize`; it must not be
@@ -1968,6 +1976,9 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 mod checkout_suggestion;
 use checkout_suggestion::checkout_counterpart;
+#[doc(hidden)]
+pub mod path_approval;
+use path_approval::ReadAsk;
 
 #[cfg(test)]
 mod lexical_comparison_tests {
@@ -2119,67 +2130,19 @@ fn reject_escaping_symlink(
             continue;
         }
 
-        iterative_follow_chain(req_id, original_path, &current, resolved_root)?;
+        broken_symlink::iterative_follow_chain(
+            req_id,
+            original_path,
+            &current,
+            resolved_root,
+            Path::to_path_buf,
+        )?;
     }
 
     Ok(())
 }
 
-/// Iteratively follow a symlink chain from `link` and reject if any hop's
-/// resolved target is outside `resolved_root`. Depth-capped at 40 hops.
-fn iterative_follow_chain(
-    req_id: &str,
-    original_path: &Path,
-    start: &Path,
-    resolved_root: &Path,
-) -> Result<(), crate::protocol::Response> {
-    let mut link = start.to_path_buf();
-    let mut depth = 0usize;
-
-    loop {
-        if depth > 40 {
-            return Err(path_error_response(req_id, original_path, resolved_root));
-        }
-
-        let target = match std::fs::read_link(&link) {
-            Ok(t) => t,
-            Err(_) => {
-                // Can't read the link — treat as escaping to be safe.
-                return Err(path_error_response(req_id, original_path, resolved_root));
-            }
-        };
-
-        let resolved_target = if target.is_absolute() {
-            normalize_path(&target)
-        } else {
-            let parent = link.parent().unwrap_or_else(|| Path::new(""));
-            normalize_path(&parent.join(&target))
-        };
-
-        // Check boundary: use canonicalized target when available (handles
-        // macOS /var → /private/var aliasing), fall back to the normalized
-        // path when canonicalize fails (e.g. broken symlink on Linux).
-        let canonical_target =
-            std::fs::canonicalize(&resolved_target).unwrap_or_else(|_| resolved_target.clone());
-
-        if !canonical_target.starts_with(resolved_root)
-            && !resolved_target.starts_with(resolved_root)
-        {
-            return Err(path_error_response(req_id, original_path, resolved_root));
-        }
-
-        // If the target is itself a symlink, follow the next hop.
-        match std::fs::symlink_metadata(&resolved_target) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                link = resolved_target;
-                depth += 1;
-            }
-            _ => break, // Non-symlink or non-existent target — chain ends here.
-        }
-    }
-
-    Ok(())
-}
+mod broken_symlink;
 
 pub type LanguageProviderFactory = fn() -> Box<dyn LanguageProvider>;
 
@@ -2857,6 +2820,7 @@ pub struct AppContext {
     /// The LSP manager's "a worker used this root" flag, readable without the
     /// manager lock (see [`AppContext::disable_rust_cargo_for_worker`]).
     lsp_rust_worker_policy: Arc<std::sync::atomic::AtomicBool>,
+    lsp_diagnostics_activity: Arc<parking_lot::Mutex<crate::lsp::manager::DiagnosticsActivity>>,
     /// Advances with every configuration publication; a background
     /// language-server applicability walk stores its result only while it
     /// still matches (see `refresh_project_applicability`).
@@ -3383,6 +3347,7 @@ impl AppContext {
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
             lsp_rust_worker_policy: lsp_manager.rust_worker_policy(),
+            lsp_diagnostics_activity: Arc::clone(&lsp_manager.diagnostics_activity),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
             project_applicability_progress: Arc::default(),
@@ -3809,17 +3774,11 @@ impl AppContext {
                 },
             }
         };
-        // The data layer's meaning plane, once it reports for the root,
-        // stands in for today's semantic index, as on the status tool. An
-        // unreachable embedding backend still reports as such: no fill can
-        // embed either.
-        if semantic_backend.available {
-            if let Some(meaning) = data_store
-                .as_ref()
-                .and_then(|report| report.meaning.as_ref())
-            {
-                semantic_index = meaning.health();
-            }
+        if let Some(health) = data_store
+            .as_ref()
+            .and_then(|report| report.meaning_health(semantic_backend.available))
+        {
+            semantic_index = health;
         }
         let callgraph_writer = self.callgraph_writer.load(Ordering::SeqCst);
         if cache_unavailable {
@@ -6444,53 +6403,6 @@ impl AppContext {
         Some(reason)
     }
 
-    /// A connect is starting: any deferred cache recovery queued for an
-    /// earlier connect is now stale.
-    pub fn note_connect_started(&self) {
-        self.connect_generation.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// A connect was refused and the configuration it would have replaced
-    /// stays active: give that configuration's retained request the current
-    /// connect generation, so later cache recoveries re-run it again. Work
-    /// queued before the refused connect keeps the older generation and is
-    /// still dropped.
-    pub fn restamp_cache_recovery_request(&self) {
-        let generation = self.connect_generation();
-        if let Some((_, _, stamped)) = self.cache_recovery.lock().as_mut() {
-            *stamped = generation;
-        }
-    }
-
-    pub fn connect_generation(&self) -> u64 {
-        self.connect_generation.load(Ordering::SeqCst)
-    }
-
-    pub fn retain_cache_recovery_request(&self, request: &crate::protocol::RawRequest) {
-        let generation = self.connect_generation();
-        *self.cache_recovery.lock() = self
-            .config()
-            .cache_dir
-            .as_ref()
-            .map(|_| (request.clone(), None, generation));
-    }
-
-    /// The retained connect request, with the connect generation it belongs
-    /// to, at most once per minute.
-    pub fn cache_recovery_request_if_due(
-        &self,
-        now: Instant,
-    ) -> Option<(crate::protocol::RawRequest, u64)> {
-        let mut recovery = self.cache_recovery.lock();
-        let (request, checked, generation) = recovery.as_mut()?;
-        if checked.is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(60))
-        {
-            return None;
-        }
-        *checked = Some(now);
-        Some((request.clone(), *generation))
-    }
-
     /// Harness-scoped storage directory. Requires configure to have set a harness;
     /// see [`Self::harness`] for the precondition and [`Self::harness_opt`] to check it.
     pub fn harness_dir(&self) -> PathBuf {
@@ -6763,12 +6675,8 @@ impl AppContext {
         }
     }
 
-    /// Why this root's checkout is never bound in the data layer, as
-    /// configure leaves today's indexes off for it: the root is a
-    /// filesystem, volume or drive root, or the home folder, or every index
-    /// is switched off. Semantic search alone still binds it: the meaning
-    /// plane fills from the checkout's file list, which a build publishes
-    /// even with the text index and call graph off.
+    /// Why this root cannot bind a data layer checkout. Semantic search
+    /// alone still binds it: meaning search needs the checkout's file list.
     pub(crate) fn data_layer_withheld(&self) -> Option<crate::data_layer::surfaces::Withheld> {
         use crate::data_layer::surfaces::Withheld;
         let planes = self.data_layer_planes();
@@ -6776,6 +6684,8 @@ impl AppContext {
             Some(Withheld::TooBroad)
         } else if self.is_home_root() {
             Some(Withheld::Home)
+        } else if let Some(reason) = crate::feature_status::git_identity_unavailable_reason(self) {
+            Some(Withheld::GitIdentity(reason))
         } else if !planes.text && !planes.callgraph && self.data_meaning_config().is_none() {
             Some(Withheld::IndexesOff)
         } else {
@@ -7068,7 +6978,7 @@ impl AppContext {
     }
 
     /// The bound root's artifact identity was provisional at its last bind
-    /// (aft.db was busy or Git was unreadable), so its index lanes are off.
+    /// (aft.db was busy or Git was unreadable), so its indexes cannot serve.
     /// A busy aft.db is retried in the background
     /// ([`crate::provisional_identity_retry`]); an unreadable Git identity
     /// waits for the next bind.
@@ -8775,26 +8685,6 @@ impl AppContext {
         self.lsp_manager.lock().shutdown_all();
     }
 
-    /// Start one inspect producer, holding the LSP manager lock only to
-    /// reserve the server and to publish it; the spawn and `initialize`
-    /// handshake run unlocked (see
-    /// [`crate::lsp::manager::start_applicable_server_unlocked`]).
-    pub fn lsp_start_applicable_server_until(
-        &self,
-        snapshot: &crate::lsp::manager::ApplicableServerSnapshot,
-        server: &crate::lsp::roots::ServerKey,
-        config: &Config,
-        deadline: Instant,
-    ) -> crate::lsp::manager::ApplicableServerStartOutcomes {
-        crate::lsp::manager::start_applicable_server_unlocked(
-            &self.lsp_manager,
-            snapshot,
-            server,
-            config,
-            deadline,
-        )
-    }
-
     /// Make a running rust-analyzer reload its workspace when its Cargo
     /// manifests, lockfile, toolchain file, or Cargo config changed since it
     /// last loaded them (see
@@ -9132,6 +9022,7 @@ impl AppContext {
         content: &str,
         timeout: std::time::Duration,
     ) -> crate::lsp::manager::PostEditWaitOutcome {
+        let activity = self.lsp_diagnostics_activity();
         let config = self.config();
         let timeout = timeout.min(Duration::from_secs(10));
         let pending = crate::lsp::manager::PostEditWaitOutcome {
@@ -9175,6 +9066,7 @@ impl AppContext {
         if let Err(err) = std::thread::Builder::new()
             .name("aft-lsp-post-edit".into())
             .spawn(move || {
+                let _activity = activity;
                 let outcome = Self::lsp_collect_post_edit_diagnostics(
                     &manager, &slot, config, &file_path, &content, deadline,
                 );
@@ -9682,7 +9574,7 @@ impl AppContext {
         // Mutating tools validate here, so a helper that is merely slow to be
         // scheduled must not refuse the user's change (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
-        self.validate_path_with_artifact_session(req_id, path, None, None, true)
+        self.validate_path_with_artifact_session(req_id, path, None, ReadPathPurpose::File, true)
     }
 
     /// Validate a write location without following its final path component.
@@ -9730,7 +9622,15 @@ impl AppContext {
             // is what gets checked, and the handler must touch the same one
             // rather than resolve the spelling against the daemon's cwd.
             let rooted = self.resolve_relative_path(path);
-            let identity = self.check_path_access(req_id, path, &rooted, None, None, true, true)?;
+            let identity = self.check_path_access(
+                req_id,
+                path,
+                &rooted,
+                None,
+                ReadPathPurpose::File,
+                true,
+                true,
+            )?;
             return Ok((rooted, identity));
         };
         let Some(file_name) = path_for_resolution.file_name() else {
@@ -9761,7 +9661,15 @@ impl AppContext {
         })??;
         let resolved = resolved_parent.join(file_name);
 
-        let identity = self.check_path_access(req_id, path, &resolved, None, None, true, true)?;
+        let identity = self.check_path_access(
+            req_id,
+            path,
+            &resolved,
+            None,
+            ReadPathPurpose::File,
+            true,
+            true,
+        )?;
         Ok((resolved, identity))
     }
 
@@ -9777,7 +9685,24 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        self.validate_read_path_with_approval(req_id, session_id, path, true)
+        self.validate_read_path_with_approval(req_id, session_id, path, ReadPathPurpose::File, true)
+    }
+
+    /// Keep the live path policy check when reading at a Git ref, without requiring
+    /// the file to exist in today's checkout.
+    pub fn validate_revision_read_path(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<PathBuf, crate::protocol::Response> {
+        self.validate_read_path_with_approval(
+            req_id,
+            session_id,
+            path,
+            ReadPathPurpose::Revision,
+            true,
+        )
     }
 
     /// Apply the normal session read policy without entering an approval route.
@@ -9789,7 +9714,13 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        self.validate_read_path_with_approval(req_id, session_id, path, false)
+        self.validate_read_path_with_approval(
+            req_id,
+            session_id,
+            path,
+            ReadPathPurpose::File,
+            false,
+        )
     }
 
     fn validate_read_path_with_approval(
@@ -9797,6 +9728,7 @@ impl AppContext {
         req_id: &str,
         session_id: &str,
         path: &Path,
+        purpose: ReadPathPurpose,
         allow_approval: bool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         self.output_files
@@ -9805,7 +9737,7 @@ impl AppContext {
             req_id,
             path,
             Some(session_id),
-            None,
+            purpose,
             allow_approval,
         );
         if crate::context::confinement::for_request(req_id) {
@@ -9828,7 +9760,7 @@ impl AppContext {
             req_id,
             path,
             Some(session_id),
-            Some(search_tool),
+            ReadPathPurpose::Search(search_tool),
             true,
         )
     }
@@ -9871,7 +9803,7 @@ impl AppContext {
         req_id: &str,
         path: &Path,
         artifact_session_id: Option<&str>,
-        search_tool: Option<WorkerSearchTool>,
+        purpose: ReadPathPurpose,
         allow_approval: bool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
@@ -9909,7 +9841,7 @@ impl AppContext {
                         path,
                         &resolved,
                         artifact_session_id,
-                        search_tool,
+                        purpose,
                         false,
                         allow_approval,
                     )?;
@@ -9921,7 +9853,7 @@ impl AppContext {
                 path,
                 &rooted,
                 artifact_session_id,
-                search_tool,
+                purpose,
                 false,
                 allow_approval,
             )?;
@@ -9967,7 +9899,7 @@ impl AppContext {
             path,
             &resolved,
             artifact_session_id,
-            search_tool,
+            purpose,
             false,
             allow_approval,
         )?;
@@ -10363,7 +10295,7 @@ impl AppContext {
             ));
         }
         if decision == AccessDecision::Ask {
-            self.answer_ask(req_id, location, &identity, AccessOperation::Read)?;
+            self.answer_ask(req_id, location, &identity, AccessOperation::Read, None)?;
         }
         Ok(())
     }
@@ -10372,7 +10304,8 @@ impl AppContext {
         self.standalone_plugin_host.store(true, Ordering::Release);
     }
 
-    pub(crate) fn missing_plugin_route(&self) -> bool {
+    #[doc(hidden)]
+    pub fn missing_plugin_route(&self) -> bool {
         matches!(
             crate::access_policy::current_ask_route(),
             crate::access_policy::AskRoute::Lowered
@@ -10390,143 +10323,6 @@ impl AppContext {
         crate::access_policy::plugin::Scope::new(&self.standalone_approval_route, session)
     }
 
-    /// Resolve an `ask` decision for the call on this thread. A lowered route
-    /// treats the ask as allow. Plugins echo exact engine ask IDs; consent
-    /// (`allow_once`) and reverse-elicitation routes allow only what was
-    /// approved for this dispatch; anything else refuses with the internal ask
-    /// code, carrying the capability to request. No UI means a path denial,
-    /// not an implicit approval.
-    fn answer_ask(
-        &self,
-        req_id: &str,
-        original: &Path,
-        identity: &Path,
-        operation: crate::access_policy::AccessOperation,
-    ) -> Result<(), crate::protocol::Response> {
-        #[cfg(any(test, all(unix, feature = "test-support")))]
-        confinement::note_ask();
-        use crate::access_policy::{AskRoute, GrantKind};
-        let route = crate::access_policy::current_ask_route();
-        // Codemode programs and fork calls cannot put a question to anyone.
-        if let Some(refusal) =
-            crate::access_policy::unasked_refusal(&route, req_id, original, identity, operation)
-        {
-            return Err(refusal);
-        }
-        match &route {
-            AskRoute::Lowered => return Ok(()),
-            AskRoute::Deny => {
-                let root = self.config().project_root.clone().unwrap_or_default();
-                return Err(path_error_response(req_id, original, &root));
-            }
-            _ => {}
-        }
-        // A directory is asked for as a subtree so one answer covers what the
-        // tool reads beneath it. The probe stays on the bounded helper when
-        // one is active, like every other path probe on the request path.
-        let probe = identity.to_path_buf();
-        let is_dir = if crate::bounded_io::current().is_some() {
-            crate::bounded_io::run(&probe, None, |path| match std::fs::metadata(path) {
-                Ok(metadata) => Ok(metadata.is_dir()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(error),
-            })
-            .map_err(|error| {
-                crate::protocol::Response::error(
-                    req_id,
-                    crate::bounded_io::timeout_code(&error),
-                    error.to_string(),
-                )
-            })?
-        } else {
-            probe.is_dir()
-        };
-        let kind = if is_dir {
-            GrantKind::Subtree
-        } else {
-            GrantKind::File
-        };
-        let grant = crate::access_policy::AccessGrant {
-            path: identity.to_path_buf(),
-            kind,
-            operation,
-        };
-        if let AskRoute::Consent { once, .. } | AskRoute::Elicitation { once } = &route {
-            if once
-                .iter()
-                .any(|approved| approved.covers_kind(operation, identity, kind))
-            {
-                return Ok(());
-            }
-        }
-        // Missing outside paths with an unambiguous checkout counterpart need
-        // correction, not permission to read the missing location.
-        if let Some(suggestion) = self.checkout_path_suggestion(original, operation) {
-            return Err(crate::protocol::Response::error(
-                req_id,
-                "path_not_found_did_you_mean",
-                format!(
-                    "path not found: {}; did you mean {}?",
-                    original.display(),
-                    crate::path_identity::normalize_path(&suggestion).display()
-                ),
-            ));
-        }
-
-        if let AskRoute::Plugin { scope, once } = route {
-            // A file approval must not become a tree approval if the target
-            // changed into a directory while the host prompt was open.
-            if once
-                .iter()
-                .any(|approved| approved.covers_kind(operation, identity, kind))
-            {
-                return Ok(());
-            }
-            let id = crate::access_policy::plugin::issue(&scope, &grant);
-            // OpenCode's `*` includes every descendant. Use the same folder
-            // eligibility as consent cards so saving a file approval cannot
-            // silently approve home, a volume root, or a system tree.
-            let saved_scope = crate::access_policy::directory_scope(&grant);
-            let pattern = match saved_scope.kind {
-                GrantKind::File => saved_scope.path,
-                GrantKind::Subtree => saved_scope.path.join("*"),
-            };
-            let mut ask = serde_json::json!({
-                "kind": "external_directory", "patterns": [pattern], "always": [pattern],
-                "grant_id": id, "path": identity, "operation": operation,
-                "parentDir": if is_dir { identity } else { identity.parent().unwrap_or(identity) },
-            });
-            // Expiry and route replacement invalidate the old approval, not
-            // the request. The host can ask again for the new route's token.
-            if let Some(reason) = scope.retry_refusal_reason(&grant, !once.is_empty()) {
-                scope.log_retry_refusal(operation, identity, reason);
-                if matches!(reason, "approval_expired" | "approval_route_replaced") {
-                    ask["reason"] = serde_json::json!(reason);
-                }
-            }
-            return Err(crate::protocol::Response::error_with_data(
-                req_id,
-                crate::protocol::ERROR_PERMISSION_REQUIRED,
-                format!(
-                    "path '{}' needs outside-access permission",
-                    original.display()
-                ),
-                serde_json::json!({"asks": [ask]}),
-            ));
-        }
-        Err(crate::protocol::Response::error_with_data(
-            req_id,
-            crate::access_policy::ACCESS_ASK_REQUIRED,
-            format!(
-                "path '{}' is outside this worker's worktree and needs permission",
-                original.display()
-            ),
-            serde_json::json!({
-                "ask": grant,
-            }),
-        ))
-    }
-
     /// Authorize `resolved` (the location for `original`) and return the
     /// identity the policy judged: the canonical path, or for a write
     /// location its canonical parent plus the final component as spelled.
@@ -10536,12 +10332,16 @@ impl AppContext {
         original: &Path,
         resolved: &Path,
         artifact_session: Option<&str>,
-        search_tool: Option<WorkerSearchTool>,
+        purpose: ReadPathPurpose,
         preserve_final: bool,
         allow_approval: bool,
     ) -> Result<PathBuf, crate::protocol::Response> {
         use crate::access_policy::{AccessDecision, AccessDenial, AccessOperation};
         use crate::policy_path::policy_path;
+        let search_tool = match purpose {
+            ReadPathPurpose::Search(tool) => Some(tool),
+            _ => None,
+        };
         if let Some(response) = self.worker_root_search_refusal(req_id, original, search_tool) {
             return Err(response);
         }
@@ -10766,7 +10566,13 @@ impl AppContext {
                         }
                     }
                 }
-                self.answer_ask(req_id, original, &identity, operation)?;
+                let read = (operation == AccessOperation::Read
+                    && !matches!(purpose, ReadPathPurpose::Revision))
+                .then_some(ReadAsk {
+                    path: resolved,
+                    search_tool,
+                });
+                self.answer_ask(req_id, original, &identity, operation, read)?;
                 crate::bounded_io::probe_access(req_id, &identity).map(|()| identity)
             }
             AccessDecision::Deny(AccessDenial::ReadOnly) => Err(crate::protocol::Response::error(
@@ -11407,6 +11213,19 @@ pub(crate) use bind_effect_fixture::configure_bind_effects_for_test;
 #[cfg(any(test, feature = "test-support"))]
 use bind_effect_fixture::{record_configure_bind_effect_for_test, ConfigureBindEffect};
 
+#[cfg(any(test, feature = "test-support"))]
+mod health_snapshot_test_support {
+    use super::AppContext;
+
+    impl AppContext {
+        /// Forces one root health summary to report contention without holding
+        /// the executor scheduler lock or blocking the health rollup.
+        pub fn hold_health_snapshot_lock_for_test(&self, while_held: impl FnOnce()) {
+            let _held = self.view_load_health.lock();
+            while_held();
+        }
+    }
+}
 #[cfg(test)]
 mod memory_estimate_tests {
     use super::*;
@@ -11957,6 +11776,7 @@ mod force_restrict_tests {
         assert!(ctx.validate_read_path("read", "session", &target).is_ok());
         let write = ctx.validate_path("write", &target).unwrap_err();
         assert_eq!(write.data["code"], "permission_required");
+        std::fs::write(outside.path().join("sibling"), "unapproved").unwrap();
         assert_eq!(
             ctx.validate_read_path("other", "session", &outside.path().join("sibling"))
                 .unwrap_err()

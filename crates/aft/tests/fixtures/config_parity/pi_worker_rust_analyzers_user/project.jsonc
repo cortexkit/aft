@@ -1,0 +1,5 @@
+{
+  "lsp": {
+    "worker_rust_analyzers": 4
+  }
+}

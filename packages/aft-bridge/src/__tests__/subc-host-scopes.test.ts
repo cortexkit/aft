@@ -14,7 +14,11 @@ import {
 } from "@cortexkit/subc-client";
 import { getActiveLogger, setActiveLogger } from "../active-logger.js";
 import type { Logger } from "../logger.js";
-import { type SubcClientLike, SubcTransportPool } from "../subc-transport.js";
+import {
+  __resetHostScopeServiceForTests,
+  type SubcClientLike,
+  SubcTransportPool,
+} from "../subc-transport.js";
 import { createAftTransportPool } from "../transport-factory.js";
 import { TEST_OTHER_ROOT, TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 
@@ -187,6 +191,7 @@ const originalLogger = getActiveLogger();
 const restoreClocks: Array<() => void> = [];
 afterEach(async () => {
   await Promise.all(pools.splice(0).map((pool) => pool.shutdown()));
+  __resetHostScopeServiceForTests();
   for (const restore of restoreClocks.splice(0).reverse()) restore();
   setActiveLogger(originalLogger);
 });
@@ -328,6 +333,7 @@ test("host-scope lookup ignores legacy and unknown providers and owners", async 
     expect(bind).toBeDefined();
     expect(bind?.opts?.scope).toEqual(supported ? scope : undefined);
     await pool.shutdown();
+    __resetHostScopeServiceForTests();
   }
 });
 
@@ -1280,6 +1286,126 @@ test("malformed head scope replies are retried rather than cached", async () => 
   }
 });
 
+test("an unavailable head-scope service gets one process-wide probe per retry and wakes all sessions", async () => {
+  const clock = retryClock();
+  const lines = scopeLogs();
+  const transports = [setup(), setup(), setup("pi")];
+  const sessions = transports.flatMap(({ client, pool }, i) =>
+    Array.from({ length: 4 }, (_, j) => ({
+      client,
+      pool,
+      bridge: pool.getBridge(TEST_PROJECT_ROOT),
+      session: `head-${i}-${j}`,
+    })),
+  );
+  const managementOpens = () =>
+    transports.flatMap(({ client }) =>
+      client.opens.filter((open) => open.target.kind === "management_surface"),
+    );
+  for (const { client } of transports) {
+    client.answer = new SubcError("scope method absent", "unknown_method");
+  }
+  await Promise.all(sessions.map(({ bridge, session }) => bridge.toolCall(session, "read", {})));
+  await clock.tick(0);
+  let expectedOpens = managementOpens().length;
+  expect(expectedOpens).toBeGreaterThan(0);
+  expect(expectedOpens).toBeLessThanOrEqual(sessions.length);
+  expect(clock.pending.size).toBe(1);
+
+  for (const { client } of transports) {
+    client.scopeOpenError = new SubcError("module disabled", "target_unavailable", {
+      state: "disabled",
+    });
+  }
+  for (const delay of [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000]) {
+    await clock.tick(delay - 1);
+    expect(managementOpens()).toHaveLength(expectedOpens);
+    await clock.tick(1);
+    expect(managementOpens()).toHaveLength(++expectedOpens);
+  }
+  expect(lines.filter((line) => line.includes("lookup=started reason=retry_due"))).toHaveLength(8);
+
+  const closed = sessions.pop()!;
+  const closedLookups = managementOpens().filter(
+    (open) => open.identity.session === closed.session,
+  );
+  await closed.pool.closeSession(TEST_PROJECT_ROOT, closed.session);
+  const gate = Promise.withResolvers<void>();
+  const recoveryAnswer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  for (const { client } of transports) {
+    client.scopeOpenError = undefined;
+    client.answer = recoveryAnswer;
+    client.scopeRequestGate = gate.promise;
+  }
+  await clock.tick(300_000);
+  expect(managementOpens()).toHaveLength(++expectedOpens);
+  const late = { ...sessions[0], session: "late-head" };
+  try {
+    expect((await late.bridge.toolCall(late.session, "read", {})).text).toBe("ok");
+    expect(managementOpens()).toHaveLength(expectedOpens);
+  } finally {
+    gate.resolve();
+  }
+  await clock.tick(0);
+  expect(managementOpens()).toHaveLength(expectedOpens + sessions.length);
+  expect(managementOpens().filter((open) => open.identity.session === closed.session)).toEqual(
+    closedLookups,
+  );
+  for (const { bridge, client, session } of [...sessions, late]) {
+    await bridge.toolCall(session, "read", {});
+    expect(client.opens.findLast((open) => open.identity.session === session)?.opts?.scope).toEqual(
+      scope,
+    );
+  }
+});
+
+test("a no_scope probe restores service without sharing its session's answer", async () => {
+  const clock = retryClock();
+  const probe = setup();
+  const peer = setup("pi");
+  probe.client.scopeOpenError = new SubcError("module is not registered", "unknown_module");
+  const probeBridge = probe.pool.getBridge(TEST_PROJECT_ROOT);
+  const peerBridge = peer.pool.getBridge(TEST_PROJECT_ROOT);
+  await probeBridge.toolCall("unscoped-head", "read", {});
+  await peerBridge.toolCall("scoped-head", "read", {});
+  expect(peer.client.reads).toHaveLength(0);
+
+  probe.client.scopeOpenError = undefined;
+  probe.client.answer = { answer: "no_scope" };
+  await clock.tick(5_000);
+  await probe.pool.getBridge(TEST_OTHER_ROOT).toolCall("unscoped-head", "read", {});
+  await peerBridge.toolCall("scoped-head", "read", {});
+  expect(probe.client.reads).toHaveLength(1);
+  expect(probe.client.opens.at(-1)?.opts?.scope).toBeUndefined();
+  expect(peer.client.reads).toHaveLength(1);
+  expect(peer.client.opens.at(-1)?.opts?.scope).toEqual(scope);
+});
+
+test("healthy head-scope lookups do not wait for another session's lookup", async () => {
+  const slow = setup();
+  const fast = setup("pi");
+  const gate = Promise.withResolvers<void>();
+  slow.client.scopeRequestGate = gate.promise;
+  const slowCall = slow.pool.getBridge(TEST_PROJECT_ROOT).toolCall("slow", "read", {});
+  let fastReply: Record<string, unknown> | undefined;
+  const fastCall = fast.pool
+    .getBridge(TEST_PROJECT_ROOT)
+    .toolCall("fast", "read", {})
+    .then((reply) => {
+      fastReply = reply;
+    });
+  try {
+    await settle();
+    expect(slow.client.reads).toHaveLength(1);
+    expect(slow.client.toolBodies).toHaveLength(0);
+    expect(fastReply?.text).toBe("ok");
+    expect(fast.client.opens.at(-1)?.opts?.scope).toEqual(scope);
+  } finally {
+    gate.resolve();
+    await Promise.all([slowCall, fastCall]);
+  }
+});
+
 test("head scope retries back off exponentially to five minutes without delaying binds", async () => {
   const clock = fakeClock();
   const { client, pool } = setup();
@@ -1376,6 +1502,8 @@ test("no_scope, missing prefrontal and lookup errors preserve an unscoped bind",
     await bridge.toolCall("head", "read", {});
     expect(client.reads).toHaveLength(1);
     expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+    await pool.shutdown();
+    __resetHostScopeServiceForTests();
   }
 });
 

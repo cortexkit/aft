@@ -52,6 +52,7 @@ pub const MAX_IDLE_CHECKOUT_HOURS: u32 = 24 * 365;
 pub const DEFAULT_LSP_IDLE_MINUTES: u32 = 60;
 pub const MIN_LSP_IDLE_MINUTES: u32 = 5;
 pub const MAX_LSP_IDLE_MINUTES: u32 = 1440;
+pub const DEFAULT_WORKER_RUST_ANALYZERS: usize = 2;
 
 const fn default_semantic_query_timeout_ms() -> u64 {
     DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
@@ -1074,6 +1075,11 @@ pub struct Config {
     /// Trusted user ceiling before project tightening; not a configure input.
     #[serde(skip)]
     pub lsp_user_max_servers: Option<usize>,
+    /// Maximum rust-analyzer processes allowed for worker sessions in this project.
+    pub lsp_worker_rust_analyzers: usize,
+    /// Process-wide ceiling before project config tightens the worker limit.
+    #[serde(skip)]
+    pub lsp_user_worker_rust_analyzers: Option<usize>,
     /// Extra directories to search when resolving LSP binaries.
     /// The plugin populates these from its own auto-install cache (e.g.
     /// `~/.cache/aft/lsp-packages/<pkg>/node_modules/.bin/`) so an LSP binary
@@ -1182,6 +1188,8 @@ impl Default for Config {
             lsp_idle_shutdown: true,
             lsp_max_servers: 8,
             lsp_user_max_servers: None,
+            lsp_worker_rust_analyzers: DEFAULT_WORKER_RUST_ANALYZERS,
+            lsp_user_worker_rust_analyzers: None,
             lsp_paths_extra: Vec::new(),
             lsp_auto_install_binaries: HashSet::new(),
             lsp_inflight_installs: HashSet::new(),

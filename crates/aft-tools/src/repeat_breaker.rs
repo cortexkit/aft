@@ -1,7 +1,9 @@
+use std::hash::{Hash, Hasher};
+
 use serde_json::{Map, Value};
 
 pub use crate::repeat_state::{escalation_starts_at, RepeatBreaker, RepeatIntervention};
-use crate::repeat_state::{hash_value, RepeatObservation};
+use crate::repeat_state::{hash_value, RepeatObservation, RepeatOutput};
 
 /// Capture the semantic input and the catalog's effect classification together
 /// before execution consumes the arguments.
@@ -48,6 +50,32 @@ pub fn output_hash(rendered_text: &str) -> u64 {
         .filter(|line| !is_foreground_task_line(line))
         .collect();
     hash_value(&kept.join("\n"))
+}
+
+pub(crate) fn output_fingerprint(rendered_text: &str, data: &Value) -> RepeatOutput {
+    RepeatOutput {
+        text_hash: output_hash(rendered_text),
+        attachment_hash: attachment_payload_hash(data),
+    }
+}
+
+fn attachment_payload_hash(data: &Value) -> Option<u64> {
+    let attachments = data.get("attachments")?.as_array()?;
+    let mut payloads = attachments.iter().filter_map(|attachment| {
+        Some((
+            attachment.get("kind").and_then(Value::as_str),
+            attachment.get("mime").and_then(Value::as_str),
+            attachment.get("data")?.as_str()?,
+        ))
+    });
+    // The payload is already base64-encoded; hashing it avoids decoding or
+    // copying the bytes again. Exclude labels and other presentation metadata.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payloads.next()?.hash(&mut hasher);
+    for payload in payloads {
+        payload.hash(&mut hasher);
+    }
+    Some(hasher.finish())
 }
 
 pub fn semantic_key(tool: &str, input: &Value) -> String {

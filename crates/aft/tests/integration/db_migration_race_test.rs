@@ -341,7 +341,7 @@ fn eight_concurrent_v8_openers_converge_on_the_fresh_v10_schema() {
         "concurrent migration failures: {failures:?}"
     );
 
-    let migrated = Connection::open(&database).expect("open concurrently migrated database");
+    let migrated = aft::db::open(&database).expect("open concurrently migrated database");
     assert_eq!(schema_version(&migrated), aft::db::CURRENT_SCHEMA_VERSION);
 
     let fresh_storage = tempfile::tempdir().expect("fresh comparison storage");

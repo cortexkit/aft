@@ -1,6 +1,7 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { mkdir, writeFile } from "node:fs/promises";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { navigationTools } from "../../tools/navigation.js";
@@ -93,6 +94,26 @@ export function runCallgraphToolcallSuite(
       expect(output).toContain("caller");
       expect(output).toContain("funcB");
     });
+
+    if (!options.harnessFactory) {
+      test("standalone enables callgraph by default and honors the project config", async () => {
+        const args = { op: "callers", filePath: "sample.ts", symbol: "normalize" };
+        expect(await runCallgraph(await harness(), args)).toContain("funcB");
+
+        const project = await harness();
+        await mkdir(project.path(".cortexkit"), { recursive: true });
+        await writeFile(
+          project.path(".cortexkit", "aft.jsonc"),
+          JSON.stringify({ indexes: { callgraph: false } }),
+        );
+        const response = await project.bridge.toolCall(
+          "standalone-index-settings",
+          "callgraph",
+          args,
+        );
+        expect(response.code).toBe("callgraph_off");
+      });
+    }
 
     test("call_tree returns forward calls through tool_call", async () => {
       const h = await harness();

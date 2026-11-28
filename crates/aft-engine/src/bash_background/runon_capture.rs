@@ -1,29 +1,58 @@
 //! Coordinate local foreground shells with remote checkout capture.
 
-use super::BgTask;
-use std::collections::{BTreeSet, HashMap};
+use super::{remote::RemoteTask, BgTask};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 const WAIT_CAP: Duration = Duration::from_secs(30);
-pub(super) const WARNING: &str =
-    "Copied while another command in this checkout was still running; its changes may be missing from the job.";
+const COMMAND_CHARS: usize = 80;
+
+pub(super) type Overlaps = BTreeMap<String, String>;
 
 pub(super) fn render_warning(
     metadata: &super::PersistedTask,
     note: Option<String>,
 ) -> Option<String> {
-    if metadata
-        .remote
-        .as_ref()
-        .is_some_and(|remote| remote.copy_warning)
-    {
-        Some(note.map_or_else(|| WARNING.to_owned(), |note| format!("{note}\n{WARNING}")))
-    } else {
-        note
+    let Some(warning) = metadata.remote.as_ref().map(|remote| &remote.copy_warning) else {
+        return note;
+    };
+    if !warning.active {
+        return note;
+    }
+    let commands = &warning.commands;
+    let detail = match commands.first_key_value() {
+        None => String::new(),
+        Some((_, command)) if commands.len() == 1 => format!(" (`{command}`)"),
+        Some((_, command)) => format!(" (`{command}` and {} more)", commands.len() - 1),
+    };
+    let warning = format!("Copied while another command in this checkout was still running{detail}; its changes may be missing from the job.");
+    Some(match note {
+        Some(note) => format!("{note}\n{warning}"),
+        None => warning,
+    })
+}
+
+pub(super) fn store_warning(task: &BgTask, remote: &mut RemoteTask) {
+    let overlaps = task
+        .runon_copy_overlaps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !overlaps.is_empty() {
+        remote.copy_warning.active = true;
+        remote.copy_warning.commands.extend(overlaps.clone());
+    }
+}
+
+fn short_command(command: &str) -> String {
+    // Mask credentials before shortening, since a partial token may not match.
+    let command = crate::log_redact::redact_command(command);
+    let line = command.lines().next().unwrap_or_default();
+    match line.char_indices().nth(COMMAND_CHARS) {
+        Some((end, _)) => format!("{}…", &line[..end]),
+        None => line.to_owned(),
     }
 }
 
@@ -31,13 +60,14 @@ struct Command {
     harness: Option<String>,
     session: String,
     workdir: PathBuf,
+    short_line: String,
 }
 
 struct CopyWindow {
     harness: Option<String>,
     session: String,
     checkout: PathBuf,
-    overlap: bool,
+    overlaps: Overlaps,
 }
 
 impl CopyWindow {
@@ -64,19 +94,28 @@ fn activity() -> MutexGuard<'static, Activity> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+pub(super) fn track_local(task: &BgTask, workdir: &Path, command: &str) {
+    task.local_capture_command
+        .get_or_init(|| LocalCommand::start(task, workdir, command));
+}
+
 pub(super) struct LocalCommand(String);
 
 impl LocalCommand {
-    pub(super) fn start(task: &BgTask, workdir: &Path) -> Self {
+    pub(super) fn start(task: &BgTask, workdir: &Path, command: &str) -> Self {
         let command = Command {
             harness: task.db_harness.clone(),
             session: task.session_id.clone(),
             workdir: super::canonicalized_path(workdir),
+            short_line: short_command(command),
         };
         let mut activity = activity();
         for copy in activity.copying.values_mut() {
             // Latch the start even if the command ends before acceptance arrives.
-            copy.overlap |= copy.includes(&command);
+            if copy.includes(&command) {
+                copy.overlaps
+                    .insert(task.task_id.clone(), command.short_line.clone());
+            }
         }
         activity.foreground.insert(task.task_id.clone(), command);
         Self(task.task_id.clone())
@@ -121,7 +160,7 @@ impl Submission {
             harness: self.task.db_harness.clone(),
             session: self.task.session_id.clone(),
             checkout: self.checkout.clone(),
-            overlap: false,
+            overlaps: Overlaps::new(),
         };
         let mut waited_for = BTreeSet::new();
         let (id, cap_hit) = loop {
@@ -139,18 +178,24 @@ impl Submission {
             }
             {
                 let mut activity = activity();
+                let matching = activity
+                    .foreground
+                    .iter()
+                    .filter(|(_, command)| window.includes(command));
                 let mut running = false;
-                for (id, command) in &activity.foreground {
-                    if window.includes(command) {
-                        running = true;
-                        waited_for.insert(id.clone());
-                    }
+                for (id, _) in matching.clone() {
+                    running = true;
+                    waited_for.insert(id.clone());
                 }
                 let cap_hit = running && tokio::time::Instant::now() >= deadline;
                 if !running || cap_hit {
                     // Start observing under the same lock as the last foreground check,
                     // so no command can start between checking and arming the window.
-                    window.overlap = cap_hit;
+                    if cap_hit {
+                        window.overlaps = matching
+                            .map(|(id, command)| (id.clone(), command.short_line.clone()))
+                            .collect();
+                    }
                     let id = activity.next_copy;
                     activity.next_copy += 1;
                     activity.copying.insert(id, window);
@@ -198,12 +243,13 @@ impl Copy {
 
 impl Drop for Copy {
     fn drop(&mut self) {
-        if activity()
-            .copying
-            .remove(&self.id)
-            .is_some_and(|window| window.overlap)
-        {
-            self.task.runon_copy_warning.store(true, Ordering::Release);
+        let window = activity().copying.remove(&self.id);
+        if let Some(window) = window.filter(|window| !window.overlaps.is_empty()) {
+            self.task
+                .runon_copy_overlaps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(window.overlaps);
         }
     }
 }

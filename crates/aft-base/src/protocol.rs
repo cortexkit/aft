@@ -55,6 +55,9 @@ pub struct PermissionAskFrame {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashCompletedFrame {
+    /// In-process link back to the registry's pending completion.
+    #[serde(skip)]
+    pub ingress_missed: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[serde(skip)]
     pub launching_identity: Option<TaskIdentity>,
     #[serde(
@@ -131,6 +134,9 @@ pub struct BashLongRunningFrame {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashPatternMatchFrame {
+    /// The originating registry already saved the pending match for a later drain.
+    #[serde(skip)]
+    pub durable_pending: bool,
     #[serde(skip)]
     pub launching_identity: Option<TaskIdentity>,
     #[serde(rename = "type")]
@@ -394,6 +400,7 @@ impl BashCompletedFrame {
     ) -> Self {
         Self {
             frame_type: "bash_completed",
+            ingress_missed: None,
             launching_identity: None,
             changed_files: None,
             task_id: task_id.into(),
@@ -448,6 +455,7 @@ impl BashPatternMatchFrame {
     ) -> Self {
         Self {
             frame_type: "bash_pattern_match",
+            durable_pending: false,
             launching_identity: None,
             batch: None,
             task_id: task_id.into(),
@@ -469,6 +477,7 @@ impl BashPatternMatchFrame {
     ) -> Self {
         Self {
             frame_type: "bash_pattern_match",
+            durable_pending: false,
             launching_identity: None,
             batch: None,
             task_id: task_id.into(),
@@ -493,6 +502,7 @@ impl BashPatternMatchFrame {
         // reason because clients only accept pattern_match and task_exit.
         Self {
             frame_type: "bash_pattern_match",
+            durable_pending: false,
             launching_identity: None,
             batch: None,
             task_id: task_id.into(),

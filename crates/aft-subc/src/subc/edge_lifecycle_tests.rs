@@ -270,7 +270,8 @@ async fn retired_shell_does_not_block_pong_or_unrelated_bind() {
     let started = project.path().join("started");
     let stop = project.path().join("stop");
     daemon.send(FrameType::Request, 1, 10, json!({
-        "name":"bash", "call_key":"detaching-shell", "arguments":{
+         "name":"bash", "call_key":"detaching-shell", "arguments":{
+             "description":"Wait for the background fixture",
             "command":format!("printf x > '{}'; for i in $(seq 1 200); do [ -e '{}' ] && break; sleep 0.05; done", started.display(), stop.display()),
         },
     })).await;

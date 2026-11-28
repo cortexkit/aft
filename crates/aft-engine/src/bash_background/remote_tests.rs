@@ -909,7 +909,7 @@ fn exec_remote_bash_unknown_reply_without_job_omits_status_hint() {
 #[test]
 fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
     let mut remote = RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         explicit_runon: false,
@@ -2826,7 +2826,7 @@ async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: keyed.then(|| KeyedSubmission {
             key: format!("aft:{task_id}"),
             created_at_ms: unix_millis(),
@@ -4957,7 +4957,7 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(return_paths_root(&main, outside.path()), main);
+    assert!(return_paths_workdir(outside.path()).1.is_none());
     let error = build_remote_request(
         &main,
         outside.path(),
@@ -5191,7 +5191,7 @@ fn unreported_git_untracked_and_ignored_reports_stay_silent() {
 #[test]
 fn remote_phase_comes_from_runner_evidence() {
     let mut remote = RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -5342,7 +5342,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
     metadata.status = BgTaskStatus::Running;
     metadata.started_at = 1_000_000;
     metadata.remote = Some(RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -5600,7 +5600,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
     // Submitted first nine minutes ago; the runner drained until now.
     metadata.started_at = now - 9 * MINUTE_MS;
     metadata.remote = Some(RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -7296,18 +7296,8 @@ fn runon_cd_snapshot_missing_git_keeps_failure_branch() {
     .is_some());
 }
 
-#[test]
-fn runon_cd_sequential_command_after_setup_is_allowed() {
-    let (_dir, request) = runon_cd_snapshot_fixture();
-    let checkout = Path::new(&request.workspace_key);
-    for package in ["plugin", "e2e-tests"] {
-        let path = checkout.join("packages").join(package);
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("source.ts"), "source\n").unwrap();
-    }
-    let command = "printf setup; cd packages/plugin && bun test src/__tests__; cd ../e2e-tests && bun test src/__tests__";
-    assert_eq!(runon_cd_refusal(command, &request).unwrap(), None);
-}
+#[path = "remote_tests/cwd_chains.rs"]
+mod cwd_chains;
 
 #[test]
 fn runon_cd_scoped_and_unknown_directories_preserve_refusals() {
@@ -7326,8 +7316,8 @@ fn runon_cd_scoped_and_unknown_directories_preserve_refusals() {
         "cd \"$DIR\" && cd ../x",
         "cd \"$DIR\"; cd ../x",
         "cd && cd ../x",
-        "cd ~ && cd ../x",
-        "cd ~/src && cd ../x",
+        "HOME=/tmp; cd ~ && cd ../x",
+        "unset HOME; cd ~/src && cd ../x",
         "cd - && cd ../x",
         "cd */sub && cd ../x",
     ] {
@@ -8791,7 +8781,7 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
-        copy_warning: false,
+        copy_warning: Default::default(),
         submission: None,
         accepted_platform: None,
         explicit_runon: true,
@@ -9310,3 +9300,6 @@ async fn runon_draining_wait_saves_its_record_at_a_coarse_step() {
 
 #[path = "remote_scope_tests.rs"]
 mod scope_tests;
+
+#[path = "remote_tests/copy_warning.rs"]
+mod copy_warning;

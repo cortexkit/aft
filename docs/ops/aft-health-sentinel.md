@@ -15,15 +15,30 @@ minus that timestamp; `snapshot_age_ms` is an alias retained for existing client
 A successful census sets `stale: false` and `stale_reason: null` (even if an
 individual root reports busy or degraded).
 
-When the executor scheduler cannot be snapshotted without contention, health is
-Degraded with detail `executor scheduler state could not be snapshotted without contention`.
-It retains the last measured census and its original timestamp, sets `stale: true`
-and `stale_reason: "executor_contended"`, and keeps increasing the age across
-repeated failed refreshes. Before any successful census, the timestamp and ages
-are null, as are unmeasured actor/root counts, root rows, call-graph counters,
-LSP/lifecycle data, memory totals, and embedding availability. Null means
-**unknown**, not zero, empty, or available. The initial pending census uses
-`not_yet_sampled`; a nonblocking cache-read miss uses `cache_contended`.
+When the executor scheduler cannot be snapshotted without contention, health retains
+the last measured census and its original timestamp, sets `stale: true` and
+`stale_reason: "executor_contended"`, keeps increasing the age across repeated
+failed refreshes, and preserves the detail `executor scheduler state could not be
+snapshotted without contention`. One missed refresh does not by itself make health
+Degraded. While the retained census is younger than three ordinary health-rollup
+intervals, its existing contention detail accompanies an Ok status. Health becomes
+Degraded when no census has succeeded for three intervals: currently 90 seconds,
+because the ordinary interval is 30 seconds. The one-second contention retries do
+not change this wall-clock threshold. Before any successful census, the existing
+unknown-census Degraded report still applies; timestamp and ages are null, as are
+unmeasured actor/root counts, root rows, call-graph counters, LSP/lifecycle data,
+memory totals, and embedding availability. Null means **unknown**, not zero, empty,
+or available. The initial pending census uses `not_yet_sampled`; a nonblocking
+cache-read miss uses `cache_contended`.
+
+Root actor snapshots use the same three-interval grace period independently per
+root, measured from that root's last successful snapshot. Repeated misses do not
+reset the timer, and a successful root snapshot or root removal clears it. A root
+first observed as contended gets the same grace period from that observation. The
+root contention detail remains visible during the grace period, but only a root
+whose last successful snapshot is at least three intervals old contributes to a
+Degraded verdict. These root snapshots can still come from a successful overall
+census, so `stale` remains false and `stale_reason` remains null.
 
 Fresh probe signals (dispatch liveness, dispatch-path/runtime counters other than
 the census-derived LSP counts, process I/O, indexing progress, and write-ledger

@@ -89,7 +89,13 @@ async function runBash(
   const bash = hooks.tool.bash;
   if (!bash) throw new Error("real plugin factory did not register the bash tool");
   const result = await bash.execute(
-    { command, wait: true, timeout: 45_000, compressed: false },
+    {
+      command,
+      description: "Run the instance disposal probe",
+      wait: true,
+      timeout: 45_000,
+      compressed: false,
+    },
     toolContext(directory, sessionID),
   );
   return typeof result === "string"

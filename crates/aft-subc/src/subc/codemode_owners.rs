@@ -12,6 +12,7 @@ use subc_protocol::scope::{ScopeKind, ScopeParent, ScopeStamp, ScopeStatus};
 fn matches_parent(identity: &RouteIdentity, parent: &ScopeParent) -> bool {
     identity.run_owner.is_none()
         && identity.call_mode == CallMode::Classic
+        && !flow_read::is_head_read_route(identity)
         && identity.scope.as_ref().is_some_and(|scope| {
             scope.owner_authorized
                 && scope.owner == parent.owner

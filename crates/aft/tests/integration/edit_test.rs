@@ -1885,11 +1885,88 @@ fn batch_overlapping_ranges_returns_overlapping_edits_error() {
 
     assert_eq!(resp["success"], false, "batch should fail: {:?}", resp);
     assert_eq!(resp["code"], "overlapping_edits");
-    assert!(resp["message"].as_str().unwrap().contains("overlaps"));
+    assert_eq!(
+        resp["message"],
+        "batch: edits overlap — edit at bytes [2..6) overlaps with edit at bytes [3..7)"
+    );
     assert_eq!(fs::read_to_string(&target).unwrap(), original);
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn batch_no_op_overlap_does_not_block_real_change() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let original = "abcdefghij\nnext line\n";
+    for (name, no_op) in [
+        (
+            "match",
+            serde_json::json!({ "oldString": "cdef", "newString": "cdef" }),
+        ),
+        (
+            "lines",
+            serde_json::json!({ "line_start": 1, "line_end": 1, "content": "abcdefghij" }),
+        ),
+    ] {
+        let target = dir.path().join(format!("{name}.txt"));
+        fs::write(&target, original).unwrap();
+        let req = serde_json::json!({
+            "id": name,
+            "command": "batch",
+            "file": target,
+            "edits": [no_op, { "match": "defg", "replacement": "YYYY" }]
+        });
+        let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+        assert_eq!(
+            resp["success"], true,
+            "{name}: identity edit blocked real change: {resp:?}"
+        );
+        assert_eq!(resp["edits_applied"], 2);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "abcYYYYhij\nnext line\n"
+        );
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn batch_all_no_op_preserves_preview_and_no_change_response() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("identity.txt");
+    let original = "alpha beta gamma\n";
+    fs::write(&target, original).unwrap();
+    let mut req = serde_json::json!({
+        "id": "identity-preview",
+        "command": "batch",
+        "file": target,
+        "preview": true,
+        "edits": [
+            { "match": "alpha", "replacement": "alpha" },
+            { "match": "gamma", "replacement": "gamma" }
+        ]
+    });
+    let preview = aft.send(&serde_json::to_string(&req).unwrap());
+    assert_eq!(preview["success"], true, "{preview:?}");
+    assert_eq!(preview["no_op"], true);
+    assert_eq!(preview["edits_applied"], 2);
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    req["id"] = serde_json::json!("identity-apply");
+    req["preview"] = serde_json::json!(false);
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+    assert_eq!(resp["success"], false, "{resp:?}");
+    assert_eq!(resp["code"], "no_change");
+    assert_eq!(
+        resp["message"],
+        "No change: the replacement is identical to the existing text."
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+    assert!(aft.shutdown().success());
 }
 
 #[test]

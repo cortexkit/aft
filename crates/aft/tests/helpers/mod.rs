@@ -28,6 +28,40 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+pub fn write_gh_fixture_pin(state: &Path, key: &ring::signature::Ed25519KeyPair, _now: u64) {
+    use ring::signature::KeyPair;
+    let public_key_hex: String = key
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    std::fs::create_dir_all(state).unwrap();
+    std::fs::write(
+        state.join("trust-root-generation.json"),
+        br#"{"generation":1,"current_key_id":"21fe31dfa154a261","previous_key_ids":[]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("trust-root.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "key_id": "21fe31dfa154a261",
+            "public_key_hex": public_key_hex,
+            "retired_key_ids": [],
+            "generation": 1,
+            "read_at_unix_secs": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+pub fn gh_fixture_anchor() -> &'static str {
+    r#"{"key_id":"21fe31dfa154a261","public_key_hex":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","generation":1}"#
+}
+
 /// Canonicalize a fixture root for Git path arguments. Git's Windows worktree
 /// creation rejects verbatim local-drive paths, even though Rust accepts them.
 pub fn canonical_git_path(path: &Path) -> PathBuf {

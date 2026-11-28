@@ -169,6 +169,25 @@ async fn settings_review_classifies_harness_overrides_like_their_root_field() {
     }
 }
 
+#[tokio::test]
+async fn settings_review_records_the_cache_choice_as_one_field() {
+    let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
+    let request = ConfigReviewRequest::new(0, vec![], None);
+    let reply = review::response(&schema, &frame(FrameType::Request, 8, json!(request)))
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+    assert!(reply.refusals.is_empty());
+    let paths: Vec<_> = reply
+        .fields
+        .iter()
+        .filter(|field| field.path.starts_with("/storage/cache_dir"))
+        .map(|field| field.path.as_str())
+        .collect();
+    assert_eq!(paths, ["/storage/cache_dir"]);
+}
+
 fn frame(kind: FrameType, corr: u64, body: Value) -> Frame {
     Frame::build(
         kind,
@@ -250,7 +269,7 @@ async fn exercise_bootstrap() {
         startup::drive_first_view(
             &control,
             &ctx,
-            Some((declaration, Schema::new(schema).unwrap())),
+            (Some((declaration, Schema::new(schema).unwrap())), false),
             &mut incoming_rx,
             &replies,
             &writer,
@@ -392,7 +411,7 @@ async fn settings_first_declaration_timeout_is_retried_without_a_push() {
             startup::drive_first_view(
                 &control,
                 &ctx,
-                Some((declaration, Schema::new(schema).unwrap())),
+                (Some((declaration, Schema::new(schema).unwrap())), false),
                 &mut incoming_rx,
                 &replies,
                 &writer,
@@ -466,6 +485,7 @@ async fn settings_changed_fetches_and_applies_pending_generation_before_ack() {
             Arc::new(Schema::new(sample_schema()).unwrap()),
             tier,
             old,
+            false,
         ));
         session.mark_ready();
         let task = {
@@ -531,15 +551,244 @@ fn settings_standalone_observation_still_reads_file_and_project() {
     assert!(!snapshot.resolved().format_on_edit);
     assert!(!snapshot.resolved().indexes.semantic);
     assert!(!snapshot.resolved().restrict_to_project_root);
-    let approved = ApprovedUser::new(validate_user(&json!({"format_on_edit":true})).unwrap());
+    assert!(snapshot.sources(snapshot.resolved()).project.path.is_some());
+}
+
+#[test]
+fn settings_daemon_never_opens_the_project_file_at_bind() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    // The legacy reader attempts to open this path and refuses the bind.
+    std::fs::create_dir_all(root.join(".cortexkit/aft.jsonc")).unwrap();
+    let approved = ApprovedUser::new(
+        validate_user(&json!({"format_on_edit":true,"bash":{"env":{"EXAMPLE":"daemon"}}})).unwrap(),
+    );
     let snapshot = crate::subc_config::PreparedBindConfig::read_with_approved(
-        Some(&file),
+        None,
         Some(&approved),
-        &root,
+        root,
         &crate::harness::Harness::Pi,
     )
     .unwrap();
     assert!(snapshot.resolved().format_on_edit);
-    assert!(!snapshot.resolved().indexes.semantic);
-    assert!(!snapshot.resolved().restrict_to_project_root);
+    let bash = &snapshot.resolved().bash;
+    assert_eq!(bash.env.get("EXAMPLE").map(String::as_str), Some("daemon"));
+    assert!(bash.project_env.is_empty());
+    let sources = snapshot.sources(snapshot.resolved());
+    assert!(sources.project.path.is_none());
+    assert!(sources.user.path.is_none());
+}
+
+#[tokio::test]
+async fn settings_review_refuses_the_entire_workspace_or_project_snapshot() {
+    let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
+    for layer in [ConfigLayer::Workspace, ConfigLayer::Project] {
+        let review = |value: Value| {
+            let mut user = ConfigLayerSnapshot::file(
+                "aft",
+                ConfigLayer::User,
+                "user/aft.jsonc",
+                Some(
+                    br#"{"bash":{"env":{"INHERITED":"user setting"},"disclaim_privacy":true}}"#
+                        .to_vec(),
+                ),
+            );
+            user.project_id = Some("p".into());
+            let mut snapshot = ConfigLayerSnapshot::file(
+                "aft",
+                layer.clone(),
+                "root/.cortexkit/aft.jsonc",
+                Some(serde_json::to_vec(&value).unwrap()),
+            );
+            snapshot.project_id = Some("p".into());
+            if layer == ConfigLayer::Workspace {
+                snapshot.workspace_id = Some("w".into());
+            }
+            frame(
+                FrameType::Request,
+                8,
+                json!(ConfigReviewRequest::new(0, vec![user, snapshot], None)),
+            )
+        };
+        let mut cases = vec![
+            (
+                json!({"format_on_edit":false, "search":{"rerank":{"backend":"onnx"}}}),
+                "/search/rerank/backend".to_string(),
+            ),
+            (
+                json!({"bash":{"changed_files":"diff"}}),
+                "/bash/changed_files".into(),
+            ),
+            (
+                json!({"harnesses":{"mcp:a/b":{"bash":{"env":{"PATH":"not returned"}}}}}),
+                "/harnesses/mcp:a~1b/bash/env/PATH".into(),
+            ),
+        ];
+        for name in [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_EXAMPLE",
+            "BASH_ENV",
+            "ENV",
+        ] {
+            cases.push((
+                json!({"bash":{"env":{(name):"not returned"}}}),
+                format!("/bash/env/{name}"),
+            ));
+        }
+        for (value, path) in cases {
+            let reply = review::response(&schema, &review(value))
+                .await
+                .unwrap()
+                .unwrap();
+            let body: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+            assert!(body.fields.is_empty());
+            assert_eq!(body.refusals.len(), 1);
+            assert_eq!(body.refusals[0].paths, [path]);
+            assert_eq!(body.refusals[0].project_id.as_deref(), Some("p"));
+            assert!(!String::from_utf8_lossy(&reply.body).contains("not returned"));
+        }
+        let clean = review(
+            json!({"format_on_edit":false, "search":{"rerank":{"backend":"off"}}, "bash":{"env":{"EXAMPLE":"safe"},"changed_files":"off"}}),
+        );
+        let reply = review::response(&schema, &clean).await.unwrap().unwrap();
+        let body: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+        assert!(body.refusals.is_empty(), "{:?}", body.refusals);
+        assert!(body
+            .fields
+            .iter()
+            .all(|field| field.project_id.as_deref() == Some("p")));
+        assert!(body
+            .fields
+            .iter()
+            .any(|field| field.path == "/storage/cache_dir"));
+        assert!(body
+            .fields
+            .iter()
+            .any(|field| field.path == "/bash/env/EXAMPLE"
+                && field.new_source == layer.known_layer().unwrap()));
+        let loosening = review(json!({"harnesses":{"pi":{"bash":{"disclaim_privacy":false}}}}));
+        let reply = review::response(&schema, &loosening)
+            .await
+            .unwrap()
+            .unwrap();
+        let body: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body.refusals[0].paths,
+            ["/harnesses/pi/bash/disclaim_privacy"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_review_refuses_higher_worker_rust_analyzer_limits() {
+    let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
+    for layer in [ConfigLayer::Workspace, ConfigLayer::Project] {
+        let user = ConfigLayerSnapshot::file(
+            "aft",
+            ConfigLayer::User,
+            "user/aft.jsonc",
+            Some(br#"{"lsp":{"max_servers":2,"worker_rust_analyzers":2}}"#.to_vec()),
+        );
+        for key in ["max_servers", "worker_rust_analyzers"] {
+            let mut snapshot = ConfigLayerSnapshot::file(
+                "aft",
+                layer.clone(),
+                "root/.cortexkit/aft.jsonc",
+                Some(serde_json::to_vec(&json!({"lsp":{(key):3}})).unwrap()),
+            );
+            snapshot.project_id = Some("p".into());
+            if layer == ConfigLayer::Workspace {
+                snapshot.workspace_id = Some("w".into());
+            }
+            let request = frame(
+                FrameType::Request,
+                8,
+                json!(ConfigReviewRequest::new(
+                    0,
+                    vec![user.clone(), snapshot],
+                    None
+                )),
+            );
+            let reply = review::response(&schema, &request).await.unwrap().unwrap();
+            let body: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+            assert!(body.fields.is_empty(), "{layer:?} {key}: {body:?}");
+            assert_eq!(body.refusals.len(), 1, "{layer:?} {key}: {body:?}");
+            assert_eq!(body.refusals[0].paths, [format!("/lsp/{key}")]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn settings_two_routes_share_the_project_view_and_unknown_falls_back() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (writer, mut written) = mpsc::channel(16);
+        let replies = readiness::PendingControlReplies::default();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let control = Arc::new(readiness::DaemonControl::new(writer.clone(), metrics.clone(), PROTOCOL_VERSION, vec![], vec![], replies.clone(), 2));
+        let executor = Arc::new(Executor::new());
+        let user_view = ConfigView::new(3, json!({"format_on_edit":true,"lsp":{"max_servers":6}}), Default::default(), vec![], ConfigStatus::Active);
+        let user = validate_user(&user_view.effective).unwrap();
+        let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
+        let session = Arc::new(Session::new(schema.clone(), user, user_view, true));
+        session.mark_ready();
+        let projects = &session.projects;
+        let first_route = projects.slot("registered", session.user(), &schema);
+        let second_route = projects.slot("registered", session.user(), &schema);
+        let missing = projects.slot("unregistered", session.user(), &schema);
+        let daemon = async {
+            for _ in 0..2 {
+                let (corr, get) = next(&mut written).await;
+                let id = get["project_id"].as_str().unwrap();
+                if id == "registered" {
+                    let mut view = ConfigView::new(4, json!({"format_on_edit":false,"harnesses":{"pi":{"revision_reads":false}},"lsp":{"max_servers":2},"bash":{"env":{"A":"user-or-workspace","B":"project"}}}), Default::default(), vec![], ConfigStatus::Active);
+                    view.project_id = Some(id.into());
+                    assert!(replies.resolve(frame(FrameType::Response, corr, json!(ConfigGetReply::new(Some(view), None)))));
+                } else {
+                    assert_eq!(id, "unregistered");
+                    assert!(replies.resolve(frame(FrameType::Error, corr, json!(ErrorBody::new("unknown_project", "project is not registered")))));
+                }
+            }
+        };
+        let (first, second, unknown, ()) = tokio::join!(first_route.fetch(&control, &executor, true), second_route.fetch(&control, &executor, true), missing.fetch(&control, &executor, true), daemon);
+        for result in [first, second, unknown] { result.unwrap(); }
+        assert!(written.try_recv().is_err(), "two routes must not issue two requests for one project");
+        assert!(Arc::ptr_eq(&first_route, &second_route));
+        let root = tempfile::tempdir().unwrap();
+        let harness = crate::harness::Harness::Pi;
+        let resolved = |view| crate::subc_config::PreparedBindConfig::read_with_approved(None, Some(view), root.path(), &harness).unwrap();
+        assert!(!resolved(&first_route.settings).resolved().format_on_edit);
+        assert!(!resolved(&second_route.settings).resolved().revision_reads);
+        assert_eq!(resolved(&second_route.settings).resolved().bash.env["B"], "project");
+        assert_eq!(resolved(&first_route.settings).resolved().lsp_max_servers, 2);
+        assert_eq!(resolved(&first_route.settings).resolved().lsp_user_max_servers, Some(6));
+        assert!(resolved(&missing.settings).resolved().format_on_edit);
+        let watch = tokio::spawn({
+            let session = session.clone();
+            let control = control.clone();
+            async move { session.run(control, executor).await }
+        });
+        let mut change = ConfigChanged::new(5, vec![]);
+        change.project_id = Some("registered".into());
+        assert!(session.intercept(&frame(FrameType::Push, 0, json!(change)), &writer, &metrics).await.unwrap());
+        let (corr, get) = next(&mut written).await;
+        assert_eq!(get["project_id"], "registered");
+        let mut pending = ConfigView::new(5, json!({"format_on_edit":true,"bash":{"env":{"B":"updated"}}}), Default::default(), vec![], ConfigStatus::Pending);
+        pending.project_id = Some("registered".into());
+        pending.attempt = Some(11);
+        assert!(replies.resolve(frame(FrameType::Response, corr, json!(ConfigGetReply::new(None, Some(pending))))));
+        let (corr, applied) = next(&mut written).await;
+        assert_eq!(applied["project_id"], "registered");
+        assert_eq!(applied["result"], "ack");
+        assert_eq!(resolved(&second_route.settings).resolved().bash.env["B"], "updated");
+        assert!(!resolved(&missing.settings).resolved().bash.env.contains_key("B"));
+        assert!(replies.resolve(frame(FrameType::Response, corr, json!(ConfigAppliedReply::new()))));
+        watch.abort();
+        let _ = watch.await;
+        drop(first_route);
+        assert!(projects.existing("registered").is_some());
+        drop(second_route);
+        assert!(projects.existing("registered").is_none());
+    }).await.unwrap();
 }

@@ -28,6 +28,65 @@ impl KillStateSave {
 }
 
 impl BgTaskRegistry {
+    pub(crate) fn kill_for_scope_revocation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, String> {
+        self.kill_with_status_reason(
+            task_id,
+            session_id,
+            BgTaskStatus::Killed,
+            Some(SCOPE_REVOKED_REASON.into()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Kill a codemode program's task once its run scope is confirmed ended.
+    pub(crate) fn kill_for_run_end(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, String> {
+        self.kill_with_status_reason(
+            task_id,
+            session_id,
+            BgTaskStatus::Killed,
+            Some(RUN_ENDED_REASON.into()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Kill a running call's task because its caller withdrew the call
+    /// (`tool.withdraw`). The task is named by the call ledger row, so it is
+    /// found by id alone; its status reason is [`WITHDRAWN_REASON`].
+    pub fn kill_withdrawn(&self, task_id: &str) -> Result<BgTaskSnapshot, String> {
+        let session_id = self
+            .task(task_id)
+            .map(|task| task.session_id.clone())
+            .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        self.kill_with_status_reason(
+            task_id,
+            &session_id,
+            BgTaskStatus::Killed,
+            Some(WITHDRAWN_REASON.into()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
+        self.kill_typed(task_id, session_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn kill_typed(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, RegistryError> {
+        self.kill_with_status_reason(task_id, session_id, BgTaskStatus::Killed, None)
+    }
+
     /// The outcome a PTY's waiter observed, once it has reaped the process:
     /// a kill's outcome is decided, and otherwise the waiter's exit status
     /// stands in for an exit marker it could not save (a full disk, say).
@@ -43,6 +102,72 @@ impl BgTaskRegistry {
             return Some(ExitMarker::Killed);
         }
         pty.coordinator.observed_exit.get().cloned()
+    }
+
+    /// Wait, at most the termination grace period, for a killed PTY's leader
+    /// to be seen exiting. A kill whose outcome is unknown (`unconfirmed`)
+    /// may leave the leader running, and then no exit is ever observed: its
+    /// unknown outcome is published here so the task never stays `killing`.
+    /// Returns whether this call published it.
+    #[cfg(unix)]
+    pub(super) fn settle_pty_kill(
+        &self,
+        task: &Arc<BgTask>,
+        unconfirmed: bool,
+        saves: &mut KillStateSave,
+    ) -> Result<bool, String> {
+        let exited = |state: &BgTaskState| {
+            state.metadata.status.is_terminal()
+                || match &state.runtime {
+                    TaskRuntime::Pty(Some(pty)) => pty.exit_observed.load(Ordering::SeqCst),
+                    _ => true,
+                }
+        };
+        let deadline = Instant::now() + super::super::process::TERMINATE_GRACE;
+        loop {
+            let state = task
+                .lock_state()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if exited(&state) {
+                return Ok(false);
+            }
+            drop(state);
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !unconfirmed {
+            return Ok(false);
+        }
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| "background task lock poisoned".to_string())?;
+        if exited(&state) {
+            return Ok(false);
+        }
+        let status = state
+            .pending_terminal_override
+            .take()
+            .unwrap_or(BgTaskStatus::FateUnknown);
+        let reason = state.metadata.status_reason.clone();
+        state.metadata.mark_terminal(status, None, reason);
+        task.mark_terminal_now();
+        // The runtime is dropped after the lock is released.
+        let retired = match &mut state.runtime {
+            TaskRuntime::Pty(runtime) => runtime.take(),
+            TaskRuntime::Piped(_) => None,
+        };
+        state.detached = true;
+        saves.record(
+            task,
+            self.persist_task_locked(task, &state.metadata, &mut db),
+            true,
+        );
+        drop(state);
+        drop(retired);
+        Ok(true)
     }
 
     pub(in crate::bash_background) fn output_limit_exceeded(&self, task: &BgTask) -> bool {
@@ -71,13 +196,16 @@ impl BgTaskRegistry {
     }
 
     /// Re-take the state lock after a PTY kill's signal and close the master.
-    /// Returns whether this call published the terminal state.
+    /// `unconfirmed` is why the kill's outcome is unknown, when it is; the
+    /// task then ends fate unknown with that reason. Returns whether this call
+    /// published the terminal state.
     pub(super) fn finish_pty_kill(
         &self,
         task: &Arc<BgTask>,
         terminal_status: BgTaskStatus,
         reason: Option<String>,
         resource_kill: bool,
+        unconfirmed: Option<String>,
         #[cfg_attr(not(windows), allow(unused_variables))] saves: &mut KillStateSave,
     ) -> Result<bool, String> {
         #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
@@ -85,8 +213,21 @@ impl BgTaskRegistry {
         let mut state = task
             .lock_state()
             .map_err(|_| "background task lock poisoned".to_string())?;
-        state.kill_in_flight = false;
-        task.kill_settled.notify_all();
+        // On Unix the kill keeps `kill_in_flight` until it has published its
+        // outcome (see `KillInFlight`); ConPTY's outcome is published here.
+        #[cfg(windows)]
+        {
+            state.kill_in_flight = false;
+            task.kill_settled.notify_all();
+        }
+        // The waiter's exit marker is published after this, with this outcome.
+        #[cfg(not(windows))]
+        if let Some(unconfirmed) = unconfirmed.clone() {
+            if !state.metadata.status.is_terminal() {
+                state.pending_terminal_override = Some(BgTaskStatus::FateUnknown);
+                state.metadata.status_reason = Some(unconfirmed);
+            }
+        }
 
         // On Unix the PTY waiter writes the exit marker and the watchdog
         // publishes the terminal state from it. Windows ConPTY gives no such
@@ -105,6 +246,10 @@ impl BgTaskRegistry {
                 .pending_terminal_override
                 .take()
                 .unwrap_or(default_status);
+            let (target_status, reason) = match unconfirmed {
+                Some(unconfirmed) => (BgTaskStatus::FateUnknown, Some(unconfirmed)),
+                None => (target_status, reason),
+            };
             if !task.paths.exit.exists() {
                 saves.record(task, write_kill_marker_if_absent(&task.paths), false);
             }

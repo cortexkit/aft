@@ -2,7 +2,7 @@
   "native": {
     "id": "confine-vector",
     "success": true,
-    "text": "0 files matching **/*.rs",
+    "text": "≥0 files matching **/*.rs",
     "rendered_files": 0,
     "complete": false,
     "no_files_matched_scope": false,
@@ -34,5 +34,5 @@
       ]
     }
   },
-  "text": "0 files matching **/*.rs\n\nshown 0 of ≥0 files (walk) · narrow: path"
+  "text": "≥0 files matching **/*.rs\n\nshown 0 of ≥0 files (walk) · narrow: path"
 }

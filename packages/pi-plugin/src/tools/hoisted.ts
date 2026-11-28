@@ -46,6 +46,7 @@ import { type Static, type TObject, Type } from "typebox";
 import { resolveBashConfig, resolveGithubConfig, toolEnabled } from "../config.js";
 import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";
 import { hashlinePatchSections } from "../omp-approval.js";
+import { OMP_FILESYSTEM_GREP, type OmpFilesystemGrepOptions } from "../omp-internal-urls.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -500,6 +501,10 @@ const GrepParams = Type.Object({
     }),
   ),
 });
+
+type GrepRuntimeParams = Static<typeof GrepParams> & {
+  [OMP_FILESYSTEM_GREP]?: OmpFilesystemGrepOptions;
+};
 
 export interface ToolSurfaceFlags {
   hoistRead: boolean;
@@ -999,18 +1004,16 @@ export function registerHoistedTools(
         promptSnippet: "Fast regex search across files (trigram-indexed inside the project root)",
         promptGuidelines: [`Prefer ${grepName} over bash-invoked find/rg for in-project searches.`],
         parameters: GrepParams,
-        async execute(
-          _toolCallId: string,
-          params: Static<typeof GrepParams>,
-          _signal,
-          _onUpdate,
-          extCtx,
-        ) {
+        async execute(_toolCallId: string, params: GrepRuntimeParams, _signal, _onUpdate, extCtx) {
           const bridge = bridgeFor(ctx, extCtx.cwd);
           const req: Record<string, unknown> = { pattern: params.pattern };
+          const omp = params[OMP_FILESYSTEM_GREP];
+          const path = omp?.path ?? params.path;
           let pathSplit: SearchPathArgSplit | undefined;
-          if (params.path) {
-            pathSplit = await splitSearchPathArg(extCtx.cwd, params.path);
+          if (path) {
+            pathSplit = Array.isArray(path)
+              ? { paths: path, missing: [] }
+              : await splitSearchPathArg(extCtx.cwd, path);
             for (const target of pathSplit.paths) {
               await assertExternalReadPermission(
                 ctx,
@@ -1019,8 +1022,11 @@ export function registerHoistedTools(
                 surface.restrictToProjectRoot,
               );
             }
-            req.path = await bridgeSearchPathArg(extCtx.cwd, pathSplit);
+            req.path = Array.isArray(path)
+              ? await Promise.all(path.map((target) => resolvePathArg(extCtx.cwd, target)))
+              : await bridgeSearchPathArg(extCtx.cwd, pathSplit);
           }
+          if (omp?.case !== undefined) req.case_sensitive = omp.case;
           if (params.include) req.include = params.include;
           if (params.offset !== undefined) req.offset = params.offset;
 

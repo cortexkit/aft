@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::lsp::registry::ServerKind;
 
 #[cfg(unix)]
-use crate::bash_background::process::ProcessIdentity;
+use crate::bash_background::process::{is_running_in_group, ProcessIdentity};
 
 #[cfg(unix)]
 use crate::bash_background::process::TERMINATE_GRACE;
@@ -59,7 +59,8 @@ impl TrackedProcess {
             kind: kind.cloned(),
             #[cfg(unix)]
             state: Mutex::new(LeaderState {
-                identity: ProcessIdentity::of(pid),
+                identity: crate::process_identity::process_start_time_ms(pid)
+                    .map(|start| ProcessIdentity::from_epoch(pid, start)),
                 ..LeaderState::default()
             }),
         }))
@@ -134,7 +135,8 @@ impl TrackedProcess {
         if state.reaped
             || !state
                 .identity
-                .is_some_and(|leader| leader.is_running_in_group(pgid))
+                .as_ref()
+                .is_some_and(|leader| is_running_in_group(leader, pgid))
         {
             if !state.warned {
                 crate::slog_warn!(

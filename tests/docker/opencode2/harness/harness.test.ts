@@ -901,7 +901,13 @@ describe("scenario isolation and liveness", () => {
       label: "call",
       response: {
         kind: "tool_calls" as const,
-        calls: [{ id: "c", name: "bash", arguments: { command: "printf x" } }],
+        calls: [
+          {
+            id: "c",
+            name: "bash",
+            arguments: { command: "printf x", description: "Print the shell alias marker" },
+          },
+        ],
       },
     };
     const v1 = await observeThenRespond(structuredClone(turn) as never, {}, 0, {}, "v1");
@@ -1170,7 +1176,13 @@ describe("shared-server controls", () => {
           label: "fallback-call",
           response: {
             kind: "tool_calls",
-            calls: [{ id: "fallback", name: "bash", arguments: { command: "printf fallback" } }],
+            calls: [
+              {
+                id: "fallback",
+                name: "bash",
+                arguments: { command: "printf fallback", description: "Print the fallback marker" },
+              },
+            ],
           },
         },
         {

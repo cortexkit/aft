@@ -36,11 +36,8 @@ fn read_allows_explicit_ranges_from_large_files() {
 
     assert_eq!(resp["success"], true, "read should succeed: {resp:?}");
     assert_eq!(resp["content"], "1: first\n2: second\n");
-    assert_eq!(resp["complete"], false, "range read is partial: {resp:?}");
-    assert_eq!(
-        resp["truncated"], true,
-        "range read should flag gap: {resp:?}"
-    );
+    assert_eq!(resp["complete"], true, "range was returned: {resp:?}");
+    assert_eq!(resp["truncated"], false);
     assert!(
         resp.get("total_lines").is_none(),
         "ranged read should not scan to EOF just to report total_lines: {resp:?}"
@@ -75,10 +72,7 @@ fn read_range_stops_after_one_line_lookahead() {
 
     assert_eq!(resp["success"], true, "read should succeed: {resp:?}");
     assert_eq!(resp["content"].as_str().unwrap().lines().count(), 10);
-    assert_eq!(
-        resp["truncated"], true,
-        "lookahead should detect more lines: {resp:?}"
-    );
+    assert_eq!(resp["truncated"], false, "lookahead is outside the range");
     assert!(
         resp.get("total_lines").is_none(),
         "lookahead-only ranged read must not report an inexact total: {resp:?}"
@@ -88,7 +82,7 @@ fn read_range_stops_after_one_line_lookahead() {
 }
 
 #[test]
-fn read_range_reports_partial_and_omits_unknown_total_lines() {
+fn read_range_reports_complete_and_omits_unknown_total_lines() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hundred.txt");
     let content = (1..=100)
@@ -100,7 +94,7 @@ fn read_range_reports_partial_and_omits_unknown_total_lines() {
     let mut aft = AftProcess::spawn();
     let resp = aft.send(
         &serde_json::json!({
-            "id": "read-range-partial",
+            "id": "read-range-complete",
             "command": "read",
             "file": path,
             "start_line": 1,
@@ -110,11 +104,8 @@ fn read_range_reports_partial_and_omits_unknown_total_lines() {
     );
 
     assert_eq!(resp["success"], true, "read should succeed: {resp:?}");
-    assert_eq!(resp["complete"], false, "range read is partial: {resp:?}");
-    assert_eq!(
-        resp["truncated"], true,
-        "range read should flag gap: {resp:?}"
-    );
+    assert_eq!(resp["complete"], true, "range was returned: {resp:?}");
+    assert_eq!(resp["truncated"], false);
     assert!(
         resp.get("total_lines").is_none(),
         "total_lines is unknown when the ranged read stops after lookahead: {resp:?}"

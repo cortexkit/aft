@@ -2428,6 +2428,11 @@ pub(super) fn submit_deferred_bash(
         .get("params")
         .filter(|params| params.is_object())
         .unwrap_or(&arguments);
+    let awaited = super::awaited_work::Candidate::for_call(
+        program_owner_scope.as_ref().or(scope_stamp.as_ref()),
+        &session_id,
+        raw_args,
+    );
     let blocking_intent = ["wait", "block_to_completion"].iter().any(|key| {
         raw_args
             .get(*key)
@@ -2648,6 +2653,8 @@ pub(super) fn submit_deferred_bash(
     let spawn_cancel = JobCancellation::new();
     let submit_cancel = spawn_cancel.clone();
     let submit_request_id = request_id.clone();
+    let awaited_for_spawn = awaited.clone();
+    let identity_for_reply = task_identity.clone();
     // Even submission can wait for a scheduler lock. The reply timer below
     // lives on the frame runtime; submission and every spawn syscall do not.
     let spawn_submission = tokio::task::spawn_blocking(move || {
@@ -2815,6 +2822,7 @@ pub(super) fn submit_deferred_bash(
                     let _display = super::rich_ui::display::enter(ledger_key.as_ref());
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
+                            let _awaited = awaited_for_spawn.as_ref().map(|item| item.prepare(ctx.bash_background()));
                             // Declared first so its test-only drop check runs after
                             // both guards restore this exact executor thread.
                             #[cfg(test)]
@@ -3203,6 +3211,100 @@ pub(super) fn submit_deferred_bash(
             }
         };
         let spawn_control = spawn_control_rx.await;
+        if let Some(candidate) = awaited {
+            let key = spawn_response.data["task_id"]
+                .as_str()
+                .filter(|_| spawn_response.success);
+            let caller_waits = !answered_startup
+                && !claim.claimed_by_module_loop()
+                && !cancel.connection.is_cancelled()
+                && !cancel.route.is_cancelled();
+            if let Some(key) = key {
+                if candidate
+                    .open(spawn_ctx.bash_background(), key, caller_waits)
+                    .await
+                {
+                    let response = match &spawn_control {
+                        Ok(BashSpawnControl::Foreground {
+                            detach_on_user_message,
+                            ..
+                        }) => {
+                            let key = key.to_owned();
+                            let session = session_id.clone();
+                            let ctx = spawn_ctx.clone();
+                            let request = request_id.clone();
+                            let format = format_context.clone();
+                            let wait_mode = *detach_on_user_message;
+                            let status = spawn_response.data["status"].clone();
+                            let remote = background_runon;
+                            tokio::task::spawn_blocking(move || {
+                                let _identity =
+                                    crate::bash_background::task_identity_scope(identity_for_reply);
+                                release_wait_registration(
+                                    ctx.bash_background(),
+                                    &session,
+                                    &key,
+                                    wait_mode,
+                                );
+                                let note = crate::commands::bash_orchestrate::kill_deadline_note(
+                                    ctx.bash_background(),
+                                    &key,
+                                    &session,
+                                    worker_session,
+                                );
+                                let mut launch = bash_background_launch_response(
+                                    &request,
+                                    &key,
+                                    false,
+                                    worker_session,
+                                    format.bash_watch_available.unwrap_or(worker_session),
+                                    &note,
+                                );
+                                launch.data["status"] = status;
+                                let launch = if remote {
+                                    with_capture_warning(&launch)
+                                } else {
+                                    launch
+                                };
+                                finalized_bash_result(launch, &ctx, &session, &format, true, repeat)
+                            })
+                            .await
+                            .ok()
+                        }
+                        _ => {
+                            let text = spawn_text_rx.await.unwrap_or_else(|_| {
+                                crate::subc_format::format_response_with_context(
+                                    "bash",
+                                    &spawn_response,
+                                    &format_context,
+                                )
+                            });
+                            Some(ToolCallResult {
+                                text,
+                                response: spawn_response,
+                            })
+                        }
+                    };
+                    send_bash_deferred_completion(
+                        &completion_tx,
+                        &task_metrics,
+                        route,
+                        corr,
+                        flags,
+                        ver,
+                        root_for_task,
+                        request_id,
+                        claim
+                            .try_claim_for_wait_task()
+                            .then_some(response)
+                            .flatten(),
+                        false,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
         let blocking_wait = matches!(
             &spawn_control,
             Ok(BashSpawnControl::Foreground {
@@ -3917,6 +4019,17 @@ async fn run_deferred_bash_wait(
     // test waiting on this event sees exactly what a drain census taken next
     // would report for this call.
     if let Some(foreground_phase) = metrics.held_bash_calls.phase(route, corr) {
+        #[cfg(feature = "test-hooks")]
+        if let Some(dir) = std::env::var_os("AFT_TEST_CONFORMANCE_BASH_WAIT_READY") {
+            let marker =
+                PathBuf::from(dir).join(format!("{}-{}-{corr}", route.channel, route.epoch));
+            if let Err(error) = std::fs::write(&marker, b"ready") {
+                log::warn!(
+                    "cannot write bash wait marker {}: {error}",
+                    marker.display()
+                );
+            }
+        }
         if let Ok(guard) = metrics.lifecycle_probe.lock() {
             if let Some(probe) = guard.as_ref() {
                 probe.bash_foreground_wait(route, corr, foreground_phase.label());

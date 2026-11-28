@@ -22,7 +22,8 @@
                 "id": "bash-happy",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'bash-fixture\\n'"
+                  "command": "printf 'bash-fixture\\n'",
+                  "description": "Print the bash fixture marker"
                 },
                 "non_mutating_evidence": {
                   "reason": "bash only observes fixture state"
@@ -97,7 +98,8 @@
                 "id": "linked-worktree-pwd",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'cwd=%s\\n' \"$(pwd -P)\""
+                  "command": "printf 'cwd=%s\\n' \"$(pwd -P)\"",
+                  "description": "Print the linked worktree path"
                 },
                 "non_mutating_evidence": {
                   "reason": "pwd only reports the working directory"
@@ -162,7 +164,8 @@
                 "id": "bash-invalid",
                 "name": "bash",
                 "arguments": {
-                  "command": 42
+                  "command": 42,
+                  "description": "Submit an invalid command type"
                 },
                 "non_mutating_evidence": {
                   "reason": "the host rejects the argument type before execution"
@@ -204,7 +207,7 @@
               {
                 "id": "bash-missing",
                 "name": "bash",
-                "arguments": {},
+                "arguments": { "description": "Submit a call without a command" },
                 "non_mutating_evidence": {
                   "reason": "the host rejects missing required arguments before execution"
                 }
@@ -266,7 +269,8 @@
                 "id": "bash-loop-ask_allow",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt"
+                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt",
+                  "description": "Write the loop permission fixture"
                 },
                 "disk_effects": [
                   "bash-loop.txt"
@@ -325,7 +329,8 @@
           {
             "tool": "bash",
             "arguments": {
-              "command": "printf 'loop permission fixture\\n' > bash-loop.txt"
+              "command": "printf 'loop permission fixture\\n' > bash-loop.txt",
+              "description": "Write the loop permission fixture"
             }
           },
           {
@@ -369,7 +374,8 @@
                 "id": "bash-loop-ask_deny",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt"
+                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt",
+                  "description": "Write the loop permission fixture"
                 },
                 "non_mutating_evidence": {
                   "reason": "reject prevents the bash write"
@@ -411,7 +417,8 @@
                 "id": "bash-loop-config_deny",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt"
+                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt",
+                  "description": "Write the loop permission fixture"
                 },
                 "non_mutating_evidence": {
                   "reason": "config_deny prevents the bash write"
@@ -463,7 +470,8 @@
                 "id": "bash-fallback-ask_allow",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
+                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt",
+                  "description": "Write the fallback permission fixture"
                 },
                 "non_mutating_evidence": {
                   "reason": "the refused command never runs, so bash-fallback.txt keeps its fixture bytes and the whole-tree snapshot stays unchanged"
@@ -523,7 +531,8 @@
                 "id": "bash-fallback-ask_deny",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
+                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt",
+                  "description": "Write the fallback permission fixture"
                 },
                 "non_mutating_evidence": {
                   "reason": "the refused command never runs, so bash-fallback.txt keeps its fixture bytes and the whole-tree snapshot stays unchanged"
@@ -583,7 +592,8 @@
                 "id": "bash-fallback-config_deny",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
+                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt",
+                  "description": "Write the fallback permission fixture"
                 },
                 "non_mutating_evidence": {
                   "reason": "config_deny prevents the bash write"
@@ -635,6 +645,7 @@
                 "name": "bash",
                 "arguments": {
                   "command": "sleep 5; printf 'completion wake\\n' > completion.txt",
+                  "description": "Write the completion marker after a delay",
                   "background": true
                 },
                 "disk_effects": [
@@ -702,6 +713,7 @@
                 "name": "bash",
                 "arguments": {
                   "command": "sleep 3; echo WATCH_MATCH; sleep 1; echo WATCH_MATCH",
+                  "description": "Print the watch pattern twice",
                   "background": true
                 },
                 "non_mutating_evidence": {
@@ -813,6 +825,7 @@
                 "name": "bash",
                 "arguments": {
                   "command": "sleep 40; printf finished-inline",
+                  "description": "Wait for delayed inline output",
                   "wait": true
                 },
                 "non_mutating_evidence": {
@@ -911,6 +924,7 @@
                 "name": "bash",
                 "arguments": {
                   "command": "sleep 40; printf finished-inline",
+                  "description": "Start the task for the synchronous watch",
                   "background": true
                 },
                 "non_mutating_evidence": {
@@ -1021,7 +1035,8 @@
                 "id": "bash-abort",
                 "name": "bash",
                 "arguments": {
-                  "command": "sleep 30"
+                  "command": "sleep 30",
+                  "description": "Start a command to abort"
                 },
                 "non_mutating_evidence": {
                   "reason": "aborted bash work does not mutate the project"
@@ -1088,7 +1103,8 @@
                 "id": "bash-t6-bash-bash-output-complete",
                 "name": "bash",
                 "arguments": {
-                  "command": "printf 'bash-fixture\\n'"
+                  "command": "printf 'bash-fixture\\n'",
+                  "description": "Print the bash fixture marker"
                 },
                 "non_mutating_evidence": {
                   "reason": "truncation fixtures only observe project data"
@@ -1138,7 +1154,8 @@
                 "id": "bash-t6-bash-bash-output-incomplete",
                 "name": "bash",
                 "arguments": {
-                  "command": "i=0; while [ $i -lt 2500 ]; do echo bash-output-$i; i=$((i+1)); done"
+                  "command": "i=0; while [ $i -lt 2500 ]; do echo bash-output-$i; i=$((i+1)); done",
+                  "description": "Print 2500 lines to test truncation"
                 },
                 "non_mutating_evidence": {
                   "reason": "truncation fixtures only observe project data"
@@ -1185,7 +1202,7 @@
           "label": "warm-watcher",
           "response": { "kind": "tool_calls", "calls": [{
             "id": "changed-files-complete-warm", "name": "bash",
-            "arguments": { "command": ":", "wait": true, "compressed": false },
+            "arguments": { "command": ":", "description": "Warm the file watcher", "wait": true, "compressed": false },
             "non_mutating_evidence": { "reason": "initialize the project's file watcher without changing files" }
           }] }
         },
@@ -1193,7 +1210,7 @@
           "label": "call-tool",
           "response": { "kind": "tool_calls", "calls": [{
             "id": "changed-files-complete", "name": "bash",
-            "arguments": { "command": "printf 'changed file\\n' > changed-files.txt", "wait": true, "compressed": false },
+            "arguments": { "command": "printf 'changed file\\n' > changed-files.txt", "description": "Write one changed file", "wait": true, "compressed": false },
             "disk_effects": ["changed-files.txt"]
           }] }
         },
@@ -1221,7 +1238,7 @@
           "label": "warm-watcher",
           "response": { "kind": "tool_calls", "calls": [{
             "id": "changed-files-incomplete-warm", "name": "bash",
-            "arguments": { "command": ":", "wait": true, "compressed": false },
+            "arguments": { "command": ":", "description": "Warm the file watcher", "wait": true, "compressed": false },
             "non_mutating_evidence": { "reason": "initialize the project's file watcher without changing files" }
           }] }
         },
@@ -1229,7 +1246,7 @@
           "label": "call-tool",
           "response": { "kind": "tool_calls", "calls": [{
             "id": "changed-files-incomplete", "name": "bash",
-            "arguments": { "command": "i=0; while [ $i -lt 41 ]; do printf 'changed\\n' > changed-$i.txt; i=$((i+1)); done", "wait": true, "compressed": false },
+            "arguments": { "command": "i=0; while [ $i -lt 41 ]; do printf 'changed\\n' > changed-$i.txt; i=$((i+1)); done", "description": "Write 41 changed files", "wait": true, "compressed": false },
             "disk_effects": ["changed-0.txt", "changed-1.txt", "changed-2.txt", "changed-3.txt", "changed-4.txt", "changed-5.txt", "changed-6.txt", "changed-7.txt", "changed-8.txt", "changed-9.txt", "changed-10.txt", "changed-11.txt", "changed-12.txt", "changed-13.txt", "changed-14.txt", "changed-15.txt", "changed-16.txt", "changed-17.txt", "changed-18.txt", "changed-19.txt", "changed-20.txt", "changed-21.txt", "changed-22.txt", "changed-23.txt", "changed-24.txt", "changed-25.txt", "changed-26.txt", "changed-27.txt", "changed-28.txt", "changed-29.txt", "changed-30.txt", "changed-31.txt", "changed-32.txt", "changed-33.txt", "changed-34.txt", "changed-35.txt", "changed-36.txt", "changed-37.txt", "changed-38.txt", "changed-39.txt", "changed-40.txt"]
           }] }
         },
@@ -1257,7 +1274,7 @@
           "label": "warm-watcher",
           "response": { "kind": "tool_calls", "calls": [{
             "id": "diff-lines-complete-warm", "name": "bash",
-            "arguments": { "command": ":", "wait": true, "compressed": false },
+            "arguments": { "command": ":", "description": "Warm the file watcher", "wait": true, "compressed": false },
             "non_mutating_evidence": { "reason": "initialize the project's file watcher without changing files" }
           }] }
         },
@@ -1265,7 +1282,7 @@
           "label": "call-tool",
           "response": { "kind": "tool_calls", "calls": [{
             "id": "diff-lines-complete", "name": "bash",
-            "arguments": { "command": "printf 'small diff\\n' > diff-lines.txt", "wait": true, "compressed": false },
+            "arguments": { "command": "printf 'small diff\\n' > diff-lines.txt", "description": "Write a one-line diff", "wait": true, "compressed": false },
             "disk_effects": ["diff-lines.txt"]
           }] }
         },
@@ -1293,7 +1310,7 @@
           "label": "warm-watcher",
           "response": { "kind": "tool_calls", "calls": [{
             "id": "diff-lines-incomplete-warm", "name": "bash",
-            "arguments": { "command": ":", "wait": true, "compressed": false },
+            "arguments": { "command": ":", "description": "Warm the file watcher", "wait": true, "compressed": false },
             "non_mutating_evidence": { "reason": "initialize the project's file watcher without changing files" }
           }] }
         },
@@ -1301,7 +1318,7 @@
           "label": "call-tool",
           "response": { "kind": "tool_calls", "calls": [{
             "id": "diff-lines-incomplete", "name": "bash",
-            "arguments": { "command": ": > diff-lines.txt; i=0; while [ $i -lt 250 ]; do printf 'diff-line-%s\\n' $i >> diff-lines.txt; i=$((i+1)); done", "wait": true, "compressed": false },
+            "arguments": { "command": ": > diff-lines.txt; i=0; while [ $i -lt 250 ]; do printf 'diff-line-%s\\n' $i >> diff-lines.txt; i=$((i+1)); done", "description": "Write a 250-line diff", "wait": true, "compressed": false },
             "disk_effects": ["diff-lines.txt"]
           }] }
         },

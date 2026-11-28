@@ -363,7 +363,7 @@ async fn scope_watch_daemon_case(binary_env: &str, expect_watch: bool) {
     .unwrap();
     // PTY launches hand back a task id even to a direct consumer, leaving a
     // running task to monitor after the consumer closes its route.
-    let reply = request(&consumer, &route, json!({"name":"bash", "arguments":{"command":"sleep 120", "background":true, "pty":true, "timeout":150000}})).await
+    let reply = request(&consumer, &route, json!({"name":"bash", "arguments":{"command":"sleep 120", "description":"Keep the scoped terminal active", "background":true, "pty":true, "timeout":150000}})).await
         .unwrap_or_else(|error| panic!("background bash request: {error}; fixture logs:\n{}", fixture_logs(&home)));
     let reply: Value = serde_json::from_slice(&reply).unwrap();
     assert_ne!(reply["isError"], true, "bash launch refused: {reply}");
@@ -1211,4 +1211,97 @@ async fn vault_transports_real_daemon_keep_implicit_aft_principal_and_scope() {
     );
     assert!(manifest["scope"].is_null(), "{result}");
     println!("real daemon: production secret.use and manifest.latest admitted as reserved:aft using implicit launch identity; secret scope owner/ref/epoch/kind preserved; manifest unscoped");
+}
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+#[tokio::test]
+#[ignore = "opt-in real-daemon Basal capture; Linux only, needs test-scope-owner"]
+async fn basal_flow_head_read_capture_uses_real_route_open() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use sha2::{Digest, Sha256};
+
+    let (_temp, home, project) = hermetic_home();
+    let script = b"export default 37;\n";
+    let manifest = b"{\"id\":\"sample\"}\n";
+    std::fs::create_dir(project.join("flows")).unwrap();
+    std::fs::write(project.join("flows/sample.js"), script).unwrap();
+    std::fs::write(project.join("flows/sample.json"), manifest).unwrap();
+    let config_path = home.join("config/cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let mut peer = config["modules"]
+        .as_object_mut()
+        .unwrap()
+        .remove("aft-test-scope-owner")
+        .unwrap();
+    peer["env"]["AFT_TEST_BASAL_FLOW_READ"] = json!("1");
+    config["modules"]["prefrontal"] = peer.clone();
+    config["modules"]["basal"] = peer;
+    config["scope_authority_owners"] = json!(["prefrontal"]);
+    std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let daemon = HermeticDaemon::start(&home).await;
+    wait_for_scope_owner(&project).await;
+    let head = SubcConsumer::connect(&daemon.connection_file, ConsumerOptions::default())
+        .await
+        .unwrap();
+    let capture: Value = serde_json::from_slice(include_bytes!(
+        "fixtures/basal-flow-head-read-v1/request.json"
+    ))
+    .unwrap();
+    let head_identity = serde_json::from_value(capture["route_open"]["identity"].clone()).unwrap();
+    let _head_route = head
+        .open_route_scoped(
+            RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            head_identity,
+            subc_protocol::scope::ScopeSelector::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "prefrontal".into(),
+                },
+                "head/fixture",
+                Some(37),
+            ),
+            options(None),
+        )
+        .await
+        .unwrap();
+    // No head AFT route is opened for head/other, even though the scope is live.
+    std::fs::write(home.join("basal-flow-read.start"), b"ready").unwrap();
+
+    let result = home.join("basal-flow-read.result");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !result.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "Basal did not complete the captured requests:\n{}",
+            fixture_logs(&home.join("logs"))
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let results: Value = serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+    for (name, bytes) in [
+        ("head-script", script.as_slice()),
+        ("head-manifest", manifest.as_slice()),
+        ("flow-read", script.as_slice()),
+    ] {
+        assert_eq!(results[name]["stage"], "file.read_exact", "{results}");
+        assert_eq!(results[name]["success"], true, "{results}");
+        assert_eq!(
+            results[name]["body"],
+            json!({
+                "bytes_base64":STANDARD.encode(bytes),
+                "size":bytes.len(),
+                "sha256":format!("{:x}", Sha256::digest(bytes)),
+            })
+        );
+    }
+    let refused = &results["other-head"];
+    assert_eq!(refused["stage"], "file.read_exact", "{results}");
+    assert_eq!(refused["success"], false, "{results}");
+    assert_eq!(
+        refused["body"]["code"],
+        "file_read_exact_route_not_admitted"
+    );
+    assert_eq!(refused["body"]["message"], "Route not admitted: parent: no open AFT route for the parent head scope head/other at epoch 38 (the head must have an AFT route open at the epoch core stamped).");
 }

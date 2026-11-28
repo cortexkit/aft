@@ -206,6 +206,31 @@ fn prepared_bind_watches_keep_the_captured_source() {
 }
 
 #[test]
+fn worker_rust_analyzers_reload_user_ceiling_and_hold_project_loosening() {
+    let fixture = Fixture::new(
+        r#"{"lsp":{"worker_rust_analyzers":2}}"#,
+        Some(r#"{"lsp":{"worker_rust_analyzers":1}}"#),
+    );
+    write(&fixture.user_path, r#"{"lsp":{"worker_rust_analyzers":3}}"#);
+    let outcome = fixture.reload();
+    assert!(applied(&outcome).contains(&"lsp.worker_rust_analyzers"));
+    assert_eq!(fixture.ctx.config().lsp_user_worker_rust_analyzers, Some(3));
+    assert_eq!(fixture.ctx.config().lsp_worker_rust_analyzers, 1);
+    write(
+        &fixture.project_path,
+        r#"{"lsp":{"worker_rust_analyzers":0}}"#,
+    );
+    assert!(applied(&fixture.reload()).contains(&"lsp.worker_rust_analyzers"));
+    assert_eq!(fixture.ctx.config().lsp_worker_rust_analyzers, 0);
+    write(
+        &fixture.project_path,
+        r#"{"lsp":{"worker_rust_analyzers":2}}"#,
+    );
+    fixture.reload();
+    assert_eq!(fixture.ctx.config().lsp_worker_rust_analyzers, 0);
+}
+
+#[test]
 fn inspect_categories_and_lsp_idle_reload_without_restart() {
     let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60,"max_servers":8}}"#, None);
     write(
@@ -374,6 +399,32 @@ fn user_file_edit_applies_live_too() {
     let outcome = fixture.reload();
     assert_eq!(applied(&outcome), vec!["url_fetch_allow_private"]);
     assert!(fixture.ctx.config().url_fetch_allow_private);
+}
+
+#[test]
+fn gh_shim_user_edit_reloads_without_reconfigure_and_keeps_harness_precedence() {
+    for harness_override in [false, true] {
+        let doc = |enabled| {
+            let mut value = json!({"github": {"shim": enabled}});
+            if harness_override {
+                value["harnesses"] = json!({"opencode": {"github": {"shim": true}}});
+            }
+            value.to_string()
+        };
+        let fixture = Fixture::new(&doc(true), None);
+        assert!(fixture.ctx.config().github.shim);
+        let generation = fixture.ctx.configure_generation();
+
+        write(&fixture.user_path, &doc(false));
+        let outcome = fixture.reload();
+        assert_eq!(fixture.ctx.config().github.shim, harness_override);
+        assert_eq!(
+            applied(&outcome).contains(&"github.shim"),
+            !harness_override
+        );
+        assert!(!deferred(&outcome).contains(&"github.shim"));
+        assert_eq!(fixture.ctx.configure_generation(), generation);
+    }
 }
 
 #[test]

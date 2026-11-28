@@ -8,7 +8,7 @@
   },
   "devDependencies": {
     "@copilotkit/aimock": "1.24.0",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": "1.7.0",
     "@types/bun": "latest",
     "@types/node": "^22.0.0",
     "bun-types": "^1.3.13",

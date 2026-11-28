@@ -74,9 +74,9 @@ fn quiescent(metadata: &PersistedTask) -> bool {
     // survivor, but an unreadable start time or group cannot prove its exit.
     !metadata.group_member_identities.iter().any(|identity| {
         super::super::process::is_process_alive(identity.pid)
-            && crate::process_identity::process_start_time_ms(identity.pid)
-                .is_none_or(|start| start == identity.started_at_ms)
-            && !identity.is_running_in_group(pgid)
+            && ProcessIdentity::of(identity.pid)
+                .is_none_or(|current| identity.same_process(&current))
+            && !super::super::process::is_running_in_group(identity, pgid)
     })
 }
 
@@ -221,6 +221,41 @@ mod tests {
         fs::write(image.join("shims/gh.cmd"), b"@launcher").unwrap();
         fs::write(&task.paths.stdout, b"result\n").unwrap();
         (task, metadata)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn clock_step_preserves_startup_image_for_escaped_survivor_but_not_reused_pid() {
+        use crate::process_identity::with_linux_boot_time_for_test;
+        let storage = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let (task, mut metadata) = saved_image(storage.path(), 1);
+        let pid = std::process::id();
+        metadata.pgid = Some(i32::MAX);
+        let saved = with_linux_boot_time_for_test(100, || ProcessIdentity::of(pid).unwrap());
+        metadata.group_member_identities = vec![saved.clone()];
+        write_task_at(&task, &metadata).unwrap();
+
+        with_linux_boot_time_for_test(200, || {
+            let mut current = ProcessIdentity::of(pid).unwrap();
+            assert_ne!(saved.started_at_ms, current.started_at_ms);
+            let sweep = || {
+                registry.cleanup_saved_task_image(
+                    &task.paths.session_dir,
+                    &metadata.task_id,
+                    || true,
+                )
+            };
+            assert_eq!(sweep().remaining, 1);
+            assert!(task.paths.io_dir.join(TASK_IMAGE_DIR).is_dir());
+
+            current.native_birth.as_mut().unwrap().start_ticks += 1;
+            let mut reused = metadata.clone();
+            reused.group_member_identities = vec![current];
+            write_task_at(&task, &reused).unwrap();
+            assert_eq!(sweep().removed, 1, "matching epoch must not hide PID reuse");
+            assert!(!task.paths.io_dir.join(TASK_IMAGE_DIR).exists());
+        });
     }
 
     #[test]

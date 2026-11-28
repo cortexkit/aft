@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1a1f91d9ef9329a9483514e44440e6e4cb9b4a1abb61850ff545943559505a18",
-      "catalog_digest": "1a1f91d9ef9329a9483514e44440e6e4cb9b4a1abb61850ff545943559505a18",
+      "generation": "8e9fdd3cd3ddf7849006ead1682839e0b3c68990a79e3c07bb9aa9b4fcd3f91a",
+      "catalog_digest": "8e9fdd3cd3ddf7849006ead1682839e0b3c68990a79e3c07bb9aa9b4fcd3f91a",
       "tools": [
         {
           "name": "status",
@@ -32,7 +32,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "c0483a7bcb53cbe7b3779c216e2eb7b238a6d6348254d98b46ac985decccc9b0",
           "semantics": 3,
           "modes": [
             "classic",
@@ -70,7 +70,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -108,7 +108,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -446,13 +447,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -1288,8 +1289,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "cbfdfca755c28bf6dcc408e28007094df90a819c311dca32845dc304cc67f42f",
-      "catalog_digest": "cbfdfca755c28bf6dcc408e28007094df90a819c311dca32845dc304cc67f42f",
+      "generation": "7221db2268635bc5064d5a60dba6130cfef2218e7f7a101e22c6ef091d88b8bd",
+      "catalog_digest": "7221db2268635bc5064d5a60dba6130cfef2218e7f7a101e22c6ef091d88b8bd",
       "tools": [
         {
           "name": "status",
@@ -1310,7 +1311,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "c0483a7bcb53cbe7b3779c216e2eb7b238a6d6348254d98b46ac985decccc9b0",
           "semantics": 3,
           "modes": [
             "classic",
@@ -1348,7 +1349,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -1386,7 +1387,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -1798,13 +1800,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -2641,8 +2643,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "754cb96898c96ed805ce339cbdcce893a67a10e8850d005222b71a53d2cd647d",
-      "catalog_digest": "754cb96898c96ed805ce339cbdcce893a67a10e8850d005222b71a53d2cd647d",
+      "generation": "67a3f27bc40075a0a26ed2c930073ddbf30293ae80f6679d854d8612fe5a9b99",
+      "catalog_digest": "67a3f27bc40075a0a26ed2c930073ddbf30293ae80f6679d854d8612fe5a9b99",
       "tools": [
         {
           "read_only": true,
@@ -2836,13 +2838,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -3101,8 +3103,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "754cb96898c96ed805ce339cbdcce893a67a10e8850d005222b71a53d2cd647d",
-      "catalog_digest": "754cb96898c96ed805ce339cbdcce893a67a10e8850d005222b71a53d2cd647d",
+      "generation": "67a3f27bc40075a0a26ed2c930073ddbf30293ae80f6679d854d8612fe5a9b99",
+      "catalog_digest": "67a3f27bc40075a0a26ed2c930073ddbf30293ae80f6679d854d8612fe5a9b99",
       "tools": [
         {
           "read_only": true,
@@ -3296,13 +3298,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -3562,8 +3564,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "adaf1a2f05f47e2af785618ba9a30340f7ba89479bf83160cd7cad774f1da1d4",
-      "catalog_digest": "adaf1a2f05f47e2af785618ba9a30340f7ba89479bf83160cd7cad774f1da1d4",
+      "generation": "f49fa3b85f26f9ffc9c616bc1f246dcabbaacdb4f5d38b7f7d23d1e6be7f9230",
+      "catalog_digest": "f49fa3b85f26f9ffc9c616bc1f246dcabbaacdb4f5d38b7f7d23d1e6be7f9230",
       "tools": [
         {
           "name": "status",
@@ -3584,7 +3586,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
+          "schema_digest": "b1b9c46c6f578a6ac0c77a012009ac52df08218edf3bb96814a661a08f185629",
           "semantics": 3,
           "modes": [
             "classic",
@@ -3622,7 +3624,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -3672,7 +3674,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -4010,13 +4013,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -4853,8 +4856,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "486a1f6fd39dd7439a3c13af4a17df40bcfe206cc615efde4effa37a71a03588",
-      "catalog_digest": "486a1f6fd39dd7439a3c13af4a17df40bcfe206cc615efde4effa37a71a03588",
+      "generation": "f06094e9b659f2c54e3648db2a36cdf179f97109421d17acaf68dbc64cf9d49e",
+      "catalog_digest": "f06094e9b659f2c54e3648db2a36cdf179f97109421d17acaf68dbc64cf9d49e",
       "tools": [
         {
           "name": "status",
@@ -4875,7 +4878,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
+          "schema_digest": "b1b9c46c6f578a6ac0c77a012009ac52df08218edf3bb96814a661a08f185629",
           "semantics": 3,
           "modes": [
             "classic",
@@ -4913,7 +4916,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -4963,7 +4966,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -5375,13 +5379,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -6218,8 +6222,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1f4117191dce93e591a3f464ba18b852cd040b6fa014c483f04ec133f69ed5b9",
-      "catalog_digest": "1f4117191dce93e591a3f464ba18b852cd040b6fa014c483f04ec133f69ed5b9",
+      "generation": "84f2efe252685a871e14bf20a767ca594d89f5ee107b0cc61a7cf9ef76c13a98",
+      "catalog_digest": "84f2efe252685a871e14bf20a767ca594d89f5ee107b0cc61a7cf9ef76c13a98",
       "tools": [
         {
           "name": "status",
@@ -6240,7 +6244,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "c0483a7bcb53cbe7b3779c216e2eb7b238a6d6348254d98b46ac985decccc9b0",
           "semantics": 3,
           "modes": [
             "classic",
@@ -6278,7 +6282,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -6316,7 +6320,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -6654,13 +6659,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -7430,8 +7435,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "a91ae13cba6cc7c57c313a4b0ee9b7b739e2b1edc0d9a4c499e140a07d1a756b",
-      "catalog_digest": "a91ae13cba6cc7c57c313a4b0ee9b7b739e2b1edc0d9a4c499e140a07d1a756b",
+      "generation": "f9829162d60a58fa704deda81a4a7d237f23b11e752bc6b493c08d8737f71ea9",
+      "catalog_digest": "f9829162d60a58fa704deda81a4a7d237f23b11e752bc6b493c08d8737f71ea9",
       "tools": [
         {
           "name": "status",
@@ -7452,7 +7457,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "c0483a7bcb53cbe7b3779c216e2eb7b238a6d6348254d98b46ac985decccc9b0",
           "semantics": 3,
           "modes": [
             "classic",
@@ -7490,7 +7495,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -7528,7 +7533,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -7940,13 +7946,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -8723,12 +8729,12 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "7b55ca9f7252399ab1ffe6d7da9529939af5c936e22f904edd531d35a723f237",
-      "catalog_digest": "7b55ca9f7252399ab1ffe6d7da9529939af5c936e22f904edd531d35a723f237",
+      "generation": "75b2ee003b1e3e6f91a65edd4a500e422d9713e93542b8e83f42374e9803c7d4",
+      "catalog_digest": "75b2ee003b1e3e6f91a65edd4a500e422d9713e93542b8e83f42374e9803c7d4",
       "tools": [
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "c0483a7bcb53cbe7b3779c216e2eb7b238a6d6348254d98b46ac985decccc9b0",
           "semantics": 3,
           "modes": [
             "classic",
@@ -8766,7 +8772,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -8804,7 +8810,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -9027,13 +9034,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -9859,12 +9866,12 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "f2b3dd280a517810d1429863899eeb7ec4f5ae2ded764c1458c9587766f677b5",
-      "catalog_digest": "f2b3dd280a517810d1429863899eeb7ec4f5ae2ded764c1458c9587766f677b5",
+      "generation": "735b3e0b75a6358a4d0e1bfcde52a017df4348fe09fde31bb2df6b6cc753598f",
+      "catalog_digest": "735b3e0b75a6358a4d0e1bfcde52a017df4348fe09fde31bb2df6b6cc753598f",
       "tools": [
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "c0483a7bcb53cbe7b3779c216e2eb7b238a6d6348254d98b46ac985decccc9b0",
           "semantics": 3,
           "modes": [
             "classic",
@@ -9902,7 +9909,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -9940,7 +9947,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -10251,13 +10259,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -11087,12 +11095,12 @@
       "hashline": true
     },
     "reply": {
-      "generation": "91a936147272e86f6186e11aac74d955b5b939cf4659daaa4e4ccf0ef3fd6af4",
-      "catalog_digest": "91a936147272e86f6186e11aac74d955b5b939cf4659daaa4e4ccf0ef3fd6af4",
+      "generation": "bbe3247a0513b8056be9f605d5c6bccdebfd6efbd0a3803a1e48f8c7889a23aa",
+      "catalog_digest": "bbe3247a0513b8056be9f605d5c6bccdebfd6efbd0a3803a1e48f8c7889a23aa",
       "tools": [
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "c0483a7bcb53cbe7b3779c216e2eb7b238a6d6348254d98b46ac985decccc9b0",
           "semantics": 3,
           "modes": [
             "classic",
@@ -11130,7 +11138,7 @@
                 "type": "string"
               },
               "description": {
-                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "description": "Human-readable description shown in UI (5-10 words)",
                 "type": "string"
               },
               "wait": {
@@ -11168,7 +11176,8 @@
               }
             },
             "required": [
-              "command"
+              "command",
+              "description"
             ]
           }
         },
@@ -11425,13 +11434,13 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "target": {
-                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
                 "anyOf": [
                   {
                     "type": "string"

@@ -2,24 +2,24 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.15.18",
+      "version": "0.15.21",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "885e17314cc76d5f317abfff451176f487e712ed6a1029bca6c3924c0f56c60d",
+      "checksum": "68c58de24f5d19b4cabea03489ee7b857b79304c89f8de4a729e4562ad665d89",
       "dependency_kind": "normal",
       "release_tag": "cortexkit-role-tool-provider-v0.13.0"
     },
     {
       "name": "cortexkit-role-tool-display",
-      "version": "0.1.14",
+      "version": "0.1.15",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "b747316be66c224ba1ff89d35edd6747de28a8d53dc56ac469e575d84d239a40",
+      "checksum": "9f810d963127c9eab94a125e67314997cfc3762c155a7fc59c18dbfca86574da",
       "dependency_kind": "normal"
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.15.19",
+      "version": "0.15.23",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "37437e95aa2d1cf1649d0cf789da6f01268e92653b37a445a5a01d3e1d5def28",
+      "checksum": "317edd5429bf62c8293c9f159fd4946e8791be53cb950221a3dba2e718f031fe",
       "dependency_kind": "dev",
       "release_tag": "cortexkit-role-tool-provider-conformance-v0.13.1"
     },
@@ -119,7 +119,14 @@
         }
       ],
       "implementation_version": "<built-package-version>",
-      "capabilities": ["tool-catalog-confine/v1", "tool-catalog-model/v1", "tool-views/v1", "system-text-facts/v1", "session-notices/v1", "call-yield/v1"]
+      "capabilities": [
+        "tool-catalog-confine/v1",
+        "tool-catalog-model/v1",
+        "tool-views/v1",
+        "system-text-facts/v1",
+        "session-notices/v1",
+        "call-yield/v1"
+      ]
     },
     "presets": {
       "head": {
@@ -171,12 +178,17 @@
             "crash_after_authorized_not_started",
             "catalog_modes_valid",
             "call_mode_matches_catalog",
-            "session_notices_describe"
+            "session_notices_describe",
+            "call_yield_accepted_final_deadline",
+            "call_yield_untagged_not_yieldable",
+            "call_yield_repeat_unknown_call",
+            "call_yield_non_carrier_unknown_call",
+            "call_yield_accepted_final_deadline_urgent_notice",
+            "call_yield_untagged_not_yieldable_urgent_notice",
+            "call_yield_repeat_unknown_call_urgent_notice",
+            "call_yield_non_carrier_unknown_call_urgent_notice"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -199,10 +211,6 @@
           ],
           "inapplicable_cases": [
             "system_text_default_served",
-            "call_yield_accepted_final_deadline",
-            "call_yield_untagged_not_yieldable",
-            "call_yield_repeat_unknown_call",
-            "call_yield_non_carrier_unknown_call",
             "stop_session_body_address_refused",
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
@@ -268,12 +276,17 @@
             "late_results_incarnation_change_refused",
             "catalog_modes_valid",
             "call_mode_matches_catalog",
-            "session_notices_describe"
+            "session_notices_describe",
+            "call_yield_accepted_final_deadline",
+            "call_yield_untagged_not_yieldable",
+            "call_yield_repeat_unknown_call",
+            "call_yield_non_carrier_unknown_call",
+            "call_yield_accepted_final_deadline_urgent_notice",
+            "call_yield_untagged_not_yieldable_urgent_notice",
+            "call_yield_repeat_unknown_call_urgent_notice",
+            "call_yield_non_carrier_unknown_call_urgent_notice"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -300,10 +313,6 @@
           ],
           "inapplicable_cases": [
             "system_text_default_served",
-            "call_yield_accepted_final_deadline",
-            "call_yield_untagged_not_yieldable",
-            "call_yield_repeat_unknown_call",
-            "call_yield_non_carrier_unknown_call",
             "stop_session_body_address_refused",
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
@@ -377,9 +386,6 @@
             "session_notices_describe"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -406,6 +412,10 @@
             "call_yield_untagged_not_yieldable",
             "call_yield_repeat_unknown_call",
             "call_yield_non_carrier_unknown_call",
+            "call_yield_accepted_final_deadline_urgent_notice",
+            "call_yield_untagged_not_yieldable_urgent_notice",
+            "call_yield_repeat_unknown_call_urgent_notice",
+            "call_yield_non_carrier_unknown_call_urgent_notice",
             "stop_session_body_address_refused",
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
@@ -474,9 +484,6 @@
             "session_notices_describe"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -507,6 +514,10 @@
             "call_yield_untagged_not_yieldable",
             "call_yield_repeat_unknown_call",
             "call_yield_non_carrier_unknown_call",
+            "call_yield_accepted_final_deadline_urgent_notice",
+            "call_yield_untagged_not_yieldable_urgent_notice",
+            "call_yield_repeat_unknown_call_urgent_notice",
+            "call_yield_non_carrier_unknown_call_urgent_notice",
             "stop_session_body_address_refused",
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
@@ -564,9 +575,6 @@
             "session_notices_describe"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -609,6 +617,10 @@
             "call_yield_untagged_not_yieldable",
             "call_yield_repeat_unknown_call",
             "call_yield_non_carrier_unknown_call",
+            "call_yield_accepted_final_deadline_urgent_notice",
+            "call_yield_untagged_not_yieldable_urgent_notice",
+            "call_yield_repeat_unknown_call_urgent_notice",
+            "call_yield_non_carrier_unknown_call_urgent_notice",
             "stop_session_body_address_refused",
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",
@@ -659,9 +671,6 @@
             "session_notices_describe"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -704,6 +713,10 @@
             "call_yield_untagged_not_yieldable",
             "call_yield_repeat_unknown_call",
             "call_yield_non_carrier_unknown_call",
+            "call_yield_accepted_final_deadline_urgent_notice",
+            "call_yield_untagged_not_yieldable_urgent_notice",
+            "call_yield_repeat_unknown_call_urgent_notice",
+            "call_yield_non_carrier_unknown_call_urgent_notice",
             "stop_session_body_address_refused",
             "stop_session_other_principal_isolated",
             "stop_session_other_session_isolated",

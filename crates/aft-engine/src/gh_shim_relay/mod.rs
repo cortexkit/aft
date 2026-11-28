@@ -419,25 +419,7 @@ async fn relay_inner<T: RelayTransport>(
     #[cfg(test)] wire_fixture: Option<Option<ScopeStamp>>,
 ) -> RelayReply {
     let params = call.params;
-    let nonce = params
-        .get("request_nonce")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let request = params.get("request");
-    let action = match call.operation {
-        BINDINGS_READ_OPERATION => "bindings.read",
-        _ => request
-            .and_then(|request| request.get("action").or_else(|| request.get("verb")))
-            .and_then(Value::as_str)
-            .unwrap_or("-"),
-    };
-    let repository = request
-        .and_then(|request| request.get("repository"))
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-
-    let mut session = "-".to_string();
-    let mut task = "-".to_string();
+    let mut admitted = None;
     let mut path = "-";
     let reply = 'reply: {
         if !is_relay_operation(call.operation) {
@@ -553,12 +535,10 @@ async fn relay_inner<T: RelayTransport>(
                 )
             }
         };
-        session = redeemed.session_id.clone();
-        task = if redeemed.task_id.is_empty() {
-            "-".to_string()
-        } else {
-            redeemed.task_id.clone()
-        };
+        admitted = Some((
+            log_field(&redeemed.session_id),
+            log_field(&redeemed.task_id),
+        ));
         match call.operation {
             READ_REQUEST_OPERATION => {
                 let stamp = call.route_scopes.for_session(&redeemed.session_id);
@@ -566,13 +546,10 @@ async fn relay_inner<T: RelayTransport>(
                 path = taken;
                 reply
             }
-            SESSION_CONTEXT_OPERATION => session_context(
-                &redeemed,
-                redeemed
-                    .lifecycle_scope
-                    .as_ref()
-                    .or_else(|| call.route_scopes.for_session(&redeemed.session_id)),
-            ),
+            SESSION_CONTEXT_OPERATION => {
+                let stamp = command_session_scope(&redeemed, call.route_scopes);
+                session_context(&redeemed, stamp)
+            }
             BINDINGS_READ_OPERATION => {
                 path = PATH_UNSCOPED;
                 bindings_read(transport, &redeemed).await
@@ -635,18 +612,95 @@ async fn relay_inner<T: RelayTransport>(
         }
     };
 
-    log(&format!(
-        "gh_shim relay: op={} session={} task={} nonce={} action={} repository={} path={} outcome={}",
-        call.operation.escape_debug(),
-        session.escape_debug(),
-        task.escape_debug(),
-        if nonce.is_empty() { "-" } else { nonce }.escape_debug(),
-        action.escape_debug(),
-        repository.escape_debug(),
-        path,
-        reply.outcome_label().escape_debug(),
-    ));
+    let operation = if is_relay_operation(call.operation) {
+        call.operation
+    } else {
+        "unknown"
+    };
+    let outcome = reply.outcome_label();
+    if let Some((session, task)) = admitted {
+        let nonce_digest = params
+            .get("request_nonce")
+            .and_then(Value::as_str)
+            .filter(|nonce| !nonce.is_empty())
+            .map(|nonce| blake3::hash(nonce.as_bytes()).to_hex());
+        let nonce_digest = nonce_digest.as_ref().map_or("-", |digest| digest.as_str());
+        let request = params.get("request");
+        let action = log_action(operation, request);
+        let repository = log_field(
+            request
+                .and_then(|request| request.get("repository"))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        log(&format!(
+            "gh_shim relay: op={operation} session={session} task={task} nonce_digest={nonce_digest} action={action} repository={repository} path={path} outcome={}",
+            outcome.escape_debug(),
+        ));
+    } else {
+        log(&format!("gh_shim relay: op={operation} outcome={outcome}"));
+    }
     reply
+}
+
+fn log_field(value: &str) -> String {
+    const MAX_LOG_FIELD_BYTES: usize = 96;
+    let mut bounded = String::new();
+    for ch in value.escape_debug() {
+        if bounded.len() + ch.len_utf8() > MAX_LOG_FIELD_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    if bounded.is_empty() {
+        bounded.push('-');
+    }
+    bounded
+}
+
+fn log_action<'a>(operation: &str, request: Option<&'a Value>) -> &'a str {
+    let action = request
+        .and_then(|request| request.get("action").or_else(|| request.get("verb")))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match (operation, action) {
+        (BINDINGS_READ_OPERATION, _) => "bindings.read",
+        (SESSION_CONTEXT_OPERATION, _) => "-",
+        (
+            READ_REQUEST_OPERATION,
+            "github.repo.get"
+            | "github.search.code"
+            | "github.search.issues"
+            | "github.actions.job_log",
+        ) => action,
+        (
+            BOT_REQUEST_OPERATION,
+            "issue comment"
+            | "pr comment"
+            | "pr review"
+            | "issue reaction"
+            | "pr reaction"
+            | "issue create"
+            | "pr create"
+            | "issue edit"
+            | "pr edit"
+            | "pr enqueue"
+            | "pr dequeue"
+            | "api:POST:/repos/*/*/pulls/*/comments/*/replies"
+            | "graphql resolvereviewthread"
+            | "graphql unresolvereviewthread"
+            | "api:POST:/repos/*/*/stacks"
+            | "api:POST:/repos/*/*/stacks/*/add"
+            | "api:POST:/repos/*/*/stacks/*/unstack"
+            | "api:PATCH:/repos/*/*/issues/comments/*"
+            | "issue close"
+            | "pr close"
+            | "issue reopen"
+            | "pr reopen"
+            | "pr ready",
+        ) => action,
+        _ => "-",
+    }
 }
 
 fn needs_captured_background(redeemed: &crate::gh_shim_ticket::Redeemed, ticket: &str) -> bool {
@@ -687,6 +741,25 @@ fn head_scope(stamp: &ScopeStamp) -> bool {
         && crate::access_policy::prefrontal::is_principal(&stamp.owner)
         && stamp.parent.is_none()
         && matches!(stamp.kind, ScopeKind::Head | ScopeKind::Ephemeral)
+}
+
+fn command_session_scope<'a>(
+    ticket: &'a crate::gh_shim_ticket::Redeemed,
+    routes: &'a RouteScopes,
+) -> Option<&'a ScopeStamp> {
+    // The run is linked to the head's scope so it ends when the head does.
+    // That link does not make the head's program a worker.
+    // Only the validated head launch of this exact run can override its lifetime stamp.
+    let head_launch = ticket.launch.as_ref().filter(|launch| {
+        launch.run.is_some()
+            && launch.run == ticket.lifecycle_scope
+            && head_scope(&launch.authority)
+            && launch.validate().is_ok()
+    });
+    head_launch
+        .map(|launch| &launch.authority)
+        .or(ticket.lifecycle_scope.as_ref())
+        .or_else(|| routes.for_session(&ticket.session_id))
 }
 
 pub(crate) fn session_context(

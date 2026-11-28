@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use super::{catalog, CatalogPreset};
+use super::{catalog, guidance::MACOS_PS_NOTE, CatalogPreset};
 
 fn request(preset: CatalogPreset) -> Value {
     let mut request = json!({
@@ -101,12 +101,31 @@ Use inspect for diagnostics.
             ),
         ] {
             let reply = catalog(request(preset), &disabled, true).unwrap();
-            assert_eq!(
-                reply["system_text"]["text"],
-                expected,
-                "{} {disabled:?}",
-                preset.name()
-            );
+            let actual = reply["system_text"]["text"].as_str().unwrap();
+            if preset == CatalogPreset::Worker {
+                // The worker Commands paragraph names the macOS setuid limit
+                // only when AFT itself runs on macOS; other platforms keep
+                // the committed text byte for byte.
+                assert_eq!(
+                    actual.contains(MACOS_PS_NOTE),
+                    cfg!(target_os = "macos"),
+                    "{} {disabled:?}",
+                    preset.name()
+                );
+                assert_eq!(
+                    actual.replace(&format!(" {MACOS_PS_NOTE}"), ""),
+                    expected,
+                    "{} {disabled:?}",
+                    preset.name()
+                );
+            } else {
+                assert_eq!(
+                    reply["system_text"]["text"],
+                    expected,
+                    "{} {disabled:?}",
+                    preset.name()
+                );
+            }
         }
     }
 }

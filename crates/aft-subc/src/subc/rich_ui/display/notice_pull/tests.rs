@@ -11,6 +11,203 @@ use subc_protocol::Principal;
 use super::super::{announce_retained, read_for_reader, tests::test_writer};
 
 #[tokio::test]
+async fn tool_provider_awaited_finish_announces_its_record_once_across_restart() {
+    use crate::bash_background::{
+        persistence::PersistedTask, BgTaskRegistry, BgTaskStatus, TaskIdentity,
+    };
+    use crate::protocol::{BashCompletedFrame, PushFrame};
+    use crate::subc::rich_ui::notices::for_awaited_work;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    let key = "bash-0000000000000001";
+    let mut task = PersistedTask::starting(
+        key.into(),
+        "worker".into(),
+        "printf hello".into(),
+        dir.path().into(),
+        None,
+        None,
+        true,
+        false,
+    );
+    task.launching_identity = Some(TaskIdentity {
+        principal: Some("reserved:broca".into()),
+        harness: "runner".into(),
+        session: "worker".into(),
+    });
+    task.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    let frame = PushFrame::BashCompleted(BashCompletedFrame::new(
+        key,
+        "worker",
+        BgTaskStatus::Completed,
+        Some(0),
+        "printf hello",
+        "hello",
+        false,
+        None,
+        None,
+        false,
+    ));
+    let registry = BgTaskRegistry::new(Default::default());
+    let record = || for_awaited_work(&registry, &frame, &task, task.started_at).unwrap();
+    let id = record().id;
+    assert_eq!(
+        stage_for_display(&writer, record(), Duration::from_secs(5))
+            .await
+            .as_deref(),
+        Some(id.as_str())
+    );
+    let bytes = writer
+        .store
+        .read(id.clone(), crate::db::display_records::now_ms())
+        .await
+        .unwrap();
+    let notice: NoticeWrite = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(notice.send_id, id);
+    assert_eq!(notice.session, "worker");
+    assert_eq!(notice.kind, "notice");
+    assert_eq!(notice.body.view, "bash_finished:1");
+    // The pending announcement survives losing AFT's in-memory queues.
+    drop(writer);
+    let writer = test_writer(path.clone());
+    assert_eq!(writer.store.restore_awaited_count().await.unwrap(), 1);
+    let first = publish_awaited_with(&writer, |published| {
+        assert_eq!(published, id);
+        std::future::ready(Ok(()))
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.as_deref(), Some(id.as_str()));
+
+    // Rebuilding the record for a replay must not clear the published receipt.
+    drop(writer);
+    let writer = test_writer(path);
+    assert_eq!(writer.store.restore_awaited_count().await.unwrap(), 0);
+    assert_eq!(
+        stage_for_display(&writer, record(), Duration::from_secs(5)).await,
+        Some(id)
+    );
+    assert_eq!(
+        publish_awaited_with(&writer, |_| async {
+            panic!("duplicate display_record_ready.v1")
+        })
+        .await
+        .unwrap(),
+        None
+    );
+    assert!(writer
+        .outbox
+        .lock()
+        .unwrap()
+        .reads
+        .due(Instant::now())
+        .is_none());
+}
+
+#[tokio::test]
+async fn a_late_awaited_notice_record_without_a_pointer_is_not_announced_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    let id = "notice:awaited:late";
+    // The blocking storage job finished, but the request's deadline left it
+    // without a pointer, so no caller authorizes publication.
+    let prepared = prepare_for_display(
+        &writer,
+        PullRecord {
+            id: id.into(),
+            bytes: b"{}".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(prepared.as_deref(), Some(id));
+    drop(writer);
+    let writer = test_writer(path);
+    assert_eq!(writer.store.restore_awaited_count().await.unwrap(), 0);
+    assert_eq!(
+        publish_awaited_with(&writer, |_| async { panic!("late draft was announced") })
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_awaited_record_announcement_does_not_block_the_next_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = test_writer(dir.path().join("aft.db"));
+    let record = |id: &str| PullRecord {
+        id: id.into(),
+        bytes: b"{}".to_vec(),
+    };
+    let first = "notice:awaited:01";
+    let second = "notice:awaited:02";
+    for id in [first, second] {
+        assert!(
+            stage_for_display(&writer, record(id), Duration::from_secs(5))
+                .await
+                .is_some()
+        );
+    }
+    assert_eq!(
+        publish_awaited_with(&writer, |id| async move {
+            assert_eq!(id, first);
+            Err("injected")
+        })
+        .await,
+        Err("injected")
+    );
+    assert_eq!(
+        publish_awaited_with(&writer, |id| async move {
+            assert_eq!(id, second);
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .as_deref(),
+        Some(second)
+    );
+    assert_eq!(
+        publish_awaited_with(&writer, |_| async {
+            panic!("record must wait for its backoff")
+        })
+        .await
+        .unwrap(),
+        None
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert_eq!(
+        publish_awaited_with(&writer, |id| async move {
+            assert_eq!(id, first);
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .as_deref(),
+        Some(first)
+    );
+}
+
+#[tokio::test]
+async fn no_awaited_announcement_needs_no_idle_sqlite_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("still-unopened.db");
+    let writer = test_writer(path.clone());
+    assert_eq!(
+        publish_awaited_with(&writer, |_| async { panic!("no record") })
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        !path.exists(),
+        "the empty in-memory count must bypass the store"
+    );
+}
+
+#[tokio::test]
 async fn notice_records_no_write_or_announcement_queued_before_views_publish() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.db");

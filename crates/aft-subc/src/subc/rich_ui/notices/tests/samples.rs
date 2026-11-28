@@ -112,7 +112,8 @@ fn notice_records_match_occipital_phone_reader_sample_contract() {
             aft_sample["templateRevision"],
             published["template_revision"]
         );
-        assert_eq!(view.template_revision, 2);
+        let terminal_capable = matches!(name, "finished" | "watch");
+        assert_eq!(view.template_revision, if terminal_capable { 3 } else { 2 });
         assert_eq!(view.notice.data_schema, published["data_schema"]);
         for (slot, document, old_digest, digest) in [
             (
@@ -142,8 +143,24 @@ fn notice_records_match_occipital_phone_reader_sample_contract() {
             };
             let mut prior = published["template"][slot].clone();
             assert_eq!(hash(&prior), old_digest);
-            assert_eq!(hash(document), digest);
             prior["catalog"]["digest"] = document["catalog"]["digest"].clone();
+            if terminal_capable {
+                assert_eq!(hash(&prior), digest);
+                prior["source"] = document["source"].clone();
+            }
+            let digest = match (name, slot) {
+                ("finished" | "watch", "row") => {
+                    "sha256:53f6286e704b9de70510c7dcce03b7fbe89991cdd2bc27c32d510f0a688fe59e"
+                }
+                ("finished", "page") => {
+                    "sha256:7a920615fa74f40654b4d34ebb59bba9c09e26b8a05826bc43909eb1f8c9a7e1"
+                }
+                ("watch", "page") => {
+                    "sha256:6d77314d5b03d3d40743b632bccf6f85c41ec693bd0bad570f7e953dcf781fc0"
+                }
+                _ => digest,
+            };
+            assert_eq!(hash(document), digest);
             assert_eq!(&prior, document);
         }
     }

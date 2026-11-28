@@ -40,12 +40,34 @@ pub trait HeapBytes {
 pub struct Seen {
     shared: HashSet<usize>,
     contended: usize,
+    map_set_entries: Option<usize>,
 }
 
 impl Seen {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Track how many entries the standard map and set walkers visit. This
+    /// excludes slices, cached totals, and custom collection implementations.
+    #[must_use]
+    pub fn counting_map_set_entries() -> Self {
+        Self {
+            map_set_entries: Some(0),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn map_set_entries_visited(&self) -> usize {
+        self.map_set_entries.unwrap_or(0)
+    }
+
+    fn count_entries(&mut self, entries: usize) {
+        if let Some(count) = &mut self.map_set_entries {
+            *count += entries;
+        }
     }
 
     /// Whether the shared allocation at `address` is met for the first time
@@ -299,6 +321,7 @@ pub fn btree_bytes(len: usize, entry: usize) -> usize {
 
 impl<K: HeapBytes, V: HeapBytes, S> HeapBytes for HashMap<K, V, S> {
     fn heap_bytes(&self, seen: &mut Seen) -> usize {
+        seen.count_entries(self.len());
         hash_table_bytes(self.capacity(), size_of::<(K, V)>())
             + self
                 .iter()
@@ -309,6 +332,7 @@ impl<K: HeapBytes, V: HeapBytes, S> HeapBytes for HashMap<K, V, S> {
 
 impl<K: HeapBytes, S> HeapBytes for HashSet<K, S> {
     fn heap_bytes(&self, seen: &mut Seen) -> usize {
+        seen.count_entries(self.len());
         hash_table_bytes(self.capacity(), size_of::<K>())
             + self.iter().map(|key| key.heap_bytes(seen)).sum::<usize>()
     }
@@ -316,6 +340,7 @@ impl<K: HeapBytes, S> HeapBytes for HashSet<K, S> {
 
 impl<K: HeapBytes, V: HeapBytes> HeapBytes for BTreeMap<K, V> {
     fn heap_bytes(&self, seen: &mut Seen) -> usize {
+        seen.count_entries(self.len());
         btree_bytes(self.len(), size_of::<K>() + size_of::<V>())
             + self
                 .iter()
@@ -326,6 +351,7 @@ impl<K: HeapBytes, V: HeapBytes> HeapBytes for BTreeMap<K, V> {
 
 impl<K: HeapBytes> HeapBytes for BTreeSet<K> {
     fn heap_bytes(&self, seen: &mut Seen) -> usize {
+        seen.count_entries(self.len());
         btree_bytes(self.len(), size_of::<K>())
             + self.iter().map(|key| key.heap_bytes(seen)).sum::<usize>()
     }
@@ -334,6 +360,15 @@ impl<K: HeapBytes> HeapBytes for BTreeSet<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_set_entry_count_tracks_nested_maps_but_not_repeated_shared_allocations() {
+        let tree = Arc::new(BTreeMap::from([(1, HashSet::from([2, 3]))]));
+        let table = HashMap::from([(4, Arc::clone(&tree)), (5, tree)]);
+        let mut seen = Seen::counting_map_set_entries();
+        assert_eq!(table.heap_bytes(&mut seen), heap_bytes_of(&table));
+        assert_eq!(seen.map_set_entries_visited(), 2 + 1 + 2);
+    }
 
     #[test]
     fn containers_count_their_capacity_and_their_elements() {

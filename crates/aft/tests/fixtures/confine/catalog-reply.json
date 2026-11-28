@@ -1,6 +1,6 @@
 {
-  "generation": "da95293d175ca66d49f248c893ff5b7f5be11facee035ca9371d3f8abf2b0286",
-  "catalog_digest": "da95293d175ca66d49f248c893ff5b7f5be11facee035ca9371d3f8abf2b0286",
+  "generation": "db68ff6f0a0d7a6fdca0280eaea34e5f520e2e51edf5209836d2d78919143b27",
+  "catalog_digest": "db68ff6f0a0d7a6fdca0280eaea34e5f520e2e51edf5209836d2d78919143b27",
   "tools": [
     {
       "read_only": true,
@@ -138,7 +138,7 @@
       "name": "aft_outline",
       "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
       "semantics": 1,
-      "version": "1.0.0",
+      "version": "1.1.0",
       "modes": [
         "classic",
         "codemode",
@@ -148,13 +148,13 @@
       "capabilities": [
         "code.outline/v1"
       ],
-      "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nUse aft_outline on a whole directory only for high-level structure mapping.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+      "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nUse aft_outline on a whole directory only for high-level structure mapping.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "target": {
-            "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+            "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
             "anyOf": [
               {
                 "type": "string"

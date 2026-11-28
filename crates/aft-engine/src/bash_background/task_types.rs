@@ -84,7 +84,7 @@ pub struct BgTask {
     #[cfg(unix)]
     pub(super) local_capture_command: std::sync::OnceLock<runon_capture::LocalCommand>,
     #[cfg(unix)]
-    pub(super) runon_copy_warning: AtomicBool,
+    pub(super) runon_copy_overlaps: Mutex<runon_capture::Overlaps>,
     /// Harness namespace the task's aft.db row is keyed under: the harness of
     /// the route that started it (or of the row it was replayed from). The
     /// root context is shared by routes from several harnesses, so this can
@@ -102,6 +102,7 @@ pub enum TaskRuntime {
 }
 
 pub struct BgTaskState {
+    pub(super) awaited_runtime: awaited_work::Runtime,
     pub(crate) metadata: PersistedTask,
     /// Only the latest pre-acceptance line, never written to task metadata.
     pub(crate) remote_admission_note: Option<String>,

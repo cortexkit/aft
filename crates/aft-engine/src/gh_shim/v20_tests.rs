@@ -2761,6 +2761,9 @@ fn v20_worker_lookup_failures_keep_cause_and_plain_reads_recover() {
                     Err(error) => panic!("{error}"),
                 }
             };
+            // Darwin can inherit nonblocking mode from the listener. The client
+            // may not have written the frame yet when accept returns.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

@@ -89,7 +89,9 @@ async function main(): Promise<void> {
     const dBash = relift(
       await client.request(direct, {
         name: "bash",
-        arguments: { params: { command: "echo principal-direct-ok" } },
+        arguments: {
+          params: { command: "echo principal-direct-ok", description: "Print the trusted marker" },
+        },
       }),
     );
     check(
@@ -108,7 +110,9 @@ async function main(): Promise<void> {
     const fBash = relift(
       await client.request(facade, {
         name: "bash",
-        arguments: { params: { command: "echo should-never-run" } },
+        arguments: {
+          params: { command: "echo should-never-run", description: "Run the denied facade probe" },
+        },
       }),
     );
     check(

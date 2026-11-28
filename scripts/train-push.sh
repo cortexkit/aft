@@ -1538,10 +1538,10 @@ fi
 # is the measured case), and in a repository that path-depends on sibling
 # checkouts that rewrites Cargo.lock to whatever those checkouts happen to be
 # at: the `version =` line of each source-less package moves and nothing
-# else. That diff cannot be an intentional edit here, because pins advance
-# through refresh-siblings-lock.sh, which moves siblings.lock in the same
-# change. So a lone Cargo.lock drift of exactly that shape is restored and
-# named rather than refused. Anything wider (a `source =` or `checksum =`
+# else. Workspace members are source-less too, so metadata must confirm that
+# none of the changed packages is a member before restoring the lockfile.
+# Pins advance through refresh-siblings-lock.sh, which moves siblings.lock in
+# the same change. Anything wider (a `source =` or `checksum =`
 # line, a dependency list, any other dirty file) is still the operator's
 # uncommitted work and stays a refusal. The gate's guarantee holds either
 # way: CI tests the pushed commit, and the restored lock IS that commit's.
@@ -1602,8 +1602,37 @@ EOF_DIFF
 # CI tests the pushed commit, not the working tree. Uncommitted work would be
 # invisible to the gate and then silently absent from what lands on main.
 if drifted="$(sibling_lock_drift_packages)"; then
-  git -C "$REPO" checkout -- Cargo.lock
-  say "restored Cargo.lock: sibling path-dependency drift in $(printf '%s' "$drifted" | paste -sd, -) (an editor's cargo run without --locked; the committed lock is what CI tests)"
+  # Refuse to restore unless Cargo can identify every workspace member and none
+  # of the drifted names belongs to one. Invalid metadata must fail closed.
+  if metadata="$(cd "$REPO" && cargo metadata --no-deps --locked --offline --format-version 1)" &&
+    printf '%s' "$metadata" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    members = data["workspace_members"]
+    packages = data["packages"]
+    if not isinstance(members, list) or not members or not isinstance(packages, list):
+        raise ValueError("invalid workspace metadata")
+    if not all(isinstance(member, str) and member for member in members):
+        raise ValueError("invalid workspace member ID")
+    names = {}
+    for package in packages:
+        package_id, name = package["id"], package["name"]
+        if not isinstance(package_id, str) or not package_id or not isinstance(name, str) or not name:
+            raise ValueError("invalid package")
+        if package_id in names:
+            raise ValueError("duplicate package ID")
+        names[package_id] = name
+    member_names = {names[member] for member in members}
+    sys.exit(bool(member_names.intersection(sys.argv[1].splitlines())))
+except (ValueError, TypeError, KeyError):
+    sys.exit(1)
+' "$drifted"; then
+    git -C "$REPO" checkout -- Cargo.lock
+    say "restored Cargo.lock: sibling path-dependency drift in $(printf '%s' "$drifted" | paste -sd, -) (an editor's cargo run without --locked; the committed lock is what CI tests)"
+  else
+    say "not restoring Cargo.lock: workspace membership could not exclude drift in $(printf '%s' "$drifted" | paste -sd, -)"
+  fi
 fi
 if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
   # Name the paths: a tree that is dirty only for a moment (a tool writing

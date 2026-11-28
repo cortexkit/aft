@@ -57,16 +57,74 @@ fn db_error(error: rusqlite::Error) -> Refusal {
     }
 }
 
+// Keep storage diagnostics separate from refusals so the revocation worker can
+// report a persistent failure without warning on every failed write.
+#[derive(Debug)]
+pub(super) enum StorageError {
+    Sqlite(rusqlite::Error),
+    JournalNotWal,
+    SchemaTooOld(u32),
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+impl StorageError {
+    pub(super) fn refusal(&self) -> Refusal {
+        let reason = match self {
+            Self::Sqlite(error) if crate::db::is_busy_error(error) => "storage_busy",
+            _ => "snapshot_invalid",
+        };
+        Refusal::new(Code::AuthorityUnavailable, reason)
+    }
+
+    fn logged_refusal(self) -> Refusal {
+        match self {
+            Self::Sqlite(error) => db_error(error),
+            Self::JournalNotWal => unavailable(
+                "db::gh_speech::connect",
+                "journal_not_wal",
+                serde_json::json!({}),
+            ),
+            Self::SchemaTooOld(schema) => unavailable(
+                "db::gh_speech::connect",
+                "schema_too_old",
+                serde_json::json!({"schema": schema}),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sqlite(error) if crate::db::is_busy_error(error) => f.write_str("storage_busy"),
+            Self::Sqlite(error) => {
+                write!(f, "database_operation ({:?})", error.sqlite_error_code())
+            }
+            Self::JournalNotWal => f.write_str("journal_not_wal"),
+            Self::SchemaTooOld(schema) => write!(f, "schema_too_old ({schema})"),
+        }
+    }
+}
+
+fn encode_record(record: &AuthorityRecord) -> serde_json::Result<(String, Vec<u8>)> {
+    let text = serde_json::to_string(record)?;
+    let hash = blake3::hash(text.as_bytes()).as_bytes().to_vec();
+    Ok((text, hash))
+}
+
 fn encoded(record: &AuthorityRecord) -> Result<(String, Vec<u8>), Refusal> {
-    let text = serde_json::to_string(record).map_err(|_| {
+    encode_record(record).map_err(|_| {
         unavailable(
             "db::gh_speech::encoded",
             "record_encoding",
             serde_json::json!({"incarnation": record.incarnation}),
         )
-    })?;
-    let hash = blake3::hash(text.as_bytes()).as_bytes().to_vec();
-    Ok((text, hash))
+    })
 }
 
 fn load(conn: &rusqlite::Connection, incarnation: &str) -> Result<StoredAuthority, Refusal> {
@@ -137,15 +195,14 @@ fn load(conn: &rusqlite::Connection, incarnation: &str) -> Result<StoredAuthorit
 fn without_start_policy(
     conn: &rusqlite::Connection,
     incarnation: &str,
-) -> Result<Option<(String, Vec<u8>)>, Refusal> {
+) -> rusqlite::Result<Option<(String, Vec<u8>)>> {
     let row: Option<(String, Vec<u8>)> = conn
         .query_row(
             "SELECT record_json,record_digest FROM gh_speech_authorities WHERE incarnation=?1 AND phase!='revoked'",
             [incarnation],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()
-        .map_err(db_error)?;
+        .optional()?;
     let Some((text, digest)) = row else {
         return Ok(None);
     };
@@ -158,7 +215,7 @@ fn without_start_policy(
     if record.policy.take().is_none() {
         return Ok(None);
     }
-    Ok(encoded(&record).ok())
+    Ok(encode_record(&record).ok())
 }
 
 fn check_not_revoked(conn: &rusqlite::Connection, incarnation: &str) -> Result<(), Refusal> {
@@ -210,7 +267,15 @@ impl Store {
         &self,
         open: impl Fn() -> rusqlite::Result<TrackedConnection>,
     ) -> Result<TrackedConnection, Refusal> {
-        let open = || Self::checked_connection(open().map_err(db_error)?);
+        self.try_connect_with(open)
+            .map_err(StorageError::logged_refusal)
+    }
+
+    fn try_connect_with(
+        &self,
+        open: impl Fn() -> rusqlite::Result<TrackedConnection>,
+    ) -> Result<TrackedConnection, StorageError> {
+        let open = || Self::checked_connection(open()?);
         self.keep_anchor(open)?;
         open()
     }
@@ -258,24 +323,14 @@ impl Store {
         Ok(())
     }
 
-    fn checked_connection(conn: TrackedConnection) -> Result<TrackedConnection, Refusal> {
-        let mode: String = conn
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))
-            .map_err(db_error)?;
+    fn checked_connection(conn: TrackedConnection) -> Result<TrackedConnection, StorageError> {
+        let mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         if mode != "wal" {
-            return Err(unavailable(
-                "db::gh_speech::connect",
-                "journal_not_wal",
-                serde_json::json!({}),
-            ));
+            return Err(StorageError::JournalNotWal);
         }
-        let schema = rows::schema_version(&conn).map_err(db_error)?;
+        let schema = rows::schema_version(&conn)?;
         if schema < 22 {
-            return Err(unavailable(
-                "db::gh_speech::connect",
-                "schema_too_old",
-                serde_json::json!({"schema": schema}),
-            ));
+            return Err(StorageError::SchemaTooOld(schema));
         }
         Ok(conn)
     }
@@ -558,19 +613,26 @@ impl Store {
     }
 
     pub(crate) fn revoke(&self, incarnation: &str, reason: &str) -> Result<(), Refusal> {
-        let mut conn = self.connect()?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error)?;
+        self.write_revocation(incarnation, reason)
+            .map_err(StorageError::logged_refusal)
+    }
+
+    pub(super) fn write_revocation(
+        &self,
+        incarnation: &str,
+        reason: &str,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.try_connect_with(|| rows::connect(&self.path))?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("INSERT OR IGNORE INTO gh_speech_task_revocations(incarnation,reason,recorded_at_ms) VALUES(?1,?2,?3)",
-            params![incarnation,reason,crate::db::call_ledger::now_ms()]).map_err(db_error)?;
+            params![incarnation,reason,crate::db::call_ledger::now_ms()])?;
         match without_start_policy(&tx, incarnation)? {
             Some((text, digest)) => tx.execute("UPDATE gh_speech_authorities SET phase='revoked',record_json=?2,record_digest=?3,generation=generation+1 WHERE incarnation=?1 AND phase!='revoked'",
-                params![incarnation,text,digest]).map_err(db_error)?,
+                params![incarnation,text,digest])?,
             None => tx.execute("UPDATE gh_speech_authorities SET phase='revoked',generation=generation+1 WHERE incarnation=?1 AND phase!='revoked'",
-                [incarnation]).map_err(db_error)?,
+                [incarnation])?,
         };
-        tx.commit().map_err(db_error)
+        Ok(tx.commit()?)
     }
 
     pub(crate) fn record_end(&self, proof: &ValidatedEnd) -> Result<(), Refusal> {

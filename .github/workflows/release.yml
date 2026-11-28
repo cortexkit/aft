@@ -1432,10 +1432,11 @@ jobs:
       # existing consumers (npm resolver, binary downloader, fleet staging).
       - name: Package alpha distribution zips
         run: |
-          cd release-assets
+          mkdir installer-assets
+          cd installer-assets
           for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
             mkdir -p "zip-stage-$target"
-            cp "aft-$target" "zip-stage-$target/ck-aft"
+            cp "../release-assets/aft-$target" "zip-stage-$target/ck-aft"
             chmod +x "zip-stage-$target/ck-aft"
             (cd "zip-stage-$target" && zip -q "../ck-aft-$target.zip" ck-aft)
             rm -rf "zip-stage-$target"
@@ -1445,7 +1446,7 @@ jobs:
           # assets keep their historical win32-<arch> names.
           for arch in arm64 x64; do
             mkdir -p "zip-stage-windows-$arch"
-            cp "aft-win32-$arch.exe" "zip-stage-windows-$arch/ck-aft.exe"
+            cp "../release-assets/aft-win32-$arch.exe" "zip-stage-windows-$arch/ck-aft.exe"
             (cd "zip-stage-windows-$arch" && zip -q "../ck-aft-windows-$arch.zip" ck-aft.exe)
             rm -rf "zip-stage-windows-$arch"
             shasum -a 256 "ck-aft-windows-$arch.zip" > "ck-aft-windows-$arch.zip.sha256"
@@ -1457,6 +1458,9 @@ jobs:
           cd release-assets
           sha256sum aft-* > checksums.sha256
           cat checksums.sha256
+
+      - name: Assemble and verify installer release assets
+        run: python3 scripts/release-installer-assets.py assemble installer-assets release-assets "$GITHUB_REF_NAME"
 
       - name: Verify curated release notes exist
         run: |

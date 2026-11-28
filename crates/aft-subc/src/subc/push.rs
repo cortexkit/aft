@@ -6,6 +6,77 @@ use super::wire::{
 };
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BgWakeState {
+    pub(super) next_nudge_at: Instant,
+    pub(super) nudges_sent: u32,
+}
+
+impl BgWakeState {
+    pub(super) fn armed(now: Instant) -> Self {
+        Self {
+            next_nudge_at: now,
+            nudges_sent: 0,
+        }
+    }
+}
+
+pub(super) type BgWakePending = HashMap<RouteChannel, BgWakeState>;
+
+// Retain all observing routes so each wake uses its own subscription correlation.
+pub(super) type BgSubsBySession =
+    HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), HashSet<RouteChannel>>;
+
+#[derive(Default)]
+pub(super) struct ReliableIngressState {
+    pub(super) overflowed: AtomicU64,
+    pub(super) unrecoverable: AtomicU64,
+    completions_missed: AtomicBool,
+    watches_missed: AtomicBool,
+}
+
+#[derive(Clone)]
+pub(super) struct ReliableIngress {
+    tx: mpsc::Sender<PushEnvelope>,
+    state: Arc<ReliableIngressState>,
+}
+
+impl ReliableIngress {
+    pub(super) fn channel(
+        state: Arc<ReliableIngressState>,
+    ) -> (Self, mpsc::Receiver<PushEnvelope>) {
+        // Hold two full session batches (128 registry completion notices each),
+        // shared with watch matches and warnings. Larger bursts rely on replay,
+        // not a daemon-wide reservation for every root's pending notices.
+        let (tx, rx) =
+            mpsc::channel(2 * crate::bash_background::registry::MAX_COMPLETION_NOTICES_PER_SESSION);
+        (Self { tx, state }, rx)
+    }
+
+    fn send(&self, envelope: PushEnvelope) {
+        let frame = match self.tx.try_send(envelope) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full((_, frame))) => {
+                self.state.overflowed.fetch_add(1, Ordering::Relaxed);
+                frame
+            }
+            Err(mpsc::error::TrySendError::Closed((_, frame))) => frame,
+        };
+        match frame {
+            PushFrame::BashCompleted(frame) if frame.ingress_missed.is_some() => {
+                frame.ingress_missed.unwrap().store(true, Ordering::Release);
+                self.state.completions_missed.store(true, Ordering::Release);
+            }
+            PushFrame::BashPatternMatch(frame) if frame.durable_pending => {
+                self.state.watches_missed.store(true, Ordering::Release);
+            }
+            _ => {
+                self.state.unrecoverable.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ReplayKey {
     pub(super) root: ProjectRootId,
@@ -36,6 +107,7 @@ type UnackedCompletions =
 /// session.send instead; durable plugin delivery writes run off-thread.
 #[derive(Default)]
 pub(super) struct CompletionDelivery {
+    pub(super) ingress: Arc<ReliableIngressState>,
     state: Arc<std::sync::Mutex<CompletionOffers>>,
     pub(super) registries:
         std::sync::Mutex<HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>>,
@@ -74,6 +146,15 @@ enum CompletionSend {
 }
 
 impl CompletionDelivery {
+    pub(super) fn push_health(&self, watches: &super::watch_delivery::WatchDelivery) -> Value {
+        let mut health = watches.health();
+        health["completions"] = self.health();
+        health["ingress_overflowed_total"] = json!(self.ingress.overflowed.load(Ordering::Relaxed));
+        health["ingress_unrecoverable_total"] =
+            json!(self.ingress.unrecoverable.load(Ordering::Relaxed));
+        health
+    }
+
     fn admit(&self, root: &ProjectRootId, task: &str) -> bool {
         if self.durably_delivered(root, task) {
             return false;
@@ -672,18 +753,9 @@ pub(super) fn progress_sender_for_root(
     root_id: ProjectRootId,
 ) -> ProgressSender {
     Arc::new(Box::new(move |frame: PushFrame| {
-        // Emitters can run on executor workers, maintenance jobs, watcher drains,
-        // semantic refresh workers, or bg-bash watchdog threads. Never block any
-        // of them on subc routing/backpressure: reliable frames use an unbounded
-        // non-blocking channel, while lossy frames use a bounded channel and keep
-        // only the newest update when that channel fills up.
+        // Producers on watchdogs and executor workers must never wait for routing.
         if frame_is_reliable(&frame) {
-            if let Err(error) = push_senders.reliable_tx.send((root_id.clone(), frame)) {
-                if let Some(task) = completed_task_id(&error.0 .1) {
-                    log::info!("subc completion push: task={task} outcome=dropped root={} reason=reliable_lane_closed", root_id.as_path().display());
-                    log::warn!("subc completion push dropped: task={task} reason=reliable_lane_closed; unacked registry completion remains eligible for recovery");
-                }
-            }
+            push_senders.reliable_tx.send((root_id.clone(), frame));
         } else {
             enqueue_lossy_push_frame(
                 &push_senders.lossy_tx,
@@ -1938,7 +2010,7 @@ pub(super) fn drain_reliable_push_turn(
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
-    reliable_rx: &mut mpsc::UnboundedReceiver<PushEnvelope>,
+    reliable_rx: &mut mpsc::Receiver<PushEnvelope>,
     first: Option<PushEnvelope>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> (usize, bool) {
@@ -1995,6 +2067,129 @@ pub(super) fn drain_reliable_push_turn(
     }
 
     (processed, deferred)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn recover_reliable_ingress(
+    writer: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    executor: &Executor,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    identities: &SessionIdentities,
+    retry: &mut RetryBuffer,
+    buffered: &mut PushBuffer,
+    completed: &mut CompletedTaskIds,
+    subscriptions: &BgSubsBySession,
+    wakes: &mut BgWakePending,
+    wake_epochs: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
+    probe: Option<&SubcTestLifecycleProbe>,
+) {
+    let ingress = &metrics.completion_delivery.ingress;
+    if ingress.watches_missed.swap(false, Ordering::AcqRel) {
+        // Watch subscribers pull their own authenticated pending state. A
+        // broadcast wake needs no overflow map of sessions or match payloads.
+        for (key, channels) in subscriptions {
+            *wake_epochs.entry(key.clone()).or_default() += 1;
+            for channel in channels {
+                wakes.insert(*channel, BgWakeState::armed(Instant::now()));
+            }
+        }
+    }
+    if !ingress.completions_missed.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let Some(actors) = executor.try_actor_entries() else {
+        ingress.completions_missed.store(true, Ordering::Release);
+        return;
+    };
+    let registries = actors
+        .iter()
+        .map(|(root, ctx)| (root, ctx.bash_background()));
+    recover_ingress_completions(registries, metrics, |root, frame| {
+        process_reliable_push_and_arm_bg_wake(
+            writer,
+            metrics,
+            routes,
+            root_channels,
+            identities,
+            retry,
+            buffered,
+            completed,
+            subscriptions,
+            wakes,
+            wake_epochs,
+            root,
+            frame,
+            probe,
+        );
+    });
+}
+
+fn recover_ingress_completions<'a>(
+    registries: impl IntoIterator<
+        Item = (
+            &'a ProjectRootId,
+            &'a crate::bash_background::BgTaskRegistry,
+        ),
+    >,
+    metrics: &DispatchPathMetrics,
+    mut push: impl FnMut(ProjectRootId, PushFrame),
+) {
+    let ingress = &metrics.completion_delivery.ingress;
+    let mut budget = RELIABLE_PUSH_DRAIN_BUDGET;
+    for (root, registry) in registries {
+        let Some(pending) = registry.pending_ingress_completions(budget) else {
+            ingress.completions_missed.store(true, Ordering::Release);
+            continue;
+        };
+        budget -= pending.len();
+        for completion in pending {
+            let missed = Arc::clone(&completion.ingress_missed);
+            let offered = if let Some(owner) = completion
+                .launching_identity
+                .as_ref()
+                .filter(|owner| super::runner_notices::is_runner(owner))
+            {
+                if super::runner_notices::retired(owner) {
+                    metrics
+                        .completion_delivery
+                        .registries
+                        .lock()
+                        .unwrap()
+                        .insert(root.clone(), registry.clone());
+                    let key = ReplayKey {
+                        root: root.clone(),
+                        principal: owner.principal.clone(),
+                        harness: owner.harness.clone(),
+                        session: owner.session.clone(),
+                    };
+                    metrics
+                        .completion_delivery
+                        .is_settled(root, &completion.task_id)
+                        || metrics
+                            .completion_delivery
+                            .settle(&key, &completion.task_id)
+                } else {
+                    // Runner delivery can address the recorded owner without a
+                    // live route. Keep the marker if its scheduler is full.
+                    super::runner_notices::enqueue(registry.clone(), completion.into_push_frame())
+                }
+            } else {
+                push(root.clone(), completion.into_push_frame());
+                true
+            };
+            if offered {
+                missed.store(false, Ordering::Release);
+            } else {
+                ingress.completions_missed.store(true, Ordering::Release);
+            }
+        }
+        if budget == 0 {
+            ingress.completions_missed.store(true, Ordering::Release);
+            break;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3310,7 +3505,8 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let (writer_tx, mut writer_rx) =
             mpsc::channel::<WriterFrame>(RELIABLE_PUSH_DRAIN_BUDGET + 8);
-        let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
+        let (reliable_tx, mut reliable_rx) =
+            mpsc::channel::<PushEnvelope>(RELIABLE_PUSH_DRAIN_BUDGET + 8);
         let total = RELIABLE_PUSH_DRAIN_BUDGET + 3;
         let first = (
             root.clone(),
@@ -3318,7 +3514,7 @@ mod tests {
         );
         for index in 1..total {
             reliable_tx
-                .send((
+                .try_send((
                     root.clone(),
                     completion_frame_with_session(&format!("budget-{index}"), &session),
                 ))
@@ -4015,7 +4211,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-push-full-root");
         let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1);
         let lossy_overflow = Arc::new(LossyOverflow::default());
-        let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
+        let (reliable_tx, mut reliable_rx) = ReliableIngress::channel(Arc::default());
         let sender = progress_sender_for_root(
             PushSenders {
                 lossy_tx,

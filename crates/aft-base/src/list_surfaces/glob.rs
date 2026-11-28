@@ -18,6 +18,15 @@ pub const DEFAULT_MAX_RESULTS: usize = 100;
 pub const MAX_DISPLAY_FILES_PER_DIRECTORY: usize = 5;
 pub const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
+/// A completed discovery yields an exact total even when display limits hide rows.
+pub fn glob_total_bound(total: usize, executor_capped: bool, incomplete_walk: bool) -> Total {
+    if executor_capped || incomplete_walk {
+        Total::AtLeast(total)
+    } else {
+        Total::Exact(total)
+    }
+}
+
 /// Builds the `ListEnvelope` for a glob response when truncated, or returns `None` if complete.
 ///
 /// Parameters:
@@ -72,14 +81,9 @@ pub fn build_glob_envelope_with_time_limit(
         return None;
     }
 
-    let total_bound = if has_walk || executor_capped {
-        Total::AtLeast(total)
-    } else {
-        Total::Exact(total)
-    };
     Some(ListEnvelope::new(
         shown,
-        total_bound,
+        glob_total_bound(total, executor_capped, has_walk),
         GLOB_UNIT,
         causes,
         GLOB_NARROW,

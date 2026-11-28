@@ -18,6 +18,182 @@ fn send(aft: &mut AftProcess, request: serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
+fn outline_zoom_rust_item_symbols() {
+    use aft::symbols::SymbolKind::{TypeAlias, Variable};
+
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "rust_items.rs",
+        include_str!("../fixtures/rust_item_navigation.rs"),
+    );
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let outline = send(
+        &mut aft,
+        json!({"id":"rust-items", "command":"outline", "file":file}),
+    );
+    assert_eq!(outline["success"], true, "{outline}");
+    let text = outline["text"].as_str().unwrap();
+    let symbols = aft::parser::FileParser::new()
+        .extract_symbols(&file)
+        .unwrap();
+
+    for (scope, parent, kind, name, declaration) in [
+        (
+            &[][..],
+            None,
+            Variable,
+            "LETTERS",
+            "const LETTERS: &str = \"abc\";",
+        ),
+        (
+            &[],
+            None,
+            Variable,
+            "ALPHABET",
+            "static ALPHABET: &[u8] = b\"abc\";",
+        ),
+        (
+            &[],
+            None,
+            TypeAlias,
+            "Alphabet",
+            "type Alphabet = &'static [u8];",
+        ),
+        (
+            &["outer", "inner"],
+            Some("inner"),
+            Variable,
+            "MODULE_COUNT",
+            "const MODULE_COUNT: usize = 3;",
+        ),
+        (
+            &["outer", "inner"],
+            Some("inner"),
+            Variable,
+            "MODULE_TABLE",
+            "static MODULE_TABLE: [u8; 3] = [1, 2, 3];",
+        ),
+        (
+            &["outer", "inner"],
+            Some("inner"),
+            TypeAlias,
+            "ModuleIndex",
+            "type ModuleIndex = usize;",
+        ),
+        (
+            &["Service"],
+            Some("Service"),
+            Variable,
+            "TRAIT_LIMIT",
+            "const TRAIT_LIMIT: usize;",
+        ),
+        (
+            &["Service"],
+            Some("Service"),
+            TypeAlias,
+            "TraitOutput",
+            "type TraitOutput: Copy;",
+        ),
+        (
+            &["Service"],
+            Some("Service"),
+            Variable,
+            "TRAIT_TABLE",
+            "static TRAIT_TABLE: [u8; 1] = [4];",
+        ),
+        (
+            &["Service for Widget"],
+            Some("Widget"),
+            Variable,
+            "TRAIT_LIMIT",
+            "const TRAIT_LIMIT: usize = 1;",
+        ),
+        (
+            &["Service for Widget"],
+            Some("Widget"),
+            TypeAlias,
+            "TraitOutput",
+            "type TraitOutput = u8;",
+        ),
+        (
+            &["Service for Widget"],
+            Some("Widget"),
+            Variable,
+            "IMPL_TABLE",
+            "static IMPL_TABLE: [u8; 1] = [5];",
+        ),
+        (
+            &["Widget"],
+            Some("Widget"),
+            Variable,
+            "DEFAULT_COUNT",
+            "const DEFAULT_COUNT: usize = 2;",
+        ),
+    ] {
+        let qualified = scope
+            .iter()
+            .copied()
+            .chain([name])
+            .collect::<Vec<_>>()
+            .join("::");
+        assert!(
+            text.contains(declaration),
+            "missing {qualified} in outline: {text}"
+        );
+        let mut matches = symbols
+            .iter()
+            .filter(|sym| sym.name == name && sym.scope_chain == scope);
+        let sym = matches
+            .next()
+            .unwrap_or_else(|| panic!("missing symbol {qualified}"));
+        assert!(matches.next().is_none(), "duplicated symbol {qualified}");
+        assert_eq!(sym.parent.as_deref(), parent, "{qualified}");
+        assert_eq!(sym.kind, kind, "{qualified}");
+        let zoom = send(
+            &mut aft,
+            json!({"id":"rust-item-zoom", "command":"zoom", "file":file, "symbols":[qualified]}),
+        );
+        assert_eq!(zoom["success"], true, "{qualified}: {zoom}");
+        assert!(
+            zoom["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(declaration)),
+            "{qualified}: {zoom}"
+        );
+    }
+    for name in ["_", "LOCAL_COUNT", "LOCAL_TABLE", "LocalIndex"] {
+        assert!(
+            !symbols.iter().any(|symbol| symbol.name == name),
+            "unexpected symbol {name}"
+        );
+        assert!(
+            !text.contains(&format!(" {name}:")),
+            "unexpected outline entry: {text}"
+        );
+    }
+    let closest_file = write_file(
+        dir.path(),
+        "closest.rs",
+        "const LETTERS: &str = \"abc\";\nfn unrelated_function() {}\n",
+    );
+    let miss = send(
+        &mut aft,
+        json!({"id":"rust-item-closest", "command":"zoom", "file":closest_file, "symbol":"LAVVXXS"}),
+    );
+    assert_eq!(miss["code"], "symbol_not_found", "{miss}");
+    assert!(
+        miss["message"]
+            .as_str()
+            .unwrap()
+            .contains("closest is `LETTERS`"),
+        "{miss}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn outline_arrow_consts_keep_declarator_ranges() {
     let dir = TempDir::new().unwrap();
     let source = "/** Format reset. */\nexport const formatReset = () => 1;\nfunction outer() {\n  /** Nested reset. */\n  const nestedReset = () => 2;\n}\n";
@@ -701,6 +877,190 @@ export function plain(n: number) { return n; }
         .unwrap()
         .contains("function doCompute"));
 
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn typescript_outline_does_not_export_locals() {
+    let dir = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let source = r#"export const factory = run(() => {
+  const bind = () => 1;
+  function register() { return bind(); }
+  return register;
+});
+export function outer() {
+  function inner() { return 1; }
+  return inner();
+}
+const shadow = () => 1;
+function unrelated() {
+  const shadow = () => 2;
+  return shadow();
+}
+const publicShadow = () => 3;
+export { shadow, shadow as publicShadow };
+const defaultEntry = () => 4;
+export default defaultEntry;
+"#;
+    for extension in ["ts", "tsx"] {
+        let file = write_file(dir.path(), &format!("locals.{extension}"), source);
+        let reply = send(
+            &mut aft,
+            json!({"id":"export-locals", "command":"outline", "file":file}),
+        );
+        assert_eq!(reply["success"], true, "{reply}");
+        let text = reply["text"].as_str().unwrap();
+        for local in [
+            "const bind",
+            "function register",
+            "function inner",
+            "const publicShadow",
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim_start().starts_with(local)),
+                "{extension}: missing unexported {local}: {text}"
+            );
+        }
+        for expected in [
+            "E const factory",
+            "E function outer",
+            "E const shadow = () => 1",
+            "const shadow = () => 2",
+            "E const defaultEntry",
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim_start().starts_with(expected)),
+                "{extension}: missing {expected}: {text}"
+            );
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn typescript_outline_and_zoom_find_exported_pattern_bindings() {
+    let dir = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let source = r#"export const {
+  use: useCommand, execute: executeCommand,
+  options: { shorthand, fallback = fallbackValue }, ...remaining
+} = makeCommands();
+export const [first, , [nested], ...tail] = makeItems();
+const { key: viaClause, hidden } = makeOther();
+export { viaClause as publicOther };
+"#;
+    for extension in ["ts", "tsx"] {
+        let file = write_file(dir.path(), &format!("patterns.{extension}"), source);
+        let reply = send(
+            &mut aft,
+            json!({"id":"export-patterns", "command":"outline", "file":file}),
+        );
+        assert_eq!(reply["success"], true, "{reply}");
+        let text = reply["text"].as_str().unwrap();
+        for alias in ["useCommand", "executeCommand"] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("E const {alias} "))),
+                "{extension}: missing outline entry for {alias}: {text}"
+            );
+        }
+        let symbols = aft::parser::FileParser::new()
+            .extract_symbols(&file)
+            .unwrap();
+        let mut exported: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| symbol.exported)
+            .map(|symbol| {
+                assert_eq!(symbol.kind, aft::symbols::SymbolKind::Variable);
+                symbol.name.as_str()
+            })
+            .collect();
+        exported.sort_unstable();
+        assert_eq!(
+            exported,
+            [
+                "executeCommand",
+                "fallback",
+                "first",
+                "nested",
+                "remaining",
+                "shorthand",
+                "tail",
+                "useCommand",
+                "viaClause",
+            ],
+            "{extension}: {reply}"
+        );
+        let reply = send(
+            &mut aft,
+            json!({"id":"zoom-pattern", "command":"zoom", "file":file, "symbol":"useCommand"}),
+        );
+        assert_eq!(reply["success"], true, "{extension}: {reply}");
+        assert!(
+            reply["content"]
+                .as_str()
+                .unwrap()
+                .contains("use: useCommand"),
+            "{reply}"
+        );
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn typescript_outline_preserves_search_definitions() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        dir.path(),
+        "module.ts",
+        "export const { value: exportedAlias } = makeValue();\nexport function indexedDefinition() { return exportedAlias; }\n",
+    );
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let search = send(
+        &mut aft,
+        json!({"id":"search-export-definition", "command":"semantic_search", "query":"indexedDefinition"}),
+    );
+    assert_eq!(search["success"], true, "{search}");
+    assert!(
+        search["structuredContent"]["results"][0]["evidence_descriptor"]["kind"] == "definition"
+            && search["results"][0]["start_line"] == 2,
+        "expected a definition rather than just a text match: {search}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn typescript_outline_preserves_call_target_resolution() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        dir.path(),
+        "module.ts",
+        "export const { value: exportedAlias } = makeValue();\nexport function target() { return exportedAlias; }\n",
+    );
+    let caller = write_file(
+        dir.path(),
+        "caller.tsx",
+        "import { target } from './module';\nexport function caller() { return <div>{target()}</div>; }\n",
+    );
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let calls = send(
+        &mut aft,
+        json!({"id":"exported-call-target", "command":"call_tree", "file":caller, "symbol":"caller", "depth":1}),
+    );
+    assert_eq!(calls["success"], true, "{calls}");
+    assert!(
+        calls["children"].as_array().unwrap().iter().any(|child| {
+            child["name"] == "target" && child["resolved"] == true && child["file"] == "module.ts"
+        }),
+        "expected the imported function to resolve to module.ts: {calls}"
+    );
     assert!(aft.shutdown().success());
 }
 

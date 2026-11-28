@@ -63,7 +63,10 @@ async function childSession(host: V2Host, script: ModelScript, parentID: string,
 async function startGroup(host: V2Host, script: ModelScript, sessionID: string, label: string) {
   const marker = join(host.project, `${label}.pids`);
   const command = `sleep 300 & child=$!; printf '%s %s\\n' "$$" "$child" > '${marker}'; wait "$child"`;
-  script[label] = { name: "shell", arguments: { command, background: true } };
+  script[label] = {
+    name: "shell",
+    arguments: { command, description: "Start a background kill probe", background: true },
+  };
   await host.turn(sessionID, label);
   await until(`${label} process group`, async () =>
     access(marker).then(
@@ -136,7 +139,11 @@ for (const ending of ["stop", "reload-stop", "provider"] as const) {
           const marker = join(host.project, "foreground.pids");
           script.hold = {
             name: "shell",
-            arguments: { command: `echo $$ > '${marker}'; sleep 300`, wait: true },
+            arguments: {
+              command: `echo $$ > '${marker}'; sleep 300`,
+              description: "Start a waiting kill probe",
+              wait: true,
+            },
           };
           await host.client.session.prompt({ sessionID: stopped, text: "hold" });
           await until("active subagent execution", async () =>

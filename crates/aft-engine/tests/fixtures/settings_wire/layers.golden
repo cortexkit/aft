@@ -1,0 +1,165 @@
+: all
+/$schema: all
+/auto_update: user
+/backup: all
+/backup/enabled: user
+/backup/max_depth: user
+/backup/max_file_size: all
+/bash: all
+/bash/background: all
+/bash/changed_files: all
+/bash/compress: all
+/bash/db_schema_hints: all
+/bash/detach_on_user_message: all
+/bash/disclaim_privacy: raise_only [false,true]
+/bash/enabled: all
+/bash/env: all
+/bash/env/*: all
+/bash/foreground_wait_window_ms: all
+/bash/host_fallback: all
+/bash/linux_scope: user
+/bash/linux_scope_max_runtime_secs: user
+/bash/long_running_reminder_enabled: all
+/bash/long_running_reminder_interval_ms: all
+/bash/memory_limit_mib: lower_only null
+/bash/powershell_tool: all
+/bash/rewrite: all
+/bash/runon_env: user
+/bash/runon_env/*: user
+/bash/subagent_background: all
+/bash/watch_sync_max_ms: all
+/bash/worker_wait_max_ms: all
+/bridge: user
+/bridge/request_timeout_ms: user
+/checker: all
+/checker/*: all
+/configure_warnings_delivery: all
+/disabled_tools: user
+/disabled_tools/*: user
+/durability: user
+/durability/macos_full_sync: user
+/edit_mode: all
+/experimental: all
+/experimental/lsp_ty: all
+/format_on_edit: all
+/formatter: all
+/formatter/*: all
+/formatter_timeout_secs: user
+/gh_shim: user
+/gh_shim/binary_path: user
+/git: all
+/git/co_author: all
+/github: user
+/github/read: user
+/github/shim: user
+/github/write: user
+/harnesses: all
+/harnesses/*: all
+/idle: all
+/idle/checkout_hours: all
+/idle/root_ttl_minutes: all
+/index: all
+/index/roots: user
+/index/roots/*: user
+/index/roots/*/indexes: user
+/index/roots/*/indexes/*: user
+/index/roots/*/path: user
+/indexes: all
+/indexes/callgraph: lower_only [false,true]
+/indexes/semantic: lower_only [false,true]
+/indexes/trigram: lower_only [false,true]
+/inspect: all
+/inspect/categories: all
+/inspect/categories/complexity: lower_only [false,true]
+/inspect/categories/cycles: lower_only [false,true]
+/inspect/categories/dead_code: lower_only [false,true]
+/inspect/categories/diagnostics: lower_only [false,true]
+/inspect/categories/duplicates: lower_only [false,true]
+/inspect/categories/todos: lower_only [false,true]
+/inspect/categories/unused_exports: lower_only [false,true]
+/inspect/diagnostics_timeout_ms: raise_only null
+/inspect/duplicates: all
+/inspect/duplicates/expected_mirrors: all
+/inspect/duplicates/expected_mirrors/*: all
+/inspect/duplicates/expected_mirrors/*/mirror: all
+/inspect/duplicates/expected_mirrors/*/source: all
+/inspect/enabled: all
+/inspect/tier2_pass_timeout_ms: all
+/lsp: all
+/lsp/auto_install: user
+/lsp/diagnostics_on_edit: all
+/lsp/disabled: user
+/lsp/disabled/*: user
+/lsp/grace_days: user
+/lsp/idle_minutes: lower_only null
+/lsp/idle_shutdown: raise_only [false,true]
+/lsp/max_servers: lower_only null
+/lsp/python: all
+/lsp/servers: user
+/lsp/servers/*: user
+/lsp/servers/*/args: user
+/lsp/servers/*/args/*: user
+/lsp/servers/*/binary: user
+/lsp/servers/*/disabled: user
+/lsp/servers/*/env: user
+/lsp/servers/*/env/*: user
+/lsp/servers/*/extensions: user
+/lsp/servers/*/extensions/*: user
+/lsp/servers/*/initialization_options: user
+/lsp/servers/*/root_markers: user
+/lsp/servers/*/root_markers/*: user
+/lsp/versions: user
+/lsp/versions/*: user
+/lsp/worker_rust_analyzers: lower_only null
+/memory: user
+/pi: all
+/pi/external_access_ask: raise_only [false,true]
+/pi/tool_presentation: all
+/remote_exec: all
+/remote_exec/default_demand: user
+/remote_exec/enabled: lower_only [false,true]
+/restrict_to_project_root: user
+/revision_reads: all
+/sandbox: all
+/sandbox/profile: all
+/sandbox/profile/head: raise_only ["off","relaxed","strict"]
+/sandbox/profile/worker: raise_only ["off","relaxed","strict"]
+/sandbox/read_deny: user
+/sandbox/read_deny/*: user
+/sandbox/write_allow: user
+/sandbox/write_allow/*: user
+/search: all
+/search/rerank: all
+/search/rerank/api_key_env: user
+/search/rerank/backend: all
+/search/rerank/endpoint: user
+/search/rerank/model: user
+/search/rerank/timeout_ms: user
+/search/rerank/top_n: user
+/semantic: all
+/semantic/api_key_env: user
+/semantic/backend: user
+/semantic/base_url: user
+/semantic/max_batch_size: all
+/semantic/max_files: all
+/semantic/max_input_tokens: all
+/semantic/model: all
+/semantic/query_instruction: all
+/semantic/query_timeout_ms: user
+/semantic/timeout_ms: all
+/shell: all
+/shell/env_provider: user
+/shell/env_provider/command: user
+/shell/env_provider/command/*: user
+/shell/env_provider/kind: user
+/shell/env_provider/timeout_ms: user
+/shell/env_provider/watch: user
+/shell/env_provider/watch/*: user
+/storage: user
+/storage/cache_dir: user
+/subc: user
+/subc/client_reaper: user
+/subc/connection_file: user
+/type_checker_timeout_secs: user
+/url_fetch_allow_private: user
+/validate_on_edit: all

@@ -1989,7 +1989,7 @@ fn custody_operation(name: &str) -> bool {
 
 /// The largest body a role reply may carry: one subc frame. Withdraw answers
 /// and late-results pages are bounded by it, never by the tool-response limit.
-pub(super) const ROLE_REPLY_BODY_LIMIT: usize = subc_protocol::MAX_FRAME_BODY_LEN as usize;
+pub(super) const ROLE_REPLY_BODY_LIMIT: usize = super::wire::CLIENT_REPLY_BODY_LIMIT;
 
 /// A custody request whose caller checks passed and that now needs the ledger.
 enum Custody {
@@ -5076,39 +5076,38 @@ mod tests {
     }
 
     #[test]
-    fn head_bash_runs_record_only_older_semantics_and_refuses_older_behavior() {
+    fn bash_refuses_old_major_pins_before_validating_arguments() {
         let tool = tools_for_session(CatalogPreset::Head, &[], true, false, false)
             .into_iter()
             .find(|tool| tool.name == "bash")
             .unwrap();
         let mut request = call("bash", json!({"command":"echo"}));
         request.preset = Some("head".into());
-        // Version 2 differs from 3 only in the app record's `tail` field, so a
-        // session whose plan still names 2 keeps its shell.
-        for runs in [2, 3] {
-            request.schema_pin = Some(
-                SchemaPin::new("bash", &tool.schema_digest, runs)
-                    .encode()
-                    .unwrap(),
-            );
+        request.call_key = Some("bash-required-description".into());
+        let current = tool.schema_pin().encode().unwrap();
+        assert!(current.ends_with(":2"));
+        let old_digest = "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a";
+        for old in [
+            format!("tp2:bash:{old_digest}:1"),
+            format!("tp1:bash:{old_digest}:2"),
+            format!("tp1:bash:{old_digest}:3"),
+        ] {
+            request.schema_pin = Some(old.clone());
+            let refusal = admit(&request, false, &[], true, "session", true).unwrap_err();
+            assert_eq!(refusal.code, "tool_major_changed");
+            assert_eq!(refusal.message, "this tool changed incompatibly");
             assert_eq!(
-                admit(&request, false, &[], true, "session", true).unwrap(),
-                CallerRole::Head,
-                "semantics {runs}"
+                refusal.detail.unwrap(),
+                json!({"tool":"bash","expected":old,"current":current})
             );
         }
-        request.schema_pin = Some(
-            SchemaPin::new("bash", &tool.schema_digest, 1)
-                .encode()
-                .unwrap(),
-        );
-        let refusal = admit(&request, false, &[], true, "session", true).unwrap_err();
-        assert_eq!(refusal.code, "tool_major_changed");
-        assert_eq!(
-            refusal.detail.unwrap(),
-            json!({"tool":"bash","expected":request.schema_pin.unwrap(),"current":tool.schema_pin().encode().unwrap()})
-        );
         request.schema_pin = None;
+        let refusal = admit(&request, false, &[], true, "session", true).unwrap_err();
+        assert_eq!(refusal.code, "invalid_request");
+        assert_eq!(refusal.message, "\"description\" is a required property");
+        assert_eq!(refusal.detail, Some(json!({"field":"arguments"})));
+        request.arguments["description"] = json!("Print the requested test output");
+        request.schema_pin = Some(current);
         assert_eq!(
             admit(&request, false, &[], true, "session", true).unwrap(),
             CallerRole::Head
@@ -5118,24 +5117,30 @@ mod tests {
     #[test]
     fn worker_shell_calls_with_old_semantics_pins_are_refused() {
         for name in ["bash", "bash_watch"] {
-            // Worker `bash` version 2 still runs (record-only change, see the
-            // head test above); version 1 is an older behavior and is refused.
             let (old, current) = if name == "bash" { (1, 3) } else { (1, 2) };
             let tool = tools_for_session(CatalogPreset::Worker, &[], true, false, false)
                 .into_iter()
                 .find(|tool| tool.name == name)
                 .unwrap();
             let arguments = if name == "bash" {
-                json!({"command":"echo"})
+                json!({"command":"echo","description":"Print the requested test output"})
             } else {
                 json!({"taskId":"bash-0123456789abcdef"})
             };
             let mut request = call(name, arguments);
             request.preset = Some("worker".into());
             request.schema_pin = Some(
-                SchemaPin::new(name, &tool.schema_digest, old)
-                    .encode()
-                    .unwrap(),
+                SchemaPin::new(
+                    name,
+                    if name == "bash" {
+                        "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a"
+                    } else {
+                        &tool.schema_digest
+                    },
+                    old,
+                )
+                .encode()
+                .unwrap(),
             );
             let refusal = admit(&request, false, &[], true, "session", true).unwrap_err();
             if name == "bash" {
@@ -5156,18 +5161,6 @@ mod tests {
                 admit(&request, false, &[], true, "session", true).unwrap(),
                 CallerRole::Worker
             );
-            if name == "bash" {
-                request.schema_pin = Some(
-                    SchemaPin::new(name, &tool.schema_digest, 2)
-                        .encode()
-                        .unwrap(),
-                );
-                assert_eq!(
-                    admit(&request, false, &[], true, "session", true).unwrap(),
-                    CallerRole::Worker,
-                    "a worker whose tool list predates bash version 3 keeps its shell"
-                );
-            }
             request.schema_pin = None;
             assert_eq!(
                 admit(&request, false, &[], true, "session", true).unwrap(),
@@ -5176,7 +5169,8 @@ mod tests {
         }
     }
 
-    const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
+    const REGENERATE_CATALOG: &str =
+        "cargo test -p aft-subc --lib regenerate_tool_provider_catalog --locked -- --ignored";
     const NOTICE_TEMPLATE_VECTORS: &str = "../../test-vectors/aft-notice-templates-v1.2";
 
     fn notice_template_vectors() -> BTreeMap<String, String> {
@@ -5193,7 +5187,7 @@ mod tests {
                 "for completion output tails, which also changes their `generation` and\n",
                 "`catalog_digest`. The reader catalog and `*.sends.json` files are unchanged.\n",
                 "Versions 1 and 1.1 remain as published.\n\n",
-                "Regenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;\n",
+                "Regenerate with `cargo test -p aft-subc --lib regenerate_notice_template_vectors -- --ignored`;\n",
                 "`notice_template_vectors_match_samples` compares every byte.\n",
             ).into(),
         );
@@ -5274,7 +5268,10 @@ mod tests {
             std::path::Path::new(crate::test_support::manifest_dir()).join(NOTICE_TEMPLATE_VECTORS);
         std::fs::create_dir_all(&root).unwrap();
         for (path, text) in notice_template_vectors() {
-            std::fs::write(root.join(path), text).unwrap();
+            let path = root.join(path);
+            if std::fs::read_to_string(&path).as_deref().ok() != Some(text.as_str()) {
+                std::fs::write(path, text).unwrap();
+            }
         }
     }
 
@@ -5343,6 +5340,7 @@ mod tests {
     #[test]
     #[ignore = "explicit fixture regeneration, not a verification gate"]
     fn regenerate_tool_provider_catalog() {
+        let _legacy_catalog = versions::legacy_catalog();
         for (relative, _) in CATALOG_FIXTURES {
             let path = std::path::Path::new(crate::test_support::manifest_dir()).join(relative);
             let mut fixtures: Value =
@@ -5366,6 +5364,12 @@ mod tests {
             )
             .unwrap();
         }
+        std::fs::write(
+            Path::new(crate::test_support::manifest_dir())
+                .join("../aft/tests/fixtures/tool_provider_bash_false_catalog.json"),
+            serde_json::to_vec(&bash_false_catalog(BASH_FALSE_CONFIG)).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5417,42 +5421,49 @@ mod tests {
         assert_eq!(presets_seen, every, "every preset has a golden");
     }
 
-    #[test]
-    fn legacy_bash_false_catalog_matches_pre_migration_bytes() {
+    const BASH_FALSE_CONFIG: &str = r#"{"bash":false,"edit_mode":"hashline"}"#;
+
+    fn bash_false_catalog(doc: &str) -> Value {
         use crate::config_resolve::{resolve_config, ConfigTier};
 
+        let result = resolve_config(&[ConfigTier {
+            tier: "user".into(),
+            source: "aft.jsonc".into(),
+            doc: doc.into(),
+        }]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let config = result.config;
+        assert!(!config.bash.enabled);
+        catalog_for_session_with(
+            json!({
+                "preset": "head",
+                "params": {"model": {"provider": "example", "model": "claude-opus-5-5"}},
+                "system_text": {"preset": "head"}
+            }),
+            &config.disabled_tools,
+            false,
+            false,
+            config.bash.worker_wait_max_ms,
+            HeadSettings::from_config(&config),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_bash_false_catalog_matches_pre_migration_bytes() {
         let _legacy_catalog = versions::legacy_catalog();
-        // Captured from the pre-migration resolver and renderer at 4d0a522e.
         // In hashline edit mode the description names shell reads that mint
         // line tags only when Bash rewriting is enabled. Pin that wording and
         // the background tool list in the same catalog.
         let expected =
             include_bytes!("../../../aft/tests/fixtures/tool_provider_bash_false_catalog.json");
-        let legacy = r#"{"bash":false,"edit_mode":"hashline"}"#;
-        let rewritten = crate::config_fix::migrate_user_config_text(legacy).unwrap();
+        let rewritten = crate::config_fix::migrate_user_config_text(BASH_FALSE_CONFIG).unwrap();
         assert!(rewritten.changed);
-        for (source, doc) in [("legacy", legacy), ("rewritten", rewritten.text.as_str())] {
-            let result = resolve_config(&[ConfigTier {
-                tier: "user".into(),
-                source: "aft.jsonc".into(),
-                doc: doc.into(),
-            }]);
-            assert!(result.errors.is_empty(), "{source}: {:?}", result.errors);
-            let config = result.config;
-            assert!(!config.bash.enabled);
-            let reply = catalog_for_session_with(
-                json!({
-                    "preset": "head",
-                    "params": {"model": {"provider": "example", "model": "claude-opus-5-5"}},
-                    "system_text": {"preset": "head"}
-                }),
-                &config.disabled_tools,
-                false,
-                false,
-                config.bash.worker_wait_max_ms,
-                HeadSettings::from_config(&config),
-            )
-            .unwrap();
+        for (source, doc) in [
+            ("legacy", BASH_FALSE_CONFIG),
+            ("rewritten", rewritten.text.as_str()),
+        ] {
+            let reply = bash_false_catalog(doc);
             let actual = serde_json::to_vec(&reply).unwrap();
             assert!(
                 actual.as_slice() == expected,
@@ -5502,7 +5513,49 @@ mod tests {
             )
         };
         let request = fixture["request"].clone();
-        let actual = catalog(request.clone(), &disabled, available).unwrap();
+        let mut actual = catalog(request.clone(), &disabled, available).unwrap();
+        let pristine = actual.clone();
+        // The worker Commands paragraph names the macOS setuid limit only
+        // when AFT itself runs on macOS. The committed fixtures hold the
+        // platform-neutral text, so expect the sentence exactly on a macOS
+        // worker that serves bash. Its digests cover the text and follow it;
+        // align them with the fixture for the byte comparison below. Their
+        // correctness stays pinned by the self-consistency checks on the
+        // unaligned values and by worker_preset_adds_bash_watch, which
+        // checks item_digest against the rendered text.
+        let generation = actual["generation"].clone();
+        let catalog_digest = actual["catalog_digest"].clone();
+        if let Some(text) = actual
+            .get("system_text")
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+        {
+            let text = text.to_string();
+            let serves_bash = actual["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .any(|name| name == "bash" || super::same_tool(name, "bash"));
+            let is_worker = fixture["request"]["preset"].as_str() == Some("worker");
+            assert_eq!(
+                text.contains(super::guidance::MACOS_PS_NOTE),
+                cfg!(target_os = "macos") && is_worker && serves_bash,
+                "{}",
+                fixture["name"]
+            );
+            if text.contains(super::guidance::MACOS_PS_NOTE) {
+                actual["system_text"]["text"] = Value::String(
+                    text.replace(&format!(" {}", super::guidance::MACOS_PS_NOTE), ""),
+                );
+                actual["system_text"]["item_digest"] =
+                    fixture["reply"]["system_text"]["item_digest"].clone();
+                actual["system_text"]["preflight_digest"] =
+                    fixture["reply"]["system_text"]["preflight_digest"].clone();
+                actual["generation"] = fixture["reply"]["generation"].clone();
+                actual["catalog_digest"] = fixture["reply"]["catalog_digest"].clone();
+            }
+        }
         // `runon` is in bash's schema exactly when the session may run remotely.
         let bash_has_runon = actual["tools"]
             .as_array()
@@ -5528,16 +5581,16 @@ mod tests {
             catalog_golden_difference(&fixture["reply"], &actual, "reply"),
             REGENERATE_CATALOG
         );
-        assert_eq!(actual["generation"], actual["catalog_digest"]);
+        assert_eq!(generation, catalog_digest);
         let mut digest_request = request;
         digest_request["digest_only"] = json!(true);
         assert_eq!(
             catalog(digest_request, &disabled, available).unwrap(),
-            json!({"generation": actual["generation"], "catalog_digest": actual["catalog_digest"]})
+            json!({"generation": generation, "catalog_digest": catalog_digest})
         );
         assert_eq!(
             catalog(fixture["request"].clone(), &disabled, available).unwrap(),
-            actual
+            pristine
         );
     }
 
@@ -7140,14 +7193,11 @@ mod tests {
                 Some("session")
             );
             // A route without a daemon scope stamp still runs plain calls.
-            assert!(admit_plain(
-                &call(name, json!({"command": "echo x"})),
-                &[],
-                true,
-                "session",
-                true
-            )
-            .is_ok());
+            let mut arguments = json!({"command": "echo x"});
+            if name == "bash" {
+                arguments["description"] = json!("Print the requested test output");
+            }
+            assert!(admit_plain(&call(name, arguments), &[], true, "session", true).is_ok());
         }
         for key in [
             "foreground_orchestrate",
@@ -7171,8 +7221,8 @@ mod tests {
         for arguments in [
             json!({}),
             json!({"command": 1}),
-            json!({"command": "echo", "timeout": 0}),
-            json!({"command": "echo", "ptyRows": 61}),
+            json!({"command": "echo", "description": "Print the requested test output", "timeout": 0}),
+            json!({"command": "echo", "description": "Print the requested test output", "ptyRows": 61}),
         ] {
             assert_eq!(
                 admit_plain(&call("bash", arguments), &[], true, "session", true)
@@ -7182,7 +7232,7 @@ mod tests {
             );
         }
         assert!(admit_plain(
-            &call("bash", json!({"command": "echo", "wait": true})),
+            &call("bash", json!({"command": "echo", "description": "Print the requested test output", "wait": true})),
             &[],
             true,
             "session",
@@ -7224,13 +7274,16 @@ mod tests {
                 3,
                 Some("tool_schema_changed"),
             ),
-            (schema.schema_digest.as_str(), 1, Some("tool_major_changed")),
-            // Version 2 differs from 3 only in the display record the apps draw
-            // (3 adds the `tail` field); the command runs the same, so a version-2
-            // pin maps to the same major.
-            (schema.schema_digest.as_str(), 2, None),
+            (
+                schema.schema_digest.as_str(),
+                1,
+                Some("tool_semantics_changed"),
+            ),
         ] {
-            let mut request = call("bash", json!({"command": "echo"}));
+            let mut request = call(
+                "bash",
+                json!({"command": "echo", "description": "Print the requested test output"}),
+            );
             request.schema_pin = Some(SchemaPin::new("bash", digest, semantics).encode().unwrap());
             let result = admit_plain(&request, &[], true, "session", true);
             match expected {
@@ -8580,7 +8633,11 @@ pub(in crate::subc) mod route_tests {
 
     #[tokio::test]
     async fn carried_unconfined_bash_is_refused_after_ledger_wait_and_older_epoch_save() {
-        carried_unconfined_after_ledger_wait("bash", json!({"command":"true"})).await;
+        carried_unconfined_after_ledger_wait(
+            "bash",
+            json!({"command":"true", "description":"Run the ledger fixture"}),
+        )
+        .await;
     }
 
     async fn carried_unconfined_after_ledger_wait(name: &str, arguments: Value) {
@@ -11544,7 +11601,8 @@ mod ledger_terminal_tests {
         inner.consumer_elicitation_capable = true;
         let key = LedgerEdge::key(&identity, "held-copy-key");
         let routes = std::collections::HashMap::from([(route_key(42, 1), identity)]);
-        let arguments = json!({"command":"printf hello"});
+        let arguments =
+            json!({"command":"printf hello","description":"Print the requested greeting"});
         let body = json!({"name":"bash", "arguments":arguments, "call_key":"held-copy-key"});
         let decoded = DecodedFrame {
             parsed_body: Default::default(),

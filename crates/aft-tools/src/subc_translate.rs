@@ -1974,7 +1974,14 @@ fn translate_grep(args: Value, project_root: &Path) -> Result<Translated, Transl
 
     let mut out = Map::new();
     out.insert("pattern".to_string(), Value::String(pattern.to_string()));
-    out.insert("case_sensitive".to_string(), Value::Bool(true));
+    // OMP's advertised grep `case` field maps to this runtime-only option.
+    let case_sensitive = match map_in.get("case_sensitive") {
+        None => true,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid_request("grep: 'case_sensitive' must be a boolean"))?,
+    };
+    out.insert("case_sensitive".to_string(), Value::Bool(case_sensitive));
     if let Some(offset) = coerce_optional_int_result(map_in.get("offset"), "offset", 0, 100_000)? {
         out.insert("offset".to_string(), Value::Number(offset.into()));
     }

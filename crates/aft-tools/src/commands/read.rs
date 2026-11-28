@@ -4,7 +4,7 @@
 //! opencode's built-in read tool with a faster Rust implementation.
 //! For symbol-based reading and call-graph annotations, use `zoom` instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,9 @@ use crate::github_read::{
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
+mod opened_checks;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use opened_checks::after_authorization_for_test;
 mod unranged;
 
 const DEFAULT_LIMIT: u32 = 2000;
@@ -99,6 +102,8 @@ struct ProcessedImage {
     mime: &'static str,
     width: u32,
     height: u32,
+    source_width: u32,
+    source_height: u32,
     resized: bool,
     source_mime: Option<&'static str>,
     animation: &'static str,
@@ -193,21 +198,26 @@ enum PreparedPathRead {
         raw_bytes: Vec<u8>,
         media: SniffedMedia,
     },
+    /// The opened file is also a protected file. The caller renders the
+    /// policy's floor refusal; `fallback` is the opener's own refusal text.
+    Floor {
+        protected: Option<PathBuf>,
+        fallback: String,
+    },
 }
 
 impl PreparedPathRead {
     fn into_response(self, id: &str) -> Response {
         let (raw_bytes, media) = match self {
             Self::Response(response) => return response,
+            Self::Floor { fallback, .. } => {
+                return Response::error(id, "denied_floor", fallback);
+            }
             Self::Media { raw_bytes, media } => (raw_bytes, media),
         };
-        let byte_size = raw_bytes.len();
         match media {
             SniffedMedia::Pdf => handle_pdf_media(id, raw_bytes),
-            SniffedMedia::Image(kind) => match process_image_with_timeout(raw_bytes, kind) {
-                Ok(image) => image_attachment_response(id, image),
-                Err(reason) => media_omitted_response(id, byte_size, reason),
-            },
+            SniffedMedia::Image(kind) => handle_image_media(id, raw_bytes, kind),
         }
     }
 }
@@ -338,6 +348,10 @@ fn image_attachment_response_with_budget(
     if budget.is_some() {
         attachment["encoding"] = serde_json::json!(image.mime.trim_start_matches("image/"));
     }
+    if image.resized {
+        attachment["source_width"] = serde_json::json!(image.source_width);
+        attachment["source_height"] = serde_json::json!(image.source_height);
+    }
     if let Some(source_mime) = image.source_mime {
         attachment
             .as_object_mut()
@@ -345,13 +359,25 @@ fn image_attachment_response_with_budget(
             .insert("source_mime".to_string(), serde_json::json!(source_mime));
     }
 
-    let mut content = format!(
-        "Read image attachment ({}, {}×{}, {}).",
-        image.mime,
-        image.width,
-        image.height,
-        attachment_size_note(byte_size)
-    );
+    let mut content = if image.resized {
+        format!(
+            "Read image attachment ({}, {}×{}, scaled from {}×{}, {}).",
+            image.mime,
+            image.width,
+            image.height,
+            image.source_width,
+            image.source_height,
+            attachment_size_note(byte_size)
+        )
+    } else {
+        format!(
+            "Read image attachment ({}, {}×{}, {}).",
+            image.mime,
+            image.width,
+            image.height,
+            attachment_size_note(byte_size)
+        )
+    };
     if image.animation == "first_frame" {
         content.push_str(" Animated image was resized from its first frame.");
     }
@@ -367,54 +393,150 @@ fn image_attachment_response_with_budget(
     )
 }
 
-static ACTIVE_IMAGE_DECODERS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-const MAX_IMAGE_DECODERS: usize = 2;
+const MAX_IMAGE_DECODERS: usize = 4;
+const IMAGE_DECODER_WAIT: Duration = Duration::from_secs(10);
+const IMAGE_DECODER_CANCEL_POLL: Duration = Duration::from_millis(25);
+static IMAGE_DECODERS: LazyLock<ImageDecoderSlots> = LazyLock::new(ImageDecoderSlots::default);
 
-struct ImageDecoderPermit;
+#[cfg(test)]
+type ImageDecoderTestHold = (
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<()>,
+);
 
-impl Drop for ImageDecoderPermit {
-    fn drop(&mut self) {
-        ACTIVE_IMAGE_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+#[cfg(test)]
+thread_local! {
+    static HOLD_IMAGE_DECODER: std::cell::Cell<Option<ImageDecoderTestHold>> = const { std::cell::Cell::new(None) };
+}
+
+#[derive(Default)]
+struct ImageDecoderSlots {
+    state: parking_lot::Mutex<ImageDecoderState>,
+    changed: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct ImageDecoderState {
+    active: usize,
+    next_ticket: u64,
+    waiters: VecDeque<u64>,
+}
+
+impl ImageDecoderSlots {
+    fn acquire(
+        &self,
+        decode_deadline: Option<Instant>,
+    ) -> Result<ImageDecoderPermit<'_>, ImageReadError> {
+        let wait_deadline = Instant::now() + IMAGE_DECODER_WAIT;
+        let wait_deadline =
+            decode_deadline.map_or(wait_deadline, |deadline| deadline.min(wait_deadline));
+        let cancellation = crate::executor::current_job_cancellation();
+        let mut state = self.state.lock();
+        let ticket = state.next_ticket;
+        state.next_ticket = ticket.wrapping_add(1);
+        state.waiters.push_back(ticket);
+
+        let result = loop {
+            // The executor signals route cancellation separately from decoder releases.
+            // Only read the signalled state here; checking whether the project root
+            // still exists could block everyone who needs the decoder lock.
+            if cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_already_requested())
+            {
+                break Err(ImageReadError::Cancelled);
+            }
+            let now = Instant::now();
+            if now >= wait_deadline {
+                break Err(ImageReadError::Omitted(format!(
+                    "image decoder capacity reached ({MAX_IMAGE_DECODERS}/{MAX_IMAGE_DECODERS} active); retry after existing image reads finish"
+                )));
+            }
+            if state.active < MAX_IMAGE_DECODERS && state.waiters.front() == Some(&ticket) {
+                state.active += 1;
+                break Ok(ImageDecoderPermit(self));
+            }
+            let wake_at = if cancellation.is_some() {
+                wait_deadline.min(now + IMAGE_DECODER_CANCEL_POLL)
+            } else {
+                wait_deadline
+            };
+            self.changed.wait_until(&mut state, wake_at);
+        };
+        state.waiters.retain(|waiting| *waiting != ticket);
+        if state.active < MAX_IMAGE_DECODERS {
+            self.changed.notify_all();
+        }
+        result
     }
 }
 
-#[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
+struct ImageDecoderPermit<'a>(&'a ImageDecoderSlots);
+
+impl Drop for ImageDecoderPermit<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().active -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
+#[derive(Debug)]
+enum ImageReadError {
+    Cancelled,
+    Omitted(String),
+}
+
+fn handle_image_media(id: &str, raw_bytes: Vec<u8>, kind: ImageKind) -> Response {
+    let byte_size = raw_bytes.len();
+    match process_image_with_timeout(raw_bytes, kind) {
+        Ok(image) => image_attachment_response(id, image),
+        Err(ImageReadError::Omitted(reason)) => media_omitted_response(id, byte_size, reason),
+        // A cancelled route discards the late completion rather than rendering an omission.
+        Err(ImageReadError::Cancelled) => {
+            Response::error(id, "request_cancelled", "request cancelled")
+        }
+    }
+}
+
 fn process_image_with_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
-) -> Result<ProcessedImage, String> {
+) -> Result<ProcessedImage, ImageReadError> {
     process_image_with_budget_timeout(
         raw_bytes,
         kind,
         crate::context::call_context::active().then_some(image_base64_budget()),
-        Instant::now() + IMAGE_PROCESS_TIMEOUT,
+        None,
     )
 }
 
-#[allow(deprecated)] // Keep decoder admission compatible with the minimum supported Rust version.
 fn process_image_with_budget_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
     budget: Option<usize>,
-    deadline: Instant,
-) -> Result<ProcessedImage, String> {
+    decode_deadline: Option<Instant>,
+) -> Result<ProcessedImage, ImageReadError> {
     #[cfg(test)]
     IMAGE_PROCESSING_DELAY.with(|delay| std::thread::sleep(delay.get()));
-    ACTIVE_IMAGE_DECODERS.fetch_update(
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-        |active| (active < MAX_IMAGE_DECODERS).then_some(active + 1),
-    ).map_err(|active| format!("image decoder capacity reached ({active}/{MAX_IMAGE_DECODERS} active); retry after existing image reads finish"))?;
-    let permit = ImageDecoderPermit;
+    let permit = IMAGE_DECODERS.acquire(decode_deadline)?;
+    // Local admission has its own window. A GitHub page shares an absolute
+    // deadline across all its images, leaving time to send the response.
+    let deadline = decode_deadline.unwrap_or_else(|| Instant::now() + IMAGE_PROCESS_TIMEOUT);
     let (tx, rx) = crossbeam_channel::bounded(1);
+    #[cfg(test)]
+    let hold = HOLD_IMAGE_DECODER.take();
     // The worker owns admission until decoding actually ends, including after a
-    // caller timeout. Reject overload rather than queueing retained image bytes.
+    // caller timeout.
     let spawned = std::thread::Builder::new()
         .name("aft-read-media".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let _permit = permit;
+            #[cfg(test)]
+            if let Some((entered, release)) = hold {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
             let result = match budget {
                 Some(budget) => process_image_fitting(raw_bytes, kind, budget, deadline),
                 None => process_image(raw_bytes, kind),
@@ -422,7 +544,9 @@ fn process_image_with_budget_timeout(
             let _ = tx.send(result);
         });
     if let Err(error) = spawned {
-        return Err(format!("failed to start image processing: {error}"));
+        return Err(ImageReadError::Omitted(format!(
+            "failed to start image processing: {error}"
+        )));
     }
 
     let timeout = if budget.is_some() {
@@ -440,6 +564,7 @@ fn process_image_with_budget_timeout(
             Err("image processing worker stopped before returning a result".to_string())
         }
     }
+    .map_err(ImageReadError::Omitted)
 }
 
 fn image_is_opaque(image: &DynamicImage) -> bool {
@@ -502,6 +627,8 @@ fn process_image_fitting(
             mime: kind.mime(),
             width,
             height,
+            source_width: width,
+            source_height: height,
             resized: false,
             source_mime: None,
             animation: if animated { "preserved" } else { "none" },
@@ -513,20 +640,22 @@ fn process_image_fitting(
     if orientation_applied {
         decoded.apply_orientation(orientation);
     }
-    let (width, height) = decoded.dimensions();
-    let (target_width, target_height) = resized_dimensions(width, height);
-    let mut current = if width.max(height) > MAX_INLINE_IMAGE_DIMENSION {
+    let (source_width, source_height) = decoded.dimensions();
+    let (target_width, target_height) = resized_dimensions(source_width, source_height);
+    let mut current = if source_width.max(source_height) > MAX_INLINE_IMAGE_DIMENSION {
         decoded.resize_exact(target_width, target_height, FilterType::Lanczos3)
     } else {
         decoded
     };
-    let mut result = if width.max(height) > MAX_INLINE_IMAGE_DIMENSION {
+    let mut result = if source_width.max(source_height) > MAX_INLINE_IMAGE_DIMENSION {
         let (bytes, mime) = encode_fitted_image(&current, kind, allow_lossy)?;
         ProcessedImage {
             bytes,
             mime,
             width: target_width,
             height: target_height,
+            source_width,
+            source_height,
             resized: true,
             source_mime: Some(kind.mime()),
             animation: if animated { "first_frame" } else { "none" },
@@ -536,8 +665,10 @@ fn process_image_fitting(
         ProcessedImage {
             bytes: raw_bytes,
             mime: kind.mime(),
-            width,
-            height,
+            width: source_width,
+            height: source_height,
+            source_width,
+            source_height,
             resized: false,
             source_mime: None,
             animation: if animated { "preserved" } else { "none" },
@@ -590,6 +721,8 @@ fn process_image_fitting(
             mime,
             width,
             height,
+            source_width,
+            source_height,
             resized: true,
             source_mime: Some(kind.mime()),
             animation: if animated { "first_frame" } else { "none" },
@@ -631,6 +764,8 @@ fn process_image(raw_bytes: Vec<u8>, kind: ImageKind) -> Result<ProcessedImage, 
             mime: source_mime,
             width: decoded_width,
             height: decoded_height,
+            source_width: decoded_width,
+            source_height: decoded_height,
             resized: false,
             source_mime: None,
             animation: if animated { "preserved" } else { "none" },
@@ -652,6 +787,8 @@ fn process_image(raw_bytes: Vec<u8>, kind: ImageKind) -> Result<ProcessedImage, 
         mime,
         width: target_width,
         height: target_height,
+        source_width: oriented_width,
+        source_height: oriented_height,
         resized: true,
         source_mime: Some(source_mime),
         animation: if animated { "first_frame" } else { "none" },
@@ -905,10 +1042,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         }
         return match media {
             SniffedMedia::Pdf => handle_pdf_media(&req.id, bytes),
-            SniffedMedia::Image(kind) => match process_image_with_timeout(bytes, kind) {
-                Ok(image) => image_attachment_response(&req.id, image),
-                Err(reason) => media_omitted_response(&req.id, byte_size, reason),
-            },
+            SniffedMedia::Image(kind) => handle_image_media(&req.id, bytes, kind),
         };
     }
     if is_binary(&bytes) {
@@ -993,11 +1127,13 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut truncated_line = false;
     let mut read_output_tail = None;
     let width = end.to_string().len();
     for (offset, line) in lines[start..end].iter().enumerate() {
         let line_number = start + offset + 1;
         let display = if line.len() > MAX_LINE_LENGTH {
+            truncated_line = true;
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
             format!(
                 "{:>width$}: {}... (truncated)\n",
@@ -1022,7 +1158,8 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         lines_read = lines_read.saturating_add(1);
     }
     let actual_end = start_line + lines_read - u32::from(lines_read > 0);
-    let truncated = start > 0 || end < lines.len() || truncated_by_size;
+    let truncated =
+        truncated_by_size || truncated_line || (!has_requested_range(req) && end < lines.len());
     Response::success(
         &req.id,
         serde_json::json!({
@@ -1302,9 +1439,12 @@ fn fit_github_images(
     for image in images {
         if !stopped && remaining > 0 && Instant::now() < deadline {
             if let Some(SniffedMedia::Image(kind)) = sniff_media(&image.bytes) {
-                if let Ok(processed) =
-                    process_image_with_budget_timeout(image.bytes, kind, Some(remaining), deadline)
-                {
+                if let Ok(processed) = process_image_with_budget_timeout(
+                    image.bytes,
+                    kind,
+                    Some(remaining),
+                    Some(deadline),
+                ) {
                     let encoded = base64_len(processed.bytes.len()).unwrap_or(usize::MAX);
                     if encoded <= remaining {
                         let mut response = image_attachment_response_with_budget(
@@ -1515,9 +1655,10 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 /// Returns for files:
 ///   `{ content, complete, total_lines?, lines_read, start_line, end_line, truncated, byte_size }`
 ///
-/// `complete` is false whenever the returned content is a slice/truncated. Full
-/// reads report exact `total_lines`; explicit ranged reads omit `total_lines`
-/// when they stop after the one-line lookahead and therefore do not know EOF.
+/// `complete` is true when all existing content in the requested range (or the
+/// whole file if no range was requested) was returned. The read checks for more
+/// data after an explicit range without counting the remaining lines, so
+/// `total_lines` may be unknown even when the requested range is complete.
 ///
 /// Returns for directories:
 ///   `{ entries[], total_entries }`
@@ -1817,6 +1958,17 @@ struct ReadWindow {
     limit: u32,
 }
 
+fn has_requested_range(req: &RawRequest) -> bool {
+    ["start_line", "end_line", "limit"]
+        .into_iter()
+        .any(|field| {
+            req.params
+                .get(field)
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+        })
+}
+
 /// Normalize zero placeholders and line bounds once so physical reads and
 /// hashline snapshots select the same 1-based window.
 fn read_window(req: &RawRequest) -> Result<ReadWindow, Response> {
@@ -1955,10 +2107,15 @@ fn handle_read_local(
         );
     }
 
-    let path = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
+    let path = match ctx.validate_read_path(&req.id, req.session(), requested) {
         Ok(path) => path,
+        Err(resp) if resp.data["code"] == "path_not_found" => {
+            return read_file_not_found(&req.id, &ctx.resolve_relative_path(requested));
+        }
         Err(resp) => return resp,
     };
+    #[cfg(test)]
+    opened_checks::authorized();
 
     if let Some(result) = ctx.output_files().read(req.session(), &path) {
         return match result {
@@ -1989,6 +2146,10 @@ fn handle_read_local(
     // reader hold. Include stat, directory iteration, open, and streaming reads:
     // any of those can wait in the kernel on a protected or remote volume.
     let owned_req = req.clone();
+    // Hold the general temp allowance's open checks for every open below,
+    // including those the filesystem helpers make.
+    let _general_temp =
+        crate::task_temp_reads::admit_general_temp(opened_checks::general_temp_root(ctx, &path));
     #[cfg(test)]
     let legacy = LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
     #[cfg(test)]
@@ -2012,6 +2173,13 @@ fn handle_read_local(
         Ok((response, captured, observations, size))
     });
     match result {
+        Ok((
+            PreparedPathRead::Floor {
+                protected,
+                fallback,
+            },
+            ..,
+        )) => opened_checks::floor_refusal(ctx, req, requested, protected.as_deref(), fallback),
         Ok((response, captured, _observations, size)) => {
             #[cfg(test)]
             {
@@ -2032,6 +2200,14 @@ fn handle_read_local(
     }
 }
 
+fn read_file_not_found(id: &str, path: &Path) -> Response {
+    Response::error(
+        id,
+        "not_found",
+        format!("read: file not found: {}", path.display()),
+    )
+}
+
 fn handle_read_path(
     req: &RawRequest,
     path: &Path,
@@ -2039,14 +2215,9 @@ fn handle_read_path(
     captured_source: &mut Option<CapturedRead>,
     observed_size: &mut Option<u64>,
 ) -> PreparedPathRead {
-    let file = path.to_string_lossy();
     // Check existence
     if !path.exists() {
-        return PreparedPathRead::Response(Response::error(
-            &req.id,
-            "not_found",
-            format!("read: file not found: {}", file),
-        ));
+        return PreparedPathRead::Response(read_file_not_found(&req.id, path));
     }
 
     // Directory listing
@@ -2077,6 +2248,12 @@ fn handle_read_path(
     let magic = match read_magic(path) {
         Ok(magic) => magic,
         Err(e) => {
+            if let Some(alias) = aft_base::opened_floor::protected_alias(&e) {
+                return PreparedPathRead::Floor {
+                    protected: alias.protected().map(Path::to_path_buf),
+                    fallback: alias.to_string(),
+                };
+            }
             return PreparedPathRead::Response(Response::error(
                 &req.id,
                 "io_error",
@@ -2260,6 +2437,7 @@ fn render_text_read(
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut truncated_line_bytes = false;
     let mut read_output_tail = None;
 
     let line_num_width = format!("{}", end_idx).len();
@@ -2272,6 +2450,7 @@ fn render_text_read(
     {
         let line_num = start_idx + i + 1; // 1-based
         let (display_text, truncated_line) = if line.len() > MAX_LINE_LENGTH {
+            truncated_line_bytes = true;
             // Find a safe UTF-8 boundary at or before MAX_LINE_LENGTH to avoid
             // panicking on multi-byte characters (e.g. emoji, CJK).
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
@@ -2327,18 +2506,18 @@ fn render_text_read(
     }
 
     let actual_end = start_line + lines_read - if lines_read > 0 { 1 } else { 0 };
-    let has_more = (start_idx > 0) || (end_idx as u32) < total_lines || truncated_by_size;
+    let truncated = (end_idx as u32) < total_lines || truncated_by_size || truncated_line_bytes;
 
     Response::success(
         &req.id,
         serde_json::json!({
             "content": output,
-            "complete": !has_more,
+            "complete": !truncated,
             "total_lines": total_lines,
             "lines_read": lines_read,
             "start_line": start_line,
             "end_line": actual_end,
-            "truncated": has_more,
+            "truncated": truncated,
             "read_output_tail": read_output_tail,
             "byte_size": byte_size,
         }),
@@ -2575,12 +2754,14 @@ fn handle_streaming_range_read(
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut truncated_line = false;
     let mut read_output_tail = None;
     let line_num_width = format!("{}", requested_start_idx + selected_lines.len()).len();
 
     for (i, line) in selected_lines.iter().enumerate() {
         let line_num = requested_start_idx + i + 1;
         let display_line = if line.len() > MAX_LINE_LENGTH {
+            truncated_line = true;
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
             format!(
                 "{:>width$}: {}... (truncated)\n",
@@ -2608,8 +2789,10 @@ fn handle_streaming_range_read(
     }
 
     let actual_end = start_line + lines_read - if lines_read > 0 { 1 } else { 0 };
-    let has_more = requested_start_idx > 0 || has_more_after_range;
-    let truncated = has_more || truncated_by_size || scan_gap;
+    let truncated = truncated_by_size
+        || truncated_line
+        || scan_gap
+        || (!has_requested_range(req) && has_more_after_range);
     if scan_gap {
         read_output_tail.get_or_insert(output.len());
         output.push_str(&format!("\nshown {lines_read} of at least {observed_lines} examined lines (line or response scan budget) · narrow: start_line/end_line; {scanned_bytes} bytes scanned\n"));
@@ -3210,6 +3393,241 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn wait_for_image_decoder_queue(count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let queued = IMAGE_DECODERS.state.lock().waiters.len();
+            if queued == count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {count} waiters, got {queued}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn repeat_read_image_rewrite_with_same_summary_restarts_guidance_count() {
+        use crate::run_tool_call::RepeatObservation;
+
+        let _decoder_guard = image_decoder_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("image.png");
+        let ctx = ctx_for(dir.path());
+        let req = request(&file, serde_json::json!({}));
+        let args = serde_json::json!({ "path": file });
+        let start = Instant::now();
+        let write_image = |channels| {
+            image::RgbImage::from_pixel(1, 1, image::Rgb(channels))
+                .save(&file)
+                .unwrap();
+        };
+        let read = || {
+            let response = handle_read(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["attachments"][0]["mime"], "image/png");
+            crate::run_tool_call::finish_tool_call_response(
+                "read",
+                &Default::default(),
+                response,
+                false,
+                None,
+                None,
+            )
+        };
+        let observe = |result: &mut crate::run_tool_call::ToolCallResult, seconds| {
+            RepeatObservation::for_agent_call("image-repeat", "read", &args, false, true, true)
+                .unwrap()
+                .observe_at(
+                    &ctx,
+                    &mut result.response,
+                    &mut result.text,
+                    start + Duration::from_secs(seconds),
+                );
+        };
+
+        write_image([1, 2, 3]);
+        let mut first = read();
+        observe(&mut first, 0);
+        let mut second = read();
+        observe(&mut second, 20);
+        assert_eq!(first.text, second.text);
+
+        write_image([4, 5, 6]);
+        let mut rewritten = read();
+        assert_ne!(
+            first.response.data["attachments"][0]["data"],
+            rewritten.response.data["attachments"][0]["data"],
+            "the read must return the new PNG payload",
+        );
+        assert_eq!(
+            first.text, rewritten.text,
+            "the image summary did not change"
+        );
+        observe(&mut rewritten, 40);
+        assert_eq!(
+            first.text, rewritten.text,
+            "new pixels must not trigger guidance"
+        );
+
+        let mut repeated = read();
+        observe(&mut repeated, 60);
+        assert_eq!(rewritten.text, repeated.text);
+        let mut unchanged = read();
+        observe(&mut unchanged, 80);
+        assert!(
+            unchanged.text.contains("3rd identical call"),
+            "{}",
+            unchanged.text
+        );
+    }
+
+    #[test]
+    fn image_decoder_reads_beyond_capacity_wait_and_all_attach() {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let png = encode_png(&rgba_image(160, 144, true)).unwrap();
+        let paths = std::array::from_fn::<_, { MAX_IMAGE_DECODERS + 2 }, _>(|i| {
+            write_fixture(root, &format!("{i}.png"), &png)
+        });
+
+        std::thread::scope(|scope| {
+            let (entered, decoding) = crossbeam_channel::unbounded();
+            let (release, hold) = crossbeam_channel::bounded::<()>(0);
+            let (done, responses) = crossbeam_channel::unbounded();
+            for path in &paths[..MAX_IMAGE_DECODERS] {
+                let (entered, hold, done) = (entered.clone(), hold.clone(), done.clone());
+                scope.spawn(move || {
+                    HOLD_IMAGE_DECODER.set(Some((entered, hold)));
+                    let _body = crate::context::call_context::enter(true);
+                    let _ = done.send(read_response(root, path, json!({})));
+                });
+            }
+            for _ in 0..MAX_IMAGE_DECODERS {
+                decoding.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            for path in &paths[MAX_IMAGE_DECODERS..] {
+                let done = done.clone();
+                scope.spawn(move || {
+                    let _body = crate::context::call_context::enter(true);
+                    let _ = done.send(read_response(root, path, json!({})));
+                });
+            }
+            // Wait for both later reads to queue before freeing the decoders.
+            wait_for_image_decoder_queue(2);
+            if let Ok(response) = responses.try_recv() {
+                panic!(
+                    "a saturated image read returned before a decoder was released: {}",
+                    response.data
+                );
+            }
+            drop(release);
+            for _ in &paths {
+                let response = responses.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(response.success, "{}", response.data);
+                assert_eq!(
+                    decoded_attachment_bytes(first_attachment(&response.data)),
+                    png
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn image_decoder_saturation_refuses_after_wait_limit() {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let png = encode_png(&rgba_image(32, 16, false)).unwrap();
+        let path = write_fixture(temp.path(), "image.png", &png);
+        let _slots: [_; MAX_IMAGE_DECODERS] =
+            std::array::from_fn(|_| IMAGE_DECODERS.acquire(None).unwrap());
+
+        let start = Instant::now();
+        let response = read_response(temp.path(), &path, json!({}));
+        let elapsed = start.elapsed();
+        assert!(
+            (Duration::from_secs(10)..Duration::from_secs(15)).contains(&elapsed),
+            "capacity refusal after {elapsed:?}, expected a 10s wait"
+        );
+        assert!(response.success);
+        assert_eq!(response.data["attachments"], json!([]));
+        assert_eq!(
+            response.data["content"],
+            "Attachment omitted: image decoder capacity reached (4/4 active); retry after existing image reads finish"
+        );
+        assert!(IMAGE_DECODERS.state.lock().waiters.is_empty());
+    }
+
+    #[test]
+    fn image_decoder_cancelled_waiter_leaves_remaining_reads_in_fifo_order() {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let png = encode_png(&rgba_image(32, 16, false)).unwrap();
+        let path = &write_fixture(root, "image.png", &png);
+        let first_slot = IMAGE_DECODERS.acquire(None).unwrap();
+        let _other_slots: [_; MAX_IMAGE_DECODERS - 1] =
+            std::array::from_fn(|_| IMAGE_DECODERS.acquire(None).unwrap());
+        let cancellation = crate::executor::JobCancellation::new();
+
+        std::thread::scope(|scope| {
+            let (done, responses) = crossbeam_channel::unbounded();
+            let (first_entered, first_decoding) = crossbeam_channel::bounded(1);
+            let (second_entered, second_decoding) = crossbeam_channel::bounded(1);
+            let (first_release, first_hold) = crossbeam_channel::bounded::<()>(0);
+            let (second_release, second_hold) = crossbeam_channel::bounded::<()>(0);
+            let timeout = Duration::from_secs(5);
+
+            for (i, hold) in [
+                None,
+                Some((first_entered, first_hold)),
+                Some((second_entered, second_hold)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let token = (i == 0).then(|| cancellation.clone());
+                let done = done.clone();
+                scope.spawn(move || {
+                    let _cancellation = token.map(crate::executor::install_job_cancellation);
+                    HOLD_IMAGE_DECODER.set(hold);
+                    let _ = done.send((i, read_response(root, path, json!({}))));
+                });
+                wait_for_image_decoder_queue(i + 1);
+            }
+
+            cancellation.request_cancel();
+            let (i, response) = responses.recv_timeout(timeout).unwrap();
+            assert_eq!(i, 0);
+            assert!(!response.success);
+            assert_eq!(response.data["code"], "request_cancelled");
+            assert_eq!(IMAGE_DECODERS.state.lock().waiters.len(), 2);
+
+            // Free only one slot so the order in which decoders start is the admission order.
+            drop(first_slot);
+            first_decoding.recv_timeout(timeout).unwrap();
+            assert!(matches!(
+                second_decoding.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ));
+            drop(first_release);
+            second_decoding.recv_timeout(timeout).unwrap();
+            drop(second_release);
+
+            for _ in 0..2 {
+                let (_, response) = responses.recv_timeout(timeout).unwrap();
+                assert_eq!(
+                    decoded_attachment_bytes(first_attachment(&response.data)),
+                    png
+                );
+            }
+            assert!(IMAGE_DECODERS.state.lock().waiters.is_empty());
+        });
+    }
+
     fn noisy_fit_fixture(transparent: bool) -> Vec<u8> {
         let mut state = 0x12345678u32;
         let image = image::RgbaImage::from_fn(1024, 1024, |_, _| {
@@ -3242,7 +3660,7 @@ mod tests {
             bytes.clone(),
             ImageKind::Png,
             None,
-            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+            Some(Instant::now() + IMAGE_PROCESS_TIMEOUT),
         )
         .unwrap();
         assert_eq!(legacy.bytes, bytes);
@@ -3275,7 +3693,7 @@ mod tests {
             noisy_fit_fixture(true),
             ImageKind::Png,
             Some(512 * 1024),
-            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+            Some(Instant::now() + IMAGE_PROCESS_TIMEOUT),
         )
         .unwrap();
         assert_eq!(image.mime, "image/png");
@@ -3306,7 +3724,7 @@ mod tests {
             noisy_fit_fixture(true),
             ImageKind::Png,
             Some(1),
-            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+            Some(Instant::now() + IMAGE_PROCESS_TIMEOUT),
         )
         .unwrap();
         assert_eq!(image.width.max(image.height), 256);
@@ -3339,6 +3757,33 @@ mod tests {
             }
         });
         DynamicImage::ImageRgba8(image)
+    }
+
+    fn jpeg_with_orientation(image: &DynamicImage, orientation: u16) -> Vec<u8> {
+        let jpeg = encode_jpeg(image).unwrap();
+        // One TIFF orientation entry in an APP1 segment exercises the decoder's
+        // real EXIF handling without depending on an external fixture file.
+        let mut exif = Vec::new();
+        exif.extend_from_slice(b"Exif\0\0");
+        exif.extend_from_slice(b"II");
+        exif.extend_from_slice(&42u16.to_le_bytes());
+        exif.extend_from_slice(&8u32.to_le_bytes());
+        exif.extend_from_slice(&1u16.to_le_bytes());
+        exif.extend_from_slice(&0x0112u16.to_le_bytes());
+        exif.extend_from_slice(&3u16.to_le_bytes());
+        exif.extend_from_slice(&1u32.to_le_bytes());
+        exif.extend_from_slice(&orientation.to_le_bytes());
+        exif.extend_from_slice(&0u16.to_le_bytes());
+        exif.extend_from_slice(&0u32.to_le_bytes());
+
+        let app1_len = u16::try_from(exif.len() + 2).unwrap();
+        let mut bytes = Vec::with_capacity(jpeg.len() + exif.len() + 4);
+        bytes.extend_from_slice(&jpeg[..2]);
+        bytes.extend_from_slice(&[0xff, 0xe1]);
+        bytes.extend_from_slice(&app1_len.to_be_bytes());
+        bytes.extend_from_slice(&exif);
+        bytes.extend_from_slice(&jpeg[2..]);
+        bytes
     }
 
     fn write_fixture(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
@@ -3388,7 +3833,14 @@ mod tests {
             assert_eq!(attachment["animation"], "none");
             assert_eq!(attachment["orientation_applied"], false);
             assert_eq!(attachment["bytes"], bytes.len());
+            assert!(attachment.get("source_width").is_none());
+            assert!(attachment.get("source_height").is_none());
             assert_eq!(decoded_attachment_bytes(attachment), bytes);
+            let expected = format!(
+                "Read image attachment ({mime}, 32×16, {}).",
+                attachment_size_note(bytes.len())
+            );
+            assert_eq!(response.data["content"].as_str(), Some(expected.as_str()));
         }
     }
 
@@ -3409,8 +3861,41 @@ mod tests {
         assert_eq!(attachment["width"], 1024);
         assert_eq!(attachment["height"], 256);
         assert_eq!(attachment["resized"], true);
+        assert_eq!(attachment["source_width"], 2048);
+        assert_eq!(attachment["source_height"], 512);
         assert_eq!(attachment["source_mime"], ImageKind::Png.mime());
+        let expected = format!(
+            "Read image attachment (image/png, 1024×256, scaled from 2048×512, {}).",
+            attachment_size_note(attachment["bytes"].as_u64().unwrap() as usize)
+        );
+        assert_eq!(response.data["content"].as_str(), Some(expected.as_str()));
         assert!(response.data.get("binary").is_none());
+    }
+
+    #[test]
+    fn resized_jpeg_reports_oriented_source_dimensions() {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let large = rgba_image(2048, 512, false);
+        let bytes = jpeg_with_orientation(&large, 6);
+        let path = write_fixture(temp.path(), "rotated.jpg", &bytes);
+
+        let response = read_response(temp.path(), &path, json!({}));
+
+        assert!(response.success);
+        let attachment = first_attachment(&response.data);
+        assert_eq!(attachment["mime"], ImageKind::Jpeg.mime());
+        assert_eq!(attachment["width"], 256);
+        assert_eq!(attachment["height"], 1024);
+        assert_eq!(attachment["resized"], true);
+        assert_eq!(attachment["source_width"], 512);
+        assert_eq!(attachment["source_height"], 2048);
+        assert_eq!(attachment["orientation_applied"], true);
+        let expected = format!(
+            "Read image attachment (image/jpeg, 256×1024, scaled from 512×2048, {}).",
+            attachment_size_note(attachment["bytes"].as_u64().unwrap() as usize)
+        );
+        assert_eq!(response.data["content"].as_str(), Some(expected.as_str()));
     }
 
     #[test]
@@ -3581,6 +4066,67 @@ mod tests {
         crate::subc_format::format_response("read", response, agent_specified_range)
     }
 
+    #[test]
+    fn read_requested_window_reports_complete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let content: String = (1..=24).map(|n| format!("line {n}\n")).collect();
+        let path = write_fixture(temp.path(), "window.txt", content.as_bytes());
+
+        for (params, start, end, total) in [
+            (json!({"start_line": 3, "end_line": 20}), 3, 20, None),
+            (json!({"end_line": 20}), 1, 20, None),
+            (json!({"limit": 20}), 1, 20, None),
+            (json!({"start_line": 3}), 3, 24, Some(24)),
+            (json!({"start_line": 3, "end_line": 99}), 3, 24, Some(24)),
+        ] {
+            let response = read_response(temp.path(), &path, params.clone());
+            assert!(response.success, "{params}: {response:?}");
+            let width = end.to_string().len();
+            let text: String = (start..=end)
+                .map(|n| format!("{n:>width$}: line {n}\n"))
+                .collect();
+            assert_eq!(render_read(&response, true), text, "{params}");
+            assert_eq!(response.data["lines_read"], end - start + 1);
+            assert_eq!(response.data["total_lines"].as_u64(), total);
+            assert_eq!(response.data["complete"], true, "{params}: {response:?}");
+            assert_eq!(response.data["truncated"], false, "{params}");
+        }
+
+        let past_end = read_response(temp.path(), &path, json!({"start_line": 25}));
+        assert!(!past_end.success);
+        assert_eq!(past_end.data["code"], "invalid_range");
+    }
+
+    #[test]
+    fn read_requested_window_with_a_clipped_line_is_incomplete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let content = format!("{}\n", "x".repeat(MAX_LINE_LENGTH + 1));
+        let path = write_fixture(temp.path(), "long-line.txt", content.as_bytes());
+
+        for params in [json!({"end_line": 1}), json!({})] {
+            let ranged = params.get("end_line").is_some();
+            let response = read_response(temp.path(), &path, params);
+            assert!(response.success);
+            assert!(render_read(&response, ranged).contains("... (truncated)"));
+            assert_eq!(response.data["complete"], false, "{response:?}");
+            assert_eq!(response.data["truncated"], true);
+        }
+    }
+
+    #[test]
+    fn default_read_window_is_incomplete_when_a_file_exceeds_the_line_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let content = "line\n".repeat(DEFAULT_LIMIT as usize + 1);
+        let path = write_fixture(temp.path(), "many-lines.txt", content.as_bytes());
+        for params in [json!({}), json!({"start_line": 0, "limit": 0})] {
+            let response = read_response(temp.path(), &path, params);
+            assert!(response.success);
+            assert_eq!(response.data["lines_read"], DEFAULT_LIMIT);
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(response.data["truncated"], true);
+        }
+    }
+
     /// Build a text fixture whose rendered line-numbered output exceeds
     /// `MAX_BYTES` (50KB) so a whole-file read truncates.
     fn oversized_text_fixture(root: &Path, name: &str) -> PathBuf {
@@ -3701,6 +4247,22 @@ mod tests {
             !text.contains("File is large"),
             "ranged read must not carry the soft note, got: {text}"
         );
+    }
+
+    #[test]
+    fn ranged_read_cut_by_response_byte_cap_is_incomplete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = oversized_text_fixture(temp.path(), "big.txt");
+        let response = read_response(
+            temp.path(),
+            &path,
+            json!({"start_line": 3, "end_line": 2000}),
+        );
+        assert!(response.success);
+        assert!(response.data["lines_read"].as_u64().unwrap() < 1998);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["truncated"], true);
+        assert!(render_read(&response, true).contains("line or response scan budget"));
     }
 }
 

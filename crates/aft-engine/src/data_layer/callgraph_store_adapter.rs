@@ -2993,6 +2993,16 @@ pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Respo
     if ctx.is_home_root() {
         return home_root_disabled_response(req_id, operation);
     }
+    if let Some(reason) = crate::feature_status::git_identity_unavailable_reason(ctx) {
+        return callgraph_index_refusal(
+            req_id,
+            "callgraph_unavailable",
+            format!(
+                "{operation}: persisted callgraph store is unavailable in this runtime: {reason}"
+            ),
+            IndexObservation::unavailable(reason),
+        );
+    }
     if !ctx.is_worktree_bridge() && ctx.callgraph_project_root().is_some() {
         // A configured root whose store this runtime cannot use (for example
         // a borrowed read-only root, or a root that is being unbound): report

@@ -1189,7 +1189,7 @@ fn codemode_head_routes_with_unverified_or_absent_principals_are_ambiguous() {
 }
 
 #[test]
-fn codemode_head_routes_with_different_flow_read_carrier_access_are_ambiguous() {
+fn codemode_head_read_carrier_is_not_an_owner_candidate() {
     let mut f = linked_fixture();
     let root = f.head_root.clone();
     second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
@@ -1200,7 +1200,18 @@ fn codemode_head_routes_with_different_flow_read_carrier_access_are_ambiguous() 
         principal_access_class(&f.routes[&channel(1)].spawn_principal).strict_sandbox,
         principal_access_class(&f.routes[&channel(3)].spawn_principal).strict_sandbox
     );
-    assert_ambiguous_field(&f, "spawn_principal");
+    let head = &f.routes[&channel(1)];
+    let carrier = &f.routes[&channel(3)];
+    assert!(head_access_differences(head, carrier).contains(&"spawn_principal"));
+    let body = call("read", json!({"path":"notes.txt"}));
+    let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+    assert!(!flow_read::principal_is_flow_read_carrier(
+        &effective.spawn_principal
+    ));
+    f.routes.remove(&channel(1));
+    let error = refusal(admit(&f.routes, channel(9), Some(&body)));
+    assert_eq!(error.code, RUN_OWNER_NOT_BOUND);
+    assert_eq!(error.detail.unwrap()["reason"], "head_route_not_bound");
 }
 
 #[test]

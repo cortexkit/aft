@@ -837,18 +837,18 @@ mod tests {
     }
 
     #[test]
-    fn export_detection_costs_one_check_per_symbol() {
+    fn javascript_export_detection_costs_one_check_per_symbol() {
         let mut source = String::new();
         for index in 0..300 {
             source.push_str(&format!("export function f{index}() {{}}\n"));
         }
         let before = EXPORT_RANGE_COMPARISONS.with(|count| count.get());
-        let symbols = symbols_from_source(&source, LangId::TypeScript);
+        let symbols = symbols_from_source(&source, LangId::JavaScript);
         let comparisons = EXPORT_RANGE_COMPARISONS.with(|count| count.get()) - before;
         assert_eq!(symbols.len(), 300);
         assert!(symbols.iter().all(|symbol| symbol.exported));
         assert!(
-            comparisons <= symbols.len(),
+            comparisons == symbols.len(),
             "{comparisons} export-range comparisons for {} symbols",
             symbols.len()
         );
@@ -2598,6 +2598,7 @@ pub fn outside_macros() {}
             [
                 "domain_ingress",
                 "domain_record",
+                "DOMAIN_LIMIT",
                 "DomainTerminal",
                 "domain_limit",
                 "outside_macros"

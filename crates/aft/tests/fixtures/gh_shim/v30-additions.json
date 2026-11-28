@@ -1,0 +1,45 @@
+{
+  "manifest_version": 30,
+  "tiers": {
+    "admin": [
+      {
+        "tuple": "secret list",
+        "platform": ["macos", "linux"]
+      },
+      {
+        "tuple": "secret set",
+        "platform": ["macos", "linux"]
+      },
+      {
+        "tuple": "variable set",
+        "platform": ["macos", "linux"]
+      }
+    ],
+    "mechanical": [
+      {
+        "tuple": "variable list",
+        "platform": ["macos", "linux"]
+      }
+    ]
+  },
+  "api_rules": [
+    {
+      "method": "POST",
+      "path_glob": "/repos/*/*/actions/runs/*/approve",
+      "tier": "admin",
+      "platform": ["macos", "linux"]
+    },
+    {
+      "method": "PUT",
+      "path_glob": "/repos/*/*/environments/*",
+      "tier": "admin",
+      "platform": ["macos", "linux"]
+    },
+    {
+      "method": "POST",
+      "path_glob": "/repos/*/*/environments/*/deployment-branch-policies",
+      "tier": "admin",
+      "platform": ["macos", "linux"]
+    }
+  ]
+}

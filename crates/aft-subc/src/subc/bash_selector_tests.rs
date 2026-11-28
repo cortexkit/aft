@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) fn shell_fixture_arguments(name: &str, mut arguments: Value) -> Value {
+    if let Some(args) = arguments.as_object_mut().filter(|_| name == "bash") {
+        args.entry("description")
+            .or_insert_with(|| json!("Run the shell fixture"));
+    }
+    arguments
+}
+
 #[tokio::test]
 async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() {
     let (dir, root) = test_support::test_root("v1-bash-selector");
@@ -67,7 +75,7 @@ pub(super) async fn call_v1_bash(
     preset: Option<&str>,
 ) -> bash::BashDeferredCompletion {
     let routes = HashMap::from([(route_key(41, 1), identity)]);
-    let mut body = json!({"name":"bash","arguments":{"command":command}});
+    let mut body = json!({"name":"bash","arguments":{"command":command,"description":"Print the requested test output"}});
     if let Some(preset) = preset {
         body["preset"] = json!(preset);
     }
@@ -286,6 +294,7 @@ async fn next_bash_reply(
         trust: BindTrust::FirstParty,
         tool_result_body: false,
         model_only: false,
+        codemode: false,
         output_scope: None,
     });
     reply.project_tool_result().unwrap();
@@ -745,7 +754,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         run_owner: None,
     }));
     let mut call = json!({"name":"bash","arguments":{
-        "command":"sleep 30; printf completed", "wait":true, "timeout":120_000
+        "command":"sleep 30; printf completed", "description":"Check the shell wait limit", "wait":true, "timeout":120_000
     }});
     call["preset"] = json!(if worker { "worker" } else { "head" });
     let frame = Frame::build(

@@ -6,8 +6,29 @@ use subc_protocol::{
     session::ModuleControlResponseToModule,
 };
 
+const BASAL_PRINCIPAL: &str = "reserved:basal";
+
+fn bind_principal_id(principal: &AuthenticatedPrincipal) -> Option<&str> {
+    match principal {
+        AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.as_deref(),
+        _ => None,
+    }
+}
+
 pub(super) fn principal_is_flow_read_carrier(principal: &AuthenticatedPrincipal) -> bool {
-    matches!(principal, AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. } if id == "reserved:basal")
+    bind_principal_id(principal) == Some(BASAL_PRINCIPAL)
+}
+
+/// A head stamp on Basal's connection delegates an exact read, not the head's route.
+pub(super) fn is_head_read_carrier(id: Option<&str>, scope: Option<&ScopeStamp>) -> bool {
+    id == Some(BASAL_PRINCIPAL) && scope.is_some_and(|stamp| stamp.kind == ScopeKind::Head)
+}
+
+pub(super) fn is_head_read_route(identity: &RouteIdentity) -> bool {
+    is_head_read_carrier(
+        bind_principal_id(&identity.spawn_principal),
+        identity.scope.as_ref(),
+    )
 }
 
 fn route_checks(identity: &RouteIdentity) -> Result<&ScopeStamp, Refusal> {
@@ -20,6 +41,10 @@ fn route_checks(identity: &RouteIdentity) -> Result<&ScopeStamp, Refusal> {
         .ok_or(Refusal::RouteNotAdmitted("owner"))?;
     if !stamp.owner_authorized || !crate::access_policy::prefrontal::is_principal(&stamp.owner) {
         return Err(Refusal::RouteNotAdmitted("owner"));
+    }
+    if stamp.kind == ScopeKind::Head {
+        unexpired(stamp)?;
+        return Ok(stamp);
     }
     if stamp.kind != ScopeKind::Ephemeral {
         return Err(Refusal::RouteNotAdmitted("kind"));
@@ -41,10 +66,11 @@ fn unexpired(stamp: &ScopeStamp) -> Result<(), Refusal> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    if stamp.expires_at_ms.is_none_or(|at| u128::from(at) <= now) {
-        return Err(Refusal::RouteNotAdmitted("expiry"));
+    match stamp.expires_at_ms {
+        Some(at) if u128::from(at) > now => Ok(()),
+        None if stamp.kind == ScopeKind::Head => Ok(()),
+        _ => Err(Refusal::RouteNotAdmitted("expiry")),
     }
-    Ok(())
 }
 
 fn live_parent(
@@ -113,28 +139,30 @@ fn parent_route<'a>(
     stamp: &ScopeStamp,
     routes: &'a HashMap<RouteChannel, RouteIdentity>,
 ) -> Result<&'a RouteIdentity, Refusal> {
-    let parent = stamp.parent.as_ref().ok_or_else(|| {
-        Refusal::ParentNotAdmitted("the flow-read scope carries no parent scope".into())
-    })?;
-    routes
-        .values()
+    let (owner, scope_ref, epoch) = if stamp.kind == ScopeKind::Head {
+        (&stamp.owner, &stamp.scope_ref, stamp.scope_epoch)
+    } else {
+        let parent = stamp.parent.as_ref().ok_or_else(|| {
+            Refusal::ParentNotAdmitted("the flow-read scope carries no parent scope".into())
+        })?;
+        (&parent.owner, &parent.scope_ref, parent.scope_epoch)
+    };
+    let head_routes = || routes.values().filter(|route| !is_head_read_route(route));
+    head_routes()
         .find(|route| {
             route.scope.as_ref().is_some_and(|s| {
-                s.owner == parent.owner
-                    && s.scope_ref == parent.scope_ref
-                    && s.scope_epoch == parent.scope_epoch
+                &s.owner == owner
+                    && &s.scope_ref == scope_ref
+                    && s.scope_epoch == epoch
                     && s.kind == ScopeKind::Head
                     && s.owner_authorized
             })
         })
         .ok_or_else(|| {
-            let mut reason = format!(
-                "no open AFT route for the parent head scope {} at epoch {} (the head must have an AFT route open at the epoch core stamped)",
-                parent.scope_ref, parent.scope_epoch
-            );
-            let epochs = routes.values()
+            let mut reason = format!("no open AFT route for the parent head scope {scope_ref} at epoch {epoch} (the head must have an AFT route open at the epoch core stamped)");
+            let epochs = head_routes()
                 .filter_map(|route| route.scope.as_ref())
-                .filter(|scope| scope.owner == parent.owner && scope.scope_ref == parent.scope_ref && scope.scope_epoch != parent.scope_epoch)
+                .filter(|scope| &scope.owner == owner && &scope.scope_ref == scope_ref && scope.scope_epoch != epoch)
                 .map(|scope| scope.scope_epoch)
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
@@ -148,10 +176,11 @@ fn parent_route<'a>(
 
 /// Intercept before watcher restoration, catalogs, grant operations or tool dispatch.
 pub(super) fn intercept(identity: &RouteIdentity, envelope: &Value) -> bool {
-    identity
-        .scope
-        .as_ref()
-        .is_some_and(|s| s.scope_ref.starts_with("flow-read/"))
+    is_head_read_route(identity)
+        || identity
+            .scope
+            .as_ref()
+            .is_some_and(|s| s.scope_ref.starts_with("flow-read/"))
         || envelope.get("op").and_then(Value::as_str) == Some(file_read_exact::OPERATION)
         || envelope.get("name").and_then(Value::as_str) == Some(file_read_exact::OPERATION)
         || envelope.get("op").and_then(Value::as_str) == Some(super::perf_sweep::OPERATION)
@@ -163,6 +192,51 @@ pub(super) fn admit_management(scope: Option<&ScopeStamp>) -> Result<(), ErrorBo
         return Err(Refusal::RouteNotAdmitted("operation").error());
     }
     Ok(())
+}
+
+pub(super) fn admit_bind_surface(
+    scope: Option<&ScopeStamp>,
+    principal: Option<&str>,
+    project_free: bool,
+) -> Result<(), ErrorBody> {
+    if is_head_read_carrier(principal, scope) {
+        return Err(Refusal::RouteNotAdmitted("operation").error());
+    }
+    if project_free {
+        Ok(())
+    } else {
+        admit_management(scope)
+    }
+}
+
+pub(super) async fn dispatch_head_read_route(
+    tx: &WriterSender,
+    metrics: &Arc<DispatchPathMetrics>,
+    decoded: &DecodedFrame,
+    identity: &RouteIdentity,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    executor: &Arc<Executor>,
+    active: &ActiveToolCalls,
+    control: Option<&Arc<readiness::DaemonControl>>,
+) -> Result<(), SubcError> {
+    let frame = &decoded.frame;
+    match decoded.body() {
+        Ok(body) => {
+            dispatch(
+                tx,
+                metrics,
+                frame,
+                identity.clone(),
+                body.clone(),
+                routes,
+                executor,
+                active,
+                control,
+            )
+            .await
+        }
+        Err(error) => refuse_undecodable_route_request(tx, frame, error, metrics).await,
+    }
 }
 
 pub(super) async fn dispatch(
@@ -222,8 +296,9 @@ async fn dispatch_with_wait(
     #[cfg(test)] hooks: DispatchHooks,
 ) -> Result<(), SubcError> {
     let limit = Instant::now() + parent_wait;
+    let head_read = is_head_read_route(&identity);
     let operation = match envelope.get("op").and_then(Value::as_str) {
-        Some(super::perf_sweep::OPERATION) => super::perf_sweep::OPERATION,
+        Some(super::perf_sweep::OPERATION) if !head_read => super::perf_sweep::OPERATION,
         _ => file_read_exact::OPERATION,
     };
     let admit = || {
@@ -238,7 +313,12 @@ async fn dispatch_with_wait(
             )
         })?;
         let expiry = read_deadline(stamp)?;
-        Ok((parent, control, expiry.min(limit), expiry <= limit))
+        Ok((
+            parent,
+            control,
+            expiry.map_or(limit, |at| at.min(limit)),
+            expiry.is_some_and(|at| at <= limit),
+        ))
     };
     let (parent, control, deadline, expires_first) = match admit() {
         Ok(admitted) => admitted,
@@ -281,17 +361,22 @@ async fn dispatch_with_wait(
         active.clone(),
     );
     tokio::spawn(async move {
-        let child = identity
+        let carrier_stamp = identity
             .scope
             .as_ref()
-            .expect("child route was checked")
+            .expect("carrier route was checked")
             .clone();
         let dispatch = async {
             // The frame loop must remain free to deliver this control RPC's answer.
-            let parent_stamp = parent.scope.as_ref().expect("parent route was checked");
+            let parent_stamp = if head_read {
+                &carrier_stamp
+            } else {
+                parent.scope.as_ref().expect("parent route was checked")
+            };
             let admission = match control.describe(parent_stamp).await {
-                Ok(reply) => live_parent(parent_stamp, &reply)
-                    .and_then(|_| unexpired(identity.scope.as_ref().unwrap())),
+                Ok(reply) => {
+                    live_parent(parent_stamp, &reply).and_then(|_| unexpired(&carrier_stamp))
+                }
                 Err(_) => Err(Refusal::ParentNotAdmitted(
                     "the daemon scope.describe request for the parent scope failed".into(),
                 )),
@@ -315,7 +400,7 @@ async fn dispatch_with_wait(
                         // still bounded by `deadline`. The busy guard moves
                         // with it, so a second sweep stays refused until this
                         // sample ends, even after the deadline has answered.
-                        let child = child.clone();
+                        let child = carrier_stamp.clone();
                         let (done, answer) = oneshot::channel();
                         #[cfg(test)]
                         let before_read = hooks.before_read;
@@ -404,7 +489,7 @@ async fn dispatch_with_wait(
                         // their inputs but their response receiver has been dropped.
                         executor.cancel_job_before_execution(&root, &cancellation);
                     }
-                    let error = if expires_first || unexpired(&child).is_err() {
+                    let error = if expires_first || unexpired(&carrier_stamp).is_err() {
                         Refusal::RouteNotAdmitted("expiry")
                     } else {
                         Refusal::PolicyTimeout
@@ -475,7 +560,7 @@ fn read_as_parent_with_hooks(
         .filter(|path| !path.is_empty() && !path.contains('\0'))
         .ok_or(Refusal::BadRequest)?;
     let path = PathBuf::from(path);
-    let deadline = read_deadline(stamp)?;
+    let deadline = read_deadline(stamp)?.unwrap_or(limit);
     let key = access_grants::scope_key(parent);
     let policy_deadline = deadline.min(limit);
     let snapshot = || {
@@ -490,7 +575,11 @@ fn read_as_parent_with_hooks(
         })
     };
     let initial = snapshot()?;
-    let grant_denial = access_grants::scope_grants_denial_for_parent(identity, Some(parent));
+    let grant_denial = if stamp.kind == ScopeKind::Head {
+        access_grants::scope_grants_denial(parent)
+    } else {
+        access_grants::scope_grants_denial_for_parent(identity, Some(parent))
+    };
     let storage = ctx.storage_dir();
     let read_storage = storage.clone();
     let root = parent.project_root.clone();
@@ -608,7 +697,10 @@ async fn wait_for_parent_policy(
     }
 }
 
-fn read_deadline(stamp: &ScopeStamp) -> Result<Instant, Refusal> {
+fn read_deadline(stamp: &ScopeStamp) -> Result<Option<Instant>, Refusal> {
+    if stamp.expires_at_ms.is_none() && stamp.kind == ScopeKind::Head {
+        return Ok(None);
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -620,13 +712,18 @@ fn read_deadline(stamp: &ScopeStamp) -> Result<Instant, Refusal> {
         .ok_or(Refusal::RouteNotAdmitted("expiry"))?;
     Instant::now()
         .checked_add(Duration::from_millis(remaining as u64))
+        .map(Some)
         .ok_or(Refusal::RouteNotAdmitted("expiry"))
 }
 
 fn before_deadline(stamp: &ScopeStamp, deadline: Instant) -> Result<(), Refusal> {
     unexpired(stamp)?;
     if Instant::now() >= deadline {
-        return Err(Refusal::RouteNotAdmitted("expiry"));
+        return Err(if stamp.expires_at_ms.is_some() {
+            Refusal::RouteNotAdmitted("expiry")
+        } else {
+            Refusal::PolicyTimeout
+        });
     }
     Ok(())
 }

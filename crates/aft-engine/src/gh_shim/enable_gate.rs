@@ -31,6 +31,10 @@ fn launch_marker() -> Option<std::ffi::OsString> {
     std::env::var_os(crate::gh_shim_paths::GH_SHIM_ENABLED_ENV)
 }
 
+pub(super) fn launched_enabled() -> bool {
+    launch_marker().as_deref() == Some(OsStr::new("1"))
+}
+
 #[cfg(test)]
 pub(super) const TEST_HONOUR_MARKER_ENV: &str = "AFT_TEST_HONOUR_GH_SHIM_ENABLED";
 

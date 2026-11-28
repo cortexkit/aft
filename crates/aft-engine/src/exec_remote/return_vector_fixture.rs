@@ -133,6 +133,11 @@ pub(crate) const RETURN_VECTORS: &[(&str, &[u8], &str)] = &[
         include_bytes!("fixtures/return-chunked/replay-retained-counted.jcs"),
         include_str!("fixtures/return-chunked/replay-retained-counted.sha256"),
     ),
+    (
+        "two-files-executable-and-non-executable",
+        include_bytes!("fixtures/return-chunked/two-files-executable-and-non-executable.jcs"),
+        include_str!("fixtures/return-chunked/two-files-executable-and-non-executable.sha256"),
+    ),
 ];
 
 /// One case, after checking its bytes against the published digest.

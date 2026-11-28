@@ -26,9 +26,15 @@ pub(crate) fn register() {
     crate::edit::register_file_reporter(super::rich_ui::display::file);
     crate::db::call_ledger::register_held_result_projector(super::project_held_ledger_result);
     crate::commands::bash_watch::restart::register(super::call_yield::settle_watch);
+    crate::bash_background::registry::awaited_work::register_kill_reply_scope(
+        super::awaited_work::current_kill_reply_scope,
+    );
     crate::late_result_bus::register(crate::late_result_bus::Hooks {
         take_due_read: super::rich_ui::display::take_due_read,
         mark_read_published: super::rich_ui::display::mark_read_published,
+        publish_awaited: |publish| {
+            Box::pin(super::rich_ui::display::publish_awaited_notice(publish))
+        },
         announce: |id, bytes, publish| {
             Box::pin(async move {
                 use super::rich_ui::notices;

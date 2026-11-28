@@ -20,7 +20,7 @@ const RUNNER_PAGE: &str = "SELECT harness,session_id,cwd,task_id,metadata,
     WHERE (status NOT IN ('completed','failed','killed','timed_out','fate_unknown')
            OR completion_delivered=0
            OR CASE WHEN json_valid(metadata)
-                   THEN json_type(metadata,'$.completion_delivered')='false' ELSE 0 END)
+                    THEN json_type(metadata,'$.completion_delivered')='false' ELSE 0 END)
       AND (harness,project_key,started_at,task_id,rowid)>(?1,?2,?3,?4,?5)
     ORDER BY harness,project_key,started_at,task_id,rowid LIMIT ?6";
 
@@ -92,7 +92,10 @@ fn sessions(
         .into_iter()
         .flatten()
         .any(|raw| raw.parse::<crate::harness::Harness>() == Ok(crate::harness::Harness::Runner));
-        if keyed || runner {
+        let awaited = metadata
+            .get("awaited_work")
+            .is_some_and(|mark| mark != "settled");
+        if keyed || runner || awaited {
             pending
                 .entry((harness, session, root))
                 .or_default()
@@ -252,6 +255,26 @@ pub(super) fn start(
             Vec::new()
         });
         on_replayed(&replayed);
+    })
+}
+
+pub(super) fn start_with_notices(
+    app: Arc<App>,
+    executor: Arc<Executor>,
+    push_senders: PushSenders,
+    storage: PathBuf,
+    connection: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    let runtime = tokio::runtime::Handle::current();
+    let notice_executor = executor.clone();
+    start(app, executor, push_senders, storage, move |replayed| {
+        // The actor holding a task accepts the offer; other actors ignore it.
+        if !replayed.is_empty() {
+            for actor in notice_executor.actor_contexts() {
+                runner_notices::offer_replayed(actor.bash_background().clone(), replayed);
+            }
+        }
+        runtime.spawn(async move { super::awaited_work::start(&connection, notice_executor) });
     })
 }
 
@@ -503,7 +526,7 @@ pub(crate) mod tests {
     fn senders() -> PushSenders {
         PushSenders {
             lossy_tx: mpsc::channel(16).0,
-            reliable_tx: mpsc::unbounded_channel().0,
+            reliable_tx: push::ReliableIngress::channel(Arc::default()).0,
             lossy_overflow: Arc::new(push::LossyOverflow::default()),
             lossy_seq: Arc::new(AtomicU64::new(0)),
             fleet_status_client: FleetStatusClient::channel(1).0,

@@ -5,6 +5,8 @@ pub mod client;
 #[doc(hidden)]
 pub mod completed_rust_check;
 #[cfg(feature = "test-hooks")]
+pub use completed_rust_check::trace::CompletedRustCheckTrace;
+#[cfg(feature = "test-hooks")]
 pub use completed_rust_check::FingerprintProbe;
 mod diagnostic_registration;
 pub mod diagnostics;
@@ -24,6 +26,7 @@ pub mod tsconfig_membership;
 pub(crate) mod typescript_diagnostics;
 #[doc(hidden)]
 pub mod typescript_project;
+pub(crate) mod typescript_temp;
 mod writer;
 
 /// LSP subsystem error type.

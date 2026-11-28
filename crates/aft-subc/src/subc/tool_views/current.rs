@@ -17,3 +17,39 @@ pub(super) fn append(entry: &mut Shipped) {
     manifest.template_revision += 1;
     entry.history.push(manifest);
 }
+
+pub(super) fn append_bash_row(entry: &mut Shipped) {
+    let mut manifest = entry.history.last().expect("redeclared bash view").clone();
+    manifest.template["row"]["source"] = json!(with_bash_title(include_str!("bash.row.ui")));
+    manifest.template_revision += 1;
+    entry.history.push(manifest);
+}
+
+pub(super) fn append_bash_neutral_stop(entry: &mut Shipped) {
+    let mut manifest = entry.history.last().expect("shipped bash view").clone();
+    manifest.template["row"]["source"] =
+        json!(with_bash_title(include_str!("bash-neutral-stop.row.ui")));
+    let page = if manifest
+        .record_schema
+        .completion_fields
+        .contains_key("tail")
+    {
+        include_str!("bash-v2.page.ui")
+    } else {
+        include_str!("bash.page.ui")
+    };
+    manifest.template["page"]["source"] = json!(page);
+    manifest.template_revision += 1;
+    entry.history.push(manifest);
+}
+
+pub(in crate::subc) fn with_bash_title(template: &str) -> String {
+    // Sessions and apps pin the bash row view's template digest. Expanding the
+    // shared title in place leaves the row's hashed template source byte-identical.
+    let prelude = include_str!("bash-title.ui");
+    let body = template.replace(
+        "$BASH_TITLE",
+        "input.description ?? (hasRest ? rest : input.command)",
+    );
+    format!("{prelude}\n{body}")
+}

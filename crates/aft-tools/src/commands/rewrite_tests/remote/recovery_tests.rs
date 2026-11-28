@@ -3034,10 +3034,11 @@ async fn runon_return_paths_copied_files_are_not_listed_as_left_on_the_server() 
     // the checkout (`sub/dist/hello.txt`) while return_paths names them
     // relative to the workdir (`dist/hello.txt`).
     let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
-        Script::ReturnVectorReporting(
-            "failed-missing",
-            &["sub/dist/hello.txt", "sub/dist/absent.txt", "sub/other.txt"],
-        ),
+        Script::ReturnVectorReporting {
+            vector: "failed-missing",
+            paths: &["dist/hello.txt", "dist/absent.txt"],
+            changed: &["sub/dist/hello.txt", "sub/dist/absent.txt", "sub/other.txt"],
+        },
         RETURN_CLAIMS,
         1,
     )

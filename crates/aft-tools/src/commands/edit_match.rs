@@ -859,7 +859,8 @@ fn handle_glob_edit_match_inner(
             Err(resp) => return resp,
         };
         let count = positions.len();
-        let new_source = source.replace(match_str, replacement);
+        let replacement = edit::LineEnding::dominant(&source).normalize(replacement);
+        let new_source = source.replace(match_str, &replacement);
         let file_str = path.display().to_string();
         version.set_bytes(std::sync::Arc::from(source.as_bytes()));
 
@@ -1839,11 +1840,12 @@ fn fuzzy_replacement_restores_newline(
 /// [`crate::fuzzy_match::ReindentPlan`]), with line separators adjusted so
 /// the match boundary neither loses nor doubles a newline. Fails with
 /// `ambiguous_indentation` when the shift cannot be determined without
-/// guessing.
+/// guessing. A GitHub comment has no file line-ending policy and passes `None`.
 pub(crate) fn push_fuzzy_replacement(
     output: &mut String,
     plan: &crate::fuzzy_match::ReindentPlan<'_>,
     index: usize,
+    line_ending: Option<edit::LineEnding>,
 ) -> Result<(), crate::error::AftError> {
     let source = plan.source();
     let matched = plan.matched(index);
@@ -1857,21 +1859,27 @@ pub(crate) fn push_fuzzy_replacement(
     let remaining = source[end..].trim_start_matches(|ch: char| ch != '\n' && ch.is_whitespace());
     let separator_is_outside =
         matched.pass > 1 && !source[..end].ends_with('\n') && remaining.starts_with('\n');
-    if separator_is_outside && replacement.ends_with('\n') {
-        output.push_str(
-            replacement
-                .strip_suffix("\r\n")
-                .unwrap_or(&replacement[..replacement.len() - 1]),
-        );
+    let inserted = if separator_is_outside && replacement.ends_with('\n') {
+        replacement
+            .strip_suffix("\r\n")
+            .unwrap_or(&replacement[..replacement.len() - 1])
     } else {
-        output.push_str(replacement);
+        replacement
+    };
+    if let Some(ending) = line_ending {
+        ending.push_normalized(output, inserted);
+    } else {
+        output.push_str(inserted);
     }
     if fuzzy_replacement_restores_newline(source, matched, replacement) {
-        output.push_str(if source[..end].ends_with("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
+        let ending = line_ending.unwrap_or_else(|| {
+            if source[..end].ends_with("\r\n") {
+                edit::LineEnding::Crlf
+            } else {
+                edit::LineEnding::Lf
+            }
         });
+        output.push_str(ending.as_str());
     }
     Ok(())
 }
@@ -1882,6 +1890,7 @@ pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
     needle: &str,
     replacement: &str,
     path: Option<&Path>,
+    line_ending: Option<edit::LineEnding>,
 ) -> Result<String, crate::error::AftError> {
     let mut removed_bytes = 0usize;
     let mut replacement_bytes = 0usize;
@@ -1907,7 +1916,7 @@ pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
     let plan = crate::fuzzy_match::ReindentPlan::new(source, needle, replacement, path, matches);
     for (index, matched) in matches.iter().enumerate() {
         result.push_str(&source[copied_through..matched.byte_start]);
-        push_fuzzy_replacement(&mut result, &plan, index)?;
+        push_fuzzy_replacement(&mut result, &plan, index, line_ending)?;
         copied_through = matched.byte_start + matched.byte_len;
     }
     result.push_str(&source[copied_through..]);
@@ -2069,6 +2078,7 @@ fn handle_single_file_edit_match(
     }
 
     // Apply edit(s) — use fuzzy match byte lengths (may differ from match_str.len()).
+    let line_ending = Some(edit::LineEnding::dominant(&source));
     let (new_source, count) = if replace_all {
         // Guard against overlapping matches before applying. The fuzzy line
         // passes (2-4) step line-by-line, so a multi-line needle can match
@@ -2096,6 +2106,7 @@ fn handle_single_file_edit_match(
             match_str,
             replacement,
             Some(path.as_path()),
+            line_ending,
         ) {
             Ok(updated) => updated,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
@@ -2112,7 +2123,7 @@ fn handle_single_file_edit_match(
             Some(path.as_path()),
             std::slice::from_ref(matched),
         );
-        if let Err(e) = push_fuzzy_replacement(&mut effective_replacement, &plan, 0) {
+        if let Err(e) = push_fuzzy_replacement(&mut effective_replacement, &plan, 0, line_ending) {
             return Response::error(&req.id, e.code(), e.to_string());
         }
         (
@@ -2316,6 +2327,7 @@ mod replace_all_tests {
                 needle,
                 replacement,
                 Some(path),
+                Some(edit::LineEnding::dominant(&source)),
             )
             .unwrap();
             assert_eq!(result, format!("def f():\n{}", shifted.repeat(1_000)));
@@ -2389,6 +2401,7 @@ mod replace_all_tests {
                 needle,
                 replacement,
                 None,
+                Some(edit::LineEnding::dominant(source)),
             )
             .expect("one-pass replacement");
             assert_eq!(actual.as_bytes(), expected.as_bytes(), "needle={needle:?}");
@@ -2402,8 +2415,15 @@ mod replace_all_tests {
         assert_eq!(matches.len(), 1_024);
 
         let (result, allocations) = crate::test_allocations::count(|| {
-            apply_sorted_non_overlapping_fuzzy_matches(&source, &matches, "old", "new", None)
-                .expect("one-pass replacement")
+            apply_sorted_non_overlapping_fuzzy_matches(
+                &source,
+                &matches,
+                "old",
+                "new",
+                None,
+                Some(edit::LineEnding::Lf),
+            )
+            .expect("one-pass replacement")
         });
 
         assert_eq!(result, "new value\n".repeat(1_024));
@@ -2834,16 +2854,22 @@ mod audit_regressions {
                 "a\nb\n",
                 "x\r\ny\r\n",
                 None,
+                Some(edit::LineEnding::Crlf),
             )
             .unwrap(),
             "x\r\ny\r\nc\r\n"
         );
         assert_eq!(
             super::apply_sorted_non_overlapping_fuzzy_matches(
-                source, &matches, "a\nb\n", "x\ny\n", None
+                source,
+                &matches,
+                "a\nb\n",
+                "x\ny\n",
+                None,
+                Some(edit::LineEnding::Crlf),
             )
             .unwrap(),
-            "x\ny\r\nc\r\n"
+            "x\r\ny\r\nc\r\n"
         );
     }
 
@@ -2854,7 +2880,12 @@ mod audit_regressions {
         assert_eq!(matches.len(), 1);
         assert_eq!(
             super::apply_sorted_non_overlapping_fuzzy_matches(
-                source, &matches, "alpha\n", "beta\n", None,
+                source,
+                &matches,
+                "alpha\n",
+                "beta\n",
+                None,
+                Some(edit::LineEnding::Lf),
             )
             .unwrap(),
             "beta\u{a0}\nnext\n"
@@ -2870,7 +2901,12 @@ mod audit_regressions {
         assert_eq!(&source[..matches[0].byte_len], "alpha\r\n");
         assert_eq!(
             super::apply_sorted_non_overlapping_fuzzy_matches(
-                source, &matches, needle, "beta", None,
+                source,
+                &matches,
+                needle,
+                "beta",
+                None,
+                Some(edit::LineEnding::Crlf),
             )
             .unwrap(),
             "beta\r\nnext\r\n"

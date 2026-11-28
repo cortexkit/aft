@@ -12,12 +12,14 @@
         "base64_bytes": 12,
         "width": 1024,
         "height": 768,
+        "source_width": 2048,
+        "source_height": 1536,
         "resized": true,
         "animation": "none",
         "orientation_applied": false
       }
     ],
-    "content": "Read image attachment (image/png, 1024×768, 240 KB)."
+    "content": "Read image attachment (image/png, 1024×768, scaled from 2048×1536, 240 KB)."
   },
   "ctx": {
     "agent_args": {

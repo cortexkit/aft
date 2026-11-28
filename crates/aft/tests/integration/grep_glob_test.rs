@@ -1092,6 +1092,51 @@ fn case_insensitive_unicode_regex_agrees_between_indexed_and_fallback_grep() {
     assert!(indexed_aft.shutdown().success());
 }
 
+#[test]
+fn tool_call_grep_case_is_honored_in_index_and_walk() {
+    let project = setup_project(&[("src/cases.txt", "CaseNeedle\nCASENEEDLE\n")]);
+    let request = |case_sensitive: Option<Value>| {
+        let mut arguments = json!({"pattern": "CaseNeedle", "path": ["src"]});
+        if let Some(value) = case_sensitive {
+            arguments["case_sensitive"] = value;
+        }
+        json!({
+            "id": "tool-call-grep-case",
+            "command": "tool_call",
+            "session_id": "grep-case",
+            "name": "grep",
+            "arguments": arguments,
+        })
+    };
+
+    for indexed in [false, true] {
+        let mut aft = AftProcess::spawn();
+        let lane = if indexed {
+            configure_with_index(&mut aft, project.path());
+            wait_for_index_ready(&mut aft, || request(None));
+            "Ready"
+        } else {
+            configure(&mut aft, project.path());
+            "Fallback"
+        };
+        for (case_sensitive, count) in [(None, 1), (Some(json!(true)), 1), (Some(json!(false)), 2)]
+        {
+            let response = send(&mut aft, request(case_sensitive));
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["index_status"], lane, "{response}");
+            assert_eq!(response["total_matches"], count, "{response}");
+        }
+        let invalid = send(&mut aft, request(Some(json!("false"))));
+        assert_eq!(invalid["success"], false, "{invalid}");
+        assert_eq!(invalid["code"], "invalid_request", "{invalid}");
+        assert_eq!(
+            invalid["message"],
+            "grep: 'case_sensitive' must be a boolean"
+        );
+        assert!(aft.shutdown().success());
+    }
+}
+
 /// Matched `(file name, line, column, match text)` rows of a grep response,
 /// sorted so the indexed and walked answers compare independent of order.
 fn match_rows(response: &Value) -> Vec<(String, u64, u64, String)> {

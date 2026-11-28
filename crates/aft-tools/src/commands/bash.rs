@@ -174,11 +174,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         None
     };
-    // A project's `bash.env` applies only while the project root is trusted at
-    // the time of the call, so trusting or untrusting takes effect on the next
-    // command without a reload.
+    // Only locally read project settings use AFT's trust list. In daemon mode
+    // `bash.env` already comes from the daemon's merged, approved view.
     crate::bash_background::enter_runon_phase("request_environment");
-    let project_trusted = project_env_trusted(ctx);
+    let project_trusted = !ctx.config_live().daemon_managed() && project_env_trusted(ctx);
     let remote_env_plan = if remote_requested {
         crate::commands::bash_remote_env::plan(ctx.config().as_ref())
     } else {
@@ -322,8 +321,6 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         Err(message) => return Response::error(&req.id, "powershell_not_installed", message),
     };
-    let execution_command = params.shell.command_text(&params.command);
-
     // NOTE (v0.30.1 prep, unblock-only): the previous two rejections
     // ("PTY mode requires background: true" and "ptyRows/ptyCols require
     // pty: true") have been removed so that:
@@ -375,12 +372,36 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     crate::bash_background::enter_runon_phase("workdir_return_paths");
-    let workdir = resolve_workdir(params.workdir.as_deref(), ctx);
+    let requested_workdir = resolve_workdir(params.workdir.as_deref(), ctx);
+    // A leading cd provides a base for interpreting relative paths, but the
+    // shell must perform the cd to set PWD and OLDPWD itself.
+    let inferred = if cfg!(unix)
+        && !params.shell.is_powershell()
+        && params.workdir.is_none()
+        && !remote_requested
+        && remote.is_none()
+    {
+        let may_use_cdpath = params
+            .env
+            .get("CDPATH")
+            .is_some_and(|value| !value.is_empty())
+            || std::env::var_os("CDPATH").is_some_and(|value| !value.is_empty())
+            || ctx.config().shell.env_provider.is_some();
+        infer_cd_workdir(&params.command, &requested_workdir, may_use_cdpath)
+    } else {
+        None
+    };
+    let (analysis_command, analysis_workdir) = inferred.as_ref().map_or(
+        (params.command.as_str(), requested_workdir.as_path()),
+        |(rest, cwd)| (*rest, cwd.as_path()),
+    );
+    let execution_command = params.shell.command_text(&params.command);
     let mut remote = remote;
-    if let Err(response) = attach_return_paths(&req.id, ctx, &params, &workdir, &mut remote) {
+    if let Err(response) =
+        attach_return_paths(&req.id, ctx, &params, &requested_workdir, &mut remote)
+    {
         return response;
     }
-    let duplicate_workdir = workdir.clone();
     let duplicate_project_root = ctx
         .config()
         .project_root
@@ -410,14 +431,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             .config()
             .project_root
             .clone()
-            .unwrap_or_else(|| workdir.clone());
+            .unwrap_or_else(|| requested_workdir.clone());
         crate::agent_child_env::inject_worker_test_threads(&bound_root, &mut params.env);
     }
 
     #[cfg(unix)]
-    let mut spawn_workdir = Some(workdir.clone());
+    let mut spawn_workdir = requested_workdir.clone();
     #[cfg(not(unix))]
-    let spawn_workdir = Some(workdir.clone());
+    let spawn_workdir = requested_workdir.clone();
     #[cfg(unix)]
     let mut host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
     #[cfg(not(unix))]
@@ -443,7 +464,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         };
-        let cwd = match std::fs::canonicalize(&workdir) {
+        let cwd = match std::fs::canonicalize(&requested_workdir) {
             Ok(cwd) => cwd,
             Err(error) => {
                 return Response::error(
@@ -478,7 +499,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 shell_path,
                 environment,
             });
-            spawn_workdir = Some(cwd);
+            spawn_workdir = cwd;
         } else {
             let mut snapshot = None;
             if ctx.config().shell.env_provider.is_some() {
@@ -555,9 +576,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else if defer_permission_asks || params.permissions_requested || ctx.config().bash_permissions
     {
         crate::bash_permissions::scan::scan_with_cwd_for_session(
-            &params.command,
+            analysis_command,
             ctx,
-            &workdir,
+            analysis_workdir,
             req.session(),
         )
     } else {
@@ -588,10 +609,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         && host_escalation.is_none()
         && remote.is_none()
         && params.env.is_empty()
-        && workdir_matches_project_root(&workdir, ctx)
+        && workdir_matches_project_root(analysis_workdir, ctx)
     {
         if let Some(response) = crate::bash_rewrite::try_rewrite_for_request(
-            &params.command,
+            analysis_command,
             &req.id,
             req.session_id.as_deref(),
             &req.host_tool_names(),
@@ -632,7 +653,6 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let workdir = spawn_workdir;
     let env = (!params.env.is_empty()).then_some(params.env.clone());
     // pty:true silently implies background:true so agents don't need to know
     // both flags. The PTY runtime requires a polling lifecycle regardless.
@@ -654,7 +674,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         &execution_command,
         &duplicate_project_root,
-        &duplicate_workdir,
+        &spawn_workdir,
     );
     #[cfg(unix)]
     let secret_launch = match secret_preflight {
@@ -675,7 +695,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         &execution_command,
         params.shell,
         shell_path,
-        workdir,
+        Some(spawn_workdir),
         env,
         hard_kill_for(&params),
         ctx,
@@ -917,28 +937,33 @@ fn attach_return_paths(
                 .into(),
         ));
     }
-    check_requested_paths(&params.return_paths).map_err(|message| {
-        refused(format!(
-            "return_paths refused: {message}; the command did not run"
-        ))
-    })?;
     // The runner copies the checkout containing workdir, which may be a linked
     // worktree outside the session's project. Containment still applies even
     // when the session permits other tools to write outside its project.
-    let root = ctx
-        .config()
-        .project_root
-        .clone()
-        .unwrap_or_else(|| workdir.to_path_buf());
     #[cfg(unix)]
-    let root = crate::bash_background::registry::remote::return_paths_root(&root, workdir);
-    let root = std::fs::canonicalize(&root).map_err(|error| {
+    let (resolved_workdir, checkout) =
+        crate::bash_background::registry::remote::return_paths_workdir(workdir);
+    #[cfg(not(unix))]
+    let (resolved_workdir, checkout) = (workdir.to_path_buf(), None::<PathBuf>);
+    let config = ctx.config();
+    let root = checkout
+        .as_deref()
+        .or(config.project_root.as_deref())
+        .unwrap_or(workdir);
+    let root = std::fs::canonicalize(root).map_err(|error| {
         refused(format!(
             "return_paths refused: cannot resolve the project root {}: {error}",
             root.display()
         ))
     })?;
-    for path in &params.return_paths {
+    let checked = check_requested_paths(&params.return_paths, &resolved_workdir, &root).map_err(
+        |message| {
+            refused(format!(
+                "return_paths refused: {message}; the command did not run"
+            ))
+        },
+    )?;
+    for path in &checked {
         let shown = path.escape_default();
         if let Err(response) = ctx.validate_path(req_id, &workdir.join(path)) {
             let reason = response.data["message"]
@@ -963,7 +988,7 @@ fn attach_return_paths(
             }
         }
     }
-    launch.return_paths = params.return_paths.clone();
+    launch.return_paths = checked;
     Ok(())
 }
 
@@ -976,6 +1001,54 @@ fn resolve_workdir(workdir: Option<&Path>, ctx: &AppContext) -> PathBuf {
         Some(path) => root.join(path),
         None => root,
     }
+}
+
+fn infer_cd_workdir<'a>(
+    line: &'a str,
+    cwd: &Path,
+    may_use_cdpath: bool,
+) -> Option<(&'a str, PathBuf)> {
+    let (prefix, rest) = line.trim_start_matches([' ', '\t']).split_once("&&")?;
+    let dir = prefix.strip_prefix("cd ")?.trim_matches([' ', '\t']);
+    let rest = rest.trim_start_matches([' ', '\t', '\n']);
+    // Apart from the HOME forms below, the directory must be a literal word.
+    if dir.is_empty()
+        || dir.starts_with('-')
+        || dir.chars().any(char::is_whitespace)
+        || dir.contains([
+            '\'', '"', '$', '\\', '`', '*', '?', '[', '{', '|', '&', ';', '<', '>', '(', ')', '#',
+        ])
+        || rest.is_empty()
+        || rest.starts_with(['#', ';', '&', '|'])
+    {
+        return None;
+    }
+    let expanded_home;
+    let dir = if let Some(suffix) = dir.strip_prefix('~') {
+        if !suffix.is_empty() && !suffix.starts_with('/') {
+            return None;
+        }
+        // Bash's env argument, bash.env config, and shell environment providers
+        // cannot set HOME. Local children inherit it from this process. Append
+        // the suffix as text: Path::join would replace HOME with a rooted suffix.
+        let mut home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+        if home.as_encoded_bytes().starts_with(b"-") {
+            return None;
+        }
+        home.push(suffix);
+        expanded_home = PathBuf::from(home);
+        expanded_home.as_path()
+    } else {
+        Path::new(dir)
+    };
+    // Bash can search CDPATH instead of using cwd for an ordinary relative word.
+    if may_use_cdpath && !dir.is_absolute() && !dir.starts_with(".") && !dir.starts_with("..") {
+        return None;
+    }
+    let workdir = cwd.join(dir);
+    // Looking through the directory also checks search permission; statting
+    // just its entry can succeed even when the shell could not enter it.
+    workdir.join(".").is_dir().then_some((rest, workdir))
 }
 
 /// Inject spawn outcomes into the same piped retry policy used on Windows.
@@ -3672,4 +3745,8 @@ exec "$@"
     #[cfg(unix)]
     #[path = "bash_env_tests.rs"]
     mod bash_env_tests;
+
+    #[cfg(unix)]
+    #[path = "bash_cd_tests.rs"]
+    mod bash_cd_tests;
 }

@@ -57,6 +57,9 @@ const MANAGED_GIT_HOOK_NAMES: &[&str] = &[
     "reference-transaction",
 ];
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
+const GIT_CO_AUTHOR_LINE_ENV: &str = "AFT_GIT_CO_AUTHOR_LINE";
+#[doc(hidden)]
+pub mod coauthor;
 const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
 const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 const SUBC_CREDENTIAL_ENV_PREFIX: &str = "SUBC_";
@@ -418,11 +421,7 @@ line=
 
 case "$mode" in
   off|'') ;;
-  auto)
-    if [ -n "${AFT_GH_SHIM_BINARY:-}" ]; then
-      line=$(probe_value "$AFT_GH_SHIM_BINARY" gh-shim --co-author-line) || exit 1
-    fi
-    ;;
+  auto) line=${AFT_GIT_CO_AUTHOR_LINE:-} ;;
   *) line="Co-authored-by: $mode" ;;
 esac
 
@@ -673,7 +672,7 @@ fn maintain_with_probe(
 
 /// Install the managed git hooks that `git.co_author` needs, without touching
 /// the gh shim. A live config reload turning co-author attribution on calls
-/// this; the shim is only changed by a full configure.
+/// this without changing the shim.
 pub(crate) fn ensure_git_hooks(storage_root: &Path) -> Result<(), String> {
     ensure_managed_git_hooks(&managed_git_hooks_dir(storage_root))
 }
@@ -700,7 +699,9 @@ pub fn scrub_inherited_process_markers() {
         std::env::remove_var(GH_SHIMS_DIR_ENV);
     }
     std::env::remove_var(GIT_CO_AUTHOR_ENV);
+    std::env::remove_var(GIT_CO_AUTHOR_LINE_ENV);
     std::env::remove_var(GH_SHIM_BINARY_ENV);
+    std::env::remove_var(crate::gh_shim::trust_root::ANCHOR_ENV);
     std::env::remove_var(crate::gh_shim_paths::GH_SHIM_ENABLED_ENV);
     let original: HashMap<String, OsString> = std::env::vars_os()
         .filter_map(|(key, value)| {
@@ -806,6 +807,16 @@ pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
     }
 }
 
+fn scrub_shim_launch_environment(environment: &mut HashMap<String, String>, windows: bool) {
+    for key in crate::gh_shim_worker_broker::CHILD_KEYS {
+        environment.remove(key);
+    }
+    if windows {
+        environment
+            .retain(|key, _| !key.eq_ignore_ascii_case(crate::gh_shim::trust_root::ANCHOR_ENV));
+    }
+}
+
 /// Add governance to one child environment. This is the single seam used
 /// before foreground, background, sandboxed, and PTY launch planning.
 ///
@@ -831,8 +842,12 @@ pub fn inject(
     }
 
     let gh_enabled = config.github.shim;
-    for key in crate::gh_shim_worker_broker::CHILD_KEYS {
-        environment.remove(key);
+    scrub_shim_launch_environment(environment, cfg!(windows));
+    if gh_enabled {
+        crate::gh_shim::manifest_sync::activate_for_launch();
+        if let Some(value) = crate::gh_shim::trust_root::shell_anchor() {
+            environment.insert(crate::gh_shim::trust_root::ANCHOR_ENV.into(), value);
+        }
     }
     environment.remove(crate::gh_shim_paths::GH_SHIM_WORKER_ENV);
     if crate::sandbox_spawn::worker_jail_active() {
@@ -851,6 +866,8 @@ pub fn inject(
         }
     }
     let co_author_enabled = config.git.co_author != "off";
+    environment.remove(GIT_CO_AUTHOR_LINE_ENV);
+    environment.remove(GH_SHIM_BINARY_ENV);
 
     // The inherited environment may already carry governance markers injected
     // by an OUTER daemon (agents spawn daemons in tests and tooling). Each
@@ -877,7 +894,6 @@ pub fn inject(
     }
     if !co_author_enabled {
         environment.remove(GIT_CO_AUTHOR_ENV);
-        environment.remove(GH_SHIM_BINARY_ENV);
         remove_managed_git_config(environment, storage_root);
     }
     if !gh_enabled && !co_author_enabled {
@@ -907,7 +923,13 @@ pub fn inject(
             explicit.to_string_lossy().into_owned(),
         );
     }
-    maintain(config, storage_root)?;
+    if gh_enabled {
+        maintain(config, storage_root)?;
+    } else {
+        // A live switch-off controls future children. Do not remove the shared
+        // shim entry from the PATH of a child launched while it was enabled.
+        ensure_git_hooks(storage_root)?;
+    }
 
     if gh_enabled {
         let shims_dir = crate::pinned_executable::shims_dir(storage_root);
@@ -934,10 +956,9 @@ pub fn inject(
         append_managed_git_config(environment, storage_root);
         environment.insert(GIT_CO_AUTHOR_ENV.to_string(), config.git.co_author.clone());
         if config.git.co_author == "auto" {
-            environment.insert(
-                GH_SHIM_BINARY_ENV.to_string(),
-                shim_binary(config)?.to_string_lossy().into_owned(),
-            );
+            if let Some(line) = coauthor::line() {
+                environment.insert(GIT_CO_AUTHOR_LINE_ENV.to_owned(), line);
+            }
         }
     }
 
@@ -2112,6 +2133,25 @@ fn windows_gh_posix(binary: &Path) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gh_shim_windows_scrubs_all_case_variants_of_the_inherited_anchor() {
+        let canonical = crate::gh_shim::trust_root::ANCHOR_ENV;
+        let alias = canonical.to_ascii_lowercase();
+        let mut inherited = std::collections::HashMap::from([
+            (canonical.to_string(), "old anchor".to_string()),
+            (alias.clone(), "another old anchor".to_string()),
+            ("OTHER".to_string(), "unchanged".to_string()),
+        ]);
+        let mut windows = inherited.clone();
+        super::scrub_shim_launch_environment(&mut windows, true);
+        assert!(!windows.contains_key(canonical));
+        assert!(!windows.contains_key(&alias));
+        assert_eq!(windows["OTHER"], "unchanged");
+        super::scrub_shim_launch_environment(&mut inherited, false);
+        assert!(!inherited.contains_key(canonical));
+        assert!(inherited.contains_key(&alias));
+    }
+
     use super::*;
     use crate::config::{Config, GitConfig};
 
@@ -2995,11 +3035,6 @@ mod tests {
         let repo = temp.path().join("repo");
         let storage = temp.path().join("storage");
         initialize_repo(&repo);
-        let shim = temp.path().join("fake-aft");
-        write_executable(
-            &shim,
-            "#!/bin/sh\nprintf '%s\\n' 'Co-authored-by: aft-alfonso[bot] <318960130+aft-alfonso[bot]@users.noreply.github.com>'\n",
-        );
         let local_hook = repo.join(".git/hooks/prepare-commit-msg");
         write_executable(
             &local_hook,
@@ -3008,10 +3043,52 @@ mod tests {
 
         let mut config = Config::default();
         config.github.shim = false;
-        config.gh_shim.binary_path = Some(shim);
         config.git.co_author = "auto".to_string();
         let mut environment = HashMap::new();
-        inject(&config, &storage, &mut environment, None).unwrap();
+        let main = coauthor::scope_fixture(serde_json::json!({"agent_id":"main-agent"}));
+        let mut worker = coauthor::scope_fixture(
+            serde_json::json!({"on_behalf_of_agent":"delegating-agent","run_id":"test-program"}),
+        );
+        worker.kind = subc_protocol::scope::ScopeKind::Ephemeral;
+        let mut task = coauthor::scope_fixture(serde_json::json!({"agent_id":"worker-agent"}));
+        task.kind = subc_protocol::scope::ScopeKind::Worker;
+        task.scope_ref = "test-worker".into();
+        let sponsoring_head =
+            coauthor::scope_fixture(serde_json::json!({"agent_id":"delegating-agent"}));
+        coauthor::link_fixture(&mut task, &sponsoring_head);
+        coauthor::link_fixture(&mut worker, &task);
+        let missing =
+            coauthor::scope_fixture(serde_json::json!({"agent_id":"agent-without-github"}));
+        coauthor::with_fixture(
+            |id| {
+                Ok(match id {
+                    "main-agent" => Some("Main Bot <main@example.test>".into()),
+                    "delegating-agent" => Some("Worker Bot <worker@example.test>".into()),
+                    "agent-without-github" => None,
+                    _ => panic!("unexpected agent ID {id}"),
+                })
+            },
+            || {
+                let _main = coauthor::enter(coauthor::agent_id(&main, None, []));
+                inject(&config, &storage, &mut environment, None).unwrap();
+                assert_eq!(
+                    environment[GIT_CO_AUTHOR_LINE_ENV],
+                    "Main Bot <main@example.test>"
+                );
+                {
+                    let _missing = coauthor::enter(coauthor::agent_id(&missing, None, []));
+                    inject(&config, &storage, &mut environment, None).unwrap();
+                    assert!(!environment.contains_key(GIT_CO_AUTHOR_LINE_ENV));
+                }
+                let _worker =
+                    coauthor::enter(coauthor::agent_id(&worker, Some(&task), [&sponsoring_head]));
+                inject(&config, &storage, &mut environment, None).unwrap();
+                assert_eq!(
+                    environment[GIT_CO_AUTHOR_LINE_ENV],
+                    "Worker Bot <worker@example.test>"
+                );
+            },
+        );
         run_git(
             &repo,
             &["commit", "--quiet", "-m", "mason: joint work"],
@@ -3025,9 +3102,7 @@ mod tests {
 
         let message = commit_message(&repo);
         assert_eq!(message.matches("Co-authored-by:").count(), 1);
-        assert!(message.contains(
-            "Co-authored-by: aft-alfonso[bot] <318960130+aft-alfonso[bot]@users.noreply.github.com>"
-        ));
+        assert!(message.contains("Co-authored-by: Worker Bot <worker@example.test>"));
         assert_eq!(message.matches("Local-Hook: default").count(), 2);
     }
 

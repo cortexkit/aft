@@ -138,7 +138,7 @@ impl BgTaskRegistry {
         let start_capture = || {
             (!task.holds_background_slot.load(Ordering::Acquire)
                 && task.local_capture_command.get().is_none())
-            .then(|| runon_capture::LocalCommand::start(task, &metadata.workdir))
+            .then(|| runon_capture::LocalCommand::start(task, &metadata.workdir, &metadata.command))
         };
         // An ungated child can edit the checkout as soon as it spawns. Keep
         // the guard here until launch succeeds so setup errors unregister it.
@@ -265,8 +265,7 @@ impl BgTaskRegistry {
                 state.metadata.status = BgTaskStatus::Starting;
                 state.metadata.child_pid = Some(child.id());
                 state.metadata.pgid = Some(child.id() as i32);
-                state.metadata.child_start_time_ms =
-                    crate::root_cache::process_start_time_ms(child.id());
+                state.metadata.record_child_identity(child.id());
                 if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
                     drop(child.stdin.take());
                     if let Some(scope) = scope.as_ref() {

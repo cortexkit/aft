@@ -75,7 +75,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # the model on fresh installs; ureq feature = sync + rustls (no native-tls, for
 # clean cross-platform builds).
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic", "half"] }
-cortexkit-role-tool-provider = "=0.15.18"
+cortexkit-role-tool-provider = "=0.15.21"
 subc-protocol = "=0.37.4"
 subc-client-rs = "=0.41.4"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
@@ -104,7 +104,7 @@ aft-engine = { path = "../aft-engine", version = "=0.68.1", features = ["test-su
 aft-base = { path = "../aft-base", version = "0.68.1", features = ["test-support"] }
 aft-db = { path = "../aft-db", version = "0.68.1", features = ["test-support"] }
 aft-parse = { path = "../aft-parse", version = "0.68.1", features = ["test-support"] }
-cortexkit-role-tool-provider = { version = "=0.15.18", features = ["test-vectors"] }
+cortexkit-role-tool-provider = { version = "=0.15.21", features = ["test-vectors"] }
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"

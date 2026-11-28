@@ -539,26 +539,34 @@ test("ambiguous background status pins the carrier until an explicit ACK", async
 
 /** Deterministic timer seam for asserting parked reconnect work without real waits. */
 class FakeClock {
-  private now = 0;
+  private time = 0;
   private nextTimerId = 0;
   private readonly timers = new Map<number, { dueAt: number; resolve: () => void }>();
   readonly scheduledDelays: number[] = [];
 
-  sleep = (ms: number): Promise<void> => {
+  now = (): number => this.time;
+
+  setTimeout = (resolve: () => void, ms: number): number => {
     this.scheduledDelays.push(ms);
-    return new Promise((resolve) => {
-      this.timers.set(this.nextTimerId++, { dueAt: this.now + ms, resolve });
-    });
+    const id = this.nextTimerId++;
+    this.timers.set(id, { dueAt: this.time + ms, resolve });
+    return id;
   };
+
+  clearTimeout = (id: unknown): void => {
+    this.timers.delete(id as number);
+  };
+
+  sleep = (ms: number): Promise<void> => new Promise((resolve) => this.setTimeout(resolve, ms));
 
   get scheduledWorkCount(): number {
     return this.timers.size;
   }
 
   async advance(ms: number): Promise<void> {
-    this.now += ms;
+    this.time += ms;
     const ready = [...this.timers.entries()]
-      .filter(([, timer]) => timer.dueAt <= this.now)
+      .filter(([, timer]) => timer.dueAt <= this.time)
       .sort(([, left], [, right]) => left.dueAt - right.dueAt);
     for (const [id, timer] of ready) {
       this.timers.delete(id);
@@ -1260,6 +1268,47 @@ describe("SubcTransport Rd reconnect", () => {
     expect((surfaced as Error).message).toBe(
       "module_id 'aft' is reloading The AFT daemon module did not return within this call's 30s deadline.",
     );
+  });
+
+  test("an in-flight reload retry can succeed after 45s within the caller's deadline", async () => {
+    const clock = new FakeClock();
+    const client = new FakeClient(async () => envelope({ success: true, text: "live" }));
+    const open = client.routeOpen.bind(client);
+    let attempts = 0;
+    client.routeOpen = async (...args) => {
+      if (++attempts === 1) {
+        await clock.sleep(44_000);
+        throw new SubcError("module_id 'aft' is reloading", "module_reloading");
+      }
+      await clock.sleep(2_000);
+      return open(...args);
+    };
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      clock,
+      routeRetrySleep: clock.sleep,
+    });
+    try {
+      const call = pool
+        .getBridge(TEST_PROJECT_ROOT)
+        .toolCall("slow-retry", "read", {}, { timeoutMs: 60_000 });
+      const result = call.catch((error: unknown) => error);
+      await settleMicrotasks();
+      expect(attempts).toBe(1);
+      await clock.advance(44_000);
+      await clock.advance(100);
+      expect(attempts).toBe(2);
+      await clock.advance(900);
+      expect(client.requests).toHaveLength(0);
+      await clock.advance(1_100);
+
+      expect(await result).toMatchObject({ success: true, text: "live" });
+      expect(client.requests[0]?.options?.timeoutMs).toBe(13_900);
+    } finally {
+      await pool.shutdown();
+    }
   });
 
   test("slow route opens during a reload cannot outlive the caller's deadline", async () => {
@@ -2580,72 +2629,82 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     ]);
   });
 
-  test("restart burst parks all bg reconnects without retaining shared ingress listeners", async () => {
-    const sessionCount = 8;
+  test("restart burst shares one bg retry schedule and staggers route opens after reconnect", async () => {
+    const sessionCount = 9;
     const clock = new FakeClock();
     const clients: FakeClient[] = [];
-    let acceptingConnections = true;
     let connectAttempts = 0;
+    let acceptingConnections = false;
+    let finishReconnect!: () => void;
+    const reconnect = new Promise<void>((resolve) => {
+      finishReconnect = resolve;
+    });
     const pool = new SubcTransportPool({
       connectionFile: "/tmp/fake",
       harness: "opencode",
+      clock,
       connect: async () => {
-        connectAttempts += 1;
-        if (!acceptingConnections) throw new SocketClosedError("daemon is restarting");
+        if (++connectAttempts > 1) {
+          if (!acceptingConnections) throw new SocketClosedError("daemon is restarting");
+          await reconnect;
+        }
         const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
         clients.push(client);
         return client;
       },
       onBgEventsNudge: () => undefined,
-      bgBackoffSleep: clock.sleep,
     });
     const transport = pool.getBridge(TEST_PROJECT_ROOT);
 
-    await Promise.all(
-      Array.from({ length: sessionCount }, (_, index) =>
-        transport.toolCall(`restart-${index}`, "read", {}),
-      ),
-    );
-    await settleMicrotasks();
+    try {
+      await Promise.all(
+        Array.from({ length: sessionCount }, (_, index) =>
+          transport.toolCall(`restart-${index}`, "read", {}),
+        ),
+      );
+      await settleMicrotasks();
 
-    const firstClient = clients[0]!;
-    const initialRouteOpens = firstClient.routeOpens.length;
-    const baselineIngressListeners = firstClient.ingressListenerCount;
-    expect(baselineIngressListeners).toBe(sessionCount);
+      const firstClient = clients[0]!;
+      expect(firstClient.ingressListenerCount).toBe(sessionCount);
+      clock.scheduledDelays.length = 0;
+      firstClient.close();
+      await settleMicrotasks();
+      expect(firstClient.ingressListenerCount).toBe(0);
+      expect(clock.scheduledWorkCount).toBe(1);
 
-    // A module restart ends every held route together. While it is unavailable,
-    // reopening routes reports a socket failure and later connects fail quickly.
-    acceptingConnections = false;
-    firstClient.routeOpenFailure = () => new SocketClosedError("daemon is restarting");
-    for (const subscription of firstClient.subscriptions.slice(0, sessionCount)) subscription.end();
-    await settleMicrotasks();
+      for (const delay of [100, 200, 400, 800, 1_600, 2_000, 2_000]) {
+        await clock.advance(delay);
+        expect(clock.scheduledWorkCount).toBe(1);
+      }
+      expect(connectAttempts).toBe(8);
+      expect(clock.scheduledDelays).toEqual([100, 200, 400, 800, 1_600, 2_000, 2_000, 2_000]);
 
-    expect(firstClient.ingressListenerCount).toBe(0);
-    expect(clock.scheduledWorkCount).toBe(sessionCount);
-    await settleMicrotasks();
-    expect(clock.scheduledWorkCount).toBe(sessionCount);
+      acceptingConnections = true;
+      await clock.advance(2_000);
+      // A slow shared connect must not release all the route opens when it settles.
+      await clock.advance(500);
+      expect(connectAttempts).toBe(9);
+      await pool.closeSession(TEST_PROJECT_ROOT, "restart-0");
+      finishReconnect();
+      await settleMicrotasks();
 
-    // The first wave probes the retired client once per session. Later waves share
-    // ensureClient's single-flight connect and follow the 100ms-to-2s schedule.
-    for (const delay of [100, 200, 400, 800, 1_600, 2_000, 2_000]) {
-      await clock.advance(delay);
-      expect(clock.scheduledWorkCount).toBe(sessionCount);
+      const recoveredClient = clients[1]!;
+      expect(recoveredClient.routeOpens).toHaveLength(4);
+      expect(clock.scheduledWorkCount).toBe(1);
+      await clock.advance(19);
+      expect(recoveredClient.routeOpens).toHaveLength(4);
+      await clock.advance(21);
+      expect(recoveredClient.routeOpens).toHaveLength(sessionCount - 1);
+      expect(recoveredClient.routeOpens.map(({ session }) => session)).not.toContain("restart-0");
+      expect(recoveredClient.ingressListenerCount).toBe(sessionCount - 1);
+      expect(clock.scheduledWorkCount).toBe(0);
+
+      await pool.shutdown();
+      expect(recoveredClient.ingressListenerCount).toBe(0);
+    } finally {
+      finishReconnect();
+      await pool.shutdown();
     }
-    expect(firstClient.routeOpens.length - initialRouteOpens).toBe(sessionCount);
-    expect(connectAttempts - 1).toBe(6);
-    expect([...new Set(clock.scheduledDelays)]).toEqual([100, 200, 400, 800, 1_600, 2_000]);
-
-    acceptingConnections = true;
-    await clock.advance(2_000);
-
-    const recoveredClient = clients[1]!;
-    expect(recoveredClient.subscriptions).toHaveLength(sessionCount);
-    expect(recoveredClient.ingressListenerCount).toBe(baselineIngressListeners);
-    expect(clock.scheduledWorkCount).toBe(0);
-
-    await pool.shutdown();
-    await settleMicrotasks();
-    expect(recoveredClient.ingressListenerCount).toBe(0);
   });
 
   test("closeSession stops the subscription and closes both routes", async () => {

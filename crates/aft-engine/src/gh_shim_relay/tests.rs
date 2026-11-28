@@ -168,9 +168,13 @@ fn fabricated_ticket_with_a_typed_head_session_is_refused_before_any_call() {
     params["session"] = json!("ses-head");
     params["session_id"] = json!("ses-head");
     params["request"]["metadata"]["session"] = json!("ses-head");
-    let (reply, _) = run(&transport, BOT_REQUEST_OPERATION, params);
+    let (reply, lines) = run(&transport, BOT_REQUEST_OPERATION, params);
     assert!(!reply.ok);
     assert_eq!(reply.data["refusal_code"], "ticket_unknown");
+    assert_eq!(
+        lines,
+        ["gh_shim relay: op=gh_shim.bot_request outcome=ticket_unknown"]
+    );
     assert!(transport.calls().is_empty(), "no mint and no plexus call");
 
     let mut absent = bot_params("", "nonce-absent");
@@ -226,14 +230,16 @@ fn untrusted_binds_are_refused_even_with_a_live_ticket() {
 }
 
 #[test]
-fn relay_log_escapes_untrusted_fields_into_one_record() {
+fn relay_log_omits_untrusted_fields_before_ticket_redemption() {
     let transport = FakeTransport::default();
     let mut params = bot_params("", "nonce\nforged record");
     params["request"]["action"] = json!("action\rforged");
     params["request"]["repository"] = json!("owner/repo\u{001b}[31m");
     let (_, lines) = run(&transport, BOT_REQUEST_OPERATION, params);
-    assert_eq!(lines.len(), 1);
-    assert!(!lines[0].chars().any(char::is_control), "{:?}", lines[0]);
+    assert_eq!(
+        lines,
+        ["gh_shim relay: op=gh_shim.bot_request outcome=ticket_absent"]
+    );
     assert!(transport.calls().is_empty());
 }
 
@@ -486,7 +492,7 @@ fn agent_bindings_request_matches_the_real_plexus_contract() {
 }
 
 #[test]
-fn relay_log_line_carries_session_task_and_nonce_but_no_ticket_or_scope() {
+fn relay_log_line_carries_session_task_and_nonce_digest_but_no_ticket_or_scope() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-log", "call-log-7", "/p");
     let ticket = live.value().unwrap().to_string();
     let transport = FakeTransport::scoped();
@@ -501,10 +507,32 @@ fn relay_log_line_carries_session_task_and_nonce_but_no_ticket_or_scope() {
     let line = &lines[0];
     assert_eq!(
         line,
-        "gh_shim relay: op=gh_shim.bot_request session=ses-log task=call-log-7 nonce=nonce-log-42 action=issue reaction repository=org/repo path=stamp outcome=completed"
+        &format!("gh_shim relay: op=gh_shim.bot_request session=ses-log task=call-log-7 nonce_digest={} action=issue reaction repository=org/repo path=stamp outcome=completed", blake3::hash(b"nonce-log-42").to_hex())
     );
+    assert!(!line.contains("nonce-log-42"));
     assert!(!line.contains(&ticket));
     assert!(!line.contains("head-ref-1"));
+}
+
+#[test]
+fn admitted_relay_log_bounds_and_escapes_fields_and_omits_unknown_actions() {
+    let session = format!("ses-limit-{}", "é".repeat(100));
+    let task = format!("call-limit\n{}", "x".repeat(100));
+    let live = crate::gh_shim_ticket::ScopedTicket::issue(&session, &task, "/p");
+    let mut params = bot_params(live.value().unwrap(), "nonce-too-sensitive-for-log");
+    params["request"]["repository"] = json!(format!("org/\r{}", "r".repeat(100)));
+    params["request"]["action"] = json!("unknown-action-not-for-log");
+    let (_, lines) = run(&FakeTransport::default(), BOT_REQUEST_OPERATION, params);
+    assert_eq!(lines.len(), 1);
+    let line = &lines[0];
+    assert!(!line.chars().any(char::is_control));
+    assert!(line.contains(" action=- repository=org/\\r"));
+    assert!(!line.contains("unknown-action-not-for-log"));
+    for field in ["session", "task", "repository"] {
+        let (_, tail) = line.split_once(&format!(" {field}=")).unwrap();
+        let (value, _) = tail.split_once(' ').unwrap();
+        assert_eq!(value.len(), 96, "{field}");
+    }
 }
 
 #[test]
@@ -682,6 +710,7 @@ fn background_ticket(
     )
     .unwrap();
     let seed = crate::gh_shim_speech::service::LaunchSeed {
+        coauthor_agent: None,
         launch: Ok(launch),
         lifecycle: Some(stamp.clone()),
         session: session.into(),
@@ -1617,6 +1646,169 @@ fn read_worker_stamp() -> ScopeStamp {
     scope
 }
 
+fn codemode_run_stamp(
+    parent: &ScopeStamp,
+    attributes: subc_protocol::scope::ScopeAttributes,
+) -> ScopeStamp {
+    use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent};
+    ScopeStamp::new(
+        parent.owner.clone(),
+        "codemode-run",
+        3,
+        ScopeKind::Ephemeral,
+    )
+    .with_parent(Some(ScopeParent::new(
+        parent.owner.clone(),
+        parent.scope_ref.clone(),
+        parent.scope_epoch,
+    )))
+    .with_parent_state(Some(ParentState::Linked))
+    .with_attributes(attributes.with_run_id(Some("program-a".into())))
+    .with_owner_authorized(true)
+    .with_expires_at_ms(Some(crate::db::call_ledger::now_ms() as u64 + 60_000))
+}
+
+fn issue_comment_params(ticket: &str) -> Value {
+    let mut params = bot_params(ticket, "codemode-issue-comment");
+    params["request"]["action"] = json!("issue comment");
+    params["request"]["body"] = json!({"body":"fixture comment"});
+    params["request"]["repository"] = json!("cortexkit/aft");
+    params
+}
+
+#[test]
+fn codemode_gh_head_read_delegates_in_either_order_with_bot_comment() {
+    use crate::gh_shim_speech::{model::LaunchAuthority, service};
+    use subc_protocol::scope::ScopeAttributes;
+    let root = tempfile::tempdir().unwrap();
+    let session = "codemode-head-read-comment";
+    let head = delegating_stamp();
+    let run = codemode_run_stamp(
+        &head,
+        ScopeAttributes::new().with_agent_id(head.attributes.agent_id.clone()),
+    );
+    let mut routes = scopes_for(session, Some(head.clone()));
+    let head_origin = launch_origin();
+    let run_origin = crate::gh_shim_speech::model::RouteOrigin {
+        channel: 2,
+        ..head_origin.clone()
+    };
+    routes.push_origin(head_origin.clone(), Some(head.clone()));
+    routes.push_origin(run_origin.clone(), Some(run.clone()));
+    let launch = LaunchAuthority::codemode(
+        head.clone(),
+        run.clone(),
+        Some(run_origin),
+        Some(head_origin),
+    )
+    .unwrap();
+    for operations in [
+        [SESSION_CONTEXT_OPERATION, BOT_REQUEST_OPERATION],
+        [BOT_REQUEST_OPERATION, SESSION_CONTEXT_OPERATION],
+    ] {
+        let seed = service::LaunchSeed {
+            coauthor_agent: None,
+            launch: Ok(launch.clone()),
+            lifecycle: Some(run.clone()),
+            session: session.into(),
+            harness: "pi".into(),
+            project_root: "/project".into(),
+        };
+        let ticket = service::with_launch(Some(seed), root.path(), || {
+            crate::gh_shim_ticket::ScopedTicket::issue(session, "call", "/project")
+        });
+        let value = ticket.value().unwrap();
+        let transport = FakeTransport::scoped();
+        for operation in operations {
+            let params = if operation == SESSION_CONTEXT_OPERATION {
+                json!({"ticket":value})
+            } else {
+                issue_comment_params(value)
+            };
+            let (reply, _) = run_with_scopes(&transport, operation, params, &routes);
+            assert!(reply.ok, "{operation}: {:?}", reply.data);
+            if operation == SESSION_CONTEXT_OPERATION {
+                // The shim delegates to native gh for a head instead of issuing read_request.
+                assert_eq!(reply.data["head"], true, "{operations:?}");
+                assert_eq!(reply.data["worker"], false, "{operations:?}");
+            }
+        }
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].2["arguments"]["request"]["action"],
+            "issue comment"
+        );
+        assert_eq!(transport.plexus_scopes(), vec![Some(scope_selector(&head))]);
+    }
+}
+
+#[test]
+fn codemode_gh_worker_run_keeps_scoped_reads_and_refuses_bot_comment() {
+    use subc_protocol::scope::ScopeAttributes;
+    let session = "codemode-worker-read-comment";
+    let worker = read_worker_stamp();
+    let run = codemode_run_stamp(
+        &worker,
+        ScopeAttributes::new().with_on_behalf_of_agent(Some("agent-fixture".into())),
+    );
+    let ticket = crate::bash_background::registry::with_scope_spawn(Some(run), || {
+        crate::gh_shim_ticket::ScopedTicket::issue(session, "call", "/project")
+    });
+    let value = ticket.value().unwrap();
+    let routes = scopes_for(session, Some(worker.clone()));
+    let transport = FakeTransport::scoped();
+    let (context, _) = run_with_scopes(
+        &transport,
+        SESSION_CONTEXT_OPERATION,
+        json!({"ticket":value}),
+        &routes,
+    );
+    assert!(context.ok, "{:?}", context.data);
+    assert_eq!(context.data["worker"], true);
+    assert_eq!(context.data["head"], false);
+    let (refusal, _) = run_with_scopes(
+        &transport,
+        BOT_REQUEST_OPERATION,
+        issue_comment_params(value),
+        &routes,
+    );
+    assert!(!refusal.ok);
+    assert_eq!(
+        refusal.data["refusal_code"],
+        crate::gh_shim_speech::WORKER_WRITE_CODE
+    );
+
+    let head_routes = scopes_for(session, Some(delegating_stamp()));
+    let (context, _) = run_with_scopes(
+        &transport,
+        SESSION_CONTEXT_OPERATION,
+        json!({"ticket":value}),
+        &head_routes,
+    );
+    assert_eq!(context.data["worker"], true);
+    let (refusal, _) = run_with_scopes(
+        &transport,
+        READ_REQUEST_OPERATION,
+        read_params(value),
+        &head_routes,
+    );
+    assert_eq!(refusal.data["refusal_code"], "agent_identity_required");
+    assert!(transport.calls().is_empty());
+
+    let (read, _) = run_with_scopes(
+        &transport,
+        READ_REQUEST_OPERATION,
+        read_params(value),
+        &routes,
+    );
+    assert!(read.ok, "{:?}", read.data);
+    assert_eq!(
+        transport.plexus_scopes(),
+        vec![Some(scope_selector(&worker))]
+    );
+}
+
 #[tokio::test]
 async fn read_bulk_selection_follows_each_routes_live_advertisement() {
     let description = Arc::new(Mutex::new(json!({})));
@@ -2133,22 +2325,11 @@ async fn worker_and_parented_ephemeral_writes_have_the_same_specific_refusal() {
 
 #[tokio::test]
 async fn validated_head_codemode_is_not_a_worker_write_but_invalid_head_is() {
-    use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent};
     let head = delegating_stamp();
-    let run = ScopeStamp::new(head.owner.clone(), "codemode-run", 3, ScopeKind::Ephemeral)
-        .with_parent(Some(ScopeParent::new(
-            head.owner.clone(),
-            head.scope_ref.clone(),
-            head.scope_epoch,
-        )))
-        .with_parent_state(Some(ParentState::Linked))
-        .with_attributes(
-            subc_protocol::scope::ScopeAttributes::new()
-                .with_agent_id(Some("agent-fixture".into()))
-                .with_run_id(Some("program-a".into())),
-        )
-        .with_owner_authorized(true)
-        .with_expires_at_ms(Some(crate::db::call_ledger::now_ms() as u64 + 60_000));
+    let run = codemode_run_stamp(
+        &head,
+        subc_protocol::scope::ScopeAttributes::new().with_agent_id(Some("agent-fixture".into())),
+    );
     let launch = crate::gh_shim_speech::model::LaunchAuthority::codemode(
         head.clone(),
         run.clone(),

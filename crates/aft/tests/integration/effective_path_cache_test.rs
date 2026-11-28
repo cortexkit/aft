@@ -177,17 +177,6 @@ fn run_bash_get_path(
     serde_json::from_str(response).unwrap()
 }
 
-fn wait_for_marker(marker: &Path) {
-    let deadline = Instant::now() + LIVENESS_CEILING;
-    while !marker.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        marker.exists(),
-        "detached probe did not execute its shell within liveness ceiling"
-    );
-}
-
 #[test]
 fn valid_cache_skips_sleeping_shell_and_returns_ping_quickly() {
     let fixture = tempfile::tempdir().unwrap();
@@ -440,26 +429,33 @@ fn cache_hit_starts_a_detached_refresh_helper_in_production() {
     let storage = fixture.path().join("storage");
     let home = fixture.path().join("home");
     let shell = fixture.path().join("bash");
-    let marker = fixture.path().join("helper-ran");
+    let inherited = fixture.path().join("inherited-bin");
+    let cached_only = fixture.path().join("cached-bin");
+    let deleted = fixture.path().join("startup-image/shims");
     fs::create_dir_all(&home).unwrap();
+    fs::create_dir(&inherited).unwrap();
+    fs::create_dir(&cached_only).unwrap();
+    fs::create_dir_all(&deleted).unwrap();
     write_executable(
         &shell,
-        "#!/bin/sh\nprintf helper-ran > \"$AFT_TEST_PATH_MARKER\"\neval \"$2\"\n",
+        "#!/bin/sh\nPATH=\"$PATH:$AFT_TEST_DELETED_PATH\"\neval \"$2\"\n",
     );
-    write_cache(
-        &storage,
-        &shell,
-        &home,
-        Some("/cached/login/bin:/usr/bin:/bin"),
-    );
+    let launch_path = std::env::join_paths([inherited.as_path(), Path::new("/bin")]).unwrap();
+    let cached_path = std::env::join_paths([&cached_only, &deleted]).unwrap();
+    let cache = write_cache(&storage, &shell, &home, cached_path.to_str());
+    let initial = fs::read(&cache).unwrap();
+    fs::remove_dir(&deleted).unwrap();
 
     let mut child = Command::new(aft_binary())
         .env("AFT_CACHE_DIR", &storage)
         .env("AFT_TEST_RAW_PATH", "0")
         .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
-        .env("AFT_TEST_PATH_MARKER", &marker)
+        .env("AFT_TEST_DELETED_PATH", &deleted)
+        .env_remove("AFT_TEST_LOGIN_SHELL_CANDIDATES")
         .env("HOME", &home)
-        .env("PATH", "/usr/bin:/bin")
+        .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+        .env("XDG_STATE_HOME", fixture.path().join("state"))
+        .env("PATH", &launch_path)
         .env("SHELL", &shell)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -475,5 +471,19 @@ fn cache_hit_starts_a_detached_refresh_helper_in_production() {
     let output = wait_with_liveness_ceiling(child, LIVENESS_CEILING);
     assert!(output.status.success());
 
-    wait_for_marker(&marker);
+    let deadline = Instant::now() + LIVENESS_CEILING;
+    let updated = loop {
+        let bytes = fs::read(&cache).unwrap();
+        if bytes != initial {
+            break serde_json::from_slice::<Value>(&bytes).unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached helper did not refresh cache"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    // The existing cache-only directory would survive if the helper inherited the
+    // merged PATH. The shell adds the deleted directory independently of that PATH.
+    assert_eq!(updated["path"].as_str(), launch_path.to_str());
 }

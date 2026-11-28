@@ -32,7 +32,7 @@ pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
         .filter(|path| is_managed_task_temp_dir(path))
         .last()
     else {
-        return Ok(None);
+        return Ok(general_temp_check(&absolute_path));
     };
     if crate::project_content::is_sqlite_or_metadata(path) {
         return Err(refused());
@@ -53,13 +53,51 @@ pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
     Ok(Some(OpenCheck { root, expected }))
 }
 
+thread_local! {
+    static GENERAL_TEMP_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous general temp root when dropped.
+pub struct GeneralTempScope(Option<PathBuf>);
+
+impl Drop for GeneralTempScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        GENERAL_TEMP_ROOT.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Mark content opens on this thread, and on the filesystem helpers it
+/// starts, as reads the general temp allowance admitted under `root`. The
+/// allowance checked the path's file type and link count before the read;
+/// opens below `root` then get the same opened-handle checks as task scratch,
+/// so a name replaced after that check cannot redirect the read. `root` and
+/// the paths opened under it are fully resolved policy paths.
+pub fn admit_general_temp(root: Option<PathBuf>) -> GeneralTempScope {
+    GeneralTempScope(GENERAL_TEMP_ROOT.with(|slot| slot.replace(root)))
+}
+
+pub(crate) fn current_general_temp() -> Option<PathBuf> {
+    GENERAL_TEMP_ROOT.with(|slot| slot.borrow().clone())
+}
+
+fn general_temp_check(absolute_path: &Path) -> Option<OpenCheck> {
+    let root = crate::path_identity::normalize_path(&current_general_temp()?);
+    let expected = crate::path_identity::normalize_path(absolute_path);
+    expected
+        .starts_with(&root)
+        .then_some(OpenCheck { root, expected })
+}
+
 pub fn open(path: &Path) -> io::Result<File> {
     let Some(check) = check_path(path)? else {
         return crate::bounded_io::open_content_file(path);
     };
-    // Sandbox task-temp directory names select stricter open checks so links
-    // cannot redirect scratch reads elsewhere. A matching name never grants
-    // access; the caller still needs authorization from the task registry.
+    // Sandbox task-temp directory names, and reads the general temp allowance
+    // admitted, select stricter open checks so links cannot redirect the read
+    // elsewhere. A matching name never grants access; the caller still needs
+    // authorization from the task registry or the access policy.
     let file = crate::bounded_io::open_content_file_no_follow(path)?;
     validate_opened(path, &check, &file)?;
     Ok(file)
@@ -79,6 +117,24 @@ fn validate_opened(path: &Path, check: &OpenCheck, file: &File) -> io::Result<()
             return Err(refused());
         }
     }
+    // Windows has no O_NOFOLLOW: the checked open asked for a final reparse
+    // point itself, so refuse one here, along with a second hard link.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is open for the whole call and `info` is writable.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || info.nNumberOfLinks != 1 {
+            return Err(refused());
+        }
+    }
     if crate::project_content::is_sqlite_or_metadata(&opened)
         || crate::project_content::is_sqlite_or_metadata(path)
     {
@@ -94,7 +150,7 @@ pub(crate) fn check_opened(path: &Path, check: Option<&OpenCheck>, file: &File) 
     Ok(())
 }
 
-fn refused() -> io::Error {
+pub(crate) fn refused() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         "scratch read escaped its task directory or named unsafe content",
@@ -312,4 +368,119 @@ pub fn is_managed(path: &Path) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(task_name)
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_os = "macos")
+))]
+mod general_temp_tests {
+    use super::*;
+
+    /// A guarded temp root holding `data.txt`, and an outside folder holding
+    /// `secret.txt` that a swapped name could point at.
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(temp.path()).unwrap();
+            let root = base.join("temp-root");
+            let outside = base.join("outside");
+            std::fs::create_dir_all(root.join("folder")).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(root.join("data.txt"), "stable").unwrap();
+            std::fs::write(root.join("folder/data.txt"), "stable").unwrap();
+            std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+            std::fs::write(outside.join("data.txt"), "secret").unwrap();
+            Self {
+                _temp: temp,
+                root,
+                outside,
+            }
+        }
+    }
+
+    fn read(path: &Path) -> io::Result<String> {
+        std::io::read_to_string(open(path)?)
+    }
+
+    #[test]
+    fn stable_general_temp_reads_still_work() {
+        let f = Fixture::new();
+        let _scope = admit_general_temp(Some(f.root.clone()));
+        assert_eq!(read(&f.root.join("data.txt")).unwrap(), "stable");
+        assert_eq!(read(&f.root.join("folder/data.txt")).unwrap(), "stable");
+        assert_eq!(
+            crate::bounded_io::read(&f.root.join("data.txt"), None).unwrap(),
+            b"stable"
+        );
+    }
+
+    #[test]
+    fn general_temp_read_refuses_a_final_name_swapped_for_a_link() {
+        let f = Fixture::new();
+        let path = f.root.join("data.txt");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(f.outside.join("secret.txt"), &path).unwrap();
+        // Without the allowance's checks the open follows the swapped link.
+        assert_eq!(read(&path).unwrap(), "secret");
+        let _scope = admit_general_temp(Some(f.root.clone()));
+        assert!(read(&path).is_err());
+        assert!(crate::bounded_io::read(&path, None).is_err());
+    }
+
+    #[test]
+    fn general_temp_read_refuses_a_parent_swapped_for_a_link() {
+        let f = Fixture::new();
+        let folder = f.root.join("folder");
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::os::unix::fs::symlink(&f.outside, &folder).unwrap();
+        let path = folder.join("data.txt");
+        let _scope = admit_general_temp(Some(f.root.clone()));
+        let error = read(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(crate::bounded_io::read(&path, None).is_err());
+    }
+
+    #[test]
+    fn general_temp_read_refuses_a_second_hard_link() {
+        let f = Fixture::new();
+        let path = f.root.join("data.txt");
+        std::fs::hard_link(&path, f.outside.join("alias.txt")).unwrap();
+        let _scope = admit_general_temp(Some(f.root.clone()));
+        assert_eq!(
+            read(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn general_temp_checks_follow_the_read_onto_filesystem_helpers() {
+        let f = Fixture::new();
+        let folder = f.root.join("folder");
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::os::unix::fs::symlink(&f.outside, &folder).unwrap();
+        let path = folder.join("data.txt");
+        let _scope = admit_general_temp(Some(f.root.clone()));
+        let caller = std::thread::current().id();
+        let (helper, result) = crate::bounded_io::run(&path, None, |path| {
+            Ok((std::thread::current().id(), read(&path)))
+        })
+        .unwrap();
+        assert_ne!(helper, caller, "the read must run on a helper thread");
+        assert!(result.is_err());
+        drop(_scope);
+        // The helper thread does not keep the checks once the scope ends.
+        assert_eq!(
+            crate::bounded_io::run(&path, None, |path| Ok(read(&path)))
+                .unwrap()
+                .unwrap(),
+            "secret"
+        );
+    }
 }

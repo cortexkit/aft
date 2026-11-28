@@ -486,7 +486,7 @@ fn secret_use_logs_deadline_once_when_worker_does_not_reply() {
     transport.timeout = Duration::from_millis(150);
     // Keep the work queued so only the caller's receive deadline can expire.
     // A live scoped open also has an SDK timer that can win with OutcomeUnknown.
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(QUEUED_WORK_CAPACITY);
     assert!(transport.worker.set(sender).is_ok());
     assert_failure_log(
         || transport.dispatch(private_params(), principal("aft")),
@@ -499,13 +499,75 @@ fn secret_use_logs_deadline_once_when_worker_does_not_reply() {
 fn secret_use_logs_worker_failure_when_the_channel_is_closed() {
     let daemon = FakeClaustrum::start();
     let transport = transport(&daemon);
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = mpsc::channel(QUEUED_WORK_CAPACITY);
     drop(receiver);
     assert!(transport.worker.set(sender).is_ok());
     assert_failure_log(
         || transport.dispatch(private_params(), principal("aft")),
         "stage=worker",
     );
+}
+
+#[test]
+fn secret_use_refuses_a_full_command_queue_as_busy() {
+    let daemon = FakeClaustrum::start();
+    let transport = transport(&daemon);
+    let (sender, _receiver) = mpsc::channel(QUEUED_WORK_CAPACITY);
+    let _reserved: Vec<_> = (0..QUEUED_WORK_CAPACITY)
+        .map(|_| sender.try_reserve().unwrap())
+        .collect();
+    assert!(transport.worker.set(sender.clone()).is_ok());
+    assert_failure_log(
+        || transport.dispatch(private_params(), principal("aft")),
+        "stage=busy",
+    );
+}
+
+#[tokio::test]
+async fn secret_use_skips_expired_queue_jobs_without_discarding_the_connection() {
+    let daemon = FakeClaustrum::start();
+    let transport = transport(&daemon);
+    let config = ConnectionConfig {
+        connection_file: transport.connection_file,
+        identity: transport.identity,
+        timeout: transport.timeout,
+    };
+    let (sender, receiver) = mpsc::channel(QUEUED_WORK_CAPACITY);
+    let now = tokio::time::Instant::now();
+    let replies: Vec<_> = [now, now + config.timeout, now, now + config.timeout]
+        .into_iter()
+        .map(|deadline| {
+            let (reply, answer) = std::sync::mpsc::channel();
+            assert!(sender
+                .try_send(Work {
+                    params: golden(0),
+                    test_principal: Some(principal("aft")),
+                    deadline,
+                    reply,
+                    failure: Default::default(),
+                })
+                .is_ok());
+            answer
+        })
+        .collect();
+    drop(sender);
+    SubcSecretUseTransport::serve(config, receiver).await;
+    for (index, answer) in replies.into_iter().enumerate() {
+        match (index % 2, answer.try_recv().unwrap()) {
+            (0, Err(error)) => assert_eq!(
+                error.to_string(),
+                "secret.use transport failed stage=deadline"
+            ),
+            (1, Ok(bytes)) => assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                json!({"result":golden(5)})
+            ),
+            _ => panic!("unexpected result for job {index}"),
+        }
+    }
+    let state = daemon.state.lock().unwrap();
+    assert_eq!(state.calls, 2);
+    assert_eq!(state.connections, 1);
 }
 
 #[test]

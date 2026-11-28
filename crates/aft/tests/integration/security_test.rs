@@ -209,6 +209,85 @@ fn write_blocks_broken_symlink_escape_from_project_root() {
 
 #[cfg(any(unix, windows))]
 #[test]
+fn write_refuses_dangling_symlink_before_preview_or_undo() {
+    // Force the alias on macOS even if TMPDIR is already canonical.
+    #[cfg(target_os = "macos")]
+    let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    fs::create_dir(&root).unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(root.canonicalize().unwrap().starts_with("/private/var"));
+    let target = root.join("target.txt");
+    let link = root.join("link.txt");
+    if !ensure_symlink(
+        create_file_symlink(&target, &link),
+        "write_refuses_dangling_symlink_before_preview_or_undo",
+    ) {
+        return;
+    }
+    let outside_link = dir.path().join("link-outside-root.txt");
+    create_file_symlink(&target, &outside_link).unwrap();
+    let original_target = fs::read_link(&link).unwrap();
+    let original_outside_target = fs::read_link(&outside_link).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_restricted(&mut aft, &root);
+    let mut write = |file: &Path, content: &str, preview: bool| {
+        aft.send(
+            &serde_json::json!({
+                "id": "write-link-test",
+                "command": "write",
+                "file": file,
+                "content": content,
+                "preview": preview,
+            })
+            .to_string(),
+        )
+    };
+    for preview in [false, true] {
+        let response = write(&link, "not written", preview);
+        assert_error_code(&response, "dangling_symlink");
+        assert_eq!(
+            response["message"],
+            format!(
+                "Cannot write through dangling symlink '{}'. Write to the target path instead.",
+                link.display()
+            )
+        );
+        let response = write(&outside_link, "not written", preview);
+        assert_error_code(&response, "path_outside_root");
+        assert!(!target.exists());
+        assert_eq!(fs::read_link(&link).unwrap(), original_target);
+        assert_eq!(
+            fs::read_link(&outside_link).unwrap(),
+            original_outside_target
+        );
+    }
+    let undo = aft.send(r#"{"id":"undo-link-test","command":"undo"}"#);
+    assert_error_code(&undo, "no_undo_history");
+
+    for (file, content, created) in [(&target, "created", true), (&link, "updated", false)] {
+        let response = aft.send(
+            &serde_json::json!({
+                "id": "write-link-control",
+                "command": "write",
+                "file": file,
+                "content": content,
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "{response:?}");
+        assert_eq!(response["created"], created);
+        assert_eq!(fs::read_to_string(&target).unwrap(), content);
+        assert_eq!(fs::read_link(&link).unwrap(), original_target);
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
 fn validate_path_rejects_broken_absolute_symlink_escape() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");

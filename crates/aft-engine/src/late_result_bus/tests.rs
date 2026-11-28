@@ -50,6 +50,17 @@ fn admit(conn: &Connection, key: &ledger::Key, custodian: &str) {
         params![key.carrier, key.call_key, custodian, format!("settlement-{}", key.call_key)]).unwrap();
 }
 
+fn admit_held(conn: &Connection, key: &ledger::Key, custodian: &str) {
+    admit(conn, key, custodian);
+    assert!(ledger::hold_permission(
+        conn,
+        key,
+        br#"{"content":[{"type":"text","text":""}],"held":{"reason":"consent"}}"#,
+        true,
+    )
+    .unwrap());
+}
+
 fn database() -> (tempfile::TempDir, crate::db::lifecycle::TrackedConnection) {
     let dir = tempfile::tempdir().unwrap();
     let db = crate::db::open(&dir.path().join("aft.db")).unwrap();
@@ -63,7 +74,7 @@ async fn prefrontal_rename_bus_preserves_custody_and_reader_subjects() {
     for module in ["prefrontal-core", "prefrontal"] {
         let key = key(module);
         let principal = format!("reserved:{module}");
-        admit(&conn, &key, &principal);
+        admit_held(&conn, &key, &principal);
         ledger::settle(&conn, &key, &frame(), "ok", None, ledger::now_ms()).unwrap();
         let before = ledger::get(&conn, &key).unwrap().unwrap();
         let mut publisher = RecordingPublisher::default();
@@ -187,7 +198,7 @@ async fn late_result_bus_publisher_matches_provider_vectors() {
     ] {
         let (_dir, conn) = database();
         let key = key(call_key);
-        admit(&conn, &key, "reserved:reader");
+        admit_held(&conn, &key, "reserved:reader");
         ledger::settle(&conn, &key, &frame(), "ok", None, ledger::now_ms()).unwrap();
         conn.execute(
             "UPDATE call_ledger SET event_id=?1, outcome=?2 WHERE carrier=?3 AND call_key=?4",
@@ -226,10 +237,10 @@ async fn late_result_bus_publisher_matches_provider_vectors() {
 }
 
 #[tokio::test]
-async fn late_result_bus_committed_entry_is_sent_once_with_only_public_fields() {
+async fn late_result_bus_committed_held_entry_is_sent_once_with_only_public_fields() {
     let (_dir, conn) = database();
     let key = key("call-42");
-    admit(&conn, &key, "reserved:broca");
+    admit_held(&conn, &key, "reserved:broca");
     let mut state = DeliveryState::default();
     let mut publisher = RecordingPublisher::default();
     drain(&conn, &mut state, &mut publisher).await;
@@ -284,14 +295,151 @@ async fn late_result_bus_committed_entry_is_sent_once_with_only_public_fields() 
 }
 
 #[tokio::test]
+async fn late_result_bus_inline_result_is_pullable_but_never_wakes() {
+    let (_dir, conn) = database();
+    let mut live = DeliveryState::default();
+    let mut live_publisher = RecordingPublisher::default();
+    drain(&conn, &mut live, &mut live_publisher).await;
+
+    let inline = key("inline");
+    let settled_at = ledger::now_ms();
+    admit(&conn, &inline, "reserved:broca");
+    ledger::settle(&conn, &inline, &frame(), "ok", None, settled_at).unwrap();
+    live.hint();
+    drain(&conn, &mut live, &mut live_publisher).await;
+
+    // Settle a later row far enough ahead that the live scan's overlap window
+    // cannot see the inline row. Only startup replay can find it.
+    let boundary = key("unscoped-boundary");
+    ledger::admit(
+        &conn,
+        &boundary,
+        "digest",
+        None,
+        ledger::State::DispatchStarted,
+    )
+    .unwrap();
+    ledger::settle(
+        &conn,
+        &boundary,
+        &frame(),
+        "ok",
+        None,
+        settled_at + OVERLAP_MS + 1,
+    )
+    .unwrap();
+    let mut replay_publisher = RecordingPublisher::default();
+    drain(&conn, &mut DeliveryState::default(), &mut replay_publisher).await;
+
+    let page = ledger::late_results(
+        &conn,
+        "reserved:broca",
+        ledger::provider_incarnation(),
+        None,
+        None,
+        settled_at,
+        1024 * 1024,
+    )
+    .unwrap()
+    .unwrap();
+    let feed: Value = serde_json::from_slice(&page).unwrap();
+    assert_eq!(feed["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(feed["entries"][0]["call_key"], "inline");
+    assert_eq!(
+        feed["entries"][0]["result"],
+        serde_json::from_slice::<Value>(&frame().body).unwrap()
+    );
+    assert_eq!(
+        (
+            live_publisher.attempts.len(),
+            replay_publisher.attempts.len()
+        ),
+        (0, 0),
+        "inline settlement must not wake in either live scan or startup replay"
+    );
+}
+
+#[tokio::test]
+async fn late_result_bus_running_hold_wakes_when_task_already_finished() {
+    let (_dir, conn) = database();
+    let call = key("racing-task");
+    let task = "task-1";
+    admit(&conn, &call, "reserved:broca");
+    assert!(ledger::transition(
+        &conn,
+        &call,
+        ledger::State::Prepared,
+        ledger::State::DispatchStarted,
+    )
+    .unwrap());
+    ledger::link_task(&conn, &call, task).unwrap();
+
+    let observe_finished_task = || {
+        ledger::observe_task(
+            &conn,
+            &call.carrier,
+            &call.call_key,
+            task,
+            Some(&frame()),
+            "unknown",
+        )
+        .unwrap()
+    };
+    // The task finishes while its original reply is still attached. The
+    // registry flushes that same completion as soon as it writes the hold.
+    assert!(!observe_finished_task());
+    assert!(ledger::hold_running(
+        &conn,
+        &call,
+        task,
+        br#"{"content":[{"type":"text","text":""}],"held":{"reason":"running"}}"#,
+        true,
+    )
+    .unwrap());
+    assert!(observe_finished_task());
+    let row = ledger::get(&conn, &call).unwrap().unwrap();
+    assert_eq!(row.state, ledger::State::Settled);
+    let mut publisher = RecordingPublisher::default();
+    drain(&conn, &mut DeliveryState::default(), &mut publisher).await;
+    assert_eq!(publisher.attempts.len(), 1);
+    assert_eq!(publisher.attempts[0].1, format!("{}:broca", row.event_id));
+}
+
+#[test]
+fn late_result_bus_busy_ledger_counts_only_a_scan_deferral() {
+    let (_dir, conn) = database();
+    let db = Mutex::new(conn);
+    let guard = db.lock().unwrap();
+    let code = try_ledger(&db).err().expect("another read holds the mutex");
+    let mut health = BusHealth {
+        connected: true,
+        ..Default::default()
+    };
+    health.record_failure(code);
+    assert_eq!(health.scan_deferrals, 1);
+    assert_eq!(health.publish_failures, 0);
+    assert_eq!(health.last_error, None);
+    assert!(health.connected);
+    drop(guard);
+    assert!(try_ledger(&db).is_ok());
+
+    health.record_failure("bus_publish_timeout");
+    health.record_failure(code);
+    assert_eq!(health.scan_deferrals, 2);
+    assert_eq!(health.publish_failures, 1);
+    assert_eq!(health.last_error, Some("bus_publish_timeout"));
+    assert!(!health.connected);
+}
+
+#[tokio::test]
 async fn late_result_bus_never_reads_uncommitted_or_failed_settlement() {
     let (dir, writer) = database();
     let reader = crate::db::open_readonly(&dir.path().join("aft.db")).unwrap();
     let key = key("commit-fails");
-    admit(&writer, &key, "reserved:broca");
+    admit_held(&writer, &key, "reserved:broca");
     let mut publisher = RecordingPublisher::default();
     let mut state = DeliveryState::default();
-    writer.execute_batch("BEGIN IMMEDIATE; UPDATE call_ledger SET state='Settled', late_entry='{}', outcome='ok' WHERE call_key='commit-fails';").unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE; UPDATE call_ledger SET state='Settled', late_entry='{}', outcome='ok', seq=1, settled_at=20000 WHERE call_key='commit-fails';").unwrap();
     drain(&reader, &mut state, &mut publisher).await;
     assert!(
         publisher.attempts.is_empty(),
@@ -326,7 +474,7 @@ async fn late_result_bus_never_reads_uncommitted_or_failed_settlement() {
 async fn late_result_bus_dropped_publish_retries_and_restart_replays_stable_id() {
     let (_dir, conn) = database();
     let key = key("retry");
-    admit(&conn, &key, "reserved:prefrontal-core");
+    admit_held(&conn, &key, "reserved:prefrontal-core");
     ledger::settle(
         &conn,
         &key,
@@ -360,13 +508,19 @@ async fn late_result_bus_dropped_publish_retries_and_restart_replays_stable_id()
         serde_json::from_slice::<Value>(&publisher.attempts[2].2).unwrap()["outcome"],
         "outcome_unknown"
     );
+    assert_eq!(
+        ledger::ack(&conn, "reserved:prefrontal-core", 1).unwrap(),
+        1
+    );
+    drain(&conn, &mut DeliveryState::default(), &mut publisher).await;
+    assert_eq!(publisher.attempts.len(), 3);
 }
 
 #[tokio::test(start_paused = true)]
 async fn late_result_bus_retry_set_uses_backoff_without_ledger_rescans() {
     let (_dir, conn) = database();
     let key = key("no-hint");
-    admit(&conn, &key, "reserved:thalamus");
+    admit_held(&conn, &key, "reserved:thalamus");
     ledger::settle(&conn, &key, &frame(), "ok", None, ledger::now_ms()).unwrap();
     let mut state = DeliveryState::default();
     let mut publisher = RecordingPublisher {
@@ -407,7 +561,7 @@ async fn late_result_bus_retry_set_uses_backoff_without_ledger_rescans() {
 async fn late_result_bus_stalled_publish_cannot_delay_settlement_reply() {
     let (_dir, conn) = database();
     let first = key("slow-bus");
-    admit(&conn, &first, "reserved:broca");
+    admit_held(&conn, &first, "reserved:broca");
     ledger::settle(&conn, &first, &frame(), "ok", None, ledger::now_ms()).unwrap();
     let mut state = DeliveryState::default();
     let mut publisher = RecordingPublisher {
@@ -462,7 +616,7 @@ async fn late_result_bus_hint_visits_only_new_rows_after_fifty_thousand_settleme
     ledger::ack(&conn, "reserved:broca", 1).unwrap();
     publisher.attempts.clear();
     let new = key("new-settlement");
-    admit(&conn, &new, "reserved:broca");
+    admit_held(&conn, &new, "reserved:broca");
     ledger::settle(&conn, &new, &frame(), "ok", None, 40_000).unwrap();
     let hint = Notify::new();
     hint.notify_one();
@@ -495,8 +649,9 @@ async fn late_result_bus_restart_does_not_republish_feed_acknowledged_entries() 
     let (_dir, conn) = database();
     let acknowledged = key("acknowledged");
     let retained = key("retained");
-    for key in [&acknowledged, &retained] {
-        admit(&conn, key, "reserved:broca");
+    let marked = key("marked");
+    for key in [&acknowledged, &retained, &marked] {
+        admit_held(&conn, key, "reserved:broca");
         ledger::settle(&conn, key, &frame(), "ok", None, 20_000).unwrap();
     }
     assert_eq!(ledger::ack(&conn, "reserved:broca", 1).unwrap(), 1);
@@ -504,6 +659,11 @@ async fn late_result_bus_restart_does_not_republish_feed_acknowledged_entries() 
         ledger::get(&conn, &acknowledged).unwrap().is_none(),
         "terminal feed ack deletes its row"
     );
+    conn.execute(
+        "UPDATE call_ledger SET acked=1 WHERE call_key=?1",
+        [&marked.call_key],
+    )
+    .unwrap();
     let mut state = DeliveryState::default();
     let mut publisher = RecordingPublisher::default();
     drain(&conn, &mut state, &mut publisher).await;
@@ -522,8 +682,8 @@ async fn late_result_bus_overlap_catches_later_commit_with_equal_timestamp_and_o
     let (_dir, conn) = database();
     let older = key("older-admission");
     let newer = key("newer-admission");
-    admit(&conn, &older, "reserved:broca");
-    admit(&conn, &newer, "reserved:broca");
+    admit_held(&conn, &older, "reserved:broca");
+    admit_held(&conn, &newer, "reserved:broca");
     ledger::settle(&conn, &newer, &frame(), "ok", None, 20_000).unwrap();
     let mut state = DeliveryState::default();
     let mut publisher = RecordingPublisher::default();
@@ -556,7 +716,7 @@ async fn late_result_bus_overlap_catches_later_commit_with_equal_timestamp_and_o
         "older-admission"
     );
     let latest = key("latest");
-    admit(&conn, &latest, "reserved:broca");
+    admit_held(&conn, &latest, "reserved:broca");
     ledger::settle(&conn, &latest, &frame(), "ok", None, 40_001).unwrap();
     state.hint();
     drain(&conn, &mut state, &mut publisher).await;
@@ -571,10 +731,10 @@ async fn late_result_bus_overlap_catches_later_commit_with_equal_timestamp_and_o
 async fn late_result_bus_retry_cap_keeps_overflow_in_the_ledger() {
     let (_dir, conn) = database();
     conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1001)
-        INSERT INTO call_ledger(carrier,call_key,digest,state,event_id,settled_at,outcome,owner,scope_ref,scope_epoch,custodian,seq,late_entry)
+        INSERT INTO call_ledger(carrier,call_key,digest,state,event_id,settled_at,outcome,owner,scope_ref,scope_epoch,custodian,seq,late_entry,first_reply_held)
         SELECT 'reserved:broca','queued-'||i,'digest','Settled','queued-event-'||i,20000,'ok',
             CASE WHEN i<=1000 THEN 'reserved:broca' ELSE 'reserved:thalamus' END,'scope',1,
-            CASE WHEN i<=1000 THEN 'reserved:broca' ELSE 'reserved:thalamus' END,i,'{}' FROM n;
+            CASE WHEN i<=1000 THEN 'reserved:broca' ELSE 'reserved:thalamus' END,i,'{}',1 FROM n;
         INSERT INTO call_ledger_ack(custodian,last_seq) VALUES ('reserved:broca',1000),('reserved:thalamus',1001);").unwrap();
     let mut state = DeliveryState {
         position: Position::Live(Cursor::default()),
@@ -612,7 +772,7 @@ async fn late_result_bus_retry_cap_keeps_overflow_in_the_ledger() {
 async fn late_result_bus_retry_drops_entries_acknowledged_by_the_feed() {
     let (_dir, conn) = database();
     let key = key("already-read");
-    admit(&conn, &key, "reserved:broca");
+    admit_held(&conn, &key, "reserved:broca");
     ledger::settle(&conn, &key, &frame(), "ok", None, 20_000).unwrap();
     let mut state = DeliveryState::default();
     let mut publisher = RecordingPublisher {
@@ -622,6 +782,30 @@ async fn late_result_bus_retry_drops_entries_acknowledged_by_the_feed() {
     drain(&conn, &mut state, &mut publisher).await;
     assert_eq!(state.pending.len(), 1);
     ledger::ack(&conn, "reserved:broca", 1).unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    retry_due(&conn, &mut state, &mut publisher).await;
+    assert!(state.pending.is_empty());
+    assert_eq!(publisher.attempts.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_result_bus_retry_requires_a_held_settlement() {
+    let (_dir, conn) = database();
+    let key = key("unmarked-retry");
+    admit_held(&conn, &key, "reserved:broca");
+    ledger::settle(&conn, &key, &frame(), "ok", None, 20_000).unwrap();
+    let mut state = DeliveryState::default();
+    let mut publisher = RecordingPublisher {
+        drop_next: true,
+        ..Default::default()
+    };
+    drain(&conn, &mut state, &mut publisher).await;
+    assert_eq!(state.pending.len(), 1);
+    conn.execute(
+        "UPDATE call_ledger SET first_reply_held=NULL WHERE call_key=?1",
+        [&key.call_key],
+    )
+    .unwrap();
     tokio::time::advance(Duration::from_secs(1)).await;
     retry_due(&conn, &mut state, &mut publisher).await;
     assert!(state.pending.is_empty());

@@ -206,7 +206,15 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       };
       await withEnv({ DEST: h.tempDir }, async () => {
         await expect(
-          callPluginBash(bash, h, { command: 'cd "$DEST" && rm -rf build' }, { ask }),
+          callPluginBash(
+            bash,
+            h,
+            {
+              command: 'cd "$DEST" && rm -rf build',
+              description: "Remove the test build directory",
+            },
+            { ask },
+          ),
         ).rejects.toThrow("rm denied by host rule");
       });
       expect(resources).toContain("rm -rf build");
@@ -244,7 +252,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     async () => {
       const { h, bash, bridgeCalls } = await pluginHarness();
 
-      const result = await callPluginBash(bash, h, { command: "echo hello" });
+      const result = await callPluginBash(bash, h, {
+        command: "echo hello",
+        description: "Print a greeting",
+      });
 
       // Agent-visible output is bash text — NOT a JSON literal that the model
       // would have to JSON.parse before reading.
@@ -266,6 +277,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const result = await callPluginBash(bash, h, {
       command: "printf 'line1\\r\\nline2\\r\\nline3\\r\\n'",
+      description: "Print lines with CRLF endings",
       compressed: false,
     });
 
@@ -279,7 +291,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     async () => {
       const { h, bash, bridgeCalls } = await pluginHarness();
 
-      const result = await callPluginBash(bash, h, { command: "false" });
+      const result = await callPluginBash(bash, h, {
+        command: "false",
+        description: "Return a failing exit status",
+      });
 
       // The agent must be able to detect command failure from the text itself,
       // because metadata is UI-only and not echoed back to the model.
@@ -300,7 +315,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     // A terminal result wins over promotion even after the deadline. Keep the
     // command alive long enough for the engine to poll on a loaded runner.
-    const result = await callPluginBash(bash, h, { command: "sleep 5 && echo late" });
+    const result = await callPluginBash(bash, h, {
+      command: "sleep 5 && echo late",
+      description: "Print output after a delay",
+    });
 
     expect(result.output).toContain("promoted to background");
     // Server text rounds 25 ms to 0s, unlike the default wait of several seconds.
@@ -320,6 +338,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const result = await callPluginBash(bash, h, {
       command: "sleep 0.2 && echo waited",
+      description: "Wait briefly and print a marker",
       wait: true,
       timeout: 5_000,
     });
@@ -341,6 +360,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const resultPromise = callPluginBash(bash, h, {
       command: WAIT_DETACH_COMMAND,
+      description: "Run the wait-detach probe",
       wait: true,
       timeout: 10_000,
     });
@@ -373,6 +393,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const result = await callPluginBash(bash, h, {
       command: "sleep 0.2 && echo background-done",
+      description: "Print a background completion marker",
       background: true,
     });
 
@@ -399,7 +420,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
         }),
       },
     } as unknown as PluginContext["client"];
-    const launched = await callPluginBash(bash, h, { command: "sleep 30", background: true });
+    const launched = await callPluginBash(bash, h, {
+      command: "sleep 30",
+      description: "Start a long background task",
+      background: true,
+    });
     const taskId = String(launched.metadata.taskId);
     const watch = createBashWatchTool(ctx);
     let metadata: Record<string, unknown> = {};
@@ -455,7 +480,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     const subdir = h.path("subdir");
     await mkdir(subdir);
 
-    const result = await callPluginBash(bash, h, { command: "pwd", workdir: subdir });
+    const result = await callPluginBash(bash, h, {
+      command: "pwd",
+      description: "Print the working directory",
+      workdir: subdir,
+    });
 
     const [cwd, taskLine] = result.output.trim().split("\n");
     expect(cwd).toBe(await realPath(subdir));
@@ -468,7 +497,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     async () => {
       const h = await harness();
 
-      const response = await bridgeBashToTerminal(h, { command: "sleep 5", timeout: 100 });
+      const response = await bridgeBashToTerminal(h, {
+        command: "sleep 5",
+        description: "Wait past the command timeout",
+        timeout: 100,
+      });
 
       expect(response.success).toBe(true);
       expect(response.status).toBe("timed_out");
@@ -484,6 +517,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const response = await h.bridge.send("bash", {
       command: `cat ${filePath}`,
+      description: "Read the test file",
       compressed: false,
     });
 
@@ -501,6 +535,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const response = await h.bridge.send("bash", {
       command: `grep -r needle ${h.path("src")}`,
+      description: "Search test files for the needle",
       compressed: false,
     });
 
@@ -518,6 +553,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const response = await bridgeBashToTerminal(h, {
       command: `cat ${filePath}`,
+      description: "Read the test file",
       compressed: false,
     });
 
@@ -533,6 +569,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
       const response = await bridgeBashToTerminal(h, {
         command: "printf '\\033[31mred\\033[0m\\nred\\nred\\nred\\nred\\n'",
+        description: "Print repeated colored lines",
       });
 
       expect(response.success).toBe(true);
@@ -543,7 +580,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
   test("git status compressor summarizes large status sections", async () => {
     const h = await harness({ experimental_bash_compress: true });
-    await bridgeBashToTerminal(h, { command: "git init -q -b main", compressed: false });
+    await bridgeBashToTerminal(h, {
+      command: "git init -q -b main",
+      description: "Initialize the test repository",
+      compressed: false,
+    });
     // Status compressor only triggers when output exceeds STATUS_SHORT_LIMIT (1024B);
     // 50 files with longer names easily clears that threshold and exercises the
     // STATUS_KEEP_PER_SECTION (10) truncation path.
@@ -551,7 +592,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       await writeFile(h.path(`untracked_file_with_long_name_${index}.txt`), `${index}\n`, "utf8");
     }
 
-    const response = await bridgeBashToTerminal(h, { command: "git status" });
+    const response = await bridgeBashToTerminal(h, {
+      command: "git status",
+      description: "Show git status",
+    });
 
     expect(response.success).toBe(true);
     expect(String(response.output_preview)).toContain("Untracked files:");
@@ -563,12 +607,20 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
   test("compressed false opts out of git status compression", async () => {
     const h = await harness({ experimental_bash_compress: true });
-    await bridgeBashToTerminal(h, { command: "git init -q -b main", compressed: false });
+    await bridgeBashToTerminal(h, {
+      command: "git init -q -b main",
+      description: "Initialize the test repository",
+      compressed: false,
+    });
     for (let index = 0; index < 15; index++) {
       await writeFile(h.path(`raw_${index}.txt`), `${index}\n`, "utf8");
     }
 
-    const response = await bridgeBashToTerminal(h, { command: "git status", compressed: false });
+    const response = await bridgeBashToTerminal(h, {
+      command: "git status",
+      description: "Show uncompressed git status",
+      compressed: false,
+    });
 
     expect(response.success).toBe(true);
     expect(String(response.output_preview)).toContain("raw_14.txt");
@@ -582,6 +634,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
       const response = await h.bridge.send("bash", {
         command: "sleep 1 && echo done",
+        description: "Print a delayed completion marker",
         background: true,
       });
 
@@ -601,6 +654,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       const h = await harness({ experimental_bash_background: true });
       const spawned = await h.bridge.send("bash", {
         command: "sleep 0.3 && echo done",
+        description: "Print a background completion marker",
         background: true,
       });
       const taskId = String(spawned.task_id);
@@ -621,7 +675,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     "bash_kill terminates a running task",
     async () => {
       const h = await harness({ experimental_bash_background: true });
-      const spawned = await h.bridge.send("bash", { command: "sleep 60", background: true });
+      const spawned = await h.bridge.send("bash", {
+        command: "sleep 60",
+        description: "Start a task to terminate",
+        background: true,
+      });
       const taskId = String(spawned.task_id);
 
       const killed = await h.bridge.send("bash_kill", { task_id: taskId });
@@ -649,6 +707,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     );
     const spawned = await h.bridge.send("bash", {
       command: "echo bg-done | tee bg-marker.txt",
+      description: "Write the background completion marker",
       background: true,
     });
     const taskId = String(spawned.task_id);
@@ -656,7 +715,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     // task, so the wait and the test's own timeout leave room for that.
     await waitForFileText(join(h.tempDir, "bg-marker.txt"), "bg-done", 30_000);
 
-    const result = await callPluginBash(bash, h, { command: "echo foreground" });
+    const result = await callPluginBash(bash, h, {
+      command: "echo foreground",
+      description: "Print the foreground marker",
+    });
 
     expect(eol(result.output)).toContain("foreground\n");
     expect(result.output).not.toContain("Background tasks completed:");
@@ -675,7 +737,12 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       // cannot turn the intended command failure into a successful status query,
       // and bridge configuration still sees an ordinary project directory.
       const command = "git --git-dir=missing-repository status";
-      const result = await callPluginBash(bash, h, { command }, { ask });
+      const result = await callPluginBash(
+        bash,
+        h,
+        { command, description: "Check a missing git repository" },
+        { ask },
+      );
 
       // Real git status fails on the missing repository — exit 128 surfaces
       // in the agent-visible output AND in the metadata.
@@ -730,7 +797,12 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
         askInvoked = true;
       }) as ToolContext["ask"];
 
-      const result = await callPluginBash(bash, h, { command: "echo allowed" }, { ask });
+      const result = await callPluginBash(
+        bash,
+        h,
+        { command: "echo allowed", description: "Print the allowed marker" },
+        { ask },
+      );
 
       expect(askInvoked).toBe(true);
       // CRLF-tolerant: PowerShell emits "allowed\r\n" on Windows. The permission
@@ -757,7 +829,12 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
       let captured: unknown;
       try {
-        await callPluginBash(bash, h, { command: "echo should-not-run" }, { ask });
+        await callPluginBash(
+          bash,
+          h,
+          { command: "echo should-not-run", description: "Run the denied probe" },
+          { ask },
+        );
         throw new Error("expected bash.execute to throw on deny");
       } catch (err) {
         captured = err;
@@ -784,6 +861,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       // does NOT trigger when patterns are already trusted.
       const response = await h.bridge.send("bash", {
         command: "git status",
+        description: "Show git status",
         permissions_requested: true,
         permissions_granted: ["git status *"],
       });
@@ -812,7 +890,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       await callPluginBash(
         bash,
         h,
-        { command: "find . | xargs grep foo" },
+        {
+          command: "find . | xargs grep foo",
+          description: "Search the test files using a pipeline",
+        },
         { ask: ask as unknown as ToolContext["ask"] },
       );
 
@@ -849,7 +930,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
         await callPluginBash(
           bash,
           h,
-          { command: "((i++))" },
+          { command: "((i++))", description: "Evaluate a Bash arithmetic expression" },
           { ask: ask as unknown as ToolContext["ask"] },
         );
       } catch (err) {
@@ -893,7 +974,7 @@ test("OpenCode executes project-enabled host fallback when the bridge binary is 
       process.platform === "win32"
         ? `${JSON.stringify(process.execPath)} -e "process.stdout.write('e2e-host-fallback')"`
         : "printf e2e-host-fallback";
-    const result = await bash.execute({ command }, {
+    const result = await bash.execute({ command, description: "Print the host fallback marker" }, {
       sessionID: "fallback-e2e",
       messageID: "message",
       agent: "agent",

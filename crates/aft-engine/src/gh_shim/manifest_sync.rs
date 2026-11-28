@@ -5,7 +5,117 @@ use super::manifest_wire::{Latest, Notice, Report};
 use super::*;
 use crate::secret::transport::ManagementSession;
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+
+const PIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+type ReadRoot = dyn Fn()
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<trust_root::Reply, ()>> + Send>>
+    + Send
+    + Sync;
+
+#[derive(Default)]
+struct MissingListNotice {
+    seen: bool,
+    missing: bool,
+    enabled_route: bool,
+    warned: bool,
+}
+
+enum ListEvent {
+    Missing,
+    Available,
+    EnabledRoute,
+}
+
+impl MissingListNotice {
+    fn observe(&mut self, event: ListEvent) -> (bool, bool) {
+        let first_missing = matches!(event, ListEvent::Missing) && !self.seen;
+        match event {
+            ListEvent::Missing => {
+                self.seen = true;
+                self.missing = true;
+            }
+            ListEvent::Available => self.missing = false,
+            ListEvent::EnabledRoute => self.enabled_route = true,
+        }
+        let warn = self.enabled_route && self.missing && !self.warned;
+        self.warned |= warn;
+        (first_missing, warn)
+    }
+}
+
+static LIST_NOTICE: std::sync::LazyLock<Mutex<MissingListNotice>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+fn note_list(event: ListEvent) {
+    let (debug, warn) = LIST_NOTICE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .observe(event);
+    if debug {
+        log::debug!("The vault has no GitHub routing list available to this installation");
+    }
+    if warn {
+        log::warn!("An enabled GitHub shim cannot fetch its routing list from the vault");
+    }
+}
+
+fn note_enabled_route() {
+    note_list(ListEvent::EnabledRoute);
+}
+
+struct RootRefresh<'a> {
+    read: &'a ReadRoot,
+    generation: tokio::sync::watch::Sender<Option<u64>>,
+    // Serialize the read and its publication: a slow older response must not
+    // overwrite a later pin read by the periodic or pre-activation refresh.
+    serial: tokio::sync::Mutex<()>,
+}
+
+impl<'a> RootRefresh<'a> {
+    fn new(read: &'a ReadRoot) -> Self {
+        Self {
+            read,
+            generation: tokio::sync::watch::Sender::new(None),
+            serial: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    async fn refresh(&self, paths: &StatePaths) -> Result<u64, Failure> {
+        let _guard = self.serial.lock().await;
+        let reply = tokio::time::timeout(Duration::from_secs(5), (self.read)())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| Failure::new("policy_root_unavailable", true))?;
+        let trust_root::Reply::Root { generation, .. } = &reply;
+        let generation = *generation;
+        trust_root::publish(paths, reply, unix_seconds())
+            .map_err(|_| Failure::new("store_error", true))?;
+        self.generation.send_if_modified(|seen| {
+            if *seen == Some(generation) {
+                return false;
+            }
+            *seen = Some(generation);
+            true
+        });
+        Ok(generation)
+    }
+
+    async fn poll(&self, paths: &StatePaths) {
+        let mut interval = tokio::time::interval(PIN_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(failure) = self.refresh(paths).await {
+                failure.record();
+            } else {
+                let _ = local_report(paths, unix_seconds());
+            }
+        }
+    }
+}
 
 #[derive(Clone, Default, Serialize)]
 struct Health {
@@ -52,10 +162,14 @@ fn digest(bytes: &str) -> String {
 fn problem_reason(problem: &ManifestProblem) -> &'static str {
     match problem {
         ManifestProblem::Missing => "manifest missing",
+        ManifestProblem::NoTrustRoot => "no pinned policy root",
         ManifestProblem::RolledBack { .. } => "manifest below high-water version",
         ManifestProblem::BelowFloor { .. } => "manifest below schema floor",
         ManifestProblem::Invalid(reason) if reason.starts_with("untrusted manifest key id") => {
             "untrusted manifest key"
+        }
+        ManifestProblem::Invalid(reason) if reason.starts_with("retired manifest key id") => {
+            "retired manifest key"
         }
         ManifestProblem::Invalid(reason) if reason == "detached signature verification failed" => {
             "detached signature verification failed"
@@ -150,9 +264,6 @@ fn activate(paths: &StatePaths, latest: &Latest, now: u64) -> Option<Report> {
             ))
         }
     };
-    if latest.version <= version_high_water(paths) {
-        return current;
-    }
     let envelope = SignedManifest {
         artifact_id: MANIFEST_ARTIFACT_ID.into(),
         envelope_version: ENVELOPE_VERSION,
@@ -161,11 +272,12 @@ fn activate(paths: &StatePaths, latest: &Latest, now: u64) -> Option<Report> {
         signature: latest.envelope.signature.clone(),
         manifest_bytes: latest.envelope.manifest_bytes.clone(),
     };
-    let verified =
-        match validate_manifest_candidate(paths, &envelope, now, compiled_manifest_trust_set()) {
-            Ok(verified) => verified,
-            Err(problem) => return Some(candidate_report(latest, problem_reason(&problem))),
-        };
+    let verified = match trust_root::read_daemon(paths)
+        .and_then(|pin| validate_manifest_candidate(paths, &envelope, now, &pin))
+    {
+        Ok(verified) => verified,
+        Err(problem) => return Some(candidate_report(latest, problem_reason(&problem))),
+    };
     if latest.version == 0 || verified.manifest.manifest_version != latest.version {
         return Some(candidate_report(
             latest,
@@ -188,6 +300,7 @@ struct Cursor {
     seq: u64,
     read_version: Option<u64>,
     read_sha256: Option<String>,
+    pin_generation: Option<u64>,
 }
 
 impl Cursor {
@@ -218,6 +331,7 @@ impl Failure {
             "not_found" => "not_found",
             "home_unavailable" => "home_unavailable",
             "store_error" => "store_error",
+            "policy_root_unavailable" => "policy_root_unavailable",
             "remote_setup_incomplete" => "remote_setup_incomplete",
             "secret_setup_incomplete" => "secret_setup_incomplete",
             "invalid_params" => "invalid_params",
@@ -235,7 +349,7 @@ impl Failure {
     }
 
     fn stop(self) -> bool {
-        matches!(self.code, "unknown_method" | "not_found")
+        self.code == "unknown_method"
     }
 
     fn record(self) {
@@ -334,6 +448,7 @@ async fn latest(session: &ManagementSession) -> Result<Latest, Failure> {
     if latest.version == 0 {
         return Err(Failure::new("transport_unavailable", true));
     }
+    note_list(ListEvent::Available);
     let mut health = HEALTH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -344,6 +459,7 @@ async fn latest(session: &ManagementSession) -> Result<Latest, Failure> {
 async fn refresh(
     session: &ManagementSession,
     paths: &StatePaths,
+    root: &RootRefresh<'_>,
     cursor: &mut Cursor,
     notice: Option<&Notice>,
 ) -> Result<Option<Report>, Failure> {
@@ -358,24 +474,28 @@ async fn refresh(
     if disagrees(&fetched) {
         fetched = latest(session).await?;
         if disagrees(&fetched) {
-            cursor.read_version = Some(fetched.version);
-            cursor.read_sha256 = Some(digest(&fetched.envelope.manifest_bytes));
             return Ok(Some(candidate_report(
                 &fetched,
                 "digest differs from the vault's notice",
             )));
         }
     }
-    cursor.read_version = Some(fetched.version);
-    cursor.read_sha256 = Some(digest(&fetched.envelope.manifest_bytes));
-    Ok(activate(paths, &fetched, unix_seconds()))
+    let generation = root.refresh(paths).await?;
+    cursor.pin_generation = Some(generation);
+    let activated = activate(paths, &fetched, unix_seconds());
+    let digest = digest(&fetched.envelope.manifest_bytes);
+    if activated.as_ref().is_some_and(|report| {
+        report.verdict == "valid"
+            && report.version == fetched.version
+            && report.payload_sha256 == digest
+    }) {
+        cursor.read_version = Some(fetched.version);
+        cursor.read_sha256 = Some(digest);
+    }
+    Ok(activated)
 }
 
-async fn run(connection_file: PathBuf, paths: StatePaths) {
-    run_with(paths, || ManagementSession::connect(&connection_file)).await;
-}
-
-async fn run_with<F, Fut>(paths: StatePaths, mut connect: F)
+async fn run_with<F, Fut>(paths: &StatePaths, root: &RootRefresh<'_>, mut connect: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<ManagementSession, ()>>,
@@ -392,15 +512,16 @@ where
             }
         };
         let mut cursor = Cursor::default();
+        let mut generations = root.generation.subscribe();
         let result: Result<(), Failure> = async {
             if let Some(pending) = pending_report.as_ref() {
                 report(&session, pending).await?;
                 pending_report = None;
             }
-            let first = refresh(&session, &paths, &mut cursor, None).await;
+            let first = refresh(&session, paths, root, &mut cursor, None).await;
             if let Err(failure) = first {
                 if failure.stop() {
-                    if let Some(current) = local_report(&paths, unix_seconds()) {
+                    if let Some(current) = local_report(paths, unix_seconds()) {
                         let _ = report(&session, &current).await;
                     }
                 }
@@ -416,7 +537,22 @@ where
                 .await
                 .map_err(Failure::transport)?;
             loop {
-                let Some(bytes) = subscription.events().recv().await else {
+                let event = tokio::select! {
+                    event = subscription.events().recv() => event,
+                    changed = generations.changed() => {
+                        changed.map_err(|_| Failure::new("policy_root_unavailable", true))?;
+                        let generation = *generations.borrow_and_update();
+                        if generation != cursor.pin_generation {
+                            pending_report = refresh(&session, paths, root, &mut cursor, None).await?;
+                            if let Some(pending) = pending_report.as_ref() {
+                                report(&session, pending).await?;
+                                pending_report = None;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let Some(bytes) = event else {
                     // The SDK closes this receiver after a normal STREAM_END
                     // frame or a lost watch. Reconnect always reads latest anew.
                     return match subscription.closed().await {
@@ -445,7 +581,8 @@ where
                 let hash_differs = notice.version == cursor.read_version
                     && notice.manifest_sha256 != cursor.read_sha256;
                 if cursor.observe(&notice) || hash_differs {
-                    pending_report = refresh(&session, &paths, &mut cursor, Some(&notice)).await?;
+                    pending_report =
+                        refresh(&session, paths, root, &mut cursor, Some(&notice)).await?;
                     if let Some(pending) = pending_report.as_ref() {
                         report(&session, pending).await?;
                         pending_report = None;
@@ -457,6 +594,16 @@ where
         session.close().await;
         if let Err(failure) = result {
             failure.record();
+            if failure.code == "not_found" {
+                note_list(ListEvent::Missing);
+                pending_report = None;
+                let mut generations = root.generation.subscribe();
+                tokio::select! {
+                    _ = tokio::time::sleep(PIN_REFRESH_INTERVAL) => {},
+                    _ = generations.changed() => {},
+                }
+                continue;
+            }
             if failure.stop() {
                 log::info!("manifest sync stopped: {}", failure.code);
                 return;
@@ -470,38 +617,83 @@ where
 #[doc(hidden)]
 pub struct Worker {
     _stop: tokio::sync::oneshot::Sender<()>,
+    ready: Arc<tokio::sync::Notify>,
+    activated: AtomicBool,
+}
+
+// Shell launches can wake the attached worker without keeping it alive
+// after the daemon connection closes.
+static ATTACHED_WORKER: Mutex<Weak<Worker>> = Mutex::new(Weak::new());
+
+impl Worker {
+    pub fn activate(&self) {
+        if !self.activated.swap(true, Ordering::AcqRel) {
+            note_enabled_route();
+            self.ready.notify_one();
+        }
+    }
+}
+
+pub(crate) fn activate_for_launch() {
+    let worker = ATTACHED_WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .upgrade();
+    if let Some(worker) = worker {
+        worker.activate();
+    }
 }
 
 /// Called only by subc startup after registration, never by a standalone shim.
 #[doc(hidden)]
-pub fn start(connection_file: PathBuf) -> Option<Worker> {
+pub fn start(
+    connection_file: PathBuf,
+    read_root: impl Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<trust_root::Reply, ()>> + Send>,
+        > + Send
+        + Sync
+        + 'static,
+) -> Option<Arc<Worker>> {
     if !aft_base::registration::module_consumer_allowed()
         || aft_base::registration::module_id().as_deref() != Some("aft")
     {
         return None;
     }
+    Some(spawn_worker(connection_file, Box::new(read_root)))
+}
+
+fn spawn_worker(connection_file: PathBuf, read_root: Box<ReadRoot>) -> Arc<Worker> {
     let (stop, stopped) = tokio::sync::oneshot::channel();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let bound = ready.clone();
     std::thread::spawn(move || {
-        if enable_gate::gh_shim_enabled_from_config_doc(&read_user_config_doc().unwrap_or_default())
-            == Some(false)
-        {
-            return;
-        }
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
-            let paths = StatePaths::from_process();
-            let _ = local_report(&paths, unix_seconds());
             runtime.block_on(async {
                 tokio::select! {
                     _ = stopped => {},
-                    _ = run(connection_file, paths) => {},
+                    _ = async {
+                        // An enabled bind or shell launch can start policy sync.
+                        bound.notified().await;
+                        let paths = StatePaths::from_process().for_daemon();
+                        let root = RootRefresh::new(read_root.as_ref());
+                        tokio::join!(root.poll(&paths), run_with(&paths, &root, || ManagementSession::connect(&connection_file)));
+                    } => {},
                 }
             });
         }
     });
-    Some(Worker { _stop: stop })
+    let worker = Arc::new(Worker {
+        _stop: stop,
+        ready,
+        activated: AtomicBool::new(false),
+    });
+    *ATTACHED_WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&worker);
+    worker
 }
 
 #[cfg(test)]

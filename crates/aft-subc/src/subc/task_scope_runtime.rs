@@ -73,7 +73,7 @@ pub(super) fn run_subc_mode_with_probe(
         dispatch,
         user_config_path,
         false,
-        MAX_FRAME_BODY_LEN as usize,
+        wire::CLIENT_REPLY_BODY_LIMIT,
         lifecycle_probe,
         registration,
     )

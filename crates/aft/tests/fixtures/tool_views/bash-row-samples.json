@@ -1,0 +1,40 @@
+[
+  {
+    "input": {
+      "command": "cd X && printf '%s\\n' BEGIN alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu END"
+    },
+    "title": "printf '%s\\n' BEGIN alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu END"
+  },
+  {
+    "input": { "command": "cd X; printf ok; printf done" },
+    "title": "printf ok; printf done"
+  },
+  {
+    "input": { "command": "cd 'my worktree' && printf ok" },
+    "title": "cd 'my worktree' && printf ok"
+  },
+  {
+    "input": { "command": "cd X && cd Y && printf ok" },
+    "title": "cd Y && printf ok"
+  },
+  {
+    "input": { "command": "cd X" },
+    "title": "cd X"
+  },
+  {
+    "input": { "command": "cd X;" },
+    "title": "cd X;"
+  },
+  {
+    "input": { "command": "printf start; cd X && printf end" },
+    "title": "printf start; cd X && printf end"
+  },
+  {
+    "input": { "command": "cd $HOME && printf ok" },
+    "title": "cd $HOME && printf ok"
+  },
+  {
+    "input": { "command": "cd X && printf ok", "description": "Print the requested test output" },
+    "title": "Print the requested test output"
+  }
+]
