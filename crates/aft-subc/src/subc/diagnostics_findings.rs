@@ -318,7 +318,7 @@ fn from_health_with_budget(
             now,
             &outage.summary(),
             vec![json!({"reason": outage.reason, "roots": outage.reason_count})],
-            "Read health metrics.index_plane_counts and the affected roots' index details.",
+            "See index_plane_counts in AFT's health report, and each project's index details.",
         ));
     }
     // Omitted diagnostic evidence is still unknown. The caller must supply the

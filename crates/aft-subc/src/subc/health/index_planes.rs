@@ -150,6 +150,7 @@ pub(super) struct IndexPlaneOutageTracker(Mutex<[Option<u64>; 3]>);
 #[derive(Clone)]
 pub(in crate::subc) struct IndexPlaneOutage {
     pub plane: &'static str,
+    label: &'static str,
     pub root_count: usize,
     pub reason: &'static str,
     pub reason_count: usize,
@@ -159,8 +160,8 @@ pub(in crate::subc) struct IndexPlaneOutage {
 impl IndexPlaneOutage {
     pub fn summary(&self) -> String {
         format!(
-            "The {} index plane has had no ready or building roots for over one hour (most common reason: {}).",
-            self.plane, self.reason,
+            "{} has not been ready on any open project for over an hour (most common reason: {}).",
+            self.label, self.reason,
         )
     }
 }
@@ -169,13 +170,13 @@ impl IndexPlaneOutageTracker {
     pub(super) fn observe(&self, counts: &IndexPlaneCounts, now_ms: u64) -> Vec<IndexPlaneOutage> {
         let mut starts = self.0.lock().unwrap_or_else(|error| error.into_inner());
         [
-            ("trigram", &counts.search_index),
-            ("semantic", &counts.semantic_index),
-            ("callgraph", &counts.callgraph_store),
+            ("trigram", "Text search", &counts.search_index),
+            ("semantic", "Meaning search", &counts.semantic_index),
+            ("callgraph", "The call graph", &counts.callgraph_store),
         ]
         .into_iter()
         .zip(starts.iter_mut())
-        .filter_map(|((plane, counts), start)| {
+        .filter_map(|((plane, label, counts), start)| {
             if counts.enabled_roots == 0 || counts.has_progress {
                 *start = None;
                 return None;
@@ -195,6 +196,7 @@ impl IndexPlaneOutageTracker {
                 .max_by_key(|(_, count)| **count)?;
             Some(IndexPlaneOutage {
                 plane,
+                label,
                 root_count: counts.enabled_roots,
                 reason,
                 reason_count,
@@ -341,6 +343,14 @@ mod tests {
                 ("trigram", 3, disk, 2),
                 ("callgraph", 1, "git_identity_unavailable", 1),
             ]
+        );
+        assert_eq!(
+            outages[0].summary(),
+            "Text search has not been ready on any open project for over an hour (most common reason: disk_reserve)."
+        );
+        assert_eq!(
+            outages[1].summary(),
+            "The call graph has not been ready on any open project for over an hour (most common reason: git_identity_unavailable)."
         );
     }
 

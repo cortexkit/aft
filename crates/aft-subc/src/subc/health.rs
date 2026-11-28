@@ -3377,7 +3377,7 @@ mod findings_snapshot_tests {
         assert!(outages.is_empty() && outages_at_hour.is_empty());
 
         let (health, outages) = check(start + hour + 1);
-        let summary = "The semantic index plane has had no ready or building roots for over one hour (most common reason: runtime_not_observed).";
+        let summary = "Meaning search has not been ready on any open project for over an hour (most common reason: runtime_not_observed).";
         assert_eq!(health.status, HealthStatus::Degraded);
         assert_eq!(health.detail.as_deref(), Some(summary));
         assert_eq!(outages.len(), 1, "{outages:?}");
@@ -3385,6 +3385,10 @@ mod findings_snapshot_tests {
         assert_eq!(outages[0]["severity"], "error");
         assert_eq!(outages[0]["first_seen_ms"], 10_000_000 + start);
         assert_eq!(outages[0]["summary"], summary);
+        assert_eq!(
+            outages[0]["hint"],
+            "See index_plane_counts in AFT's health report, and each project's index details."
+        );
         assert_eq!(
             outages[0]["samples"],
             json!([{ "reason":"runtime_not_observed", "roots":1 }])
