@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2e0f9e2c2611e83760ea9a77f190121c4ecc7c5cdf575284bd70ae2db7ed03c8",
-      "catalog_digest": "2e0f9e2c2611e83760ea9a77f190121c4ecc7c5cdf575284bd70ae2db7ed03c8",
+      "generation": "c24f2bd7645d25c75564554c8b4a4ba23e337f352c60dddc2695fa0014bede87",
+      "catalog_digest": "c24f2bd7645d25c75564554c8b4a4ba23e337f352c60dddc2695fa0014bede87",
       "tools": [
         {
           "name": "status",
@@ -1240,8 +1240,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ba442f7ab7ad20fbbd696e8721529ebf245e36fabe20321b8975a834506b57ba",
-      "catalog_digest": "ba442f7ab7ad20fbbd696e8721529ebf245e36fabe20321b8975a834506b57ba",
+      "generation": "0a5c4a2499b0b7606dcfb4485e8812ea39b4904bf15928f30c4e8e979e0591df",
+      "catalog_digest": "0a5c4a2499b0b7606dcfb4485e8812ea39b4904bf15928f30c4e8e979e0591df",
       "tools": [
         {
           "name": "status",
@@ -2466,8 +2466,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "06ec2fc15c4b4c17290c89080e4f0d414828a7521a444a94ccced4b2a86c27e1",
-      "catalog_digest": "06ec2fc15c4b4c17290c89080e4f0d414828a7521a444a94ccced4b2a86c27e1",
+      "generation": "f8c1bee423a3c4e18fbac92239d81160a4b938f4c6dcef0428106378462bc131",
+      "catalog_digest": "f8c1bee423a3c4e18fbac92239d81160a4b938f4c6dcef0428106378462bc131",
       "tools": [
         {
           "name": "status",
@@ -4786,8 +4786,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8dee01796723acedb037e66bbc0d3cec959063968abbb09e43e44b603205156f",
-      "catalog_digest": "8dee01796723acedb037e66bbc0d3cec959063968abbb09e43e44b603205156f",
+      "generation": "1425db72362095b3ad96f28eac61f63cba7f0bf1b5d472c271048344a37b4895",
+      "catalog_digest": "1425db72362095b3ad96f28eac61f63cba7f0bf1b5d472c271048344a37b4895",
       "tools": [
         {
           "name": "status",
@@ -7080,8 +7080,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c9a3eb8502d446dc7b225c52484065fd9bfa3f3d2f1e95376437ec88de689f62",
-      "catalog_digest": "c9a3eb8502d446dc7b225c52484065fd9bfa3f3d2f1e95376437ec88de689f62",
+      "generation": "49a633b473ff04c50c97bb7fc7056ffca70fce494d19fd384c4fd427c52e799e",
+      "catalog_digest": "49a633b473ff04c50c97bb7fc7056ffca70fce494d19fd384c4fd427c52e799e",
       "tools": [
         {
           "name": "status",
@@ -9306,8 +9306,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "0edc7818bf30cff756a9539bd946735f6e92592fb9586f31de0f01964bcba165",
-      "catalog_digest": "0edc7818bf30cff756a9539bd946735f6e92592fb9586f31de0f01964bcba165",
+      "generation": "3c0e721fcc4987bc0da9c5e89539d4fe3100465413834e3d28dd6242c23a49ff",
+      "catalog_digest": "3c0e721fcc4987bc0da9c5e89539d4fe3100465413834e3d28dd6242c23a49ff",
       "tools": [
         {
           "name": "status",
@@ -10411,8 +10411,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1611db7a681091f3f81586c2a4714d0a16d2d2c2caa9cc55a4d569391222c89b",
-      "catalog_digest": "1611db7a681091f3f81586c2a4714d0a16d2d2c2caa9cc55a4d569391222c89b",
+      "generation": "cb5e6638bef57ab6ddd74a56c2163f90ea03f88e1eadd1522daabe8977e50ceb",
+      "catalog_digest": "cb5e6638bef57ab6ddd74a56c2163f90ea03f88e1eadd1522daabe8977e50ceb",
       "tools": [
         {
           "name": "status",
@@ -11710,8 +11710,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "fbf12e3001b8b57ae8fd088160d7a0729d446d75d80d8480b6301322647d2d32",
-      "catalog_digest": "fbf12e3001b8b57ae8fd088160d7a0729d446d75d80d8480b6301322647d2d32",
+      "generation": "1296f219a7888d323553eb75f7b1195e0d12884ac51d0c75695abe68dfd4441e",
+      "catalog_digest": "1296f219a7888d323553eb75f7b1195e0d12884ac51d0c75695abe68dfd4441e",
       "tools": [
         {
           "name": "status",
@@ -13011,8 +13011,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "620e6ad226ebdf1877d24ec0711f9afe2a5359263d1808629e7fa0af6cb134c7",
-      "catalog_digest": "620e6ad226ebdf1877d24ec0711f9afe2a5359263d1808629e7fa0af6cb134c7",
+      "generation": "68bda1459aa71b918cdff8210992c8613cf89ddb62f4c956888c645f78616e70",
+      "catalog_digest": "68bda1459aa71b918cdff8210992c8613cf89ddb62f4c956888c645f78616e70",
       "tools": [
         {
           "name": "status",
@@ -15481,8 +15481,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d347dc67e76a0949d8f4bf879a14ea71e60faf15dce6042084b2b98fd3da4eaa",
-      "catalog_digest": "d347dc67e76a0949d8f4bf879a14ea71e60faf15dce6042084b2b98fd3da4eaa",
+      "generation": "7de43dc7ffd5588930e531901620ec4894e709d99ecab57d1be3a24cc7039912",
+      "catalog_digest": "7de43dc7ffd5588930e531901620ec4894e709d99ecab57d1be3a24cc7039912",
       "tools": [
         {
           "name": "status",
@@ -17925,8 +17925,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f53a680aa13d89104bd767b92b9d63df7b5860cdfd5742c25c01648045f3985e",
-      "catalog_digest": "f53a680aa13d89104bd767b92b9d63df7b5860cdfd5742c25c01648045f3985e",
+      "generation": "2ba370bee475cd469c2269369204d46d58ab9c74d19e4799b6a0185ffbdf8068",
+      "catalog_digest": "2ba370bee475cd469c2269369204d46d58ab9c74d19e4799b6a0185ffbdf8068",
       "tools": [
         {
           "name": "status",
@@ -20301,8 +20301,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "89aca621a33661330a5180193afc30fce271812212d43309cf5c91806f3ee303",
-      "catalog_digest": "89aca621a33661330a5180193afc30fce271812212d43309cf5c91806f3ee303",
+      "generation": "b682eb138aab1ac8bcd436868d8d26db449d08342fe773d38dfb6bdd9b12b92d",
+      "catalog_digest": "b682eb138aab1ac8bcd436868d8d26db449d08342fe773d38dfb6bdd9b12b92d",
       "tools": [
         {
           "name": "status",

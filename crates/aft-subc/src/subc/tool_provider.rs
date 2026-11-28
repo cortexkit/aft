@@ -5268,7 +5268,10 @@ mod tests {
             std::path::Path::new(crate::test_support::manifest_dir()).join(NOTICE_TEMPLATE_VECTORS);
         std::fs::create_dir_all(&root).unwrap();
         for (path, text) in notice_template_vectors() {
-            std::fs::write(root.join(path), text).unwrap();
+            let path = root.join(path);
+            if std::fs::read_to_string(&path).as_deref().ok() != Some(text.as_str()) {
+                std::fs::write(path, text).unwrap();
+            }
         }
     }
 
