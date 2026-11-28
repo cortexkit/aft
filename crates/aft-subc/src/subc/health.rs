@@ -32,7 +32,9 @@ mod reply_tracking;
 mod root_evidence;
 pub(super) use reply_tracking::bash_watch_warning_wait_ms;
 use reply_tracking::UnansweredTool;
-use root_evidence::{health_failure_evidence, health_failure_field, health_nondefault};
+use root_evidence::{
+    health_failure_evidence, health_failure_field, health_nondefault, root_findings_evidence,
+};
 
 const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
     "executor scheduler state could not be snapshotted without contention";
@@ -3405,6 +3407,91 @@ mod findings_snapshot_tests {
     }
 
     #[test]
+    fn index_plane_outage_not_opened_requires_an_installed_meaning_opener() {
+        use crate::context::SemanticIndexStatus;
+        use crate::subc::test_support::{route_identity_with_harness, test_ctx, test_root};
+        use crate::subc::{remove_route_channel, route_delivery, route_key, BindTrust};
+
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let (_dir, root) = test_root("semantic-not-opened-rollup");
+        let ctx = test_ctx();
+        ctx.update_config(|config| {
+            config.indexes.semantic = true;
+            config.indexes.trigram = false;
+            config.indexes.callgraph = false;
+        });
+        *ctx.semantic_index_status().write().unwrap() =
+            SemanticIndexStatus::Failed(crate::semantic_admission::NOT_OPENED_STATUS.to_owned());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+
+        let mut routes = HashMap::new();
+        let mut channels = HashMap::new();
+        let mut install = |channel, kind| {
+            let mut route =
+                route_identity_with_harness(&root, kind, BindTrust::FirstParty, "runner");
+            Arc::get_mut(&mut route.0).unwrap().scope = Some(
+                serde_json::from_value(json!({
+                    "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+                    "ref": kind, "scope_epoch": 1, "kind": kind, "owner_authorized": true,
+                }))
+                .unwrap(),
+            );
+            route_delivery::install_route(
+                &executor,
+                &app.route_delivery_sessions,
+                &mut routes,
+                &mut channels,
+                channel,
+                route,
+                &root,
+                &metrics,
+            );
+        };
+        let observe = |at_ms| {
+            cache.clock_ms.store(at_ms, Ordering::Relaxed);
+            cache.refresh_for_test(&executor, &app);
+            let rollup = cache.published_snapshot();
+            assert_eq!(
+                rollup.metrics["index_plane_counts"]["semantic_index"]["off"],
+                1
+            );
+            let findings = json!(cache.findings(10_000_000 + at_ms, 1));
+            let outage = findings
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|finding| {
+                    finding["check"] == "index_plane_outage" && finding["key"] == "semantic"
+                })
+                .cloned();
+            (rollup.status, outage)
+        };
+        let hour = 3_600_000;
+        install(route_key(1, 1), "worker");
+        assert_eq!(observe(0), (HealthStatus::Ok, None));
+        assert_eq!(observe(hour + 1), (HealthStatus::Ok, None));
+
+        let head = route_key(2, 1);
+        install(head, "head");
+        let head_started = hour + 2;
+        assert_eq!(observe(head_started), (HealthStatus::Ok, None));
+        assert_eq!(observe(head_started + hour), (HealthStatus::Ok, None));
+        let (status, outage) = observe(head_started + hour + 1);
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(
+            outage.unwrap()["samples"],
+            json!([{ "reason": "not_opened", "roots": 1 }])
+        );
+
+        remove_route_channel(&mut routes, &mut channels, head).unwrap();
+        assert_eq!(observe(head_started + hour + 2), (HealthStatus::Ok, None));
+        assert_eq!(routes.len(), 1);
+    }
+
+    #[test]
     fn diagnostics_findings_keep_last_snapshot_through_idle_interval_and_assembly() {
         let cache = HealthRollupCache::new();
         let executor = Executor::new();
@@ -4380,6 +4467,7 @@ fn build_health_diagnostic_rollup_from_actors(
             Some(config.indexes),
             ctx.artifact_identity_provisional_reason().as_deref(),
             backend_failure.is_some(),
+            ctx.has_meaning_opener(),
         );
         candidates.push(RootCandidate {
             refresh_counts: root_evidence::refresh_counts(&ctx),
@@ -4408,7 +4496,7 @@ fn build_health_diagnostic_rollup_from_actors(
             continue;
         }
         let health = unhosted_standing_health_snapshot(&standing);
-        index_plane_counts.add_root(&health, None, None, false);
+        index_plane_counts.add_root(&health, None, None, false, false);
         candidates.push(RootCandidate {
             refresh_counts: None,
             root_label: health.project_root.clone(),
@@ -4752,17 +4840,6 @@ fn build_health_diagnostic_rollup_from_actors(
         memory_census_at_ms,
         memory_census_answers,
     }
-}
-
-fn root_findings_evidence(health: &RootHealthSnapshot, evidence: &Value) -> Value {
-    json!({
-        "project_root": health.project_root,
-        "state": health.state,
-        "cache_unavailable_reason": health.cache_unavailable_reason,
-        "view_storage_reserve": health.view_storage_reserve,
-        "suspended_domains": health.suspended_domains,
-        "diagnostics_evidence": evidence,
-    })
 }
 
 /// How many roots with a failed index store the health summary names, in

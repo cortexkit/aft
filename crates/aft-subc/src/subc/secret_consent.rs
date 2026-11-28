@@ -949,7 +949,7 @@ pub(crate) fn with_secret_identity_for_test<R>(
     stamp: ScopeStamp,
     run: impl FnOnce() -> R,
 ) -> R {
-    let identity = RouteIdentity(Arc::new(test_identity_data(root, stamp)));
+    let identity = RouteIdentity::new(Arc::new(test_identity_data(root, stamp)));
     let _scopes = SecretScopeGuard::install(Some(call_scopes(&identity)));
     let _identity = SecretIdentityGuard::install(identity);
     run()
@@ -988,7 +988,7 @@ pub(crate) fn with_secret_bound_identity_for_test<R>(
     lifetime: ScopeStamp,
     run: impl FnOnce() -> R,
 ) -> R {
-    let head = RouteIdentity(Arc::new(test_identity_data(root, head)));
+    let head = RouteIdentity::new(Arc::new(test_identity_data(root, head)));
     let mut data = test_identity_data(root, lifetime);
     data.call_mode = CallMode::Codemode;
     data.run_owner = Some(Arc::new(super::codemode::RunOwner {
@@ -1008,7 +1008,7 @@ pub(crate) fn with_secret_bound_identity_for_test<R>(
         },
         run_principal: head.spawn_principal.clone(),
     }));
-    let identity = RouteIdentity(Arc::new(data));
+    let identity = RouteIdentity::new(Arc::new(data));
     let _scopes = SecretScopeGuard::install(Some(call_scopes(&identity)));
     let _identity = SecretIdentityGuard::install(identity);
     run()

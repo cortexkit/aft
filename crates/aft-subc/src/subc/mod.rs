@@ -240,8 +240,8 @@ mod fork_call;
 mod health;
 mod installed_routes;
 #[cfg(test)]
-use installed_routes::remove_root_channel;
-use installed_routes::{insert_route_channel, remove_route_channel, RootChannels};
+use installed_routes::{insert_route_channel, remove_root_channel};
+use installed_routes::{remove_route_channel, RootChannels, RouteIdentity};
 mod legacy_root;
 mod metadata_route;
 mod remote_calls;
@@ -1621,9 +1621,6 @@ struct RouteBindCompletion {
     corr: u64,
     flags: Flags,
 }
-
-#[derive(Debug, Clone)]
-struct RouteIdentity(Arc<RouteIdentityData>);
 
 #[derive(Default)]
 struct ManagementIdentity {
@@ -8223,7 +8220,7 @@ async fn handle_control_request(
                 }
             };
 
-            let route_identity = RouteIdentity(Arc::new(RouteIdentityData {
+            let route_identity = RouteIdentity::new(Arc::new(RouteIdentityData {
                 output_scope: Default::default(),
                 root: bind_root_id.clone(),
                 project_root: PathBuf::from(&bind_project_root),
@@ -13441,7 +13438,7 @@ pub(crate) mod test_support {
         ));
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), Arc::clone(&ctx));
-        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+        let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().into(),
@@ -14757,7 +14754,7 @@ pub(crate) mod test_support {
         trust: BindTrust,
         harness: &str,
     ) -> RouteIdentity {
-        RouteIdentity(Arc::new(RouteIdentityData {
+        RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
@@ -15903,15 +15900,23 @@ mod tests {
     fn deleted_root_with_bound_route_is_reclaimed_after_confirmation_and_routes_are_purged() {
         let (root_dir, root) = test_root("deleted-bound-root-reap");
         let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), test_ctx()));
-        root_dir.close().expect("delete project root");
+        let ctx = test_ctx();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
 
         let route = route_key(19, 3);
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
         let cancel_signal = PersistentCancelSignal::new();
-        let mut routes = HashMap::from([(route, route_identity(&root, "deleted-route"))]);
-        let mut root_channels =
-            RootChannels::from(HashMap::from([(root.clone(), HashSet::from([route]))]));
+        let mut routes = HashMap::new();
+        let mut root_channels = RootChannels::default();
+        installed_routes::insert_route_channel_with_actor(
+            &mut routes,
+            &mut root_channels.channels,
+            route,
+            route_identity(&root, "deleted-route"),
+            Some(&ctx),
+        );
+        assert!(ctx.has_meaning_opener());
+        root_dir.close().expect("delete project root");
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
         let mut route_bash_cancels = HashMap::from([(
             route,
@@ -16017,6 +16022,7 @@ mod tests {
         );
 
         assert!(routes.is_empty());
+        assert!(!ctx.has_meaning_opener());
         assert!(root_channels.is_empty());
         assert!(installed_route_epochs.is_empty());
         assert!(route_bash_cancels.is_empty());
@@ -18830,7 +18836,7 @@ mod tests {
     async fn route_bind_ack_precedes_route_egress_in_writer_queue() {
         let (_dir, root) = test_root("route-bind-b2-ordering");
         let route = route_key(7, 3);
-        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+        let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
@@ -18971,7 +18977,7 @@ mod tests {
     async fn answered_route_bind_is_counted_in_the_bind_ack_window() {
         let (_dir, root) = test_root("route-bind-ack-latency");
         let route = route_key(8, 1);
-        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+        let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),

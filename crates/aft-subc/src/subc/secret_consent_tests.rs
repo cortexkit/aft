@@ -266,7 +266,7 @@ fn data(
 }
 
 fn classic(scope: Option<ScopeStamp>) -> RouteIdentity {
-    RouteIdentity(Arc::new(data(
+    RouteIdentity::new(Arc::new(data(
         tool_provider::RouteRole::ToolProviderV1,
         CallMode::Classic,
         scope,
@@ -307,7 +307,7 @@ fn bound(head: &RouteIdentity, run_stamp: ScopeStamp) -> RouteIdentity {
         },
         run_principal: head.spawn_principal.clone(),
     }));
-    RouteIdentity(Arc::new(effective))
+    RouteIdentity::new(Arc::new(effective))
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +385,7 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
     vec![
         (
             "standalone",
-            RouteIdentity(Arc::new(data(
+            RouteIdentity::new(Arc::new(data(
                 tool_provider::RouteRole::Legacy,
                 CallMode::Classic,
                 None,
@@ -394,7 +394,7 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
         ),
         (
             "plugin-only route",
-            RouteIdentity(Arc::new(data(
+            RouteIdentity::new(Arc::new(data(
                 tool_provider::RouteRole::ToolProviderV1,
                 CallMode::Classic,
                 None,
@@ -418,7 +418,7 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
         ),
         (
             "flow read",
-            RouteIdentity(Arc::new(RouteIdentityData {
+            RouteIdentity::new(Arc::new(RouteIdentityData {
                 spawn_principal: principal("reserved:basal"),
                 ..data(
                     tool_provider::RouteRole::Legacy,
@@ -430,7 +430,7 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
         ),
         (
             "rich-UI read",
-            RouteIdentity(Arc::new(RouteIdentityData {
+            RouteIdentity::new(Arc::new(RouteIdentityData {
                 spawn_principal: principal("reserved:occipital"),
                 ..data(
                     tool_provider::RouteRole::ToolProviderV1,

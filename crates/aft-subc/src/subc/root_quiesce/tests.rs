@@ -469,6 +469,34 @@ async fn attach_goodbye_due_while_bind_pending_quiesces_as_soon_as_bind_fails() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn meaning_opener_counts_only_after_ack_and_is_released_on_drain_exit() {
+    let (_dir, root) = test_root("meaning-opener-drain");
+    let ctx = test_ctx();
+    let mut attach = Attach::new();
+    let route = route_key(1, 1);
+    assert!(attach
+        .executor
+        .register_actor(root.clone(), Arc::clone(&ctx)));
+    attach
+        .live
+        .insert(root.clone(), RootMeta::new(Instant::now()));
+
+    attach.begin_bind(&root, route);
+    attach.configure_ready(&root, route, success()).await;
+    assert!(
+        !ctx.has_meaning_opener(),
+        "the bind ACK has not been written"
+    );
+    attach.ack().await;
+    assert!(ctx.has_meaning_opener(), "the plugin route is installed");
+
+    attach.settle(true);
+    attach.close();
+    assert!(attach.routes.is_empty());
+    assert!(!ctx.has_meaning_opener());
+}
+
+#[tokio::test(start_paused = true)]
 async fn attach_shutdown_and_drain_consume_grace_without_waiting() {
     for draining in [false, true] {
         let (_dir, root) = test_root("goodbye-exit");

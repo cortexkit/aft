@@ -71,12 +71,14 @@ impl IndexPlaneCounts {
         indexes: Option<IndexesConfig>,
         provisional_identity: Option<&str>,
         backend_failed: bool,
+        has_meaning_opener: bool,
     ) {
         let unmeasured = root.state == RootHealthState::Busy;
         let semantic_enabled = indexes.is_some_and(|config| config.semantic);
         let search_status = root.search_index.as_ref().map(|index| index.status);
         let graph_status = root.callgraph_store.as_ref().map(|index| index.status);
-        let semantic_status = match root.semantic_index.as_ref().map(|index| index.status) {
+        let observed_semantic = root.semantic_index.as_ref().map(|index| index.status);
+        let semantic_status = match observed_semantic {
             Some(_) if backend_failed => Some("backend_unavailable"),
             // No semantic build can report disabled even with the setting
             // on. Count that as off, not as explicitly disabled.
@@ -95,8 +97,13 @@ impl IndexPlaneCounts {
             unmeasured,
             || blocked_reason(root, "callgraph", graph_status, provisional_identity),
         );
+        // A worker-only root is intentionally not opened for meaning search.
+        // It still belongs in the status totals, but not in the outage clock.
+        let semantic_expected = semantic_enabled
+            && (has_meaning_opener
+                || observed_semantic != Some(crate::semantic_admission::NOT_OPENED_LABEL));
         self.semantic_index
-            .add(semantic_status, semantic_enabled, unmeasured, || {
+            .add(semantic_status, semantic_expected, unmeasured, || {
                 blocked_reason(root, "semantic", semantic_status, provisional_identity)
             });
     }

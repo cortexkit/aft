@@ -988,7 +988,7 @@ mod preset_writer_tests {
     use super::*;
 
     fn identity(root: &Path, principal: &str) -> RouteIdentity {
-        RouteIdentity(Arc::new(RouteIdentityData {
+        RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: ProjectRootId::from_path(root).unwrap(),
             project_root: root.into(),

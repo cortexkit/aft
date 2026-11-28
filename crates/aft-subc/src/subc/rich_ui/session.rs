@@ -160,7 +160,7 @@ fn effective_identity(
         return Err(super::authorization::refusal("session_not_bound"));
     };
     let id = principal(policy).ok_or_else(|| super::authorization::refusal("session_not_bound"))?;
-    Ok(RouteIdentity(Arc::new(RouteIdentityData {
+    Ok(RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: policy.root.clone(),
         project_root: policy.project_root.clone(),
