@@ -28,8 +28,10 @@ const NIX_OUTLINE_DEPTH: usize = 1;
 /// scanner's read limit. Four MiB per file — the read limit itself —
 /// leaves every real file whole (a normal outline keeps a small multiple
 /// of the file's own attr-path bytes) and caps the pathological one; past
-/// the bound the walk stops emitting, so the outline keeps its leading,
-/// exact portion. The cap bounds retained name bytes, not total record
+/// the bound, bindings whose entry no longer fits are skipped (their subtree
+/// not descended) while the walk continues over the rest, so the outline
+/// keeps an in-order bounded subset of exact rows — each kept symbol is
+/// complete and correct, but the kept set need not be a prefix of the walk. The cap bounds retained name bytes, not total record
 /// bytes: per-symbol overhead is uncharged and stays a linear factor of
 /// the file size — what is ruled out is the super-linear name copy.
 /// Stored signature bytes are bounded separately, by the

@@ -155,8 +155,9 @@ pub struct RawAftConfig {
     )]
     pub validate_on_edit: Option<RawValidateOnEdit>,
     #[schemars(
-        description = "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go')."
+        description = "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go'). nixfmt is valid only under the 'nix' key."
     )]
+    #[schemars(schema_with = "formatter_map_schema")]
     pub formatter: Option<HashMap<String, RawFormatter>>,
     #[schemars(
         description = "Per-language type checker overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go')."
@@ -1153,6 +1154,12 @@ pub fn resolve_config_for_harness(
                 message: format!("Unknown edit_mode value {value:?}; falling back to \"default\""),
             });
         }
+
+        // Refuse a bad nixfmt pair per config file, before this tier merges
+        // into the accumulated map: dropping the entry here keeps the file's
+        // other formatter keys alive and lets a lower file's value for that
+        // language survive (a post-merge removal would erase both).
+        sanitize_formatter_map(&mut raw, &tier.tier, &mut warnings);
 
         if is_user {
             merge_trusted_config(&mut merged, raw);
@@ -2324,6 +2331,46 @@ fn merge_project_sandbox(
         .then_some(sandbox)
 }
 
+/// Formatter map schema: the shared value enum plus a `patternProperties`
+/// rule so editors flag `nixfmt` under any language key other than `nix` —
+/// the same rule the resolver enforces when the config is read.
+fn formatter_map_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let mut schema =
+        <HashMap<String, RawFormatter> as schemars::JsonSchema>::json_schema(generator);
+    schema.insert(
+        "patternProperties".to_string(),
+        serde_json::json!({
+            "^(?!nix$).*$": { "not": { "const": "nixfmt" } }
+        }),
+    );
+    schema
+}
+
+/// Drops `formatter.<language> = "nixfmt"` pairs where the key is not `nix`,
+/// per config file and before files merge, warning once per dropped pair.
+/// The other entries of the file survive, and a lower-precedence file's value
+/// for the same language is not erased by a post-merge removal.
+fn sanitize_formatter_map(raw: &mut RawAftConfig, tier: &str, warnings: &mut Vec<ConfigWarning>) {
+    let Some(formatter) = raw.formatter.as_mut() else {
+        return;
+    };
+    for (language, tool) in formatter.clone() {
+        if tool != RawFormatter::Nixfmt || language == "nix" {
+            continue;
+        }
+        formatter.remove(&language);
+        warnings.push(ConfigWarning {
+            code: "nixfmt_wrong_language",
+            key: "formatter",
+            tier: tier.to_string(),
+            value: format!("{language}=nixfmt"),
+            message: format!(
+                "nixfmt formats Nix files only; formatter.{language} = \"nixfmt\" is dropped and {language} keeps its configured formatter or detection"
+            ),
+        });
+    }
+}
+
 fn merge_formatter_map(
     base: &mut Option<HashMap<String, RawFormatter>>,
     override_map: Option<HashMap<String, RawFormatter>>,
@@ -3173,20 +3220,11 @@ fn apply_resolved_config(
     if let Some(formatter) = &raw.formatter {
         let mut kept = HashMap::with_capacity(formatter.len());
         for (language, tool) in formatter {
-            // nixfmt formats Nix files only: under any other language key it
-            // would silently disable that language's own formatter detection,
-            // so the pair is refused when the config is read. Removing it
-            // restores detection for that language.
+            // Defense in depth: sanitize_formatter_map already dropped these
+            // pairs per config file (with the tier warning), so nothing
+            // reaches here; a silent skip keeps a resolver bug from ever
+            // wiring nixfmt to a foreign language.
             if *tool == RawFormatter::Nixfmt && language != "nix" {
-                warnings.push(ConfigWarning {
-                    code: "nixfmt_wrong_language",
-                    key: "formatter",
-                    tier: "config".into(),
-                    value: format!("{language}=nixfmt"),
-                    message: format!(
-                        "nixfmt formats Nix files only; formatter.{language} = \"nixfmt\" is refused and does not disable {language} formatter detection"
-                    ),
-                });
                 continue;
             }
             kept.insert(language.clone(), tool.as_str().to_string());
@@ -4141,6 +4179,60 @@ mod tests {
                 .iter()
                 .any(|warning| warning.message.contains("formatter.rust")),
             "the refusal must be reported as a warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn nixfmt_refusal_drops_only_the_bad_entry_of_a_mixed_map() {
+        // The bad pair must not take its healthy siblings down with it:
+        // formatter.nix and formatter.go are valid and keep working even
+        // though formatter.rust is dropped.
+        let result = super::resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"formatter":{"rust":"nixfmt","nix":"nixfmt","go":"gofmt"}}"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.formatter.get("nix").map(String::as_str),
+            Some("nixfmt")
+        );
+        assert_eq!(
+            result.config.formatter.get("go").map(String::as_str),
+            Some("gofmt")
+        );
+        assert!(!result.config.formatter.contains_key("rust"));
+    }
+
+    #[test]
+    fn nixfmt_refusal_keeps_the_lower_files_value_for_that_language() {
+        // A project's bad pair must not erase the user's valid setting:
+        // the refusal happens per file before the tiers merge, so the
+        // user's formatter.rust = "none" survives and detection stays off.
+        let result = super::resolve_config_for_harness(
+            &[
+                tier("user", r#"{"formatter":{"rust":"none"}}"#),
+                tier("project", r#"{"formatter":{"rust":"nixfmt"}}"#),
+            ],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.formatter.get("rust").map(String::as_str),
+            Some("none"),
+            "the user's rust = none must survive the project's bad pair: {:?}",
+            result.config.formatter
+        );
+        let refusal = result
+            .warnings
+            .iter()
+            .find(|warning| warning.message.contains("formatter.rust"));
+        assert!(
+            refusal.is_some_and(|warning| warning.tier == "project"),
+            "the refusal must be reported against the file that set it: {:?}",
             result.warnings
         );
     }

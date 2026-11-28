@@ -115,7 +115,7 @@
       ]
     },
     "formatter": {
-      "description": "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
+      "description": "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go'). nixfmt is valid only under the 'nix' key.",
       "type": "object",
       "additionalProperties": {
         "type": "string",
@@ -132,6 +132,13 @@
           "nixfmt",
           "none"
         ]
+      },
+      "patternProperties": {
+        "^(?!nix$).*$": {
+          "not": {
+            "const": "nixfmt"
+          }
+        }
       }
     },
     "checker": {
@@ -991,7 +998,7 @@
             ]
           },
           "formatter": {
-            "description": "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
+            "description": "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go'). nixfmt is valid only under the 'nix' key.",
             "type": "object",
             "additionalProperties": {
               "type": "string",
@@ -1008,6 +1015,13 @@
                 "nixfmt",
                 "none"
               ]
+            },
+            "patternProperties": {
+              "^(?!nix$).*$": {
+                "not": {
+                  "const": "nixfmt"
+                }
+              }
             }
           },
           "checker": {

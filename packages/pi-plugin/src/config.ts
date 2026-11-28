@@ -1794,6 +1794,31 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig {
       if (parsed[key] !== undefined) {
         partialConfig[key] = parsed[key];
       }
+    } else if (key === "formatter") {
+      // A formatter map fails as a whole when one pair is bad (e.g.
+      // formatter.rust = "nixfmt"), but the other languages' settings are
+      // valid and must survive: keep every entry except the offending ones.
+      const raw = (configForParsing.formatter ?? {}) as Record<string, unknown>;
+      const kept: Record<string, string> = {};
+      const dropped: string[] = [];
+      for (const [language, value] of Object.entries(raw)) {
+        if (!FormatterEnum.safeParse(value).success || (value === "nixfmt" && language !== "nix")) {
+          dropped.push(language);
+          continue;
+        }
+        kept[language] = value as string;
+      }
+      if (Object.keys(kept).length > 0) {
+        partialConfig.formatter = kept;
+      }
+      if (dropped.length > 0) {
+        invalidSections.push(
+          `formatter: dropped ${dropped.map((l) => `formatter.${l}`).join(", ")} — ${sectionResult.error.issues
+            .filter((i) => i.path[0] === "formatter")
+            .map((i) => `${i.path.join(".")}: ${i.message}`)
+            .join(", ")}`,
+        );
+      }
     } else {
       warn(`Discarded invalid configuration section: ${key}`);
       const sectionErrors = sectionResult.error.issues
@@ -2219,7 +2244,15 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   );
   // A project may switch an index off, never back on.
   const indexes = mergeIndexes(base.indexes, override.indexes, true);
-  const formatter = { ...base.formatter, ...override.formatter };
+  // Harness blocks merge after schema validation, so the nixfmt language-key
+  // rule is re-applied here: a harness override of formatter.rust = "nixfmt"
+  // is dropped and the base tier's value for that language survives.
+  const harnessFormatter = Object.fromEntries(
+    Object.entries(override.formatter ?? {}).filter(
+      ([language, value]) => !(value === "nixfmt" && language !== "nix"),
+    ),
+  );
+  const formatter = { ...base.formatter, ...harnessFormatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
   const search = mergeProjectSearchConfig(base.search, override.search);

@@ -299,8 +299,10 @@ Omit an optional setting instead of using `null`.
   // Keys: "typescript", "python", "rust", "go", "nix"
   // Values: "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" | "nixfmt" | "none"
   // "nixfmt" is accepted only under the "nix" key: it formats Nix files only, so
-  // pairing it with another language is refused at config read (with a warning)
-  // instead of disabling that language's formatter detection.
+  // pairing it with another language drops just that entry when the file is read
+  // (the Rust resolver warns, the plugins report a validation error) instead of
+  // disabling that language's formatter detection — the map's other entries stay
+  // in effect and a lower-precedence config file's value for that language survives.
   "formatter": {
     "typescript": "biome",
     "rust": "rustfmt"

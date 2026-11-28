@@ -2008,3 +2008,33 @@ describe("pi.external_access_ask", () => {
     expect(config.pi?.external_access_ask).toBe(true);
   });
 });
+
+// nixfmt language-key refusal: dropping the bad pair must keep the map's
+// valid entries and a lower-precedence file's value for the same language.
+test("formatter refusal drops only the bad entry of a mixed map", () => {
+  const fixture = createConfigFixture();
+  writeFileSync(
+    fixture.userConfigPath,
+    JSON.stringify({ formatter: { rust: "nixfmt", nix: "nixfmt", go: "gofmt" } }),
+  );
+  const loaded = runConfigLoader(fixture.projectDirectory, {
+    HOME: join(fixture.root, "home"),
+    XDG_CONFIG_HOME: fixture.xdgConfigHome,
+  });
+  const config = JSON.parse(loaded.stdout);
+  expect(config.formatter).toEqual({ nix: "nixfmt", go: "gofmt" });
+  expect(loaded.stderr).toContain("formatter.rust");
+});
+
+test("formatter refusal keeps the lower file's value for that language", () => {
+  const fixture = createConfigFixture();
+  writeFileSync(fixture.userConfigPath, JSON.stringify({ formatter: { rust: "none" } }));
+  writeFileSync(fixture.projectConfigPath, JSON.stringify({ formatter: { rust: "nixfmt" } }));
+  const loaded = runConfigLoader(fixture.projectDirectory, {
+    HOME: join(fixture.root, "home"),
+    XDG_CONFIG_HOME: fixture.xdgConfigHome,
+  });
+  const config = JSON.parse(loaded.stdout);
+  expect(config.formatter).toEqual({ rust: "none" });
+  expect(loaded.stderr).toContain("formatter.rust");
+});
