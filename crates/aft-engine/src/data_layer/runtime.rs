@@ -2471,7 +2471,7 @@ impl DataCheckout {
     }
 
     /// Sets a test checkout's meaning configuration without starting a fill,
-    /// so a test can read how the plane reports before any model loads.
+    /// so a test can read the meaning-search state before any model loads.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn configure_meaning_without_fill_for_test(
         &self,

@@ -321,7 +321,8 @@ impl Meaning {
     }
 
     /// Recheck with each bind, or on a query if no configuration was given
-    /// or an opener changed. Probing Git on every query would read the
+    /// or the set of sessions opening a root for meaning search changed
+    /// (see `semantic_admission`). Probing Git on every query would read the
     /// filesystem even for a checkout whose admission is unchanged.
     pub(crate) fn configure_for_root(
         &self,

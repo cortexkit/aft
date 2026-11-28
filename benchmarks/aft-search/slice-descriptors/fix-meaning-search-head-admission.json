@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft-tools/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "meaning-head-admission"
+  ],
+  "note": "The ranking fence hit is crates/aft-tools/src/commands/semantic_search/mod.rs: a dead query-time reload arm (guarded by `&& false`) and its unused helper are removed. Ranking code is unchanged; this change decides which roots start a meaning fill."
+}

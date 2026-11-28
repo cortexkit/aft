@@ -9,8 +9,9 @@
 //!
 //! A root is *opened* when one of these holds:
 //!
-//! 1. A daemon-stamped head route or an unscoped standalone OpenCode or Pi
-//!    session has the root bound right now.
+//! 1. A route whose daemon scope stamp is `Head` (a main agent's session), or
+//!    an unscoped standalone OpenCode or Pi session, has the root bound right
+//!    now.
 //! 2. The root belongs to the same Git repository (the same Git common
 //!    directory) as a root an interactive session has bound: a delegated
 //!    worker's linked worktree of a repository the user has open.
