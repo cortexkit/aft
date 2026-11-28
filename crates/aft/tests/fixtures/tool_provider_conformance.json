@@ -86,10 +86,7 @@
       "crash_after_prepared_not_started",
       "crash_after_authorized_not_started",
       "tool_result_v1_valid",
-      "system_text_preset_optional_served",
-      "catalog_capability_filter_matches_describe",
-      "catalog_filter_preserves_plan_item",
-      "catalog_filter_model_refused"
+      "system_text_preset_optional_served"
     ],
     "inapplicable_cases": [
       "system_text_default_served"
@@ -192,9 +189,6 @@
             "call_yield_non_carrier_unknown_call_urgent_notice"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -293,9 +287,6 @@
             "call_yield_non_carrier_unknown_call_urgent_notice"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -395,9 +386,6 @@
             "session_notices_describe"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -496,9 +484,6 @@
             "session_notices_describe"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -590,9 +575,6 @@
             "session_notices_describe"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -689,9 +671,6 @@
             "session_notices_describe"
           ],
           "skipped_cases": [
-            "catalog_capability_filter_matches_describe",
-            "catalog_filter_preserves_plan_item",
-            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
