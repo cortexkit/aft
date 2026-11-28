@@ -1,7 +1,7 @@
 /// <reference path="../../bun-test.d.ts" />
 
-import { mkdir, writeFile } from "node:fs/promises";
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { mkdir, writeFile } from "node:fs/promises";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { navigationTools } from "../../tools/navigation.js";

@@ -69,10 +69,13 @@ describe.skipIf(!binary.binaryPath)("outside-file always scope", () => {
             readTargets = await existingFileTargets(await realpath("/usr/share/zoneinfo/Etc"));
           }
           for (const operation of ["read", "write"] as const) {
-            const [firstTarget, siblingTarget] = operation === "read" ? readTargets : [first, sibling];
+            const [firstTarget, siblingTarget] =
+              operation === "read" ? readTargets : [first, sibling];
             if (!firstTarget || !siblingTarget) {
               if (label !== "root") throw new Error(`need two existing files for ${label}: read`);
-              console.warn(`SKIP OpenCode ${version} root read: ${folder} has fewer than two regular files`);
+              console.warn(
+                `SKIP OpenCode ${version} root read: ${folder} has fewer than two regular files`,
+              );
               continue;
             }
             const expected = narrow ? firstTarget : join(folder, "*");
