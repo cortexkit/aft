@@ -22642,18 +22642,27 @@ mod tests {
     #[test]
     fn cargo_verdict_fixture_golden_agent_output() {
         let (foreground, completion) = synapse_agent_text();
-        // The context budget depends on the platform's absolute capture-path
-        // length. Golden the complete verdict block in the final visible text,
-        // while the neighboring tests assert each line class independently.
+        // The preview reserves space for recovery instructions with absolute
+        // paths to stdout and stderr. Check the optional panic messages
+        // separately from the required verdict.
         let golden =
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/verdict.txt")
-                .trim_end();
-        for text in [foreground, completion] {
+            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/verdict.txt").trim_end();
+        let message = include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/stdout")
+            .lines()
+            .find(|line| line.starts_with("engine: LFM2 Metal step metallib is missing beside"))
+            .expect("fixture panic message");
+        let message_line = format!("\n{message}");
+        for (text, expected_count) in [(foreground, 3..=3), (completion, 1..=3)] {
             let body = text.rsplit_once("\nshown ").expect("bash cap trailer").0;
             assert!(
-                body.ends_with(golden),
+                body.replace(&message_line, "").ends_with(golden),
                 "agent-visible verdict differs from golden: {body}"
             );
+            assert!(expected_count.contains(&body.matches(&message_line).count()));
+            for (offset, _) in body.match_indices(&message_line) {
+                let location = body[..offset].lines().last().expect("panic location");
+                assert!(location.contains(" panicked at ") && location.ends_with(':'));
+            }
             assert!(body.contains(
                 "[truncated output; full output: read \"<stdout>\" and read \"<stderr>\"]"
             ));

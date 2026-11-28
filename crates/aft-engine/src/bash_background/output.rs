@@ -388,14 +388,41 @@ fn cap_test_verdict(
     // including a wrapper's verdict after the runner's own summary.
     required[last] = true;
     let mut empty_count = 0;
+    let mut required_bytes = 0;
     for (index, is_empty) in empty.iter_mut().enumerate() {
+        if required[index] {
+            required_bytes += lines[index].len() + 1;
+        }
         if *is_empty && !required[index] {
             empty_count += 1;
         } else {
             *is_empty = false;
         }
     }
+    let marker = marker
+        .filter(|marker| !marker.is_empty())
+        .unwrap_or("[truncated output; full output unavailable]");
+    let marker = if completion_preview {
+        marker
+    } else {
+        &marker[..floor_char_boundary(
+            marker,
+            threshold
+                .saturating_sub(REQUIRED_LINE_MIN_BYTES + 2)
+                .min(marker.len()),
+        )]
+    };
+    let essentials_budget = threshold.saturating_sub(marker.len() + 2);
     let empty_summary = format!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out ({empty_count} empty test targets)");
+    if empty_count > 0 {
+        required_bytes += empty_summary.len() + 1;
+    }
+    keep_panic_messages(
+        &lines,
+        &mut required,
+        &empty,
+        essentials_budget.saturating_sub(required_bytes - 1),
+    );
     let mut context = PiecedText::default();
     let mut essentials = Vec::new();
     let mut context_lines = 0;
@@ -420,26 +447,13 @@ fn cap_test_verdict(
             context.copy(input, line_range);
         }
     }
-    let marker = marker
-        .filter(|marker| !marker.is_empty())
-        .unwrap_or("[truncated output; full output unavailable]");
-    let marker = if completion_preview {
-        marker
-    } else {
-        &marker[..floor_char_boundary(
-            marker,
-            threshold
-                .saturating_sub(REQUIRED_LINE_MIN_BYTES + 2)
-                .min(marker.len()),
-        )]
-    };
     let essentials = cap_required_lines(
         input,
         &essentials,
         if completion_preview {
             usize::MAX
         } else {
-            threshold.saturating_sub(marker.len() + 2)
+            essentials_budget
         },
     );
     let available = threshold.saturating_sub(essentials.text.len() + marker.len() + 2);
@@ -506,6 +520,28 @@ fn cap_test_verdict(
     }
     capped.append(essentials);
     Some(capped)
+}
+
+// The test verdict already protects each selected panic location. Preserve
+// its following message when it fits without evicting required verdict lines.
+fn keep_panic_messages(lines: &[&str], required: &mut [bool], empty: &[bool], mut room: usize) {
+    for (index, pair) in lines.windows(2).enumerate() {
+        if room == 0 {
+            break;
+        }
+        if !required[index] || required[index + 1] || empty[index + 1] {
+            continue;
+        }
+        let location = pair[0].trim();
+        let header = location.starts_with("thread '") && location.contains(" panicked at ");
+        let split_header = index > 0 && lines[index - 1].trim_end().ends_with("panicked at");
+        if location.ends_with(':') && (header || split_header) {
+            if let Some(remaining) = room.checked_sub(pair[1].len() + 1) {
+                required[index + 1] = true;
+                room = remaining;
+            }
+        }
+    }
 }
 
 // A cut line needs room for the byte-count marker and some actual output.
@@ -1283,5 +1319,30 @@ mod tests {
         assert!(capped.text.ends_with("wrapper verdict"));
         assert_eq!(capped.text.matches("panicked at").count(), 20);
         assert!(capped.text.len() > COMPLETION_FAILURE_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn failed_previews_keep_panic_message_with_location() {
+        let panic = "thread 'example' panicked at src/lib.rs:560:5:\nmove 1: row moved 80 points, expected 60";
+        let noise = "ordinary progress\n".repeat(2_000);
+        let input = format!(
+            "{noise}test example ... FAILED\n{panic}\n{noise}\
+             test result: FAILED. 0 passed; 1 failed\nwrapper verdict\n"
+        );
+
+        for (preview, budget) in [
+            (
+                cap_completion_output(&input, false),
+                COMPLETION_FAILURE_PREVIEW_BYTES,
+            ),
+            (
+                cap_final_output_preserving(&input, None, &[], true),
+                FINAL_OUTPUT_BODY_CAP_BYTES,
+            ),
+        ] {
+            assert!(preview.truncated);
+            assert!(preview.text.contains(panic), "{}", preview.text);
+            assert!(preview.text.len() <= budget);
+        }
     }
 }
