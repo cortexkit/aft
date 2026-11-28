@@ -93,8 +93,11 @@ crates/aft/tests/fixtures/aft-user-commands-v1/** text eol=lf
 # platform (Windows autocrlf would otherwise serve and hash CRLF bytes).
 crates/aft-subc/src/subc/tool_views/*.ui text eol=lf
 crates/aft-subc/src/subc/tool_views/*.json text eol=lf
+crates/aft-subc/src/subc/rich_ui/notices/*.ui text eol=lf
 crates/aft/tests/fixtures/tool_views/phone-reader-*/** -text
 crates/aft/tests/fixtures/notice-records/phone-reader-*/** -text
 # The settings schema is compared byte-for-byte with the generated editor
 # schema, so it must stay LF on every platform.
 assets/aft.schema.json text eol=lf
+# The rendered settings layer policy is compared byte-for-byte with this golden.
+crates/aft-engine/tests/fixtures/settings_wire/layers.golden text eol=lf
