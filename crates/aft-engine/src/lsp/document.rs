@@ -1,0 +1,645 @@
+use std::collections::HashMap;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use crate::bounded_io::open_content_file;
+
+// Start above zero so gopls can echo the version without omitting it.
+pub(super) const FIRST_VERSION: i32 = 1;
+
+#[cfg(feature = "test-hooks")]
+pub const FIRST_VERSION_FOR_TEST: i32 = FIRST_VERSION;
+
+/// Per-document state tracked for LSP synchronization.
+///
+/// We track `mtime`, `size`, and a content hash so we can
+/// detect when a file has been changed
+/// outside the AFT pipeline (another tool, another session, manual edit) and
+/// resync the LSP server before issuing diagnostic requests. Without this,
+/// `ensure_file_open` would skip already-open files and return diagnostics
+/// computed from stale in-memory content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentEntry {
+    /// Monotonically increasing LSP version.
+    pub version: i32,
+    /// Filesystem modification time at the moment we last synced this file
+    /// to the LSP server (didOpen or didChange). `None` if the file did not
+    /// exist on disk when we last synced (e.g. in-memory-only test fixtures
+    /// or files mid-rename).
+    pub mtime: Option<SystemTime>,
+    /// Filesystem byte size at the moment we last synced. `None` for the
+    /// same reasons as `mtime`.
+    pub size: Option<u64>,
+    /// BLAKE3 hash of the synchronized text. Metadata alone cannot prove that
+    /// diagnostics describe the current content, even for a large document.
+    pub content_hash: Option<[u8; 32]>,
+    /// FIFO dispatch order of the acknowledged didOpen/didChange carrying this
+    /// text. Absent for synthetic state and failed or unconfirmed writes.
+    pub sync_order: Option<u64>,
+}
+
+/// Tracks document state for LSP synchronization.
+///
+/// LSP requires:
+/// 1. didOpen before didChange (document must be opened first)
+/// 2. Version numbers must be monotonically increasing
+/// 3. Full content sent with each change (TextDocumentSyncKind::Full)
+///
+/// This store ALSO records (mtime, size, content hash) at sync time so callers can detect
+/// disk drift via `is_stale_on_disk()` and resync stale entries before
+/// issuing pull-diagnostic requests against potentially stale server state.
+#[derive(Debug)]
+pub struct DocumentStore {
+    entries: HashMap<PathBuf, DocumentEntry>,
+    entry_bytes: u64,
+    /// Higher than every version of a closed document. A scalar floor avoids
+    /// retaining one path forever for every file an inspect briefly opened.
+    reopen_version_floor: i32,
+}
+
+impl Default for DocumentStore {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            entry_bytes: 0,
+            reopen_version_floor: FIRST_VERSION,
+        }
+    }
+}
+
+impl DocumentStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        crate::memory::MemoryEstimate::estimated(self.entry_bytes)
+            .count("documents", self.entries.len())
+    }
+
+    #[cfg(test)]
+    fn recounted_memory(&self) -> crate::memory::MemoryEstimate {
+        let bytes = self.entries.keys().fold(0u64, |bytes, path| {
+            bytes
+                .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+                .saturating_add(std::mem::size_of::<DocumentEntry>() as u64)
+                .saturating_add(crate::memory::path_bytes(path))
+        });
+        crate::memory::MemoryEstimate::estimated(bytes).count("documents", self.entries.len())
+    }
+
+    /// Check if a document is already opened (tracked).
+    pub fn is_open(&self, path: &Path) -> bool {
+        self.entries.contains_key(path)
+    }
+
+    /// Open a document, recording its on-disk metadata/hash. The initial version
+    /// starts at one and advances past every closed document's last version.
+    /// If metadata cannot be read, the
+    /// document is still tracked but `mtime`/`size` will be `None`, which
+    /// causes `is_stale_on_disk()` to conservatively report stale on the
+    /// next check (forcing a resync).
+    pub fn open(&mut self, path: PathBuf) -> i32 {
+        let snapshot = DiskSnapshot::read(&path);
+        self.open_with(path, &snapshot)
+    }
+
+    /// [`Self::open`] with the file's disk state already read, so a document
+    /// opened in several servers reads and hashes the file once.
+    pub fn open_with(&mut self, path: PathBuf, snapshot: &DiskSnapshot) -> i32 {
+        let version = self.next_open_version();
+        let entry = DocumentEntry {
+            version,
+            mtime: snapshot.mtime,
+            size: snapshot.size,
+            content_hash: snapshot.content_hash(&path),
+            sync_order: snapshot.sync_order,
+        };
+        if !self.entries.contains_key(&path) {
+            self.entry_bytes = self.entry_bytes.saturating_add(Self::entry_bytes(&path));
+        }
+        self.entries.insert(path, entry);
+        version
+    }
+
+    /// Reopening must not reuse a version that a delayed publication can carry.
+    pub(crate) fn next_open_version(&self) -> i32 {
+        self.reopen_version_floor
+    }
+
+    /// Bump the version for an already-open document and refresh the
+    /// recorded mtime/size/hash from disk (the caller is presumed to be sending
+    /// a `didChange` with fresh content right after this call). Returns the
+    /// new version, or `None` if the document is not open.
+    pub fn bump_version(&mut self, path: &Path) -> Option<i32> {
+        let snapshot = DiskSnapshot::read(path);
+        self.bump_version_with(path, &snapshot)
+    }
+
+    /// [`Self::bump_version`] with the file's disk state already read.
+    pub fn bump_version_with(&mut self, path: &Path, snapshot: &DiskSnapshot) -> Option<i32> {
+        let content_hash = snapshot.content_hash(path);
+        let entry = self.entries.get_mut(path)?;
+        entry.version += 1;
+        entry.mtime = snapshot.mtime;
+        entry.size = snapshot.size;
+        entry.content_hash = content_hash;
+        entry.sync_order = snapshot.sync_order;
+        Some(entry.version)
+    }
+
+    /// Get current version, or None if not open.
+    pub fn version(&self, path: &Path) -> Option<i32> {
+        self.entries.get(path).map(|e| e.version)
+    }
+
+    /// Record an explicit version after startup coalesced several unsent edits.
+    pub(crate) fn sync_at_version(&mut self, path: PathBuf, version: i32, snapshot: &DiskSnapshot) {
+        self.open_with(path.clone(), snapshot);
+        self.entries
+            .get_mut(&path)
+            .expect("document just inserted")
+            .version = version;
+    }
+
+    /// Get the full document entry, or None if not open.
+    pub fn entry(&self, path: &Path) -> Option<&DocumentEntry> {
+        self.entries.get(path)
+    }
+
+    /// Close a document and remove from tracking. Returns the last known
+    /// version, or `None` if the document was not open.
+    pub fn close(&mut self, path: &Path) -> Option<i32> {
+        let (stored_path, entry) = self.entries.remove_entry(path)?;
+        self.entry_bytes = self
+            .entry_bytes
+            .saturating_sub(Self::entry_bytes(&stored_path));
+        self.reopen_version_floor = self.reopen_version_floor.max(entry.version + 1);
+        Some(entry.version)
+    }
+
+    fn entry_bytes(path: &Path) -> u64 {
+        (std::mem::size_of::<PathBuf>() as u64)
+            .saturating_add(std::mem::size_of::<DocumentEntry>() as u64)
+            .saturating_add(crate::memory::path_bytes(path))
+    }
+
+    /// Get all open document paths.
+    pub fn open_documents(&self) -> Vec<&PathBuf> {
+        self.entries.keys().collect()
+    }
+
+    /// Returns true if the document is currently open AND its on-disk
+    /// metadata differs from what we recorded at the last sync. Use this
+    /// before issuing pull diagnostics to decide whether `bump_version` +
+    /// `didChange` is needed first.
+    ///
+    /// Conservative semantics: returns true if the file used to have known
+    /// metadata but cannot be read now (e.g. deleted or permission error),
+    /// or if we never recorded metadata for the open entry.
+    pub fn is_stale_on_disk(&self, path: &Path) -> bool {
+        self.is_stale_against(path, &DiskSnapshot::read(path))
+    }
+
+    /// [`Self::is_stale_on_disk`] against disk state already read. The file
+    /// is hashed only when its modification time and size both match the
+    /// last sync: an edit that kept both (a coarse-mtime filesystem, two
+    /// writes within one tick) is caught only by its content. A changed
+    /// time or size already proves the file changed, so no hash is needed.
+    pub fn is_stale_against(&self, path: &Path, snapshot: &DiskSnapshot) -> bool {
+        let Some(entry) = self.entries.get(path) else {
+            // Not open at all — caller should `open` instead of asking about
+            // staleness. We still return true so the caller doesn't act on
+            // stale assumptions.
+            return true;
+        };
+        let current_mtime = snapshot.mtime;
+        let current_size = snapshot.size;
+
+        match (entry.mtime, current_mtime) {
+            (Some(prev), Some(now)) if prev == now => {
+                if entry.size != current_size {
+                    return true;
+                }
+
+                match current_size {
+                    Some(_) => match (entry.content_hash, snapshot.content_hash(path)) {
+                        (Some(prev_hash), Some(now_hash)) => prev_hash != now_hash,
+                        _ => true,
+                    },
+                    None => true,
+                }
+            }
+            (Some(_), Some(_)) => true, // mtimes differ
+            // Either we didn't record before or can't read now — be safe.
+            _ => true,
+        }
+    }
+}
+
+/// One file's disk state: metadata read at once, and a
+/// BLAKE3 content hash read on first use and then shared, so every server's
+/// store and every staleness check in one operation reads the file once.
+/// Metadata fields are `None` if the path cannot be statted or if the
+/// platform doesn't support the queried metadata (rare). The hash is `None`
+/// for unreadable files.
+#[derive(Debug, Default, Clone)]
+pub struct DiskSnapshot {
+    mtime: Option<SystemTime>,
+    size: Option<u64>,
+    content_hash: std::cell::OnceCell<Option<[u8; 32]>>,
+    sync_order: Option<u64>,
+}
+
+impl DiskSnapshot {
+    pub(crate) fn with_sync_order(mut self, order: Option<u64>) -> Self {
+        self.sync_order = order;
+        self
+    }
+    /// Use the text actually sent, not a second disk read that could observe a
+    /// concurrent write and incorrectly certify text the server never received.
+    pub(crate) fn for_content(path: &Path, content: &str) -> Self {
+        let snapshot = Self::read(path);
+        let _ = snapshot
+            .content_hash
+            .set(Some(*blake3::hash(content.as_bytes()).as_bytes()));
+        snapshot
+    }
+    pub fn read(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(meta) => Self {
+                mtime: meta.modified().ok(),
+                size: Some(meta.len()),
+                content_hash: std::cell::OnceCell::new(),
+                sync_order: None,
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn content_hash(&self, path: &Path) -> Option<[u8; 32]> {
+        *self.content_hash.get_or_init(|| {
+            self.size?;
+            #[cfg(test)]
+            CONTENT_READS.with(|reads| reads.set(reads.get() + 1));
+            file_content_hash(path)
+        })
+    }
+}
+
+/// Read document text with the same regular-file requirement as its hash proof.
+pub(crate) fn read_file_content(path: &Path) -> io::Result<String> {
+    let mut content = String::new();
+    open_content_file(path)?.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+/// Stream large regular files rather than allocating another full document buffer.
+pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
+    #[cfg(any(test, feature = "test-support"))]
+    CONTENT_HASH_READS.with(|reads| reads.set(reads.get() + 1));
+    let mut file = open_content_file(path).ok()?;
+    #[cfg(test)]
+    CONTENT_HASH_BEFORE_READ.with(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
+    });
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(*hasher.finalize().as_bytes())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static CONTENT_HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// One-shot pause after opening a hash input, isolated to the installing test thread.
+    #[cfg(test)]
+    pub(crate) static CONTENT_HASH_BEFORE_READ: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    /// Files read for a content hash on this thread.
+    #[cfg(test)]
+    pub(crate) static CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Public helper: read metadata for an arbitrary path. Useful for callers
+/// that want to consult disk state without going through the store.
+pub fn file_metadata(path: &Path) -> io::Result<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path)?;
+    let mtime = meta.modified()?;
+    let size = meta.len();
+    Ok((mtime, size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::time::Duration;
+
+    fn write_file(path: &Path, content: &str) {
+        let mut f = fs::File::create(path).expect("create test file");
+        f.write_all(content.as_bytes()).expect("write content");
+    }
+
+    fn advance_mtime(path: &Path, duration: Duration) {
+        let modified = fs::metadata(path)
+            .expect("stat test file")
+            .modified()
+            .expect("test file mtime");
+        let advanced = modified.checked_add(duration).expect("advanced mtime");
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(advanced))
+            .expect("set advanced mtime");
+    }
+
+    fn content_reads() -> usize {
+        CONTENT_READS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn content_reads_require_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("regular.ts");
+        fs::write(&file, "content").unwrap();
+        assert_eq!(read_file_content(&file).unwrap(), "content");
+        assert_eq!(
+            file_content_hash(&file),
+            Some(*blake3::hash(b"content").as_bytes())
+        );
+        assert!(read_file_content(dir.path()).is_err());
+        assert_eq!(file_content_hash(dir.path()), None);
+        fs::write(&file, [0xff]).unwrap();
+        assert_eq!(
+            read_file_content(&file).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            file_content_hash(&file),
+            Some(*blake3::hash(&[0xff]).as_bytes())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_content_reads_do_not_wait_for_fifo_writers() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("held.ts");
+        let name = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a live, NUL-terminated path and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (finished, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let hash = file_content_hash(&file);
+            let text = read_file_content(&file);
+            let _ = finished.send((hash, text));
+        });
+        // Do not scope this worker: a regressed blocking open must fail the
+        // deadline assertion, not strand the test in an implicit thread join.
+        let (hash, text) = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("content readers waited for a FIFO writer");
+        reader.join().unwrap();
+        assert_eq!(hash, None);
+        assert_eq!(text.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn large_diagnostics_document_detects_same_metadata_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.ts");
+        let mut content = vec![b'a'; 4 * 1024 * 1024 + 1];
+        fs::write(&path, &content).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        content[0] = b'b';
+        fs::write(&path, content).unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(modified)).unwrap();
+        assert!(store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn diagnostics_sync_hash_describes_sent_text_not_a_later_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ts");
+        fs::write(&path, "new disk text").unwrap();
+        let mut store = DocumentStore::new();
+        store.open_with(
+            path.clone(),
+            &DiskSnapshot::for_content(&path, "sent old text"),
+        );
+        assert!(store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn a_changed_modification_time_proves_staleness_without_reading_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.rs");
+        write_file(&path, "fn a() {}\n");
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        advance_mtime(&path, Duration::from_secs(5));
+
+        let before = content_reads();
+        assert!(store.is_stale_on_disk(&path));
+        assert_eq!(content_reads() - before, 0, "a changed mtime needs no hash");
+    }
+
+    #[test]
+    fn one_snapshot_hashes_the_file_once_for_every_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.rs");
+        write_file(&path, "fn a() {}\n");
+        let mut stores = [
+            DocumentStore::new(),
+            DocumentStore::new(),
+            DocumentStore::new(),
+        ];
+
+        let before = content_reads();
+        let snapshot = DiskSnapshot::read(&path);
+        for store in &mut stores {
+            store.open_with(path.clone(), &snapshot);
+        }
+        for store in &stores {
+            assert!(!store.is_stale_against(&path, &snapshot));
+        }
+        assert_eq!(content_reads() - before, 1, "three stores, one read");
+    }
+
+    #[test]
+    fn document_memory_estimate_is_zero_when_empty_and_nonzero_when_populated() {
+        let mut store = DocumentStore::new();
+        assert_eq!(store.estimated_memory().estimated_bytes, Some(0));
+        store.open(PathBuf::from("/tmp/aft-document-memory"));
+        let estimate = store.estimated_memory();
+        assert!(estimate.estimated_bytes.unwrap() > 0);
+        assert_eq!(estimate.counts["documents"], 1);
+    }
+
+    #[test]
+    fn document_memory_running_totals_match_recount() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("nested/first.rs");
+        let second = dir.path().join("longer-second.rs");
+        let mut store = DocumentStore::new();
+        for path in [&first, &second, &first] {
+            store.open(path.clone());
+            assert_eq!(store.estimated_memory(), store.recounted_memory());
+        }
+        store.bump_version(&first);
+        assert_eq!(store.estimated_memory(), store.recounted_memory());
+        let alias = dir.path().join("nested//first.rs");
+        assert_eq!(first, alias);
+        for path in [&second, &alias, &first] {
+            store.close(path);
+            assert_eq!(store.estimated_memory(), store.recounted_memory());
+        }
+        assert_eq!(store.estimated_memory().estimated_bytes, Some(0));
+    }
+
+    #[test]
+    fn fresh_store_opens_at_one_and_tracks_versions_until_close() {
+        let mut store = DocumentStore::new();
+        let path = PathBuf::from("/tmp/aft-doc-test-doesnt-exist");
+        assert!(!store.is_open(&path));
+
+        let v = store.open(path.clone());
+        assert_eq!(v, 1);
+        assert!(store.is_open(&path));
+        assert_eq!(store.version(&path), Some(1));
+
+        let bumped = store.bump_version(&path);
+        assert_eq!(bumped, Some(2));
+        assert_eq!(store.version(&path), Some(2));
+
+        let closed = store.close(&path);
+        assert_eq!(closed, Some(2));
+        assert!(!store.is_open(&path));
+    }
+
+    #[test]
+    fn nonexistent_path_is_always_stale() {
+        let store = DocumentStore::new();
+        let path = PathBuf::from("/tmp/aft-doc-test-never-opened");
+        // Not open at all → stale
+        assert!(store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn freshly_opened_real_file_is_not_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("a.txt");
+        write_file(&path, "hello");
+
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        assert!(!store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn opened_then_disk_changed_is_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("b.txt");
+        write_file(&path, "hello");
+
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        assert!(!store.is_stale_on_disk(&path));
+
+        write_file(&path, "hello world!");
+        advance_mtime(&path, Duration::from_secs(2));
+
+        assert!(store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn opened_file_same_size_and_mtime_but_different_hash_is_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("same-size.txt");
+        write_file(&path, "hello");
+        let original_mtime = fs::metadata(&path)
+            .expect("stat original")
+            .modified()
+            .expect("original mtime");
+
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        assert!(!store.is_stale_on_disk(&path));
+
+        write_file(&path, "jello");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(original_mtime))
+            .expect("restore original mtime");
+
+        assert!(
+            store.is_stale_on_disk(&path),
+            "same mtime+size should still be stale when content hash differs"
+        );
+
+        store.bump_version(&path);
+        assert!(!store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn opened_file_then_deleted_is_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("c.txt");
+        write_file(&path, "data");
+
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        assert!(!store.is_stale_on_disk(&path));
+
+        fs::remove_file(&path).expect("remove file");
+        // Cannot read metadata anymore → conservatively stale
+        assert!(store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn bump_version_refreshes_mtime() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("d.txt");
+        write_file(&path, "original");
+
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+
+        write_file(&path, "updated");
+        advance_mtime(&path, Duration::from_secs(2));
+        assert!(store.is_stale_on_disk(&path));
+
+        // After bump_version, the entry should pick up the new mtime/size
+        // (the caller is presumed to send didChange with the fresh content).
+        store.bump_version(&path);
+        assert!(!store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn open_documents_returns_all_paths() {
+        let mut store = DocumentStore::new();
+        store.open(PathBuf::from("/tmp/p1"));
+        store.open(PathBuf::from("/tmp/p2"));
+        let docs = store.open_documents();
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[test]
+    fn entry_returns_full_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("e.txt");
+        write_file(&path, "abc");
+
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+
+        let entry = store.entry(&path).expect("entry");
+        assert_eq!(entry.version, 1);
+        assert!(entry.mtime.is_some());
+        assert_eq!(entry.size, Some(3));
+        assert!(entry.content_hash.is_some());
+    }
+}

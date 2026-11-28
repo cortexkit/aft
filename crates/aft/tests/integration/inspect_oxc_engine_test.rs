@@ -1898,8 +1898,16 @@ fn oxc_engine_warm_facts_cache_resolves_3k_file_corpus_under_perf_gate() {
     // on a loaded Windows release runner at 1.53s (2% over), same wall-clock
     // class previously removed from inspect_tier2_reuse. Cache-hit asserts
     // above are the functional gate.
+    // Native Windows debug medians were 1.39 s before and after moving the
+    // inspect engine into aft-engine; the hosted runner reached 5.29 s. A 15 s
+    // cap leaves room for that outlier while still catching a roughly tenfold
+    // regression from the debug median.
+    #[cfg(all(windows, debug_assertions))]
+    let coarse_limit = Duration::from_secs(15);
+    #[cfg(not(all(windows, debug_assertions)))]
+    let coarse_limit = Duration::from_secs(5);
     assert!(
-        elapsed <= Duration::from_secs(5),
+        elapsed <= coarse_limit,
         "warm oxc resolution over {FILE_COUNT} files took {elapsed:?}; stats={:#?}",
         warm.stats
     );

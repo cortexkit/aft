@@ -31,14 +31,14 @@ interface DisplayFile {
   sourcePath?: string;
 }
 
-/** `crates/aft/src/edit.rs::build_unified_diff`: an `Index:` banner, file headers, then hunks. */
+/** `crates/aft-engine/src/edit.rs::build_unified_diff`: an `Index:` banner, file headers, then hunks. */
 function unifiedPatch(path: string, hunks: string): string {
   return `Index: ${path}\n${"=".repeat(67)}\n--- ${path}\n+++ ${path}\n${hunks}`;
 }
 
 /**
  * A successful hashline `edit` reply as the Pi transport sends it
- * (`crates/aft/src/hashline/integration/transport.rs::render_mutation_response`),
+ * (`crates/aft-engine/src/hashline/integration/transport.rs::render_mutation_response`),
  * plus the `text` the tool_call layer copies from `output`. The absolute-path
  * fields of the real reply are left out: the Pi adapter does not read them.
  */

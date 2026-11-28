@@ -144,7 +144,7 @@ Focused checks:
 ```sh
 python3 -m unittest discover -s scripts/telemetry/callgraph-exactness -p 'test_*.py' -v
 cargo check -p agent-file-tools --example callgraph_exactness --features test-hooks
-cargo test -p agent-file-tools --lib -- data_layer::incremental_tests
+cargo test -p aft-engine --lib -- data_layer::incremental_tests
 cargo build --profile ci-storm -p agent-file-tools --example callgraph_exactness --features test-hooks
 python3 scripts/telemetry/callgraph-exactness/smoke.py \
   --binary "$CARGO_TARGET_DIR/ci-storm/examples/callgraph_exactness" \

@@ -233,7 +233,7 @@ fn public_domain_is_strict_and_interval_arithmetic_is_post_validation() {
         );
     }
 
-    let source = include_str!("../src/commands/semantic_search/paging.rs");
+    let source = include_str!("../../aft-tools/src/commands/semantic_search/paging.rs");
     assert!(source.contains("(self.offset as u64).saturating_add(self.top_k as u64)"));
     assert!(!source.contains(".clamp(1, MAX_PUBLIC_TOP_K)"));
 }
@@ -255,9 +255,9 @@ fn top_k_out_of_range_is_never_clamped_into_a_page() {
 
 #[test]
 fn build_l_is_harness_only_and_public_top_k_300_is_rejected() {
-    let paging_source = include_str!("../src/commands/semantic_search/paging.rs");
-    let backend_surface = include_str!("../src/commands/semantic_search/mod.rs");
-    let agent_surface = include_str!("../src/subc_translate.rs");
+    let paging_source = include_str!("../../aft-tools/src/commands/semantic_search/paging.rs");
+    let backend_surface = include_str!("../../aft-tools/src/commands/semantic_search/mod.rs");
+    let agent_surface = include_str!("../../aft-tools/src/subc_translate.rs");
     assert!(paging_source.contains("pub(crate) fn build_l"));
     assert!(!backend_surface.contains("build_l"));
     assert!(!agent_surface.contains("build_l"));

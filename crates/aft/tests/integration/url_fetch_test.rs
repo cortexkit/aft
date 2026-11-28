@@ -1094,39 +1094,53 @@ fn json_outline_works() {
 fn body_size_cap() {
     let project = TempDir::new().unwrap();
     let storage = TempDir::new().unwrap();
-    let server = spawn_mock_server(1, |_path, stream| {
-        let body = format!("# Large\n{}", "x".repeat(11 * 1024 * 1024));
+    let body = format!("# Large\n{}", "x".repeat(11 * 1024 * 1024));
+    let server = spawn_mock_server(1, move |_path, stream| {
         write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
         )
         .expect("write oversized headers");
-        stream.flush().expect("flush oversized headers");
+        // The client closes the connection once it has detected truncation.
         let _ = stream.write_all(body.as_bytes());
     });
-    let mut aft = configure_with_storage(project.path(), storage.path());
-
-    let resp = aft.send(
-        &json!({
-            "id": "large",
-            "command": "outline",
-            "file": server.url("/large.md"),
-            "allow_private": true,
-        })
-        .to_string(),
+    let url = server.url("/large.md");
+    let ctx = aft_tools::tools_test_support::test_context(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        aft::config::Config {
+            project_root: Some(project.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            url_fetch_allow_private: true,
+            ..Default::default()
+        },
     );
+    let req = serde_json::from_value(json!({
+        "id": "large",
+        "command": "outline",
+        "file": url,
+        "allow_private": true,
+    }))
+    .unwrap();
 
-    assert_eq!(
-        resp["success"], true,
-        "bounded outline should succeed: {resp:?}"
+    // A standalone outline's 5 s request budget leaves about 2 s to download.
+    // Give this call enough time to use the normal 20 s fetch ceiling as a hang
+    // catch. The assertion is about bytes, not how fast CI transfers them.
+    let response = aft_base::bounded_io::with_budget(
+        Some(aft_base::bounded_io::Budget::after(Duration::from_secs(30))),
+        || aft::commands::outline::handle_outline(&req, &ctx),
     );
-    assert_eq!(resp["complete"], false);
-    assert!(resp["text"]
+    assert!(
+        response.success,
+        "bounded outline should succeed: {response:?}"
+    );
+    assert_eq!(response.data["complete"], false);
+    assert!(response.data["text"]
         .as_str()
         .unwrap_or_default()
         .contains("Download truncated at 8388608 of"));
-    assert!(aft.shutdown().success());
+    let cached = cache_content_path_for_url(&ctx.cache_dir(), &url, ".md");
+    assert_eq!(fs::metadata(cached).unwrap().len(), 8 * 1024 * 1024);
 }
 
 // Oversized bodies must remain useful without either downloading or rendering

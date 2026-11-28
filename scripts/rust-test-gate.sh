@@ -538,8 +538,8 @@ if phase_enabled lib; then
       gate_cargo nextest run "${lib_archive_args[@]}" --profile gate \
         -E 'kind(lib)' -- platform_verifier_tls_client_subprocess
   else
-    run_phase "cargo test --features wasm-grammars -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
-      gate_cargo test --features wasm-grammars -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
+    run_phase "cargo test --features wasm-grammars -p aft-engine --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
+      gate_cargo test --features wasm-grammars -p aft-engine --lib platform_verifier_tls_client_subprocess --quiet
   fi
 
   if phase_enabled lib-shard \

@@ -1,0 +1,420 @@
+use super::*;
+use crate::bash_background::BgTaskStatus;
+use aft_engine::test_bridge::bash_remote::bash_background::registry::root_reclaim_tests::*;
+
+struct ReclaimFixture {
+    _dir: tempfile::TempDir,
+    storage: tempfile::TempDir,
+    root: ProjectRootId,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    roots: HashMap<ProjectRootId, RootMeta>,
+    metrics: DispatchPathMetrics,
+    now: Instant,
+}
+
+impl ReclaimFixture {
+    fn new() -> Self {
+        let (dir, root) = test_support::test_root("deleted-root-reclaim");
+        let ctx = test_support::test_ctx();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let now = Instant::now();
+        let mut meta = RootMeta::new(now);
+        // Two independent probes have already confirmed absence; each test
+        // exercises the task cleanup sweeps that follow that confirmation.
+        meta.consecutive_missing_sweeps = 2;
+        let roots = HashMap::from([(root.clone(), meta)]);
+        std::fs::remove_dir_all(root.as_path()).unwrap();
+        let deadline = now + Duration::from_secs(5);
+        while executor.dispatch_loop_liveness().has_pending_work() {
+            assert!(Instant::now() < deadline, "registration did not settle");
+            std::thread::yield_now();
+        }
+        Self {
+            _dir: dir,
+            storage: tempfile::tempdir().unwrap(),
+            root,
+            ctx,
+            executor,
+            roots,
+            metrics: DispatchPathMetrics::new(),
+            now,
+        }
+    }
+
+    fn task(&self, id: &str, root: &Path, status: BgTaskStatus, pid: Option<u32>) {
+        register_task(
+            self.ctx.bash_background(),
+            self.storage.path(),
+            root,
+            id,
+            status,
+            pid,
+        );
+    }
+
+    fn sweep(&mut self) -> IdleReapOutcome {
+        reap_idle_roots_with_presence(
+            self.now,
+            &mut self.roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &self.executor,
+            &self.metrics,
+            &RootPresence::default(),
+        )
+    }
+
+    fn wait_for_kill(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.roots[&self.root]
+            .reclaim_kill_in_flight
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            assert!(Instant::now() < deadline, "reclaim kill did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn assert_reclaimed(&self, outcome: IdleReapOutcome) {
+        assert_eq!(
+            outcome.forgotten_deleted_roots,
+            vec![self.root.clone()],
+            "root retained: {}",
+            self.metrics.reap_census_for_test()
+        );
+        assert!(!self.roots.contains_key(&self.root));
+        assert!(self.executor.actor_context(&self.root).is_none());
+    }
+}
+
+#[test]
+fn deleted_root_delivered_completions_settle_once_after_descendants_exit() {
+    let mut fixture = ReclaimFixture::new();
+    let registry = fixture.ctx.bash_background().clone();
+    registry.set_harness(crate::harness::Harness::Opencode);
+    let db = Arc::new(std::sync::Mutex::new(
+        crate::db::open(&fixture.storage.path().join("aft.db")).unwrap(),
+    ));
+    registry.set_db_pool(Arc::clone(&db));
+    for (id, status) in [
+        ("bash-0000000000000091", BgTaskStatus::Completed),
+        ("bash-0000000000000092", BgTaskStatus::Failed),
+    ] {
+        let group = OwnedGroup::spawn();
+        fixture.task(id, fixture.root.as_path(), status, Some(group.child().id()));
+        deliver_terminal_and_remove_output(&registry, id);
+        // Completion sampled a live group member. Its later exit leaves the
+        // saved descendant list stale, just as a short-lived child can exit
+        // between a command's completion and deleted-root reclamation.
+        drop(group);
+    }
+    assert_eq!(completion_attempts(&registry), 2);
+    assert_eq!(fixture.sweep().evicted, 0);
+    fixture.wait_for_kill();
+    assert_eq!(
+        completion_attempts(&registry),
+        2,
+        "reclaim reprocessed already-delivered terminal completions"
+    );
+    fixture.now += RECLAIM_KILL_RETRY;
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+    for _ in 0..3 {
+        fixture.now += RECLAIM_KILL_RETRY;
+        assert_eq!(fixture.sweep().evicted, 0);
+    }
+    assert_eq!(kill_attempts(&registry), 1);
+    assert_eq!(completion_attempts(&registry), 2);
+    assert!(registry
+        .pending_completions_for_session("reclaim")
+        .is_empty());
+    let conn = db.lock().unwrap();
+    let delivered: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bash_tasks WHERE completion_delivered = 1 AND status IN ('completed', 'failed')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered, 2);
+}
+
+#[test]
+fn deleted_root_reused_group_is_not_signaled_and_does_not_block_reclaim() {
+    let mut fixture = ReclaimFixture::new();
+    let registry = fixture.ctx.bash_background().clone();
+    let mut group = OwnedGroup::spawn();
+    let id = "bash-0000000000000093";
+    fixture.task(
+        id,
+        fixture.root.as_path(),
+        BgTaskStatus::Completed,
+        Some(group.child().id()),
+    );
+    deliver_terminal_and_remove_output(&registry, id);
+    // Keep the group number but make every saved start time differ from the
+    // live process, modeling a group number reused by an unrelated command.
+    disown_group_identities(&registry, id);
+    assert_eq!(fixture.sweep().evicted, 0);
+    fixture.wait_for_kill();
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+    assert!(group.child_mut().try_wait().unwrap().is_none());
+    assert_eq!(completion_attempts(&registry), 1);
+}
+
+#[test]
+fn deleted_root_terminal_survivor_is_killed_and_reclaimed_in_two_sweeps() {
+    assert_terminal_survivor_reclaimed(false);
+}
+
+#[test]
+fn deleted_root_terminal_group_with_no_sample_is_checked_before_reclaim() {
+    assert_terminal_survivor_reclaimed(true);
+}
+
+fn assert_terminal_survivor_reclaimed(clear_sample: bool) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut fixture = ReclaimFixture::new();
+    let mut group = OwnedGroup::spawn();
+    fixture.task(
+        "bash-0000000000000001",
+        fixture.root.as_path(),
+        BgTaskStatus::Completed,
+        Some(group.child().id()),
+    );
+    if clear_sample {
+        clear_descendant_sample(fixture.ctx.bash_background(), "bash-0000000000000001");
+    }
+    assert_eq!(fixture.sweep().evicted, 0);
+    fixture.wait_for_kill();
+    // The worker settles group liveness, not this test's Child handle. Reap
+    // the child to observe the signal rather than requiring try_wait to be
+    // ready immediately after the worker clears its in-flight flag. The wait
+    // is bounded so a group that survived fails the test instead of hanging it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = group.child_mut().try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal task's owned group survived reclaim"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        matches!(status.signal(), Some(libc::SIGTERM) | Some(libc::SIGKILL)),
+        "terminal task's owned group was not killed by a reclaim signal: {status}"
+    );
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+}
+
+#[test]
+fn deleted_root_is_not_blocked_by_another_roots_running_task() {
+    let mut fixture = ReclaimFixture::new();
+    let other = tempfile::tempdir().unwrap();
+    let mut group = OwnedGroup::spawn();
+    fixture.task(
+        "bash-0000000000000002",
+        other.path(),
+        BgTaskStatus::Running,
+        Some(group.child().id()),
+    );
+    // Actor retirement detaches its registry. Keep the task itself so the
+    // assertion observes its state rather than racing the registry teardown.
+    let foreign = fixture
+        .ctx
+        .bash_background()
+        .task_for_test("bash-0000000000000002")
+        .unwrap();
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+    assert!(foreign.is_running());
+    assert!(
+        group.child_mut().try_wait().unwrap().is_none(),
+        "foreign task must not be signaled"
+    );
+    assert_eq!(kill_attempts(fixture.ctx.bash_background()), 0);
+}
+
+#[test]
+fn deleted_root_reclaim_retries_after_failed_terminal_group_sample() {
+    use crate::bash_background::process::LiveDescendantsUnavailable;
+    use aft_engine::test_bridge::bash_remote::bash_background::registry::install_kill_signal_gate_for_test;
+    use aft_engine::test_bridge::bash_remote::scoped_listing_failure;
+
+    let mut fixture = ReclaimFixture::new();
+    let registry = fixture.ctx.bash_background().clone();
+    // Keep the watchdog from racing the test's terminal publisher.
+    registry.test_shutdown_flag().store(true, Ordering::SeqCst);
+    let hold = fixture.storage.path().join("hold");
+    let hold = std::ffi::CString::new(hold.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(hold.as_ptr(), 0o600) }, 0);
+    let task_id = registry
+        .spawn(
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            "read -r line < hold",
+            "reclaim".into(),
+            fixture.storage.path().to_path_buf(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(60)),
+            None,
+            fixture.storage.path().to_path_buf(),
+            8,
+            true,
+            false,
+            Some(fixture.root.as_path().to_path_buf()),
+        )
+        .expect("spawn task blocked on FIFO");
+    let pgid = registry.notice_metadata(&task_id).unwrap().pgid.unwrap();
+    let (terminal_published, release) =
+        install_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
+
+    // Run the same kill worker directly so the test can join it. Model a first
+    // submission on the sweep after the test's 30-second wait started.
+    let old_deadline = fixture.now + Duration::from_secs(30);
+    let first_attempt_at = fixture.now + Duration::from_millis(10);
+    fixture
+        .roots
+        .get_mut(&fixture.root)
+        .unwrap()
+        .reclaim_kill_submitted_at = Some(first_attempt_at);
+    let worker = {
+        let registry = registry.clone();
+        let root = fixture.root.clone();
+        std::thread::spawn(move || registry.kill_running_tasks_for_root(root.as_path()))
+    };
+    terminal_published
+        .recv_timeout(Duration::from_secs(10))
+        .expect("kill published terminal state before sampling the group");
+    let listing_failure = scoped_listing_failure(pgid);
+    release.send(()).unwrap();
+    assert_eq!(worker.join().unwrap(), 1);
+    drop(listing_failure);
+    let metadata = registry.notice_metadata(&task_id).unwrap();
+    assert_eq!(metadata.status, BgTaskStatus::Killed);
+    assert!(metadata.live_descendants.is_none());
+    assert_eq!(
+        metadata.live_descendants_unavailable,
+        Some(LiveDescendantsUnavailable::ListingFailed)
+    );
+
+    fixture.now = old_deadline;
+    let old_final_sweep = fixture.sweep();
+    assert!(old_final_sweep.forgotten_deleted_roots.is_empty());
+    assert_eq!(kill_attempts(&registry), 1);
+    assert_eq!(
+        fixture.metrics.reap_census_for_test()["deleted_task_blockers"]["task_kill_backoff"],
+        1,
+        "the root should still be in backoff at the old test deadline"
+    );
+
+    let outcome = test_support::reap_until_forgotten(
+        &fixture.root,
+        &mut fixture.roots,
+        &HashMap::new(),
+        &HashMap::new(),
+        &fixture.executor,
+        &fixture.metrics,
+    );
+    fixture.assert_reclaimed(outcome);
+    assert_eq!(kill_attempts(&registry), 2);
+}
+
+#[test]
+fn deleted_root_unkillable_task_backs_off_counted_kill_threads() {
+    let mut fixture = ReclaimFixture::new();
+    fixture.task(
+        "bash-0000000000000003",
+        fixture.root.as_path(),
+        BgTaskStatus::Running,
+        None,
+    );
+    refuse_reclaim_kills(fixture.ctx.bash_background());
+    for _ in 0..100 {
+        assert_eq!(fixture.sweep().evicted, 0);
+        fixture.wait_for_kill();
+        fixture.now += Duration::from_millis(100);
+    }
+    assert_eq!(
+        kill_attempts(fixture.ctx.bash_background()),
+        1,
+        "100 sweeps over 10 seconds must spawn only the initial kill thread"
+    );
+    assert_eq!(
+        fixture.metrics.reap_census_for_test()["deleted_task_blockers"]["task_kill_backoff"],
+        1
+    );
+    fixture.now += RECLAIM_KILL_RETRY;
+    assert_eq!(fixture.sweep().evicted, 0);
+    fixture.wait_for_kill();
+    assert_eq!(
+        kill_attempts(fixture.ctx.bash_background()),
+        2,
+        "retry once the backoff expires"
+    );
+    finish_task(fixture.ctx.bash_background(), "bash-0000000000000003");
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+}
+
+#[test]
+fn deleted_root_running_task_is_killed_before_reclaim() {
+    let mut fixture = ReclaimFixture::new();
+    let mut group = OwnedGroup::spawn();
+    fixture.task(
+        "bash-0000000000000004",
+        fixture.root.as_path(),
+        BgTaskStatus::Running,
+        Some(group.child().id()),
+    );
+    assert_eq!(fixture.sweep().evicted, 0);
+    assert_eq!(
+        fixture.metrics.reap_census_for_test()["deleted_task_blockers"]["task_kill_in_flight"],
+        1
+    );
+    assert!(fixture.roots.contains_key(&fixture.root));
+    fixture.wait_for_kill();
+    assert!(
+        group.child_mut().try_wait().unwrap().is_some(),
+        "running task survived reclaim"
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .bash_background()
+            .observed_status("bash-0000000000000004", "reclaim", 0)
+            .unwrap()
+            .info
+            .status,
+        BgTaskStatus::Killed
+    );
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+}
+
+#[test]
+fn deleted_root_task_registry_contention_is_censused_without_kill_threads() {
+    let mut fixture = ReclaimFixture::new();
+    let ctx = Arc::clone(&fixture.ctx);
+    assert_eq!(
+        while_task_map_locked(ctx.bash_background(), || fixture.sweep()).evicted,
+        0
+    );
+    assert_eq!(
+        fixture.metrics.reap_census_for_test()["deleted_task_blockers"]["task_registry_busy"],
+        1
+    );
+    assert_eq!(kill_attempts(ctx.bash_background()), 0);
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+}
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::{BgTaskRegistryTestExt as _, BgTaskTestExt as _};

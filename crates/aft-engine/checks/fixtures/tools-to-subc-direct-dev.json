@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {"id": "aft-tools", "name": "aft-tools"},
+    {"id": "aft-subc", "name": "aft-subc"}
+  ],
+  "workspace_members": ["aft-tools", "aft-subc"],
+  "resolve": {"nodes": [
+    {"id": "aft-tools", "deps": [
+      {"pkg": "aft-subc", "dep_kinds": [{"kind": "dev", "target": "cfg(unix)"}]}
+    ]},
+    {"id": "aft-subc", "deps": []}
+  ]}
+}

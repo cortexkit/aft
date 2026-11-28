@@ -654,6 +654,9 @@ fn client_child() {
                 if value["op"] == "raw" {
                     let socket: &mut tokio_rustls::client::TlsStream<TcpStream> = raw_sockets.last_mut().ok_or(())?;
                     socket.write_all(value["wire"].as_str().ok_or(())?.as_bytes()).await.map_err(|_| ())?;
+                    // The peer can wait for the last byte before responding. Reading
+                    // does not flush the ciphertext still buffered by rustls.
+                    socket.flush().await.map_err(|_| ())?;
                     let mut response = Vec::new(); socket.read_to_end(&mut response).await.map_err(|_| ())?;
                     if let Some(length) = value["tail_bytes"].as_u64() {
                         if length < 2 { return Err(()); }

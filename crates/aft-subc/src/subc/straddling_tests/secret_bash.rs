@@ -1,0 +1,1294 @@
+use crate::bash_background::secrets::*;
+use crate::context::AppContext;
+use crate::protocol::RawRequest;
+use crate::protocol::Response;
+use crate::sandbox_spawn::SpawnPlan;
+use crate::secret::SecretVault;
+use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
+use aft_engine::test_bridge::bash_remote::bash_background::secrets::{PROXY_KEYS, REMOVE_KEYS};
+use aft_engine::test_bridge::bash_remote::secrets_support::*;
+#[cfg(not(windows))]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(not(windows))]
+use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
+#[cfg(unix)]
+use aft_engine::test_bridge::bash_remote::{PreflightTestExt as _, PreparedTaskTestExt as _};
+use serde_json::json;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+#[cfg(unix)]
+#[path = "secrets_audit_tests.rs"]
+mod audit_followups;
+
+struct Vault {
+    resolves: AtomicUsize,
+    materials: AtomicUsize,
+    #[cfg(unix)]
+    port: u16,
+    audits: Mutex<Vec<secret_rules::audit::AuditRecordV1>>,
+    resolve_kinds: Mutex<Vec<String>>,
+    material_kinds: Mutex<Vec<String>>,
+    expected_epoch: AtomicU64,
+}
+
+impl Vault {
+    fn new(_port: u16) -> Arc<Self> {
+        #[cfg(unix)]
+        set_https_port((_port != 0).then_some(_port));
+        Arc::new(Self {
+            resolves: AtomicUsize::new(0),
+            materials: AtomicUsize::new(0),
+            #[cfg(unix)]
+            port: _port,
+            audits: Mutex::new(Vec::new()),
+            resolve_kinds: Mutex::new(Vec::new()),
+            material_kinds: Mutex::new(Vec::new()),
+            expected_epoch: AtomicU64::new(1),
+        })
+    }
+}
+
+const KEY: &[u8] = b"s4-test-api-key-0123456789";
+
+impl SecretVault for Vault {
+    fn use_secret(
+        &self,
+        scope: &crate::secret::SecretScope,
+        label: &str,
+        target: &ApiKeyTarget,
+    ) -> UseAnswer {
+        #[cfg(unix)]
+        {
+            // The real limits change only in the audit tests' isolated child
+            // processes; a shared test process keeps its limits.
+            if std::env::var_os(crate::secret_proxy::test_hardening::REAL_ENV).is_some() {
+                let mut core: libc::rlimit = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) }, 0);
+                assert_eq!((core.rlim_cur, core.rlim_max), (0, 0));
+                #[cfg(target_os = "linux")]
+                assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+            }
+        }
+        assert_eq!(scope.reference(), "secret-bash");
+        assert_eq!(scope.owner(), "reserved:prefrontal");
+        assert_eq!(
+            scope.stamp().scope_epoch,
+            self.expected_epoch.load(Ordering::SeqCst)
+        );
+        self.resolves.fetch_add(1, Ordering::SeqCst);
+        self.resolve_kinds
+            .lock()
+            .unwrap()
+            .push(scope.kind().to_owned());
+        if target.scheme != "https"
+            || target.host != "localhost"
+            || target.port != Some(443)
+            || target.path != "/api"
+        {
+            return UseAnswer::NotFound;
+        }
+        self.materials.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(scope.reference(), "secret-bash");
+        assert_eq!(scope.owner(), "reserved:prefrontal");
+        assert_eq!(
+            scope.stamp().scope_epoch,
+            self.expected_epoch.load(Ordering::SeqCst)
+        );
+        assert_eq!(label, "test");
+        self.material_kinds
+            .lock()
+            .unwrap()
+            .push(scope.kind().to_owned());
+        UseAnswer::Released(ReleasedApiKey::new(
+            "authorization_bearer".into(),
+            Material::new(KEY.to_vec()),
+        ))
+    }
+    fn audit(
+        &self,
+        record: &secret_rules::audit::AuditRecordV1,
+    ) -> Result<(), crate::secret::AuditError> {
+        self.audits.lock().unwrap().push(record.clone());
+        Ok(())
+    }
+}
+
+fn with_vault<R>(vault: Arc<dyn SecretVault>, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Arc<dyn SecretVault>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            replace_vault(self.0.take());
+        }
+    }
+    let _restore = Restore(replace_vault(Some(vault)));
+    run()
+}
+
+fn context(root: &Path, storage: &Path) -> AppContext {
+    crate::test_context(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.to_owned()),
+            storage_dir: Some(storage.to_owned()),
+            experimental_bash_background: true,
+            sandbox: crate::config::SandboxConfig {
+                profile: crate::config::SandboxRoles {
+                    head: crate::config::SandboxMode::Strict,
+                    worker: crate::config::SandboxMode::Strict,
+                },
+                ..Default::default()
+            },
+            ..crate::config::Config::default()
+        },
+    )
+}
+
+fn request(command: &str) -> RawRequest {
+    serde_json::from_value(json!({"id":"secret-bash", "command":"bash", "session_id":"secret-bash", "params":{"command":command,"background":true,"compressed":false}})).unwrap()
+}
+
+#[cfg(unix)]
+fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {
+    serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-bash","kind":kind,"scope_epoch":1,"owner_authorized":true})).unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution() {
+    use crate::subc::scope_watch::{revision, Source};
+    use std::ffi::OsString;
+    use std::os::unix::process::CommandExt;
+    struct Session(std::process::Child);
+    impl Drop for Session {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    // No secret is released and no sandbox is resolved. A harmless session
+    // leader supplies only the process identity that proxy arming requires.
+    let mut child = std::process::Command::new("/bin/sleep");
+    child.arg("30");
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let child = Session(child.spawn().unwrap());
+    let authorization = stamp("head");
+    let mut lifetime = stamp("ephemeral");
+    lifetime.scope_ref = "secret-bash-run".into();
+    let authorization_scope = crate::secret::SecretScope::from_stamp(&authorization);
+    let lifetime_scope = crate::secret::SecretScope::from_stamp(&lifetime);
+    let runtime = || {
+        let proxy = crate::secret_proxy::SecretProxy::start_for_test(
+            crate::secret_proxy::ProxyConfig {
+                vault: Vault::new(0),
+                authorization_scope: authorization_scope.clone(),
+                lifetime_scope: lifetime_scope.clone(),
+                scanned_labels: vec!["test".into()],
+                consent_context: None,
+                test_https_port: None,
+                approval_clock: None,
+                origin: "scope-watch-unit".into(),
+            },
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )
+        .unwrap();
+        unarmed_runtime(
+            proxy,
+            storage.path().join("unused-trust.pem"),
+            lifetime_scope.clone(),
+            authorization_scope.clone(),
+        )
+    };
+    let layout = crate::bash_background::persistence::allocate_task_layout(
+        storage.path(),
+        "scope-watch-unit",
+    )
+    .unwrap();
+    let environment = aft_engine::test_bridge::bash_remote::ChildEnvironment::from([(
+        OsString::from("SAFE"),
+        OsString::from("yes"),
+    )]);
+    let prepared = aft_engine::test_bridge::bash_remote::prepare_task_payload(
+        &layout,
+        b"true",
+        root.path(),
+        root.path(),
+        &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+        Path::new("/bin/sh"),
+        &environment,
+    )
+    .unwrap();
+    prepared.set_secret_runtime(runtime());
+    let plan = crate::sandbox_spawn::SpawnPlan::Unsandboxed.with_prepared_task(prepared);
+    let registry = ctx.bash_background();
+    assert!(registry.secret_authorization_scope_stamps().is_empty());
+    let before_arm = revision(Source::Shell);
+    registry
+        .arm_secret_proxy(&plan, "scope-watch-unit", child.0.id())
+        .unwrap();
+    assert!(revision(Source::Shell) > before_arm);
+    assert_eq!(
+        registry.secret_authorization_scope_stamps(),
+        vec![authorization.clone()]
+    );
+    assert!(registry
+        .live_scope_stamps()
+        .iter()
+        .any(|scope| scope == &authorization));
+    let before_stop = revision(Source::Shell);
+    registry.stop_secret_proxy("scope-watch-unit");
+    assert!(revision(Source::Shell) > before_stop);
+    assert!(registry.secret_authorization_scope_stamps().is_empty());
+    assert!(registry.live_scope_stamps().is_empty());
+    plan.prepared_task().unwrap().set_secret_runtime(runtime());
+    registry
+        .arm_secret_proxy(&plan, "scope-watch-unit", child.0.id())
+        .unwrap();
+    let before_scope_end = revision(Source::Shell);
+    registry.kill_scope(&lifetime);
+    assert!(revision(Source::Shell) > before_scope_end);
+    assert!(registry.secret_authorization_scope_stamps().is_empty());
+    assert!(registry.live_scope_stamps().is_empty());
+}
+
+fn code(response: &Response) -> Option<&str> {
+    response.data.get("code").and_then(|code| code.as_str())
+}
+
+#[test]
+fn secret_bash_sandbox_raise_host_refuses_before_scope_or_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    ctx.update_config(|config| config.sandbox = Default::default());
+    let vault = Vault::new(443);
+    let mut req = request("echo '{{ck-secret:test}}' > must-not-run");
+    req.params["params"]["sandbox"] = json!("host");
+    let reply = with_vault(vault.clone(), || crate::commands::bash::handle(&req, &ctx));
+    assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+    assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but a host-escalation request would bypass the strict sandbox. No command was started.");
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("must-not-run").exists());
+    assert!(!storage.path().join("tasks").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_bash_sandbox_raise_role_and_task_plans_are_command_local() {
+    with_safe_ptrace(|| with_isolated_account(7, secret_bash_sandbox_raise_role_and_task_plans));
+}
+
+#[cfg(unix)]
+fn with_isolated_account<R>(expected_reads: usize, run: impl FnOnce() -> R) -> R {
+    let account = tempfile::tempdir().unwrap();
+    crate::worker_jail_canary::with_test_preparation_home(account.path(), expected_reads, run)
+}
+
+#[cfg(unix)]
+fn with_safe_ptrace<R>(run: impl FnOnce() -> R) -> R {
+    #[cfg(target_os = "linux")]
+    {
+        aft_engine::test_bridge::bash_remote::sandbox_spawn::with_secret_ptrace_scope_for_test(
+            Some("1"),
+            run,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        run()
+    }
+}
+
+#[cfg(unix)]
+fn secret_bash_sandbox_raise_role_and_task_plans() {
+    use crate::sandbox_spawn::{
+        AuthenticatedPrincipal, RequestedSandboxTier, SandboxRequirement, SandboxTaskKind,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let _launcher = native_launcher(root.path());
+    let ctx = context(root.path(), storage.path());
+    let operator_binary = storage.path().join("operator-aft");
+    std::fs::write(&operator_binary, "operator executable fixture").unwrap();
+    ctx.update_config(|config| {
+        config.sandbox = Default::default();
+        config.gh_shim.binary_path = Some(operator_binary);
+    });
+    let requirement = SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap();
+    for worker in [false, true] {
+        crate::sandbox_spawn::with_worker_jail(worker, || {
+            let expected = if worker {
+                crate::config::SandboxMode::Relaxed
+            } else {
+                crate::config::SandboxMode::Off
+            };
+            for (pty, background) in [(false, false), (false, true), (true, true)] {
+                let plan = preflight(&ctx, "sandbox-raise", pty, background, requirement).unwrap();
+                assert!(plan.plan().protects_secret_memory(), "{:?}", plan.plan());
+                assert_eq!(
+                    crate::sandbox_spawn::effective_sandbox_mode(
+                        &ctx,
+                        &AuthenticatedPrincipal::FirstParty
+                    ),
+                    expected
+                );
+            }
+        });
+    }
+    let task = crate::bash_background::persistence::allocate_task_layout(
+        &crate::bash_background::task_storage_dir(&ctx),
+        "ordinary",
+    )
+    .unwrap();
+    let ordinary = aft_engine::test_bridge::bash_remote::resolve_command_sandbox_spawn(
+        &ctx,
+        &AuthenticatedPrincipal::FirstParty,
+        RequestedSandboxTier::Native,
+        SandboxTaskKind::BashForeground,
+        &task.paths.io_dir,
+        None,
+        SandboxRequirement::for_command("echo ordinary"),
+    );
+    assert_eq!(ordinary, SpawnPlan::Unsandboxed);
+    let reply = crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx);
+    assert_eq!(code(&reply), Some("secret_refused"), "{reply:?}");
+    crate::bash_background::persistence::delete_resolved_task(&task).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn secret_bash_sandbox_raise_linux_yama_refusals_precede_authorization() {
+    with_isolated_account(2, secret_bash_sandbox_raise_linux_yama_refusals);
+}
+
+#[cfg(target_os = "linux")]
+fn secret_bash_sandbox_raise_linux_yama_refusals() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let _launcher = native_launcher(root.path());
+    let ctx = context(root.path(), storage.path());
+    ctx.update_config(|config| config.sandbox = Default::default());
+    let vault = Vault::new(443);
+    for value in [Some("0"), None] {
+        let reply =
+            aft_engine::test_bridge::bash_remote::sandbox_spawn::with_secret_ptrace_scope_for_test(
+                value,
+                || {
+                    with_vault(vault.clone(), || {
+                        crate::commands::bash::handle(
+                            &request("echo '{{ck-secret:test}}' > must-not-run"),
+                            &ctx,
+                        )
+                    })
+                },
+            );
+        assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+        let message = reply.data["message"].as_str().unwrap();
+        assert!(message.starts_with("This command needs the strict sandbox because it uses a vault key, but Linux Yama ptrace_scope"), "{reply:?}");
+        assert!(
+            message.contains(if value.is_some() {
+                "is \"0\""
+            } else {
+                "could not be read:"
+            }),
+            "{reply:?}"
+        );
+        assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+        assert!(!root.path().join("must-not-run").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_bash_sandbox_raise_setup_refusals_name_the_cause() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    ctx.update_config(|config| config.sandbox = Default::default());
+    let vault = Vault::new(443);
+    let unavailable = SpawnPlan::Refused {
+        code: "sandbox_unavailable",
+        message: "the native launcher executable is unavailable".into(),
+        mismatch_class: None,
+    };
+    let reply = with_vault(vault.clone(), || {
+        aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(unavailable, || {
+            crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
+        })
+    });
+    assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+    assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but the strict sandbox could not be prepared: the native launcher executable is unavailable. No command was started.");
+    ctx.update_config(|config| config.project_root = Some(root.path().join("missing")));
+    let reply = with_vault(vault.clone(), || {
+        crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
+    });
+    assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+    assert!(
+        reply.data["message"].as_str().unwrap().contains(
+            "the strict sandbox could not be prepared: project root is not an existing directory:"
+        ),
+        "{reply:?}"
+    );
+    assert!(!reply.data["message"]
+        .as_str()
+        .unwrap()
+        .contains("select sandbox.profile off"));
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_bash_sandbox_raise_saved_plan_keeps_strict_profile() {
+    with_safe_ptrace(|| {
+        with_isolated_account(1, || {
+            use crate::sandbox_spawn::{AuthenticatedPrincipal, SandboxRequirement};
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let _launcher = native_launcher(root.path());
+            let ctx = context(root.path(), storage.path());
+            ctx.update_config(|config| config.sandbox = Default::default());
+            let preflight = preflight(
+                &ctx,
+                "sandbox-raise-snapshot",
+                false,
+                true,
+                SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap(),
+            )
+            .unwrap();
+            let task = preflight.task().as_ref().unwrap();
+            let principal = AuthenticatedPrincipal::FirstParty;
+            let shell = Path::new("/bin/sh");
+            let prepared = aft_engine::test_bridge::bash_remote::prepare_task_payload(
+                task,
+                b"printf probe",
+                root.path(),
+                root.path(),
+                &principal,
+                shell,
+                &Default::default(),
+            )
+            .unwrap();
+            let plan = preflight.plan().clone().with_prepared_task(prepared);
+            let digest = aft_engine::test_bridge::bash_remote::save_local_launch(
+                &plan,
+                root.path(),
+                root.path(),
+                &principal,
+                shell,
+                false,
+                None,
+                crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS,
+            )
+            .unwrap();
+            let (restored, ..) =
+                aft_engine::test_bridge::bash_remote::restore_local_launch(task, &digest).unwrap();
+            assert!(restored.protects_secret_memory(), "{restored:?}");
+            assert_eq!(
+                crate::sandbox_spawn::effective_sandbox_mode(&ctx, &principal),
+                crate::config::SandboxMode::Off
+            );
+        })
+    });
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write() {
+    const CHILD: &str = "AFT_SANDBOX_RAISE_PROBE";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let test = format!(
+            "{}::secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write",
+            module_path!().split_once("::").unwrap().1
+        );
+        command
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("HOME", home.path());
+        for key in [
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            let path = home.path().join(key);
+            std::fs::create_dir(&path).unwrap();
+            command.env(key, path);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    with_isolated_account(1, secret_bash_sandbox_raise_real_spawn_probe);
+}
+
+#[cfg(target_os = "macos")]
+fn secret_bash_sandbox_raise_real_spawn_probe() {
+    use std::ffi::{OsStr, OsString};
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("ungranted-write");
+    let _launcher = native_launcher(root.path());
+    let ctx = context(root.path(), storage.path());
+    ctx.update_config(|config| config.sandbox = Default::default());
+    let raised = preflight(
+        &ctx,
+        "sandbox-raise",
+        false,
+        false,
+        crate::sandbox_spawn::SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap(),
+    )
+    .unwrap();
+    let args = [
+        OsString::from("-c"),
+        OsString::from("printf started; printf probe > \"$1\""),
+        OsString::from("probe"),
+        target.as_os_str().to_owned(),
+    ];
+    let run = |plan: &SpawnPlan| {
+        aft_engine::test_bridge::bash_remote::sandbox_spawn::probe_command_for_plan(
+            plan,
+            OsStr::new("/bin/sh"),
+            &args,
+            root.path(),
+            &HashMap::new(),
+        )
+        .unwrap()
+        .output()
+        .unwrap()
+    };
+    let off = run(&SpawnPlan::Unsandboxed);
+    assert!(off.status.success(), "{off:?}");
+    assert_eq!(off.stdout, b"started");
+    assert_eq!(std::fs::read(&target).unwrap(), b"probe");
+    std::fs::remove_file(&target).unwrap();
+    let denied = run(raised.plan());
+    assert!(!denied.status.success(), "{denied:?}");
+    assert_eq!(
+        denied.stdout, b"started",
+        "the sandboxed shell must actually run: {denied:?}"
+    );
+    assert!(!target.exists());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("Operation not permitted"),
+        "{denied:?}"
+    );
+}
+
+#[test]
+fn secret_bash_scan_and_environment_conflicts() {
+    assert_eq!(
+        labels("echo '{{ck-secret:a}} {{ck-secret:a}} {{ck-secret:b}} {{ck-secret:BAD}}'"),
+        ["a", "b"]
+    );
+    for key in PROXY_KEYS.iter().chain(REMOVE_KEYS.iter()) {
+        assert!(env_conflicts(&HashMap::from([(
+            key.to_string(),
+            String::new()
+        )])));
+    }
+    assert!(!env_conflicts(&HashMap::from([(
+        "OTHER".into(),
+        "value".into()
+    )])));
+}
+
+#[test]
+fn secret_bash_remote_precedes_plan_scope_and_runon_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    let vault = Vault::new(443);
+    let mut req = request("echo '{{ck-secret:test}}'");
+    req.params["params"]["runon"] = json!("invalid-demand");
+    let reply = with_vault(vault.clone(), || crate::commands::bash::handle(&req, &ctx));
+    assert_eq!(code(&reply), Some("secrets_remote_refused"));
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+    assert_eq!(vault.audits.lock().unwrap().len(), 1);
+    assert!(!std::fs::read_dir(storage.path())
+        .unwrap()
+        .any(|entry| entry.unwrap().file_name() == "tasks"));
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_bash_legacy_remote_is_refused_before_any_job() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    let launch = crate::bash_background::RemoteLaunch {
+        explicit_runon: false,
+        connection_file: None,
+        harness: "broca".into(),
+        session: "secret-bash".into(),
+        requested_platform: None,
+        requested_vcpus: None,
+        requested_memory_mib: None,
+        requested_network: false,
+        configured_env_names: vec![],
+        return_paths: Vec::new(),
+        params: crate::exec_remote::FrozenParams {
+            remote_exec: Some(crate::exec_remote::policy::RemoteExecPolicy {
+                enabled: true,
+                legacy_commands: Some(json!(["echo"])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    };
+    let vault = Vault::new(443);
+    let reply = with_vault(vault.clone(), || {
+        crate::bash_background::with_remote_policy(Some(launch), || {
+            crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
+        })
+    });
+    assert_eq!(code(&reply), Some("secrets_remote_refused"));
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn secret_bash_nonqualifying_plans_precede_scope_and_rewrite() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    let vault = Vault::new(443);
+    let plans = [
+        SpawnPlan::Unsandboxed,
+        SpawnPlan::RelaxedUnenforced,
+        SpawnPlan::Host {
+            shell_path: "/bin/sh".into(),
+            environment: Default::default(),
+        },
+    ];
+    for plan in plans {
+        let reply = with_vault(vault.clone(), || {
+            aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(plan, || {
+                crate::commands::bash::handle(
+                    &request("echo '{{ck-secret:test}}' >> must-not-be-rewritten"),
+                    &ctx,
+                )
+            })
+        });
+        assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+        // Windows has no strict sandbox at all, so the platform reason comes
+        // before any plan is considered.
+        let reason = if cfg!(windows) {
+            "this platform has no strict native sandbox (Windows is unsupported)"
+        } else {
+            "the resolved plan has no strict native launcher"
+        };
+        assert_eq!(
+            reply.data["message"],
+            format!("This command needs the strict sandbox because it uses a vault key, but {reason}. No command was started.")
+        );
+        assert!(!root.path().join("must-not-be-rewritten").exists());
+    }
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn secret_bash_windows_refuses_all_profiles_without_a_job() {
+    for mode in [
+        crate::config::SandboxMode::Off,
+        crate::config::SandboxMode::Relaxed,
+        crate::config::SandboxMode::Strict,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.path().to_owned());
+        config.storage_dir = Some(storage.path().to_owned());
+        config.sandbox.profile = crate::config::SandboxRoles {
+            head: mode,
+            worker: mode,
+        };
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let vault = Vault::new(443);
+        let reply = with_vault(vault.clone(), || {
+            crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
+        });
+        assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+        assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but this platform has no strict native sandbox (Windows is unsupported). No command was started.");
+        assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(unix)]
+fn native_launcher_candidates(
+    executable: &Path,
+    provided: Option<std::path::PathBuf>,
+    target: Option<std::ffi::OsString>,
+    manifest: Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    if let Some(provided) = provided {
+        return vec![provided];
+    }
+    // Nextest only supplies BIN_EXE variables to integration tests and benches,
+    // not library tests. Locate the profile above Cargo's old `deps` or new
+    // `build/<package>/<unit>` intermediate tree in the extracted archive.
+    let Some(profile_dir) = cortexkit_test_support::cargo_profile_dir_of(executable) else {
+        return Vec::new();
+    };
+    let profile = profile_dir.file_name().unwrap();
+    let mut candidates = vec![profile_dir.join("aft")];
+    if let Some(target) = target {
+        candidates.push(std::path::PathBuf::from(target).join(profile).join("aft"));
+    }
+    if let Some(manifest) = manifest {
+        candidates.push(
+            std::path::PathBuf::from(manifest)
+                .join("../../target")
+                .join(profile)
+                .join("aft"),
+        );
+    }
+    candidates
+}
+
+#[cfg(unix)]
+fn native_launcher(root: &Path) -> impl Drop {
+    let candidates = native_launcher_candidates(
+        &std::env::current_exe().unwrap(),
+        std::env::var_os("AFT_TEST_AFT_BINARY")
+            .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
+            .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
+            .map(std::path::PathBuf::from),
+        std::env::var_os("CARGO_TARGET_DIR"),
+        std::env::var_os("CARGO_MANIFEST_DIR"),
+    );
+    let launcher = candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("build the real aft binary before running native secret-bash tests; looked in {candidates:?}")
+        });
+    aft_engine::test_bridge::bash_remote::sandbox_spawn::install_sandbox_launcher_for_test(
+        root, launcher,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn native_launcher_candidates_support_both_cargo_layouts() {
+    for executable in [
+        "/archive/target/debug/deps/agent_file_tools-hash",
+        "/archive/target/debug/build/agent-file-tools/hash/aft",
+        "/archive/target/debug/build/agent-file-tools/hash/out/aft",
+    ] {
+        let candidates = native_launcher_candidates(
+            Path::new(executable),
+            None,
+            Some("/custom-target".into()),
+            Some("/checkout/crates/aft".into()),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                std::path::PathBuf::from("/archive/target/debug/aft"),
+                std::path::PathBuf::from("/custom-target/debug/aft"),
+                std::path::PathBuf::from("/checkout/crates/aft/../../target/debug/aft"),
+            ],
+            "{executable}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_launcher_candidates_respect_explicit_binary_even_if_missing() {
+    let binary = std::path::PathBuf::from("/missing/explicit-aft");
+    assert_eq!(
+        native_launcher_candidates(
+            Path::new("/archive/target/debug/build/agent-file-tools/hash/aft"),
+            Some(binary.clone()),
+            Some("/custom-target".into()),
+            None,
+        ),
+        vec![binary],
+        "a missing explicit binary must fail rather than use a stale fallback"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_bash_real_plan_precedence_and_untrusted_request_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let _launcher = native_launcher(root.path());
+    let ctx = context(root.path(), storage.path());
+    let req = request("echo '{{ck-secret:test}}'");
+    let reply = crate::commands::bash::handle(&req, &ctx);
+    assert_eq!(code(&reply), Some("secret_refused"), "{reply:?}");
+    let mut forged = req.clone();
+    forged.params["params"]["scope"] = serde_json::to_value(stamp("head")).unwrap();
+    let vault = Vault::new(443);
+    let reply = with_vault(vault.clone(), || {
+        crate::commands::bash::handle(&forged, &ctx)
+    });
+    assert_eq!(code(&reply), Some("secret_refused"));
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+    let reply = crate::subc::with_secret_identity_for_test(root.path(), stamp("head"), || {
+        crate::commands::bash::handle(&req, &ctx)
+    });
+    assert!(
+        reply.success,
+        "an eligible launch does not ask an unavailable vault: {reply:?}"
+    );
+    for key in PROXY_KEYS.iter().chain(REMOVE_KEYS.iter()) {
+        let mut conflict = req.clone();
+        conflict.params["params"]["env"] = json!({*key: "conflict"});
+        let reply = with_vault(vault.clone(), || {
+            crate::subc::with_secret_identity_for_test(root.path(), stamp("head"), || {
+                crate::commands::bash::handle(&conflict, &ctx)
+            })
+        });
+        assert_eq!(code(&reply), Some("secrets_env_conflict"));
+    }
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+    ctx.update_config(|config| {
+        config
+            .bash
+            .env
+            .insert("NO_PROXY".into(), "localhost".into());
+    });
+    let reply = with_vault(vault.clone(), || crate::commands::bash::handle(&req, &ctx));
+    assert_eq!(code(&reply), Some("secrets_env_conflict"));
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_bash_real_pipeline_background_pty_environment_and_key_scan() {
+    // A fresh process gives the platform TLS verifier its own native-root
+    // environment without racing unrelated tests' process-wide TLS cache.
+    const CHILD: &str = "AFT_SECRET_BASH_NATIVE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let test = format!(
+            "{}::secret_bash_real_pipeline_background_pty_environment_and_key_scan",
+            module_path!().split_once("::").unwrap().1
+        );
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success() && String::from_utf8_lossy(&result.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    native_pipeline();
+}
+
+#[cfg(unix)]
+fn native_pipeline() {
+    use base64::Engine;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    use rustls::pki_types::pem::PemObject;
+    let native = native_roots().unwrap();
+    let first_native = rustls::pki_types::CertificateDer::pem_slice_iter(&native)
+        .next()
+        .expect("native roots must contain certificates")
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let _launcher = native_launcher(root.path());
+    let expected_native = root.path().join("expected-native.b64");
+    std::fs::write(
+        &expected_native,
+        base64::engine::general_purpose::STANDARD.encode(first_native.as_ref()),
+    )
+    .unwrap();
+    let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "AFT bash fixture upstream CA");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca = params.self_signed(&ca_key).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        // Do not mutate the host keychains. This fixture tests the real bash
+        // pipeline with a local upstream anchor, not macOS system-store trust.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        set_upstream(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+    }
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .unwrap();
+    let tls = Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+            )
+            .unwrap(),
+    );
+    let roots = root.path().join("roots.pem");
+    std::fs::write(&roots, ca.pem()).unwrap();
+    unsafe {
+        std::env::set_var("SSL_CERT_FILE", &roots);
+        std::env::set_var("https_proxy", "http://127.0.0.1:1");
+        std::env::set_var("NO_PROXY", "localhost");
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let vault = Vault::new(listener.local_addr().unwrap().port());
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen_server = seen.clone();
+    let cases = vec![
+        (crate::config::SandboxMode::Strict, false),
+        (crate::config::SandboxMode::Strict, true),
+    ];
+    let expected_requests = cases.len() * 2;
+    let encodings = vec![
+        std::str::from_utf8(KEY).unwrap().to_owned(),
+        base64::engine::general_purpose::STANDARD.encode(KEY),
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(KEY),
+        base64::engine::general_purpose::URL_SAFE.encode(KEY),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(KEY),
+        KEY.iter().map(|byte| format!("{byte:02x}")).collect(),
+        KEY.iter().map(|byte| format!("{byte:02X}")).collect(),
+        KEY.iter().map(|byte| format!("%{byte:02X}")).collect(),
+        KEY.iter().map(|byte| format!("%{byte:02x}")).collect(),
+    ];
+    let body = encodings.join("\n");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while seen_server.load(Ordering::SeqCst) < expected_requests && Instant::now() < deadline {
+            let (socket, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            // BSD can inherit the listener's O_NONBLOCK; TLS reads here block.
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(tls.clone()).unwrap(),
+                socket,
+            );
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.to_lowercase().contains(&format!(
+                "authorization: bearer {}",
+                std::str::from_utf8(KEY).unwrap()
+            )));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            seen_server.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(seen_server.load(Ordering::SeqCst), expected_requests);
+    });
+    let memory_probe = root.path().join("memory-probe.py");
+    std::fs::write(&memory_probe, r#"import ctypes, errno, os, sys
+pid = int(sys.argv[1])
+if sys.platform == 'darwin':
+    lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+    port = ctypes.c_uint(0)
+    assert lib.task_for_pid(lib.mach_task_self(), pid, ctypes.byref(port)) != 0, 'daemon task port exposed'
+else:
+    try:
+        f = open('/proc/%d/mem' % pid, 'rb')
+    except OSError as error:
+        # Restricted procfs mounts can hide an untraceable process as ENOENT.
+        assert error.errno in (errno.EACCES, errno.EPERM, errno.ENOENT), error
+    else:
+        f.close()
+        raise AssertionError('daemon memory exposed')
+    assert ctypes.CDLL(None).ptrace(16, pid, 0, 0) == -1, 'daemon ptrace exposed'
+paths = [os.environ[k] for k in ['SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO']]
+assert len(set(paths)) == 1
+assert open(paths[0], 'rb').read().count(b'BEGIN CERTIFICATE') > 1
+assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\n', b'').replace(b'\r', b'')
+"#).unwrap();
+    let mut expected_origins = Vec::new();
+    for (index, (mode, pty)) in cases.into_iter().enumerate() {
+        vault
+            .expected_epoch
+            .store(if pty { 1 } else { index as u64 + 1 }, Ordering::SeqCst);
+        #[cfg(target_os = "linux")]
+        assert!(
+            std::fs::metadata(format!("/proc/{}/mem", std::process::id())).is_ok(),
+            "the target must exist outside the child sandbox"
+        );
+        let ctx = context(root.path(), storage.path());
+        ctx.update_config(|config| {
+            config.sandbox.profile.head = mode;
+            config.sandbox.profile.worker = mode;
+        });
+        let gate = root.path().join(format!("go-{index}"));
+        let command = format!("{}; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", crate::test_gate::gate(&format!("'{}'", gate.display()), "sleep 0.05"), vault.port, vault.port);
+        let command = format!(
+            "python3 '{}' {} '{}' || exit 71; printf 'memory-and-bundle-ok\\n' >&2; {command}",
+            memory_probe.display(),
+            std::process::id(),
+            expected_native.display()
+        );
+        let mut req = request(&command);
+        req.params["params"]["pty"] = json!(pty);
+        req.params["params"]["env"] =
+            json!({"SSL_CERT_FILE":"/must-not-read-tool-supplied-trust-path"});
+        let mut lifetime = stamp("worker");
+        lifetime.scope_epoch = index as u64 + 1;
+        if pty {
+            lifetime = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-run","kind":"ephemeral","scope_epoch":index as u64 + 1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap();
+        }
+        let launch = || {
+            crate::bash_background::registry::with_scope_spawn(Some(lifetime.clone()), || {
+                crate::commands::bash::handle(&req, &ctx)
+            })
+        };
+        let response = with_vault(vault.clone(), || {
+            if pty {
+                crate::subc::with_secret_bound_identity_for_test(
+                    root.path(),
+                    stamp("head"),
+                    lifetime.clone(),
+                    launch,
+                )
+            } else {
+                crate::subc::with_secret_identity_for_test(root.path(), lifetime.clone(), launch)
+            }
+        });
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        expected_origins.extend([task_id.to_owned(), task_id.to_owned()]);
+        let address = ctx
+            .bash_background()
+            .secret_proxy_address_for_test(task_id)
+            .unwrap();
+        assert_eq!(
+            vault.resolves.load(Ordering::SeqCst),
+            index * 2,
+            "launch asks nothing; each previous outgoing request asked once"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            index * 2,
+            "requests must wait until the launch returns"
+        );
+        std::fs::write(&gate, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while seen.load(Ordering::SeqCst) < (index + 1) * 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let diagnostic = ctx
+            .bash_background()
+            .status(
+                task_id,
+                "secret-bash",
+                Some(root.path()),
+                Some(storage.path()),
+                8192,
+            )
+            .map(|snapshot| {
+                let output = |path: Option<String>| {
+                    path.and_then(|path| std::fs::read_to_string(path).ok())
+                        .unwrap_or_default()
+                };
+                format!(
+                    "status={:?}, exit={:?}\nstdout:\n{}\nstderr:\n{}",
+                    snapshot.info.status,
+                    snapshot.exit_code,
+                    output(snapshot.output_path),
+                    output(snapshot.stderr_path)
+                )
+            })
+            .unwrap_or_else(|| "task no longer registered".into());
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            (index + 1) * 2,
+            "command failed before upstream:\n{diagnostic}"
+        );
+        let snapshot = loop {
+            let snapshot = ctx
+                .bash_background()
+                .status(
+                    task_id,
+                    "secret-bash",
+                    Some(root.path()),
+                    Some(storage.path()),
+                    8192,
+                )
+                .unwrap();
+            assert!(!snapshot
+                .output_preview
+                .contains(std::str::from_utf8(KEY).unwrap()));
+            let output = snapshot
+                .output_path
+                .as_ref()
+                .and_then(|path| std::fs::read(path).ok())
+                .unwrap_or_default();
+            assert!(!output.windows(KEY.len()).any(|window| window == KEY));
+            if String::from_utf8_lossy(&output)
+                .matches("{{ck-secret:test}}")
+                .count()
+                >= encodings.len() * 2
+            {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy output missing: {snapshot:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let pid = snapshot.child_pid.unwrap() as i32;
+        assert_eq!(
+            unsafe { libc::getsid(pid) },
+            pid,
+            "command must lead its own session"
+        );
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        if pty {
+            ctx.bash_background().kill_scope(&lifetime);
+        } else {
+            ctx.bash_background().detach();
+            assert!(
+                crate::bash_background::process::is_process_alive(pid as u32),
+                "detach should leave the child alive but revoke its proxy"
+            );
+            assert!(
+                std::net::TcpStream::connect(address).is_err(),
+                "detach left listener alive while child was alive"
+            );
+            assert!(crate::bash_background::process::is_process_alive(
+                pid as u32
+            ));
+            crate::bash_background::process::terminate_pgid(pid, None);
+        }
+        assert!(
+            std::net::TcpStream::connect(address).is_err(),
+            "ended scope kept proxy listener alive"
+        );
+    }
+    server.join().unwrap();
+    assert_eq!(vault.materials.load(Ordering::SeqCst), expected_requests);
+    assert_eq!(
+        *vault.resolve_kinds.lock().unwrap(),
+        ["worker", "worker", "head", "head"].repeat(expected_requests / 4)
+    );
+    assert_eq!(
+        *vault.material_kinds.lock().unwrap(),
+        ["worker", "worker", "head", "head"].repeat(expected_requests / 4)
+    );
+    let audits = vault.audits.lock().unwrap();
+    assert_eq!(audits.len(), expected_requests);
+    for (index, record) in audits.iter().enumerate() {
+        let scope = record.scope.as_ref().unwrap();
+        assert_eq!(scope.owner, "reserved:prefrontal");
+        assert_eq!(scope.reference, "secret-bash");
+        assert_eq!(
+            scope.kind,
+            if (index / 2) % 2 == 0 {
+                "worker"
+            } else {
+                "head"
+            }
+        );
+        assert_eq!(record.host.as_deref(), Some("localhost"));
+        assert_eq!(record.port, Some(vault.port));
+        assert_eq!(record.matched_prefix.as_ref().unwrap().path_prefix, "/api");
+        assert_eq!(record.location_kind.as_deref(), Some("bearer"));
+        assert_eq!(record.decision, secret_rules::audit::Decision::Substituted);
+        assert_eq!(record.reason, secret_rules::audit::AuditReason::Matched);
+        assert_eq!(record.label, "test");
+        assert_eq!(record.origin, expected_origins[index]);
+        assert!(!record.request_id.is_empty());
+        let serialized = record.to_json_line_with_key(KEY).unwrap();
+        for encoded in &encodings {
+            assert!(!serialized.contains(encoded));
+        }
+    }
+    fn scan(path: &Path, encodings: &[String]) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                scan(&path, encodings);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                assert!(
+                    !bytes.windows(KEY.len()).any(|window| window == KEY),
+                    "key on disk at {}",
+                    path.display()
+                );
+                for encoded in encodings {
+                    assert!(
+                        !bytes
+                            .windows(encoded.len())
+                            .any(|window| window == encoded.as_bytes()),
+                        "encoded key on disk at {}",
+                        path.display()
+                    );
+                }
+                if path
+                    .file_name()
+                    .is_some_and(|name| name == "environment.bin")
+                {
+                    assert!(
+                        !bytes.windows(7).any(|window| window == b"http://"),
+                        "proxy credential persisted"
+                    );
+                }
+            }
+        }
+    }
+    scan(storage.path(), &encodings);
+}

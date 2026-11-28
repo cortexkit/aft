@@ -29,15 +29,21 @@ fn search(aft: &mut AftProcess, marker: &str) -> Value {
 
 #[test]
 fn windows_moved_directory_reaches_ready_grep_and_search() {
-    directory_move(false);
+    directory_move(false, None);
 }
 
 #[test]
 fn windows_large_moved_directory_reaches_ready_grep_and_search() {
-    directory_move(true);
+    directory_move(true, None);
 }
 
-fn directory_move(large: bool) {
+#[cfg(feature = "test-hooks")]
+#[test]
+fn windows_expired_directory_arrival_rescans_and_indexes_descendants() {
+    directory_move(false, Some("expired"));
+}
+
+fn directory_move(large: bool, deadline_mode: Option<&str>) {
     let _serial = crate::helpers::watcher_serial_lock();
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("project");
@@ -66,7 +72,7 @@ fn directory_move(large: bool) {
         }
     }
 
-    let mut aft = start(&root);
+    let mut aft = start_with_arrival_deadline(&root, deadline_mode);
     let absent = search(&mut aft, "moved_windows_marker");
     assert_eq!(absent["success"], true, "{absent}");
 
@@ -109,6 +115,13 @@ fn directory_move(large: bool) {
         assert_eq!(all["complete"], true, "{all}");
         assert_eq!(all["total_matches"], 2050, "{all}");
         assert!(fallbacks > 0 && corpus_rescans > 0, "{before}\n{after}");
+    } else if deadline_mode == Some("expired") {
+        assert!(fallbacks > 0 && corpus_rescans > 0, "{before}\n{after}");
+        assert!(
+            after["rescans_unknown_total"].as_u64().unwrap()
+                > before["rescans_unknown_total"].as_u64().unwrap(),
+            "the deadline fallback must schedule a watcher rescan: {after}"
+        );
     } else {
         assert_eq!(fallbacks, 0, "{after}");
         assert_eq!(corpus_rescans, 0, "{after}");
@@ -120,7 +133,17 @@ fn directory_move(large: bool) {
 }
 
 fn start(root: &Path) -> AftProcess {
-    let mut aft = AftProcess::spawn_with_real_watcher();
+    start_with_arrival_deadline(root, None)
+}
+
+fn start_with_arrival_deadline(root: &Path, deadline_mode: Option<&str>) -> AftProcess {
+    let mut aft = match deadline_mode {
+        Some(mode) => AftProcess::spawn_with_real_watcher_env(&[(
+            "AFT_TEST_WATCHER_DIRECTORY_ARRIVAL_DEADLINE",
+            std::ffi::OsStr::new(mode),
+        )]),
+        None => AftProcess::spawn_with_real_watcher(),
+    };
     let configured = aft.send(
         &json!({
             "id": "directory-move-configure", "command": "configure",
@@ -179,7 +202,10 @@ fn windows_directory_arrival_cost_200() {
         "// initial_windows_marker\n",
     )
     .unwrap();
-    let mut aft = start(root);
+    // This case bounds structural work, not filesystem speed. Grant the
+    // subtree walker no time limit while keeping its entry cap. The expiry
+    // case separately proves that limited discovery falls back to a rescan.
+    let mut aft = start_with_arrival_deadline(root, Some("no_expiry"));
     let before = counters(&mut aft);
     for i in 0..200 {
         let directory = root.join(format!("crates/measure/arrival-{i:03}"));

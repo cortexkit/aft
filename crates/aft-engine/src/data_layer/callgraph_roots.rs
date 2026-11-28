@@ -1,0 +1,338 @@
+//! Where `trace_to` and `impact` say execution starts.
+//!
+//! A trace follows callers until none are left; the function it stops at is
+//! a root. Each root gets one kind, from the facts extraction recorded:
+//!
+//! - `main`: where the program starts, as its language defines it: `fn main`
+//!   at the root of a Rust binary target, `func main` in a Go `package
+//!   main` and a top-level `func init()` in any Go package (the runtime
+//!   runs it at start-up; code never calls it), `main` in C, C++ and
+//!   Objective-C, and the top-level code of a Python module that has an
+//!   `if __name__ == "__main__":` block. JavaScript and TypeScript define
+//!   no starting function.
+//! - `test`: test code, by test attribute or test file.
+//! - `attribute`: an entry attribute extraction recorded, such as
+//!   `#[no_mangle]` or `#[tauri::command]`.
+//! - `public API`: an exported function no caller in the repository calls.
+//! - `no caller found`: none of the above, and nothing in the repository
+//!   calls it: a callback, a trait object, reflection, or dead code.
+//!
+//! Function names are never guessed at: a method called `run` is a root only
+//! when nothing calls it. Dead-code analysis keeps its own, more cautious
+//! rule (`callgraph::is_entry_point`).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
+
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::callgraph_store::StoreNode;
+use crate::file_kind::is_test_file;
+use crate::parser::LangId;
+
+/// The kind of a root: why a path of callers ends at it. Declared in the
+/// order replies list kinds and sort paths by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootKind {
+    /// Where the program starts, as its language defines it.
+    Main,
+    /// Test code.
+    Test,
+    /// An entry attribute marks the function as called from outside the
+    /// program.
+    Attribute,
+    /// An exported function no caller in the repository calls.
+    PublicApi,
+    /// Not exported, and nothing in the repository calls it.
+    NoCallerFound,
+}
+
+impl RootKind {
+    const ALL: [Self; 5] = [
+        Self::Main,
+        Self::Test,
+        Self::Attribute,
+        Self::PublicApi,
+        Self::NoCallerFound,
+    ];
+
+    /// The kind's name in replies (`main`, `public_api`).
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Test => "test",
+            Self::Attribute => "attribute",
+            Self::PublicApi => "public_api",
+            Self::NoCallerFound => "no_caller_found",
+        }
+    }
+
+    /// The kind its name in a reply names.
+    #[must_use]
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.wire() == name)
+    }
+
+    /// The kind as rendered text shows it on a root.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Test => "test",
+            Self::Attribute => "attribute",
+            Self::PublicApi => "public API",
+            Self::NoCallerFound => "no caller found",
+        }
+    }
+
+    /// `count` roots of this kind, as a summary line names them.
+    fn counted(self, count: usize) -> String {
+        let one = count == 1;
+        match self {
+            Self::Main if one => "main".to_string(),
+            Self::Main => format!("{count} main functions"),
+            Self::Test => format!("{count} test{}", if one { "" } else { "s" }),
+            Self::Attribute => format!(
+                "{count} function{} with an entry attribute",
+                if one { "" } else { "s" }
+            ),
+            Self::PublicApi => format!("{count} public API function{}", if one { "" } else { "s" }),
+            Self::NoCallerFound => format!(
+                "{count} function{} with no caller found",
+                if one { "" } else { "s" }
+            ),
+        }
+    }
+}
+
+/// The roots a reply reached, counted once per function and kind.
+#[derive(Debug, Default)]
+pub(crate) struct RootTally {
+    seen: BTreeSet<(RootKind, String, String)>,
+}
+
+impl RootTally {
+    pub(crate) fn add(&mut self, kind: RootKind, node: &StoreNode) {
+        self.seen
+            .insert((kind, node.file.clone(), node.symbol.clone()));
+    }
+
+    /// How many distinct roots of each kind were added; kinds with none are
+    /// left out.
+    pub(crate) fn counts(&self) -> BTreeMap<RootKind, usize> {
+        let mut counts = BTreeMap::new();
+        for (kind, _, _) in &self.seen {
+            *counts.entry(*kind).or_default() += 1;
+        }
+        counts
+    }
+}
+
+/// The summary of a reply's `root_counts` object, kinds in [`RootKind`]
+/// order: `main, 4 tests, 2 public API functions`. `None` when it names no
+/// root.
+#[must_use]
+pub fn summary(counts: &serde_json::Map<String, Value>) -> Option<String> {
+    let parts = RootKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            let count = counts.get(kind.wire())?.as_u64()?;
+            (count > 0).then(|| kind.counted(count as usize))
+        })
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// The tag rendered text puts on a root: `[root: main]`, or for an entry
+/// attribute `[root: attribute no_mangle]`.
+#[must_use]
+pub fn tag(kind: &str, attribute: Option<&str>) -> Option<String> {
+    let kind = RootKind::from_wire(kind)?;
+    Some(match (kind, attribute) {
+        (RootKind::Attribute, Some(attribute)) => format!("[root: attribute {attribute}]"),
+        _ => format!("[root: {}]", kind.label()),
+    })
+}
+
+/// Labels the roots one reply reaches. It reads a Rust package's Cargo
+/// manifest the first time a `fn main` in it is a root, to tell binary
+/// targets from libraries, and keeps the answer for the rest of the reply.
+pub(crate) struct Roots<'a> {
+    project_root: &'a Path,
+    /// Per package directory, the root files of its program targets.
+    rust_programs: HashMap<PathBuf, BTreeSet<PathBuf>>,
+}
+
+impl<'a> Roots<'a> {
+    pub(crate) fn new(project_root: &'a Path) -> Self {
+        Self {
+            project_root,
+            rust_programs: HashMap::new(),
+        }
+    }
+
+    /// The kind of `node` as a root. `caller_is_test` is the test fact the
+    /// call site that reached it carried, when there was one.
+    pub(crate) fn kind(&mut self, node: &StoreNode, caller_is_test: Option<bool>) -> RootKind {
+        if is_test_file(&node.file)
+            || node.entry.is_test == Some(true)
+            || caller_is_test == Some(true)
+        {
+            RootKind::Test
+        } else if node.entry.program_start
+            && (node.lang != LangId::Rust || self.is_rust_program_root(&node.file))
+        {
+            RootKind::Main
+        } else if node.entry.entry_attribute.is_some() {
+            RootKind::Attribute
+        } else if node.exported || node.entry.default_export {
+            RootKind::PublicApi
+        } else {
+            RootKind::NoCallerFound
+        }
+    }
+
+    /// Whether `file` (relative to the project root) is the root file of a
+    /// target Cargo builds into a program.
+    fn is_rust_program_root(&mut self, file: &str) -> bool {
+        let path = normalize(&self.project_root.join(file));
+        let Some(package) = owning_manifest_dir(&normalize(self.project_root), &path) else {
+            return false;
+        };
+        self.rust_programs
+            .entry(package)
+            .or_insert_with_key(|package| rust_program_roots(package))
+            .contains(&path)
+    }
+}
+
+/// `path` with `.` components dropped and `..` applied, without reading the
+/// file system.
+pub(crate) fn normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// The directory of the nearest `Cargo.toml` above `file`, no higher than
+/// `project_root`: the package `file` belongs to.
+fn owning_manifest_dir(project_root: &Path, file: &Path) -> Option<PathBuf> {
+    let mut directory = file.parent();
+    while let Some(current) = directory {
+        if !current.starts_with(project_root) {
+            return None;
+        }
+        if current.join("Cargo.toml").is_file() {
+            return Some(current.to_path_buf());
+        }
+        directory = current.parent();
+    }
+    None
+}
+
+/// The root files of the targets Cargo builds into programs in the package
+/// at `directory`: its binaries (`[[bin]]` entries and, unless `autobins` is
+/// off, `src/main.rs`, `src/bin/*.rs` and `src/bin/*/main.rs`), its
+/// examples, its build script, and test or bench targets that turn the test
+/// harness off. Empty when the manifest cannot be read or declares no
+/// `[package]`.
+pub(crate) fn rust_program_roots(directory: &Path) -> BTreeSet<PathBuf> {
+    let mut roots = BTreeSet::new();
+    let Some(manifest) = std::fs::read_to_string(directory.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Value>().ok())
+    else {
+        return roots;
+    };
+    let Some(package) = manifest.get("package").filter(|package| package.is_table()) else {
+        return roots;
+    };
+    let mut add = |path: PathBuf| {
+        if path.is_file() {
+            roots.insert(normalize(&path));
+        }
+    };
+    for (table, target_directory, harness_off_only) in [
+        ("bin", "src/bin", false),
+        ("example", "examples", false),
+        ("test", "tests", true),
+        ("bench", "benches", true),
+    ] {
+        let targets = manifest
+            .get(table)
+            .and_then(toml::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for target in targets {
+            // With the test harness on, the harness supplies `main`.
+            if harness_off_only
+                && target.get("harness").and_then(toml::Value::as_bool) != Some(false)
+            {
+                continue;
+            }
+            if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
+                add(directory.join(path));
+            } else if let Some(name) = target.get("name").and_then(toml::Value::as_str) {
+                add(directory.join(target_directory).join(format!("{name}.rs")));
+                add(directory.join(target_directory).join(name).join("main.rs"));
+                if table == "bin" {
+                    add(directory.join("src/main.rs"));
+                }
+            }
+        }
+    }
+    let discover = |key: &str| {
+        package
+            .get(key)
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    };
+    let mut discovered = Vec::new();
+    if discover("autobins") {
+        discovered.push(directory.join("src/main.rs"));
+        discovered.extend(target_files(&directory.join("src/bin")));
+    }
+    if discover("autoexamples") {
+        discovered.extend(target_files(&directory.join("examples")));
+    }
+    match package.get("build") {
+        Some(toml::Value::String(path)) => discovered.push(directory.join(path)),
+        Some(toml::Value::Boolean(false)) => {}
+        _ => discovered.push(directory.join("build.rs")),
+    }
+    for path in discovered {
+        add(path);
+    }
+    roots
+}
+
+/// The target root files Cargo discovers in `directory`: each `*.rs` file,
+/// and `main.rs` in each subdirectory.
+fn target_files(directory: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                Some(path.join("main.rs"))
+            } else {
+                (path.extension().and_then(|extension| extension.to_str()) == Some("rs"))
+                    .then_some(path)
+            }
+        })
+        .collect()
+}

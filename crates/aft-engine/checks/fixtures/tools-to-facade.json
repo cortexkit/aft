@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {"id": "aft-tools", "name": "aft-tools"},
+    {"id": "agent-file-tools", "name": "agent-file-tools"}
+  ],
+  "workspace_members": ["aft-tools", "agent-file-tools"],
+  "resolve": {"nodes": [
+    {"id": "aft-tools", "deps": [
+      {"pkg": "agent-file-tools", "dep_kinds": [{"kind": null, "target": null}]}
+    ]},
+    {"id": "agent-file-tools", "deps": []}
+  ]}
+}

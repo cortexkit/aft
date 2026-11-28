@@ -1,0 +1,1 @@
+{"result":{"error":{"class":"transient","code":"shape_compiling","message":"…","retry_after_ms":1000,"safe_to_retry_same_request":true,"details":{"lane_id":"qwen3-embedding-0.6b-ane","shape":4096}},"module_generation":169}}

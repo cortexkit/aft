@@ -27,6 +27,9 @@ use aft::list_surfaces::inspect::build_inspect_envelope;
 use aft::list_surfaces::outline::build_outline_files_envelope;
 use aft::list_surfaces::search::attach_projected_search_envelope;
 use aft::list_surfaces::{ExclusionEntry, ReasonKind, EXCLUSIONS, LIST_SURFACES};
+
+#[path = "../list_envelope/test_source_exclusions.rs"]
+mod test_source_exclusions;
 use aft::ndjson_text::build_ndjson_text;
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext, OutlineMode};
@@ -2485,26 +2488,21 @@ pub struct CallSite {
     pub code: String,
 }
 
-fn aft_src_dir() -> PathBuf {
-    manifest_path("src")
-}
-
-fn base_src_dir() -> PathBuf {
-    manifest_path("../aft-base/src")
-}
-
 fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
+    fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display())) {
+            let entry = entry.unwrap();
             let path = entry.path();
             if path.is_dir() {
-                files.extend(collect_rs_files(&path));
+                walk(&path, files);
             } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
                 files.push(path);
             }
         }
     }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    assert!(!files.is_empty(), "no Rust sources under {}", dir.display());
     files.sort();
     files
 }
@@ -2519,15 +2517,24 @@ fn registry_file_key(relative: &Path) -> String {
 
 pub fn find_call_sites(function: &str) -> Vec<CallSite> {
     let mut sites = Vec::new();
-    for (source_dir, path) in [aft_src_dir(), base_src_dir()]
-        .into_iter()
-        .flat_map(|root| {
-            collect_rs_files(&root)
-                .into_iter()
-                .map(move |path| (root.clone(), path))
-        })
-    {
-        let source = fs::read_to_string(&path).unwrap_or_default();
+    for (source_dir, path) in [
+        "src",
+        "../aft-base/src",
+        "../aft-db/src",
+        "../aft-engine/src",
+        "../aft-parse/src",
+        "../aft-subc/src",
+        "../aft-tools/src",
+    ]
+    .into_iter()
+    .map(manifest_path)
+    .flat_map(|root| {
+        collect_rs_files(&root)
+            .into_iter()
+            .map(move |path| (root.clone(), path))
+    }) {
+        let source =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
         let file = registry_file_key(path.strip_prefix(&source_dir).unwrap_or(&path));
         let mut in_test_module = false;
         for (index, line) in source.lines().enumerate() {
@@ -2607,25 +2614,28 @@ pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
 }
 
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
-    let source_dir = aft_src_dir();
-    let base_dir = base_src_dir();
-    let mut paths = collect_rs_files(&source_dir.join("commands"));
-    paths.extend(collect_rs_files(&source_dir.join("search_state")));
-    paths.extend(collect_rs_files(&source_dir.join("search_index")));
-    paths.push(source_dir.join("data_layer/callgraph_store_adapter.rs"));
-    paths.push(source_dir.join("bash_background/scoped_tasks.rs"));
-    paths.push(source_dir.join("bash_changed_files.rs"));
-    paths.push(source_dir.join("run_tool_call.rs"));
-    paths.push(source_dir.join("subc_format.rs"));
-    paths.push(source_dir.join("tool_output.rs"));
-    paths.push(source_dir.join("output_store.rs"));
-    paths.push(source_dir.join("file_read_exact.rs"));
-    paths.push(source_dir.join("subc/bind_log.rs"));
-    paths.push(source_dir.join("subc/diagnostics_findings.rs"));
-    paths.push(source_dir.join("runtime_drain.rs"));
-    paths.push(source_dir.join("parser/todo_markers.rs"));
-    paths.push(source_dir.join("parser/dead_code_facts.rs"));
-    paths.push(source_dir.join("bash_permissions/scan.rs"));
+    let tools_dir = manifest_path("../aft-tools/src");
+    let engine_dir = manifest_path("../aft-engine/src");
+    let subc_dir = manifest_path("../aft-subc/src");
+    let parse_dir = manifest_path("../aft-parse/src");
+    let base_dir = manifest_path("../aft-base/src");
+    let mut paths = collect_rs_files(&tools_dir.join("commands"));
+    paths.extend(collect_rs_files(&engine_dir.join("search_state")));
+    paths.extend(collect_rs_files(&engine_dir.join("search_index")));
+    paths.push(engine_dir.join("data_layer/callgraph_store_adapter.rs"));
+    paths.push(engine_dir.join("bash_background/scoped_tasks.rs"));
+    paths.push(engine_dir.join("bash_changed_files.rs"));
+    paths.push(tools_dir.join("run_tool_call.rs"));
+    paths.push(tools_dir.join("subc_format.rs"));
+    paths.push(tools_dir.join("tool_output.rs"));
+    paths.push(engine_dir.join("output_store.rs"));
+    paths.push(engine_dir.join("file_read_exact.rs"));
+    paths.push(subc_dir.join("subc/bind_log.rs"));
+    paths.push(subc_dir.join("subc/diagnostics_findings.rs"));
+    paths.push(engine_dir.join("runtime_drain.rs"));
+    paths.push(parse_dir.join("parser/todo_markers.rs"));
+    paths.push(parse_dir.join("parser/dead_code_facts.rs"));
+    paths.push(engine_dir.join("bash_permissions/scan.rs"));
     paths.extend(collect_rs_files(&base_dir.join("compress")));
     let primitives = [
         "budget.exhausted()",
@@ -2645,17 +2655,13 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     ];
     let mut discovered = Vec::new();
     for path in paths {
-        let relocated = path
-            .strip_prefix(&source_dir)
-            .ok()
-            .map(|relative| base_dir.join(relative));
-        let path = relocated.filter(|file| file.exists()).unwrap_or(path);
-        if !path.exists() {
-            continue;
-        }
-        let source = fs::read_to_string(&path).unwrap_or_default();
+        let source =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
         let file = registry_file_key(
-            path.strip_prefix(&source_dir)
+            path.strip_prefix(&tools_dir)
+                .or_else(|_| path.strip_prefix(&engine_dir))
+                .or_else(|_| path.strip_prefix(&subc_dir))
+                .or_else(|_| path.strip_prefix(&parse_dir))
                 .or_else(|_| path.strip_prefix(&base_dir))
                 .unwrap_or(&path),
         );
@@ -2739,7 +2745,7 @@ pub fn resolve_cut(site: &DiscoveredCut) -> Result<&'static str, String> {
             return Ok(surface.list_id);
         }
     }
-    for exclusion in EXCLUSIONS {
+    for exclusion in EXCLUSIONS.iter().chain(test_source_exclusions::TEST_ONLY) {
         if (site.file == exclusion.file || site.file.ends_with(exclusion.file))
             && exclusion
                 .enclosing_item

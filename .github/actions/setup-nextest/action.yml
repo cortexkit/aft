@@ -78,9 +78,18 @@ runs:
         archive_name="cargo-nextest-${NEXTEST_VERSION}-${platform}.tar.gz"
         archive="$RUNNER_TEMP/$archive_name"
         checksum_file="$RUNNER_TEMP/cargo-nextest-${NEXTEST_VERSION}-${release_target}.sha256"
-        curl --fail --location --silent --show-error \
-          --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 180 \
-          --output "$archive" "https://get.nexte.st/${NEXTEST_VERSION}/${platform}"
+        download() {
+          local url="$1" retries="$2"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 10 --max-time 60 \
+            --retry "$retries" --retry-all-errors --retry-delay 5 --retry-max-time 180 \
+            --output "$archive" "$url"
+        }
+        if ! download "https://get.nexte.st/${NEXTEST_VERSION}/${platform}" 2 || [[ ! -s "$archive" ]]; then
+          echo "Nextest redirector unavailable; retrying from the pinned GitHub release asset" >&2
+          release="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}"
+          download "$release/cargo-nextest-${NEXTEST_VERSION}-${release_target}.tar.gz" 8
+        fi
         test -s "$archive"
         printf '%s  %s\n' "$expected_sha256" "$archive" > "$checksum_file"
         if command -v sha256sum >/dev/null 2>&1; then

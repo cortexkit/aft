@@ -1,0 +1,2981 @@
+//! Frame encoding and writer-queue helpers used by the subc transport edge.
+
+#[cfg(test)]
+use serde::ser::{SerializeMap, SerializeStruct};
+#[cfg(test)]
+use serde::{Serialize, Serializer};
+
+use super::{
+    control_flags, fmt, mpsc, Arc, AtomicUsize, BindTrust, DispatchPathMetrics, ErrorBody, Flags,
+    Frame, FrameType, Ordering, PathBuf, Response, RouteChannel, ToolCallResult, Value,
+    CONTROL_SEND_TIMEOUT, RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
+};
+use crate::logging::ToolCallCaller;
+use crate::run_tool_call::{PhaseTrace, ToolCallEgressTiming, ToolCallPhaseDurations};
+use std::borrow::Cow;
+use subc_protocol::{FrameBuildError, MAX_FRAME_BODY_LEN};
+
+pub(super) type WriterSender = mpsc::Sender<WriterFrame>;
+
+pub(super) struct ToolResponseWriteTrace {
+    phase_trace: PhaseTrace,
+    name: String,
+    caller: ToolCallCaller,
+    root: PathBuf,
+    session: String,
+    channel: u16,
+    corr: u64,
+    enqueued_at: Option<std::time::Instant>,
+    queue_depth: usize,
+    writer_active_at_enqueue: bool,
+    writer_queue_was_full: bool,
+    reserve_timeouts: u32,
+}
+
+impl ToolResponseWriteTrace {
+    pub(super) fn new(
+        phase_trace: PhaseTrace,
+        name: String,
+        caller: ToolCallCaller,
+        root: PathBuf,
+        session: String,
+        channel: u16,
+        corr: u64,
+    ) -> Self {
+        Self {
+            phase_trace,
+            name,
+            caller,
+            root,
+            session,
+            channel,
+            corr,
+            enqueued_at: None,
+            queue_depth: 0,
+            writer_active_at_enqueue: false,
+            writer_queue_was_full: false,
+            reserve_timeouts: 0,
+        }
+    }
+
+    pub(super) fn note_write_failure(&self, error: &str) {
+        if self.name == "tool.catalog" {
+            log::warn!(
+                "tool.catalog reply could not be sent session={} channel={} corr={} error={}",
+                self.session,
+                self.channel,
+                self.corr,
+                error
+            );
+        }
+    }
+
+    fn mark_writer_queue_full(&mut self) {
+        self.writer_queue_was_full = true;
+    }
+
+    fn mark_reserve_timeout(&mut self) {
+        self.reserve_timeouts = self.reserve_timeouts.saturating_add(1);
+    }
+
+    fn mark_enqueued(&mut self, queue_depth: usize, writer_active: bool) {
+        self.enqueued_at = Some(std::time::Instant::now());
+        self.queue_depth = queue_depth;
+        self.writer_active_at_enqueue = writer_active;
+    }
+
+    pub(super) fn finish(
+        self,
+        dequeued: std::time::Instant,
+        write_started: std::time::Instant,
+        write_finished: std::time::Instant,
+        frame_bytes: usize,
+        prepare_cpu: Option<std::time::Duration>,
+    ) -> Option<CompletedToolResponseTrace> {
+        let phases = self.phase_trace.finish(ToolCallEgressTiming {
+            enqueued: self.enqueued_at?,
+            dequeued,
+            write_started,
+            write_finished,
+            frame_bytes,
+            queue_depth: self.queue_depth,
+            writer_active_at_enqueue: self.writer_active_at_enqueue,
+            writer_queue_was_full: self.writer_queue_was_full,
+            reserve_timeouts: self.reserve_timeouts,
+            prepare_cpu,
+        })?;
+        Some(CompletedToolResponseTrace {
+            name: self.name,
+            caller: self.caller,
+            root: self.root,
+            session: self.session,
+            channel: self.channel,
+            corr: self.corr,
+            phases,
+        })
+    }
+}
+
+pub(super) struct CompletedToolResponseTrace {
+    pub(super) name: String,
+    pub(super) caller: ToolCallCaller,
+    pub(super) root: PathBuf,
+    pub(super) session: String,
+    pub(super) channel: u16,
+    pub(super) corr: u64,
+    pub(super) phases: ToolCallPhaseDurations,
+}
+
+enum WriterFrameBody {
+    Owned,
+    SharedPush(Arc<Vec<u8>>),
+}
+
+pub(super) struct WriterFrame {
+    /// The route-specific header. Shared Push bodies remain outside this frame.
+    pub(super) frame: Frame,
+    body_storage: WriterFrameBody,
+    pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
+    pub(super) held_reply: bool,
+    /// Keep the recipient policy after retention consumes result_projection.
+    response_policy: Option<ToolResponsePolicy>,
+    result_projection: Option<(ToolResponsePolicy, usize, Option<ToolCallResult>)>,
+    prepared_projection: Option<Arc<Vec<u8>>>,
+    ack_receipt: Option<(
+        super::a0_egress::AckPublication,
+        tokio::sync::oneshot::Sender<Result<bool, SubcError>>,
+    )>,
+    ack_completion: Option<super::a0_egress::AckCompletion>,
+    cancelled_calls: Option<Arc<dyn aft_base::pending_notices::NoticeAcknowledgment>>,
+}
+
+impl From<Frame> for WriterFrame {
+    fn from(frame: Frame) -> Self {
+        Self::plain(frame)
+    }
+}
+
+impl std::ops::Deref for WriterFrame {
+    type Target = Frame;
+
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
+
+impl WriterFrame {
+    pub(super) fn plain(frame: Frame) -> Self {
+        Self {
+            frame,
+            body_storage: WriterFrameBody::Owned,
+            tool_response_trace: None,
+            held_reply: false,
+            response_policy: None,
+            result_projection: None,
+            prepared_projection: None,
+            ack_receipt: None,
+            ack_completion: None,
+            cancelled_calls: Default::default(),
+        }
+    }
+
+    pub(super) fn shared_push(frame: Frame, body: Arc<Vec<u8>>) -> Self {
+        debug_assert_eq!(frame.header.len as usize, body.len());
+        Self {
+            frame,
+            body_storage: WriterFrameBody::SharedPush(body),
+            tool_response_trace: None,
+            held_reply: false,
+            response_policy: None,
+            result_projection: None,
+            prepared_projection: None,
+            ack_receipt: None,
+            ack_completion: None,
+            cancelled_calls: Default::default(),
+        }
+    }
+
+    pub(super) fn with_ack_receipt(
+        frame: Frame,
+        publication: super::a0_egress::AckPublication,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<Result<bool, SubcError>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut outgoing = Self::plain(frame);
+        outgoing.ack_receipt = Some((publication, tx));
+        (outgoing, rx)
+    }
+
+    pub(super) fn begin_ack_write(&mut self) -> bool {
+        if self
+            .ack_receipt
+            .as_ref()
+            .is_some_and(|(publication, _)| !publication.begin_write())
+        {
+            let publication = &self.ack_receipt.as_ref().unwrap().0;
+            if let Ok(Some(error)) = publication.error_frame(&self.frame) {
+                // When the bind is retracted, replace its queued writer frame
+                // with the error frame in place. Keeping its queue position
+                // prevents candidate refusals overtaking the bind's error.
+                self.frame = error;
+                return true;
+            }
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn finish_ack_write(&mut self, written: bool) {
+        let retracted = self
+            .ack_receipt
+            .as_ref()
+            .is_some_and(|(publication, _)| publication.is_retracted());
+        if written {
+            if let Some((publication, _)) = self.ack_receipt.as_ref() {
+                if retracted {
+                    publication.finished(false);
+                } else {
+                    publication.written();
+                }
+            }
+        }
+        if written {
+            if let Some(completion) = self.ack_completion.take() {
+                completion.publish(retracted);
+            }
+        } else {
+            self.ack_completion.take();
+        }
+        if let Some((publication, receipt)) = self.ack_receipt.take() {
+            let _ = publication;
+            let _ = receipt.send(if written {
+                Ok(true)
+            } else {
+                Err(SubcError::WriterClosed)
+            });
+        }
+        drop(self.finish_cancelled_call_notices(written));
+    }
+
+    pub(super) fn finish_cancelled_call_notices(
+        &mut self,
+        written: bool,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let cancelled_calls = self.cancelled_calls.take();
+        if written && self.frame.header.ty == FrameType::Response {
+            return cancelled_calls?.commit_written_frame(self.body());
+        }
+        None
+    }
+
+    pub(super) fn set_ack_completion(&mut self, completion: super::a0_egress::AckCompletion) {
+        self.ack_completion = Some(completion);
+    }
+
+    fn traced_tool_response(frame: impl Into<Self>, trace: ToolResponseWriteTrace) -> Self {
+        let mut outgoing = frame.into();
+        outgoing.tool_response_trace = Some(trace);
+        outgoing
+    }
+
+    pub(super) fn retained_tool_response(
+        mut frame: Frame,
+        policy: ToolResponsePolicy,
+        image_alt: Option<&str>,
+    ) -> Self {
+        if let Some(scope) = &policy.output_scope {
+            if let Ok(mut result) = retained_tool_result(&frame.body) {
+                if result.text.len() > crate::tool_output::TEXT_LIMIT {
+                    crate::tool_output::cap_with_scope(
+                        scope,
+                        "retained tool",
+                        &result.response,
+                        &mut result.text,
+                    );
+                    if let Ok(rebuilt) = build_legacy_tool_response_frame(
+                        frame.header.ver,
+                        super::route_key(frame.header.channel, frame.header.epoch),
+                        frame.header.corr,
+                        frame.header.flags,
+                        &result,
+                        policy.trust,
+                        MAX_FRAME_BODY_LEN as usize,
+                    ) {
+                        frame = rebuilt;
+                    }
+                }
+            }
+        }
+        let mut outgoing = Self::plain(frame);
+        outgoing.response_policy = Some(policy.clone());
+        if policy.tool_result_body {
+            let source = if outgoing.header.ty == FrameType::Response {
+                if outgoing.frame.body.len() >= super::result_body::MAX_RESULT_BYTES {
+                    let response = super::result_body::too_large(
+                        "retained-tool-reply",
+                        outgoing.frame.body.len(),
+                        "narrow the call with paths, pattern, or offset/limit",
+                    );
+                    Some(ToolCallResult {
+                        text: response.data["message"].as_str().unwrap().into(),
+                        response,
+                    })
+                } else {
+                    retained_tool_result(&outgoing.frame.body)
+                        .ok()
+                        .map(|mut result| {
+                            if let Some(parts) = result
+                                .response
+                                .data
+                                .get_mut("attachments")
+                                .and_then(Value::as_array_mut)
+                            {
+                                for part in parts.iter_mut().filter(|part| part["kind"] == "image")
+                                {
+                                    part["alt"] = serde_json::json!(
+                                        image_alt.unwrap_or("image from retained tool reply")
+                                    );
+                                }
+                            }
+                            result
+                        })
+                }
+            } else {
+                None
+            };
+            outgoing.result_projection = Some((policy, MAX_FRAME_BODY_LEN as usize, source));
+        } else if policy.model_only && outgoing.header.ty == FrameType::Response {
+            outgoing.prepared_projection = Some(Arc::new(
+                model_only_body(&outgoing.frame.body).unwrap_or_else(|_| {
+                    br#"{"content":[{"type":"text","text":"retained tool reply could not be decoded"}],"isError":true}"#.to_vec()
+                }),
+            ));
+        }
+        outgoing
+    }
+
+    pub(super) fn retained_tool_response_with_source(
+        frame: Frame,
+        policy: ToolResponsePolicy,
+        image_alt: Option<&str>,
+        source: Option<Vec<u8>>,
+    ) -> Self {
+        let Some(source) =
+            source.filter(|_| policy.tool_result_body && frame.header.ty == FrameType::Response)
+        else {
+            return Self::retained_tool_response(frame, policy, image_alt);
+        };
+        let rendered = super::retained_result::render(
+            &source,
+            &frame.body,
+            policy.include_structured(),
+            super::result_body::MAX_RESULT_BYTES,
+        );
+        let refusal = match rendered {
+            Ok(rendered) if rendered.size < super::result_body::MAX_RESULT_BYTES => {
+                let valid = serde_json::from_slice::<
+                    cortexkit_role_tool_provider::result::ToolResult,
+                >(&rendered.bytes)
+                .ok()
+                .is_some_and(|result| {
+                    cortexkit_role_tool_provider::result::validate(&result).is_ok()
+                });
+                if valid {
+                    let mut outgoing = Self::plain(frame);
+                    outgoing.response_policy = Some(policy);
+                    outgoing.prepared_projection = Some(Arc::new(rendered.bytes));
+                    return outgoing;
+                }
+                Response::error(
+                    "retained-tool-reply",
+                    super::result_body::FALLBACK_ERROR_CODE,
+                    "retained tool reply could not be decoded",
+                )
+            }
+            Ok(rendered) => super::result_body::too_large(
+                "response_too_large",
+                rendered.size,
+                "narrow the call with paths, pattern, or offset/limit",
+            ),
+            Err(_) => Response::error(
+                "retained-tool-reply",
+                super::result_body::FALLBACK_ERROR_CODE,
+                "retained tool reply could not be decoded",
+            ),
+        };
+        let result = ToolCallResult {
+            text: refusal.data["message"].as_str().unwrap().into(),
+            response: refusal,
+        };
+        build_tool_response_frame(
+            frame.header.ver,
+            super::route_key(frame.header.channel, frame.header.epoch),
+            frame.header.corr,
+            frame.header.flags,
+            &result,
+            policy,
+        )
+        .expect("bounded retained-result refusal must serialize")
+    }
+
+    /// Retain a bounded trust-independent source, not the first consumer's view.
+    /// Rendered text is inherited from the unchanged legacy frame where possible;
+    /// each image payload is stored once, with raw JSON fields preserved exactly.
+    pub(super) fn tool_result_source_for_retention(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, SubcError> {
+        let Some((mut projected, result, policy, body_limit)) = self.take_projected_result()?
+        else {
+            return Ok(None);
+        };
+        let limit = crate::db::call_ledger::MAX_TOOL_RESULT_SOURCE_BYTES;
+        let mut source = super::retained_result::encode(&result, &self.frame.body, limit)
+            .map_err(SubcError::Json)?;
+        if source.size >= limit {
+            let response = super::result_body::too_large(
+                "response_too_large",
+                source.size,
+                "narrow the call with paths, pattern, or offset/limit",
+            );
+            let fallback = ToolCallResult {
+                text: response.data["message"].as_str().unwrap().into(),
+                response,
+            };
+            let header = &self.frame.header;
+            let (frame, fallback) = build_result_body_frame(
+                header.ver,
+                super::route_key(header.channel, header.epoch),
+                header.corr,
+                header.flags,
+                fallback,
+                policy,
+                body_limit,
+            )?;
+            projected = frame;
+            source = super::retained_result::encode(&fallback, &self.frame.body, limit)
+                .map_err(SubcError::Json)?;
+        }
+        debug_assert!(source.size < limit);
+        self.prepared_projection = Some(Arc::new(projected.body));
+        Ok(Some(source.bytes))
+    }
+
+    /// The ledger proxy forwards legacy response bytes unchanged. The final
+    /// transport writer projects the reply after the ledger has persisted those bytes.
+    pub(super) fn project_tool_result(&mut self) -> Result<(), SubcError> {
+        self.prepare_tool_result()?;
+        if self.frame.header.ty != FrameType::Response {
+            return Ok(());
+        }
+        let mut body = self
+            .prepared_projection
+            .take()
+            .map(|body| Arc::try_unwrap(body).unwrap_or_else(|body| body.as_ref().clone()))
+            .unwrap_or_else(|| self.frame.body.clone());
+        // Retained replies can carry a pre-rendered projection from before the
+        // text budget existed. Check the actual text at the last writer step.
+        if let Some(scope) = self
+            .response_policy
+            .as_ref()
+            .and_then(|policy| policy.output_scope.as_ref())
+        {
+            if body.len() > crate::tool_output::TEXT_LIMIT {
+                let mut envelope: Value = serde_json::from_slice(&body).map_err(SubcError::Json)?;
+                let mut text = envelope["content"]
+                    .as_array()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if text.len() > crate::tool_output::TEXT_LIMIT {
+                    let response = Response::success(
+                        "retained-tool-text",
+                        envelope["structuredContent"].clone(),
+                    );
+                    crate::tool_output::cap_with_scope(scope, "tool", &response, &mut text);
+                    if let Some(parts) = envelope["content"].as_array_mut() {
+                        let mut first = true;
+                        parts.retain_mut(|part| {
+                            if part["text"].is_string() {
+                                if !first {
+                                    return false;
+                                }
+                                part["text"] = Value::String(std::mem::take(&mut text));
+                                first = false;
+                            }
+                            true
+                        });
+                    }
+                    body = serde_json::to_vec(&envelope).map_err(SubcError::Json)?;
+                }
+            }
+        }
+        let header = &self.frame.header;
+        self.frame = Frame::build_with_version(
+            header.ver,
+            header.ty,
+            header.flags,
+            header.channel,
+            header.epoch,
+            header.corr,
+            body,
+        )
+        .map_err(SubcError::FrameBuild)?;
+        Ok(())
+    }
+
+    /// A failed ledger write may report the result, but must not bypass the
+    /// recipient's projection by quoting the complete retained legacy body.
+    pub(super) fn settlement_error_body(&self) -> Cow<'_, [u8]> {
+        if !self
+            .response_policy
+            .as_ref()
+            .is_some_and(|policy| policy.model_only)
+        {
+            return Cow::Borrowed(&self.frame.body);
+        }
+        if let Some(body) = &self.prepared_projection {
+            return Cow::Borrowed(body.as_slice());
+        }
+        Cow::Owned(
+            model_only_body(&self.frame.body)
+                .unwrap_or_else(|_| b"runner result could not be projected".to_vec()),
+        )
+    }
+
+    fn prepare_tool_result(&mut self) -> Result<(), SubcError> {
+        if let Some((projected, _, _, _)) = self.take_projected_result()? {
+            self.prepared_projection = Some(Arc::new(projected.body));
+        }
+        Ok(())
+    }
+
+    fn take_projected_result(
+        &mut self,
+    ) -> Result<Option<(Frame, ToolCallResult, ToolResponsePolicy, usize)>, SubcError> {
+        let Some((policy, limit, source)) = self.result_projection.take() else {
+            return Ok(None);
+        };
+        if self.frame.header.ty != FrameType::Response {
+            return Ok(None);
+        }
+        let mut result = match source {
+            Some(result) => result,
+            None => retained_tool_result(&self.frame.body)?,
+        };
+        if let Err(reason) = complete_image_dimensions(&mut result) {
+            let text = format!("Attachment omitted: {reason}");
+            result = ToolCallResult {
+                response: Response::error(
+                    "image-reply",
+                    super::result_body::FALLBACK_ERROR_CODE,
+                    &text,
+                ),
+                text,
+            };
+        }
+        let header = &self.frame.header;
+        let projected = build_result_body_frame(
+            header.ver,
+            super::route_key(header.channel, header.epoch),
+            header.corr,
+            header.flags,
+            result,
+            policy.clone(),
+            limit,
+        )?;
+        Ok(Some((projected.0, projected.1, policy, limit)))
+    }
+
+    pub(super) fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    pub(super) fn body(&self) -> &[u8] {
+        match &self.body_storage {
+            WriterFrameBody::Owned => &self.frame.body,
+            WriterFrameBody::SharedPush(body) => body,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn shared_push_body_strong_count(&self) -> Option<usize> {
+        match &self.body_storage {
+            WriterFrameBody::Owned => None,
+            WriterFrameBody::SharedPush(body) => Some(Arc::strong_count(body)),
+        }
+    }
+
+    fn mark_writer_queue_full(&mut self) {
+        if let Some(trace) = self.tool_response_trace.as_mut() {
+            trace.mark_writer_queue_full();
+        }
+    }
+
+    fn mark_reserve_timeout(&mut self) {
+        if let Some(trace) = self.tool_response_trace.as_mut() {
+            trace.mark_reserve_timeout();
+        }
+    }
+
+    fn mark_enqueued(&mut self, queue_depth: usize, writer_active: bool) {
+        if let Some(trace) = self.tool_response_trace.as_mut() {
+            trace.mark_enqueued(queue_depth, writer_active);
+        }
+    }
+}
+
+pub(super) enum WriterEnqueueOutcome {
+    Enqueued,
+    Full(WriterFrame),
+    Closed,
+}
+
+impl WriterEnqueueOutcome {
+    #[cfg(test)]
+    pub(super) fn is_enqueued(&self) -> bool {
+        matches!(self, Self::Enqueued)
+    }
+}
+
+pub(super) fn decrement_counted_channel(counter: &AtomicUsize) {
+    let previous = counter.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(previous > 0, "counted channel depth underflow");
+}
+
+pub(super) async fn send_counted_channel<T>(
+    tx: &mpsc::Sender<T>,
+    counter: &AtomicUsize,
+    item: T,
+) -> Result<(), mpsc::error::SendError<T>> {
+    counter.fetch_add(1, Ordering::Relaxed);
+    match tx.send(item).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            decrement_counted_channel(counter);
+            Err(error)
+        }
+    }
+}
+
+fn enqueue_writer_item(
+    permit: mpsc::Permit<'_, WriterFrame>,
+    metrics: &DispatchPathMetrics,
+    mut item: WriterFrame,
+) {
+    let queue_depth = metrics.writer_queued.fetch_add(1, Ordering::Relaxed) + 1;
+    item.mark_enqueued(queue_depth, metrics.writer_active.load(Ordering::Relaxed));
+    metrics.mark_shell_reply_queued(item.frame());
+    permit.send(item);
+}
+
+pub(super) fn try_enqueue_writer_item(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    mut item: WriterFrame,
+) -> WriterEnqueueOutcome {
+    match tx.try_reserve() {
+        Ok(permit) => {
+            enqueue_writer_item(permit, metrics, item);
+            WriterEnqueueOutcome::Enqueued
+        }
+        Err(mpsc::error::TrySendError::Full(())) => {
+            metrics
+                .writer_saturation_count
+                .fetch_add(1, Ordering::Relaxed);
+            item.mark_writer_queue_full();
+            WriterEnqueueOutcome::Full(item)
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            drop(item);
+            WriterEnqueueOutcome::Closed
+        }
+    }
+}
+
+pub(super) fn try_enqueue_writer_frame(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+) -> WriterEnqueueOutcome {
+    try_enqueue_writer_item(tx, metrics, WriterFrame::plain(frame))
+}
+
+pub(super) fn try_enqueue_shared_push_frame(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+    body: Arc<Vec<u8>>,
+) -> WriterEnqueueOutcome {
+    try_enqueue_writer_item(tx, metrics, WriterFrame::shared_push(frame, body))
+}
+
+pub(super) async fn send_reliable_writer_item(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    mut item: WriterFrame,
+    context: &'static str,
+) -> Result<(), SubcError> {
+    let mut warned = false;
+    let mut backoff = RELIABLE_WRITER_RETRY_INITIAL_BACKOFF;
+
+    loop {
+        match try_enqueue_writer_item(tx, metrics, item) {
+            WriterEnqueueOutcome::Enqueued => return Ok(()),
+            WriterEnqueueOutcome::Closed => return Err(SubcError::WriterClosed),
+            WriterEnqueueOutcome::Full(returned_item) => {
+                item = returned_item;
+            }
+        }
+
+        match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.reserve()).await {
+            Ok(Ok(permit)) => {
+                enqueue_writer_item(permit, metrics, item);
+                return Ok(());
+            }
+            Ok(Err(_)) => return Err(SubcError::WriterClosed),
+            Err(_) => {
+                metrics
+                    .writer_saturation_count
+                    .fetch_add(1, Ordering::Relaxed);
+                item.mark_reserve_timeout();
+                if !warned {
+                    log::warn!(
+                        "subc attach: writer queue stayed full while sending {context}; retrying reliable frame"
+                    );
+                    warned = true;
+                }
+                tokio::time::sleep(backoff).await;
+                backoff =
+                    std::cmp::min(backoff.saturating_mul(2), RELIABLE_WRITER_RETRY_MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+pub(super) async fn send_reliable_writer_frame(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: impl Into<WriterFrame>,
+    context: &'static str,
+) -> Result<(), SubcError> {
+    send_reliable_writer_item(tx, metrics, frame.into(), context).await
+}
+
+pub(super) async fn send_traced_tool_response_frame(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: impl Into<WriterFrame>,
+    trace: ToolResponseWriteTrace,
+) -> Result<(), SubcError> {
+    send_reliable_writer_item(
+        tx,
+        metrics,
+        WriterFrame::traced_tool_response(frame, trace),
+        "tool response",
+    )
+    .await
+}
+
+pub(super) async fn send_frame(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: Frame,
+) -> Result<(), SubcError> {
+    match try_enqueue_writer_item(tx, metrics, WriterFrame::plain(frame)) {
+        WriterEnqueueOutcome::Enqueued => Ok(()),
+        WriterEnqueueOutcome::Closed => Err(SubcError::WriterClosed),
+        WriterEnqueueOutcome::Full(item) => {
+            match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.reserve()).await {
+                Ok(Ok(permit)) => {
+                    enqueue_writer_item(permit, metrics, item);
+                    Ok(())
+                }
+                Ok(Err(_)) => Err(SubcError::WriterClosed),
+                Err(_) => {
+                    metrics
+                        .writer_saturation_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(SubcError::WriterBackpressureTimeout)
+                }
+            }
+        }
+    }
+}
+
+/// Borrowed flat response matching the standalone NDJSON shape without cloning
+/// the response id or any structured data values.
+#[cfg(test)]
+struct FlatToolResponse<'a> {
+    response: &'a crate::protocol::Response,
+    text: &'a str,
+}
+
+#[cfg(test)]
+impl Serialize for FlatToolResponse<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let data = self.response.data.as_object();
+        let has_text = data.is_some_and(|data| data.contains_key("text"));
+        let field_count =
+            2 + data.map_or(0, |data| {
+                data.len()
+                    - usize::from(data.contains_key("id"))
+                    - usize::from(data.contains_key("success"))
+            }) + usize::from(!has_text);
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        match data.and_then(|data| data.get("id")) {
+            Some(value) => map.serialize_entry("id", value)?,
+            None => map.serialize_entry("id", &self.response.id)?,
+        }
+        match data.and_then(|data| data.get("success")) {
+            Some(value) => map.serialize_entry("success", value)?,
+            None => map.serialize_entry("success", &self.response.success)?,
+        }
+        if let Some(data) = data {
+            for (key, value) in data {
+                match key.as_str() {
+                    "id" | "success" => {}
+                    "text" => map.serialize_entry(key, self.text)?,
+                    _ => map.serialize_entry(key, value)?,
+                }
+            }
+        }
+        if !has_text {
+            map.serialize_entry("text", self.text)?;
+        }
+        map.end()
+    }
+}
+
+#[cfg(test)]
+struct ToolResponseEnvelope<'a> {
+    result: &'a ToolCallResult,
+    /// First-party binds get the full flat response in `structuredContent`
+    /// for the plugin re-lift; untrusted (MCP) binds get text-only.
+    include_structured: bool,
+}
+
+// A trusted envelope carries the rendered text twice — once as the outer MCP
+// `content`, once inside `structuredContent` — and for reads the raw `content`
+// data field rides along a third time, so a read body crosses the connection
+// roughly 3x. This is deliberate, not an oversight: the bridge re-lifts
+// `structuredContent` to reconstruct the flat response. The bridge's
+// `reliftReply` now tolerates omission of `structuredContent.text`, but AFT
+// still emits it until every supported plugin version includes that fallback.
+// Only then can the duplicate be dropped behind the plugin version floor.
+//
+// Measured on a live daemon: the largest real frames were ~200 KB, with zero
+// egress-write time, writer queue depth 1, never full, and no reserve
+// timeouts — the amplification costs nothing observable. Revisit if
+// If `egress_write` becomes nonzero, the writer queue backs up, or typical
+// frames grow well past a few hundred KB, the duplicate content is costly
+// enough to justify dropping `structuredContent.text` after the plugin floor
+// makes that omission compatible.
+
+#[cfg(test)]
+impl Serialize for ToolResponseEnvelope<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let fields = if self.include_structured { 3 } else { 2 };
+        let mut envelope = serializer.serialize_struct("ToolResponseEnvelope", fields)?;
+        envelope.serialize_field(
+            "content",
+            &[TextContent {
+                kind: "text",
+                text: &self.result.text,
+            }],
+        )?;
+        envelope.serialize_field("isError", &!self.result.response.success)?;
+        if self.include_structured {
+            envelope.serialize_field(
+                "structuredContent",
+                &FlatToolResponse {
+                    response: &self.result.response,
+                    text: &self.result.text,
+                },
+            )?;
+        }
+        envelope.end()
+    }
+}
+
+#[cfg(test)]
+#[derive(Serialize)]
+struct TextContent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+const TRANSPORT_MIB: usize = 1024 * 1024;
+const TOOL_RESPONSE_ENVELOPE_MARGIN_DIVISOR: usize = 8;
+const RESPONSE_TOO_LARGE_CODE: &str = "response_too_large";
+const TRANSPORT_TRUNCATION_REASON: &str = "transport_frame_limit";
+
+fn transport_limit_mib(bytes: usize) -> usize {
+    bytes.div_ceil(TRANSPORT_MIB).max(1)
+}
+
+fn tool_response_text_limit(max_body_len: usize, include_structured: bool) -> usize {
+    // Trusted binds carry rendered text in both MCP content and structuredContent.
+    // Keep one eighth free for the envelope and sidecars; anything larger there
+    // is handled by the correlated fallback instead of silently dropping the call.
+    let margin = (max_body_len / TOOL_RESPONSE_ENVELOPE_MARGIN_DIVISOR)
+        .max(1_024)
+        .min(max_body_len / 2);
+    let rendered_copies = if include_structured { 2 } else { 1 };
+    max_body_len.saturating_sub(margin) / rendered_copies
+}
+
+fn truncate_rendered_text(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.len() <= limit {
+        return Cow::Borrowed(text);
+    }
+
+    let notice = format!(
+        "[response truncated at {} MiB: full output exceeds the transport frame limit; use offset/limit or write to a file]",
+        transport_limit_mib(limit)
+    );
+    let suffix = format!("\n{notice}");
+    let mut prefix_end = text.len().min(limit.saturating_sub(suffix.len()));
+    while !text.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+
+    let mut truncated = String::with_capacity(prefix_end.saturating_add(suffix.len()));
+    truncated.push_str(&text[..prefix_end]);
+    truncated.push_str(&suffix);
+    Cow::Owned(truncated)
+}
+
+fn serialize_tool_response_body(
+    result: &ToolCallResult,
+    include_structured: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serialize_tool_response_body_with_text(result, include_structured, &result.text, false, false)
+}
+
+fn serialize_tool_response_body_with_text(
+    result: &ToolCallResult,
+    include_structured: bool,
+    rendered_text: &str,
+    transport_truncated: bool,
+    tool_result_body: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let data_capacity = result
+        .response
+        .data
+        .as_object()
+        .and_then(|data| {
+            ["content", "output", "preview_diff"]
+                .into_iter()
+                .find_map(|key| data.get(key).and_then(Value::as_str))
+                .map(|data_text| {
+                    if transport_truncated && data_text == result.text.as_str() {
+                        rendered_text.len()
+                    } else {
+                        data_text.len()
+                    }
+                })
+        })
+        .unwrap_or(0);
+    let capacity = rendered_text
+        .len()
+        .saturating_add(include_structured.then_some(data_capacity).unwrap_or(0))
+        .saturating_add(
+            include_structured
+                .then_some(rendered_text.len())
+                .unwrap_or(0),
+        )
+        .saturating_add(512);
+    let mut body = Vec::with_capacity(capacity);
+
+    body.extend_from_slice(b"{\"content\":[{\"type\":\"text\",\"text\":");
+    let encoded_text_start = body.len();
+    serde_json::to_writer(&mut body, rendered_text)?;
+    let encoded_text_end = body.len();
+    body.push(b'}');
+    if tool_result_body {
+        if let Some(attachments) = result.response.data["attachments"].as_array() {
+            for image in attachments.iter().filter(|part| part["kind"] == "image") {
+                body.extend_from_slice(b",{\"type\":\"image\",\"data\":");
+                serde_json::to_writer(&mut body, &image["data"])?;
+                body.extend_from_slice(b",\"mimeType\":");
+                serde_json::to_writer(&mut body, &image["mime"])?;
+                body.extend_from_slice(b",\"width\":");
+                serde_json::to_writer(&mut body, &image["width"])?;
+                body.extend_from_slice(b",\"height\":");
+                serde_json::to_writer(&mut body, &image["height"])?;
+                body.extend_from_slice(b",\"alt\":");
+                serde_json::to_writer(&mut body, &image["alt"])?;
+                body.push(b'}');
+            }
+        }
+    }
+    body.extend_from_slice(b"],\"isError\":");
+    body.extend_from_slice(if result.response.success {
+        b"false"
+    } else {
+        b"true"
+    });
+
+    if tool_result_body && !result.response.success {
+        body.extend_from_slice(b",\"errorCode\":");
+        serde_json::to_writer(
+            &mut body,
+            &super::result_body::error_code(result.response.data["code"].as_str()),
+        )?;
+    }
+
+    if include_structured {
+        body.extend_from_slice(b",\"structuredContent\":{\"id\":");
+        let data = result.response.data.as_object();
+        let response_id = data.and_then(|data| data.get("id"));
+        // Early orchestration errors have no native dispatch. Pin only their
+        // outgoing ID too; the remaining legacy/result body is serialized normally.
+        #[cfg(feature = "test-hooks")]
+        let fixture_id = serde_json::json!("conformance-result-probe");
+        #[cfg(feature = "test-hooks")]
+        let response_id = if std::env::var_os("AFT_TEST_CONFORMANCE_RESPONSE_ID").is_some() {
+            Some(&fixture_id)
+        } else {
+            response_id
+        };
+        match response_id {
+            Some(value) => serde_json::to_writer(&mut body, value)?,
+            None => serde_json::to_writer(&mut body, &result.response.id)?,
+        }
+        body.extend_from_slice(b",\"success\":");
+        match data.and_then(|data| data.get("success")) {
+            Some(value) => serde_json::to_writer(&mut body, value)?,
+            None => body.extend_from_slice(if result.response.success {
+                b"true"
+            } else {
+                b"false"
+            }),
+        }
+
+        let mut has_text = false;
+        let mut has_complete = false;
+        let mut has_truncated = false;
+        let mut has_truncation_reason = false;
+        if let Some(data) = data {
+            for (key, value) in data {
+                match key.as_str() {
+                    "id" | "success" => continue,
+                    "text" => has_text = true,
+                    "complete" => has_complete = true,
+                    "truncated" => has_truncated = true,
+                    "truncation_reason" => has_truncation_reason = true,
+                    _ => {}
+                }
+                body.push(b',');
+                serde_json::to_writer(&mut body, key)?;
+                body.push(b':');
+                match key.as_str() {
+                    "text" => body.extend_from_within(encoded_text_start..encoded_text_end),
+                    "complete" if transport_truncated => body.extend_from_slice(b"false"),
+                    "truncated" if transport_truncated => body.extend_from_slice(b"true"),
+                    "truncation_reason" if transport_truncated => {
+                        serde_json::to_writer(&mut body, TRANSPORT_TRUNCATION_REASON)?;
+                    }
+                    _ if value.as_str() == Some(result.text.as_str()) => {
+                        body.extend_from_within(encoded_text_start..encoded_text_end);
+                    }
+                    _ => serde_json::to_writer(&mut body, value)?,
+                }
+            }
+        }
+        if !has_text {
+            body.extend_from_slice(b",\"text\":");
+            body.extend_from_within(encoded_text_start..encoded_text_end);
+        }
+        if transport_truncated {
+            if !has_complete {
+                body.extend_from_slice(b",\"complete\":false");
+            }
+            if !has_truncated {
+                body.extend_from_slice(b",\"truncated\":true");
+            }
+            if !has_truncation_reason {
+                body.extend_from_slice(b",\"truncation_reason\":\"transport_frame_limit\"");
+            }
+        }
+        body.push(b'}');
+    }
+    body.push(b'}');
+    Ok(body)
+}
+
+fn response_too_large_frame(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    body_len: usize,
+    max_body_len: usize,
+    include_structured: bool,
+) -> Frame {
+    let message = format!(
+        "tool response serialized to {body_len} bytes, exceeding the daemon transport limit of {max_body_len} bytes; re-run with a narrower range, a smaller limit, or offset+limit paging; output over {} MiB cannot cross the daemon transport",
+        transport_limit_mib(max_body_len)
+    );
+    // Never copy the original response id or data into this backstop. Its bounded
+    // fields make the fallback frame independent of the oversized source payload.
+    let response = Response::error_with_data(
+        format!("subc-{}-{corr}", route.channel),
+        RESPONSE_TOO_LARGE_CODE,
+        message.clone(),
+        serde_json::json!({
+            "complete": false,
+            "truncated": true,
+            "truncation_reason": TRANSPORT_TRUNCATION_REASON,
+        }),
+    );
+    let result = ToolCallResult {
+        text: message,
+        response,
+    };
+    let body = serialize_tool_response_body(&result, include_structured)
+        .expect("fixed response_too_large envelope must serialize");
+    debug_assert!(
+        body.len() <= max_body_len,
+        "fixed response_too_large envelope must fit the effective body limit"
+    );
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        body,
+    )
+    .expect("fixed response_too_large envelope must fit the protocol frame limit")
+}
+
+// LLM runners show the model only an ordinary call's text, so their replies
+// drop the structured result (diffs, task records). No caller-role
+// attestation reaches RouteIdentity, so match exact principals, not
+// harnesses: Thalamus binds with the same `opencode` and `pi` harness names
+// as AFT's own OpenCode and Pi plugins, which render those diffs.
+const LLM_RUNNER_PRINCIPALS: &[&str] = &[
+    "reserved:broca",
+    "reserved:thalamus-harness",
+    "reserved:thalamus-pi",
+];
+
+#[derive(Clone)]
+pub(super) struct ToolResponsePolicy {
+    pub(super) trust: BindTrust,
+    pub(super) tool_result_body: bool,
+    pub(super) model_only: bool,
+    pub(super) output_scope: Option<Arc<crate::output_store::OutputScope>>,
+}
+
+impl ToolResponsePolicy {
+    pub(super) fn model_only_for_bind(
+        principal: Option<&str>,
+        call_mode: &subc_protocol::call_mode::CallMode,
+    ) -> bool {
+        call_mode == &subc_protocol::call_mode::CallMode::Classic
+            && principal.is_some_and(|id| LLM_RUNNER_PRINCIPALS.contains(&id))
+    }
+
+    /// Retain the complete native result when the original route is gone.
+    /// Delivery must instead derive its policy from the receiving route.
+    pub(super) fn for_retention() -> Self {
+        Self {
+            trust: BindTrust::FirstParty,
+            tool_result_body: true,
+            model_only: false,
+            output_scope: None,
+        }
+    }
+
+    fn include_structured(&self) -> bool {
+        !matches!(self.trust, BindTrust::Untrusted) && !self.model_only
+    }
+
+    /// Custody replies embed recorded results, not freshly serialized tool
+    /// replies. Project those copies without changing the durable records.
+    pub(super) fn project_custody_body(self, body: Vec<u8>) -> Result<Vec<u8>, serde_json::Error> {
+        if !self.model_only {
+            return Ok(body);
+        }
+        let mut reply: Value = serde_json::from_slice(&body)?;
+        let strip_result = |entry: &mut Value| {
+            if let Some(result) = entry.get_mut("result").and_then(Value::as_object_mut) {
+                result.remove("structuredContent");
+            }
+        };
+        // Completed withdraw answers and individual late entries embed one
+        // result; late_results pages embed one per entry.
+        strip_result(&mut reply);
+        if let Some(entries) = reply.get_mut("entries").and_then(Value::as_array_mut) {
+            for entry in entries {
+                strip_result(entry);
+            }
+        }
+        serde_json::to_vec(&reply)
+    }
+}
+
+impl From<BindTrust> for ToolResponsePolicy {
+    fn from(trust: BindTrust) -> Self {
+        Self {
+            trust,
+            tool_result_body: false,
+            model_only: false,
+            output_scope: None,
+        }
+    }
+}
+
+impl From<&super::RouteIdentity> for ToolResponsePolicy {
+    fn from(identity: &super::RouteIdentity) -> Self {
+        let principal = match &identity.spawn_principal {
+            super::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+                principal_id.as_deref()
+            }
+            super::AuthenticatedPrincipal::FirstParty => None,
+        };
+        Self {
+            trust: identity.trust,
+            tool_result_body: identity.tool_result_body,
+            // Programs read arbitrary fields. Only positively identified
+            // ordinary calls lose structured data; flow and unknown modes keep it.
+            model_only: Self::model_only_for_bind(principal, &identity.call_mode),
+            output_scope: identity.output_scope.get().cloned(),
+        }
+    }
+}
+
+pub(super) fn build_tool_response_frame(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    result: &ToolCallResult,
+    policy: impl Into<ToolResponsePolicy>,
+) -> Result<WriterFrame, SubcError> {
+    build_tool_response_frame_with_limit(
+        ver,
+        route,
+        corr,
+        flags,
+        result,
+        policy,
+        MAX_FRAME_BODY_LEN as usize,
+    )
+}
+
+/// Carrier bodies are already closed and validated. Keep them out of the
+/// ordinary serializer, which adds id, success and rendered text fields.
+pub(super) fn build_carrier_response_frame(
+    request: &Frame,
+    entry: Option<&Value>,
+    body: Value,
+) -> Result<WriterFrame, SubcError> {
+    if super::rich_ui::carrier::validate_body(entry, &body).is_err() {
+        return build_carrier_response_frame(
+            request,
+            None,
+            super::rich_ui::carrier::error_body("result_schema_mismatch"),
+        );
+    }
+    Ok(WriterFrame::plain(
+        Frame::build_with_version(
+            request.header.ver,
+            FrameType::Response,
+            request.header.flags,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            serde_json::to_vec(&body).map_err(SubcError::Json)?,
+        )
+        .map_err(SubcError::FrameBuild)?,
+    ))
+}
+
+pub(super) fn build_tool_response_frame_with_limit(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    result: &ToolCallResult,
+    policy: impl Into<ToolResponsePolicy>,
+    max_body_len: usize,
+) -> Result<WriterFrame, SubcError> {
+    // A fork call refused in place of an access question is answered with the
+    // role's ERROR, like a refusal at admission, never with a tool result.
+    if let Some(error) = super::fork_call::reply_refusal(&result.response) {
+        let body = serde_json::to_vec(&error).map_err(SubcError::Json)?;
+        return Frame::build_with_version(
+            ver,
+            FrameType::Error,
+            flags,
+            route.channel,
+            route.epoch,
+            corr,
+            body,
+        )
+        .map(WriterFrame::plain)
+        .map_err(SubcError::FrameBuild);
+    }
+    let _alloc_label = crate::alloc_trace::scope(crate::alloc_trace::Label::FRAME_ENCODE, None);
+    let policy = policy.into();
+    let cancelled_calls = result.response.notices.cancelled_calls.clone();
+    let mut capped;
+    let result = if result.text.len() > crate::tool_output::TEXT_LIMIT {
+        if let Some(scope) = &policy.output_scope {
+            capped = ToolCallResult {
+                text: result.text.clone(),
+                response: Response {
+                    id: result.response.id.clone(),
+                    success: result.response.success,
+                    data: result.response.data.clone(),
+                    notices: Default::default(),
+                },
+            };
+            crate::tool_output::cap_with_scope(scope, "tool", &capped.response, &mut capped.text);
+            &capped
+        } else {
+            result
+        }
+    } else {
+        result
+    };
+    let trust = policy.trust;
+    if !policy.tool_result_body {
+        let frame =
+            build_legacy_tool_response_frame(ver, route, corr, flags, result, trust, max_body_len)?;
+        // The ledger retains the full legacy frame. Only the final writer sees
+        // the runner's projection, just as it does for tool-result/v1 replies.
+        let projection = policy
+            .model_only
+            .then(|| model_only_body(&frame.body))
+            .transpose()
+            .map_err(SubcError::Json)?;
+        let mut outgoing = WriterFrame::plain(frame);
+        outgoing.response_policy = Some(policy);
+        outgoing.prepared_projection = projection.map(Arc::new);
+        outgoing.cancelled_calls = cancelled_calls;
+        return Ok(outgoing);
+    }
+    let mut source = ToolCallResult {
+        text: result.text.clone(),
+        response: Response {
+            id: result.response.id.clone(),
+            success: result.response.success,
+            data: result.response.data.clone(),
+            notices: Default::default(),
+        },
+    };
+    // Image paths are send-only metadata, not a change to the legacy structured
+    // payload retained by the call ledger.
+    let alts: Vec<_> = source
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+        .map(|parts| {
+            parts
+                .iter_mut()
+                .map(|part| part.as_object_mut().and_then(|part| part.remove("alt")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let frame =
+        build_legacy_tool_response_frame(ver, route, corr, flags, &source, trust, max_body_len)?;
+    if let Some(parts) = source
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+    {
+        for (part, alt) in parts.iter_mut().zip(alts) {
+            if let Some(alt) = alt {
+                part["alt"] = alt;
+            }
+        }
+    }
+    let mut outgoing = WriterFrame::plain(frame);
+    outgoing.cancelled_calls = cancelled_calls;
+    outgoing.response_policy = Some(policy.clone());
+    outgoing.result_projection = Some((policy, max_body_len, Some(source)));
+    Ok(outgoing)
+}
+
+fn build_legacy_tool_response_frame(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    result: &ToolCallResult,
+    trust: BindTrust,
+    max_body_len: usize,
+) -> Result<Frame, SubcError> {
+    // `content`/`isError` is the MCP-native surface a GENERIC host reads. The
+    // FIRST-PARTY AFT plugin instead reads `structuredContent`, which carries
+    // the full flat standalone shape ({id, success, ...data, text}) so every
+    // structured sidecar the plugin drives UI from — status_bar, bg_completions
+    // (in-band drain), preview_diff, code, message, attachments — survives the
+    // route. subc relays the body byte-for-byte, so this reaches the plugin
+    // unchanged. SubcTransport.toolCall re-lifts `structuredContent` straight to
+    // the flat ToolCallResult, so nothing downstream of the transport differs
+    // from the NDJSON path.
+    //
+    // UNTRUSTED binds (MCP hosts via subc-mcp) get text-only replies: they
+    // have no re-lift layer, we declare no outputSchema (so omitting is
+    // MCP-spec-clean), and hosts like Claude Code prefer `structuredContent`
+    // for model input when present — feeding the model a raw JSON dump with
+    // the rendered text buried inside it, at a multiple of the token cost.
+    let include_structured = !matches!(trust, BindTrust::Untrusted);
+    let effective_max_body_len = max_body_len.min(MAX_FRAME_BODY_LEN as usize);
+    let text_limit = tool_response_text_limit(effective_max_body_len, include_structured);
+    let rendered_text = truncate_rendered_text(&result.text, text_limit);
+    let transport_truncated = matches!(rendered_text, Cow::Owned(_));
+    let body = serialize_tool_response_body_with_text(
+        result,
+        include_structured,
+        &rendered_text,
+        transport_truncated,
+        false,
+    )
+    .map_err(SubcError::Json)?;
+
+    if effective_max_body_len < MAX_FRAME_BODY_LEN as usize && body.len() > effective_max_body_len {
+        return Ok(response_too_large_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            body.len(),
+            effective_max_body_len,
+            include_structured,
+        ));
+    }
+
+    match Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        body,
+    ) {
+        Ok(frame) => Ok(frame),
+        Err(FrameBuildError::BodyExceedsMax { body_len, max }) => Ok(response_too_large_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            body_len,
+            max as usize,
+            include_structured,
+        )),
+        Err(FrameBuildError::BodyTooLarge { body_len }) => Ok(response_too_large_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            body_len,
+            MAX_FRAME_BODY_LEN as usize,
+            include_structured,
+        )),
+    }
+}
+
+fn retained_tool_result(body: &[u8]) -> Result<ToolCallResult, SubcError> {
+    let mut envelope: Value = serde_json::from_slice(body).map_err(SubcError::Json)?;
+    let text = envelope["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let data = envelope
+        .as_object_mut()
+        .and_then(|body| body.remove("structuredContent"))
+        .filter(Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(ToolCallResult {
+        text,
+        response: Response {
+            id: data["id"].as_str().unwrap_or("retained-tool-reply").into(),
+            success: envelope["isError"] != true,
+            data,
+            notices: Default::default(),
+        },
+    })
+}
+
+/// Preserve the model-facing fields verbatim while dropping display data.
+/// Raw values keep image parts and escaped text unchanged on legacy replies.
+fn model_only_body(body: &[u8]) -> Result<Vec<u8>, serde_json::Error> {
+    use serde_json::value::RawValue;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ModelResult<'a> {
+        #[serde(borrow)]
+        content: &'a RawValue,
+        #[serde(borrow)]
+        is_error: &'a RawValue,
+        #[serde(borrow)]
+        error_code: Option<&'a RawValue>,
+    }
+    let result: ModelResult<'_> = serde_json::from_slice(body)?;
+    let mut slim = Vec::with_capacity(result.content.get().len() + 128);
+    slim.extend_from_slice(b"{\"content\":");
+    slim.extend_from_slice(result.content.get().as_bytes());
+    slim.extend_from_slice(b",\"isError\":");
+    slim.extend_from_slice(result.is_error.get().as_bytes());
+    if let Some(code) = result.error_code {
+        slim.extend_from_slice(b",\"errorCode\":");
+        slim.extend_from_slice(code.get().as_bytes());
+    }
+    slim.push(b'}');
+    Ok(slim)
+}
+
+fn complete_image_dimensions(result: &mut ToolCallResult) -> Result<(), String> {
+    use base64::Engine;
+    let Some(parts) = result
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for part in parts.iter_mut().filter(|part| part["kind"] == "image") {
+        if part["width"].as_u64().is_some_and(|value| value > 0)
+            && part["height"].as_u64().is_some_and(|value| value > 0)
+        {
+            continue;
+        }
+        // Older GitHub-read sidecars contain raw image data but no dimensions.
+        // Read the image header, without decoding or allocating a pixel buffer.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(part["data"].as_str().unwrap_or(""))
+            .map_err(|error| error.to_string())?;
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|error| error.to_string())?
+            .into_dimensions()
+            .map_err(|error| error.to_string())?;
+        if width == 0 || height == 0 {
+            return Err("image has no pixels".into());
+        }
+        part["width"] = serde_json::json!(width);
+        part["height"] = serde_json::json!(height);
+    }
+    Ok(())
+}
+
+fn build_result_body_frame(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    mut result: ToolCallResult,
+    policy: ToolResponsePolicy,
+    max_body_len: usize,
+) -> Result<(Frame, ToolCallResult), SubcError> {
+    let include_structured = policy.include_structured();
+    let mut body = serialize_tool_response_body_with_text(
+        &result,
+        include_structured,
+        &result.text,
+        false,
+        true,
+    )
+    .map_err(SubcError::Json)?;
+    // The result contract is strictly below 3 MiB, independently of the transport cap.
+    if body.len() >= super::result_body::MAX_RESULT_BYTES || body.len() > max_body_len {
+        let response = super::result_body::too_large(
+            "response_too_large",
+            body.len(),
+            "narrow the call with paths, pattern, or offset/limit",
+        );
+        result = ToolCallResult {
+            text: response.data["message"].as_str().unwrap().into(),
+            response,
+        };
+        body = serialize_tool_response_body_with_text(
+            &result,
+            include_structured,
+            &result.text,
+            false,
+            true,
+        )
+        .map_err(SubcError::Json)?;
+    }
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        body,
+    )
+    .map(|frame| (frame, result))
+    .map_err(SubcError::FrameBuild)
+}
+
+pub(super) fn build_error_frame(
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    flags: Flags,
+    code: &str,
+    message: &str,
+) -> Result<Frame, SubcError> {
+    let body = serde_json::to_vec(&ErrorBody::new(code, message)).map_err(SubcError::Json)?;
+    Frame::build_with_version(ver, FrameType::Error, flags, channel, epoch, corr, body)
+        .map_err(SubcError::FrameBuild)
+}
+
+pub(super) fn build_held_frame(
+    ver: u8,
+    route: super::RouteChannel,
+    corr: u64,
+    flags: Flags,
+    reason: &str,
+    detail: Option<Value>,
+) -> Result<Frame, SubcError> {
+    use cortexkit_role_tool_provider::result::{ContentPart, HeldReply, ToolResult};
+    let mut held = serde_json::to_value(HeldReply::new(reason)).map_err(SubcError::Json)?;
+    if let Some(detail) = detail {
+        held["detail"] = detail;
+    }
+    let held = serde_json::from_value(held).map_err(SubcError::Json)?;
+    let body = ToolResult::new(vec![ContentPart::Text {
+        text: String::new(),
+    }])
+    .with_held(held);
+    cortexkit_role_tool_provider::result::validate(&body).map_err(|error| {
+        SubcError::Json(<serde_json::Error as serde::ser::Error>::custom(
+            error.to_string(),
+        ))
+    })?;
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        serde_json::to_vec(&body).map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)
+}
+
+/// [`build_error_frame`] with a machine-readable `detail` object, for errors
+/// a caller must act on programmatically (such as which request field was
+/// refused).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_error_frame_with_detail(
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    flags: Flags,
+    code: &str,
+    message: &str,
+    detail: Value,
+) -> Result<Frame, SubcError> {
+    let body = serde_json::to_vec(&ErrorBody::new(code, message).with_detail(detail))
+        .map_err(SubcError::Json)?;
+    Frame::build_with_version(ver, FrameType::Error, flags, channel, epoch, corr, body)
+        .map_err(SubcError::FrameBuild)
+}
+
+pub(super) fn build_goodbye_frame(
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+) -> Result<Frame, SubcError> {
+    Frame::build_with_version(
+        ver,
+        FrameType::Goodbye,
+        control_flags(),
+        channel,
+        epoch,
+        corr,
+        Vec::new(),
+    )
+    .map_err(SubcError::FrameBuild)
+}
+
+pub(super) fn response_message(response: &Response, fallback: &str) -> String {
+    response
+        .data
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+pub(super) fn response_is_fatal_panic(response: &Response) -> bool {
+    !response.success && response.data.get("code").and_then(Value::as_str) == Some("actor_fatal")
+}
+
+#[derive(Debug)]
+pub enum SubcError {
+    RuntimeThread(std::io::Error),
+    Runtime(std::io::Error),
+    Registration(subc_client_rs::registration::RegistrationError),
+    StorageLease(std::io::Error),
+    ConnectionFile {
+        path: PathBuf,
+        source: subc_transport::ConnectionFileError,
+    },
+    NoEndpoint {
+        path: PathBuf,
+    },
+    InvalidEndpoint {
+        path: PathBuf,
+        endpoint: String,
+    },
+    Connect {
+        endpoint: String,
+        source: std::io::Error,
+    },
+    Auth {
+        endpoint: String,
+        source: subc_transport::AuthError,
+    },
+    FrameIo(subc_transport::FrameIoError),
+    FrameBuild(subc_protocol::FrameBuildError),
+    WriterClosed,
+    WriterBackpressureTimeout,
+    WriterJoin(tokio::task::JoinError),
+    Json(serde_json::Error),
+    ClosedBeforeHelloAck,
+    /// The daemon connection ended (EOF) after attach without a channel-0
+    /// Goodbye. Not a stop request: the process must exit non-zero so the
+    /// supervisor restarts it, because the supervisor reads exit 0 as "asked
+    /// to stop" and never respawns (fleet-wide outage 2026-09-06, 4.5 h).
+    ConnectionLost,
+    /// A worker panicked on a mutating job and the executor marked its actor
+    /// fatal; the module tore itself down. Like `ConnectionLost` this must
+    /// exit non-zero: the first such teardown (2026-09-11, a search-lane
+    /// panic) exited 0, the supervisor read it as "stopped on request", and
+    /// every seat on the host lost its tools until an operator ran a manual
+    /// start.
+    ActorFatal,
+    HelloRejected {
+        body: Option<ErrorBody>,
+    },
+    UnexpectedFrame {
+        ty: FrameType,
+    },
+}
+
+impl fmt::Display for SubcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeThread(e) => write!(f, "failed to start subc runtime thread: {e}"),
+            Self::Runtime(e) => write!(f, "failed to build subc tokio runtime: {e}"),
+            Self::Registration(e) => write!(f, "subc registration channel: {e}"),
+            Self::StorageLease(e) => write!(f, "failed to acquire subc storage lease: {e}"),
+            Self::ConnectionFile { path, source } => {
+                write!(f, "failed to read subc connection file {path:?}: {source}")
+            }
+            Self::NoEndpoint { path } => {
+                write!(f, "subc connection file {path:?} has no endpoints")
+            }
+            Self::InvalidEndpoint { path, endpoint } => {
+                write!(
+                    f,
+                    "subc connection file {path:?} has invalid endpoint {endpoint}"
+                )
+            }
+            Self::Connect { endpoint, source } => {
+                write!(f, "failed to connect to subc endpoint {endpoint}: {source}")
+            }
+            Self::Auth { endpoint, source } => {
+                write!(
+                    f,
+                    "failed to authenticate to subc endpoint {endpoint}: {source}"
+                )
+            }
+            Self::FrameIo(e) => write!(f, "subc frame I/O error: {e}"),
+            Self::FrameBuild(e) => write!(f, "subc frame build error: {e}"),
+            Self::WriterClosed => write!(f, "subc writer task closed"),
+            Self::WriterBackpressureTimeout => write!(
+                f,
+                "subc writer task stayed backpressured while sending a control frame"
+            ),
+            Self::WriterJoin(e) => write!(f, "subc writer task join error: {e}"),
+            Self::Json(e) => write!(f, "subc JSON error: {e}"),
+            Self::ClosedBeforeHelloAck => {
+                write!(f, "subc daemon closed the connection before HelloAck")
+            }
+            Self::ConnectionLost => write!(
+                f,
+                "subc daemon connection ended without a channel-0 Goodbye; exiting for supervisor restart"
+            ),
+            Self::ActorFatal => write!(
+                f,
+                "an executor actor panicked and the module tore itself down; exiting for supervisor restart"
+            ),
+            Self::HelloRejected { body } => match body {
+                Some(b) => write!(f, "subc rejected ModuleHello: {} ({})", b.code, b.message),
+                None => write!(f, "subc rejected ModuleHello (unparseable error body)"),
+            },
+            Self::UnexpectedFrame { ty } => {
+                write!(f, "subc sent unexpected frame in place of HelloAck: {ty:?}")
+            }
+        }
+    }
+}
+
+impl SubcError {
+    /// True when this error only says the daemon connection is gone after
+    /// attach: the socket was closed or reset under a read or write, or the
+    /// writer task ended because its socket write failed. Such an error means
+    /// the connection ended, not that the module failed, and the exit code is
+    /// decided the way a clean end of the connection decides it.
+    pub(super) fn is_connection_closed(&self) -> bool {
+        match self {
+            Self::WriterClosed
+            | Self::FrameIo(subc_transport::FrameIoError::UnexpectedEof { .. }) => true,
+            Self::FrameIo(subc_transport::FrameIoError::Io(error)) => matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        }
+    }
+}
+
+impl std::error::Error for SubcError {}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use crate::subc::route_key;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use subc_protocol::PROTOCOL_VERSION;
+
+    #[test]
+    fn writer_depth_counter_tracks_enqueued_frames_until_drain() {
+        let metrics = DispatchPathMetrics::new();
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(8);
+
+        for corr in 1..=3 {
+            let frame = Frame::build(FrameType::Ping, control_flags(), 0, 0, corr, Vec::new())
+                .expect("test frame");
+            assert!(try_enqueue_writer_frame(&writer_tx, &metrics, frame).is_enqueued());
+        }
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 3);
+
+        for _ in 0..3 {
+            writer_rx.try_recv().expect("queued writer frame");
+            decrement_counted_channel(&metrics.writer_queued);
+        }
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reliable_writer_send_retries_after_timeout_and_preserves_frame() {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(1);
+        writer_tx
+            .try_send(WriterFrame::plain(
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
+            ))
+            .expect("prefill writer queue");
+
+        let metrics_for_task = Arc::clone(&metrics);
+        let tx_for_task = writer_tx.clone();
+        let send_task = tokio::spawn(async move {
+            send_reliable_writer_frame(
+                &tx_for_task,
+                &metrics_for_task,
+                Frame::build(FrameType::Pong, control_flags(), 0, 0, 2, Vec::new()).unwrap(),
+                "test reliable frame",
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.writer_saturation_count.load(Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reliable send should observe a timed-out full writer queue");
+
+        let prefilled = writer_rx.recv().await.expect("prefilled frame");
+        assert_eq!(prefilled.header.corr, 1);
+        let result = tokio::time::timeout(Duration::from_secs(2), send_task)
+            .await
+            .expect("reliable send should finish after writer drains")
+            .expect("reliable send task should not panic");
+        assert!(result.is_ok());
+        let delivered = writer_rx.recv().await.expect("retried reliable frame");
+        assert_eq!(delivered.header.corr, 2);
+    }
+
+    #[test]
+    fn response_is_fatal_panic_only_matches_panic_exclusive_code() {
+        let tool_error = Response::error("request-1", "internal_error", "ordinary tool error");
+        let panic_error = Response::error("request-2", "actor_fatal", "mutating panic");
+
+        assert!(!response_is_fatal_panic(&tool_error));
+        assert!(response_is_fatal_panic(&panic_error));
+    }
+
+    #[tokio::test]
+    async fn control_send_times_out_when_writer_queue_remains_full() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<WriterFrame>(1);
+        let metrics = DispatchPathMetrics::new();
+        writer_tx
+            .try_send(WriterFrame::plain(
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
+            ))
+            .expect("prefill writer queue");
+        let started = Instant::now();
+
+        let result = send_frame(
+            &writer_tx,
+            &metrics,
+            Frame::build(FrameType::Pong, control_flags(), 0, 0, 2, Vec::new()).unwrap(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SubcError::WriterBackpressureTimeout)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "control send guard should be bounded"
+        );
+    }
+
+    pub(in crate::subc) fn legacy_tool_response_body(
+        result: &ToolCallResult,
+        include_structured: bool,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&ToolResponseEnvelope {
+            result,
+            include_structured,
+        })
+        .expect("serialize legacy tool response envelope")
+    }
+
+    fn assert_tool_response_frame_matches_legacy(result: &ToolCallResult, trust: BindTrust) {
+        let include_structured = !matches!(trust, BindTrust::Untrusted);
+        let legacy = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Response,
+            control_flags(),
+            7,
+            3,
+            42,
+            legacy_tool_response_body(result, include_structured),
+        )
+        .expect("build legacy tool response frame");
+        let optimized = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(7, 3),
+            42,
+            control_flags(),
+            result,
+            trust,
+        )
+        .expect("build optimized tool response frame");
+        assert_eq!(optimized.header.encode(), legacy.header.encode());
+        assert_eq!(optimized.body, legacy.body);
+    }
+
+    fn production_shape_result(tool: &str, payload_bytes: usize) -> ToolCallResult {
+        let payload = "x".repeat(payload_bytes);
+        let response = match tool {
+            "read" => Response::success(
+                "subc-7-42",
+                json!({
+                    "content": payload,
+                    "path": "/workspace/src/fixture.rs",
+                    "start_line": 1,
+                    "end_line": payload_bytes / 40 + 1,
+                    "total_lines": payload_bytes / 40 + 1,
+                    "truncated": false,
+                }),
+            ),
+            "edit" => Response::success(
+                "subc-7-42",
+                json!({
+                    "path": "/workspace/src/fixture.rs",
+                    "edits_applied": 1,
+                    "diff": { "additions": 12, "deletions": 8 },
+                    "preview_diff": payload,
+                }),
+            ),
+            "bash" => Response::success(
+                "subc-7-42",
+                json!({
+                    "output": payload,
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "status": "completed",
+                }),
+            ),
+            _ => unreachable!("production-shape probe tool"),
+        };
+        let text = crate::subc_format::format_response_with_context(
+            tool,
+            &response,
+            &crate::subc_format::FormatContext::default(),
+        );
+        ToolCallResult { text, response }
+    }
+
+    fn result_route(
+        principal: Option<&str>,
+        harness: &str,
+        mode: subc_protocol::call_mode::CallMode,
+    ) -> crate::subc::RouteIdentity {
+        let root = crate::subc::ProjectRootId::from_path(std::path::Path::new(
+            crate::test_support::manifest_dir(),
+        ))
+        .unwrap();
+        let mut identity = crate::subc::test_support::route_identity_with_harness(
+            &root,
+            "result-session",
+            BindTrust::FirstParty,
+            harness,
+        );
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.tool_result_body = true;
+        data.call_mode = mode;
+        let crate::subc::AuthenticatedPrincipal::RouteBind {
+            principal_id,
+            harness: bound_harness,
+            ..
+        } = &mut data.spawn_principal
+        else {
+            unreachable!("fixture route bind");
+        };
+        *principal_id = principal.map(str::to_owned);
+        *bound_harness = harness.into();
+        identity
+    }
+
+    fn display_results() -> [ToolCallResult; 2] {
+        [
+            ToolCallResult {
+                text: "Edited fixture.rs".into(),
+                response: Response::success(
+                    "edit-id",
+                    json!({
+                        "path": "fixture.rs",
+                        "metadata": {"diff": "--- a/fixture.rs\n+++ b/fixture.rs\n@@ -1 +1 @@\n-old\n+new\n"},
+                        "status_bar": {"errors": 0},
+                    }),
+                ),
+            },
+            ToolCallResult {
+                text: "command output".into(),
+                response: Response::success(
+                    "bash-id",
+                    json!({
+                        "output": "command output",
+                        "output_preview": "command output",
+                        "text": "command output",
+                        "exit_code": 0,
+                        "status": "completed",
+                    }),
+                ),
+            },
+        ]
+    }
+
+    fn projected_result_body(
+        result: &ToolCallResult,
+        policy: impl Into<ToolResponsePolicy>,
+    ) -> Vec<u8> {
+        let mut outgoing = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(7, 3),
+            42,
+            control_flags(),
+            result,
+            policy,
+        )
+        .unwrap();
+        outgoing.project_tool_result().unwrap();
+        outgoing.frame.body
+    }
+
+    fn assert_full_results(identity: &crate::subc::RouteIdentity) {
+        for result in display_results() {
+            assert_eq!(
+                projected_result_body(&result, identity),
+                legacy_tool_response_body(&result, true),
+                "full structured result must remain byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn runner_ordinary_edit_has_only_model_content() {
+        use subc_protocol::call_mode::CallMode;
+        for (principal, harness) in [
+            ("reserved:broca", "opencode"),
+            ("reserved:thalamus-harness", "opencode"),
+            ("reserved:thalamus-pi", "pi"),
+        ] {
+            let identity = result_route(Some(principal), harness, CallMode::Classic);
+            assert_eq!(
+                projected_result_body(&display_results()[0], &identity),
+                br#"{"content":[{"type":"text","text":"Edited fixture.rs"}],"isError":false}"#
+            );
+        }
+    }
+
+    #[test]
+    fn runner_ordinary_bash_has_no_duplicate_output() {
+        use subc_protocol::call_mode::CallMode;
+        for (principal, harness) in [
+            ("reserved:broca", "opencode"),
+            ("reserved:thalamus-harness", "opencode"),
+            ("reserved:thalamus-pi", "pi"),
+        ] {
+            let identity = result_route(Some(principal), harness, CallMode::Classic);
+            assert_eq!(
+                projected_result_body(&display_results()[1], &identity),
+                br#"{"content":[{"type":"text","text":"command output"}],"isError":false}"#
+            );
+        }
+    }
+
+    #[test]
+    fn codemode_results_keep_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        for principal in [
+            "reserved:broca",
+            "reserved:thalamus-harness",
+            "reserved:basal",
+        ] {
+            assert_full_results(&result_route(
+                Some(principal),
+                "opencode",
+                CallMode::Codemode,
+            ));
+        }
+    }
+
+    #[test]
+    fn tool_output_cap_codemode_keeps_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = crate::test_context(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.path().into()),
+                ..Default::default()
+            },
+        )
+        .with_test_checkpoint_store();
+        let original = "structured body\n".repeat(20_000);
+        let result = ToolCallResult {
+            text: original.clone(),
+            response: Response::success("id", json!({"output":original})),
+        };
+        for principal in [
+            "reserved:broca",
+            "reserved:thalamus-harness",
+            "reserved:basal",
+        ] {
+            let route = result_route(Some(principal), "opencode", CallMode::Codemode);
+            route
+                .output_scope
+                .set(Arc::new(crate::output_store::OutputScope::new(
+                    &ctx,
+                    "result-session",
+                    Some("opencode"),
+                )))
+                .unwrap();
+            let body: Value =
+                serde_json::from_slice(&projected_result_body(&result, &route)).unwrap();
+            assert!(body["content"][0]["text"].as_str().unwrap().len() <= 51_200);
+            assert_eq!(body["structuredContent"]["output"], original);
+            assert!(body["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[output cut at 50 KB of "));
+        }
+    }
+
+    #[test]
+    fn tool_output_cap_last_writer_bounds_prepared_retained_text() {
+        use subc_protocol::call_mode::CallMode;
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = crate::test_context(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.path().into()),
+                ..Default::default()
+            },
+        )
+        .with_test_checkpoint_store();
+        let original = "old retained output\n".repeat(10_000);
+        let body = serde_json::to_vec(&json!({"content":[{"type":"text","text":original}], "isError":false, "structuredContent":{"output":original}})).unwrap();
+        let route = result_route(Some("reserved:broca"), "opencode", CallMode::Codemode);
+        route
+            .output_scope
+            .set(Arc::new(crate::output_store::OutputScope::new(
+                &ctx,
+                "result-session",
+                Some("opencode"),
+            )))
+            .unwrap();
+        let frame =
+            Frame::build(FrameType::Response, control_flags(), 1, 1, 1, body.clone()).unwrap();
+        let mut outgoing = WriterFrame::plain(frame);
+        outgoing.response_policy = Some(route.reply_policy());
+        outgoing.prepared_projection = Some(Arc::new(body));
+        outgoing.project_tool_result().unwrap();
+        let result: Value = serde_json::from_slice(&outgoing.frame.body).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= 51_200);
+        assert_eq!(result["structuredContent"]["output"], original);
+        let path = text
+            .rsplit_once("; full result saved to ")
+            .unwrap()
+            .1
+            .strip_suffix("; read it with read and a line range]")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn plugin_results_keep_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        for harness in ["opencode", "pi"] {
+            for principal in ["direct", "reserved:aft"] {
+                assert_full_results(&result_route(Some(principal), harness, CallMode::Classic));
+            }
+        }
+    }
+
+    #[test]
+    fn unidentified_callers_keep_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        for principal in [
+            None,
+            Some("reserved:prefrontal"),
+            Some("reserved:basal"),
+            Some("reserved:broca-next"),
+            Some("reserved:thalamus-harness-copy"),
+        ] {
+            assert_full_results(&result_route(principal, "opencode", CallMode::Classic));
+        }
+    }
+
+    #[test]
+    fn runner_flow_and_unknown_modes_keep_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        for mode in [CallMode::Flow, CallMode::Unknown("future-mode".into())] {
+            assert_full_results(&result_route(Some("reserved:broca"), "broca", mode));
+        }
+    }
+
+    #[test]
+    fn runner_legacy_results_are_slimmed_only_at_write() {
+        use subc_protocol::call_mode::CallMode;
+        for principal in ["reserved:broca", "reserved:thalamus-harness"] {
+            let mut runner = result_route(Some(principal), "opencode", CallMode::Classic);
+            Arc::get_mut(&mut runner.0).unwrap().tool_result_body = false;
+            for result in display_results() {
+                let mut outgoing = build_tool_response_frame(
+                    PROTOCOL_VERSION,
+                    route_key(7, 3),
+                    42,
+                    control_flags(),
+                    &result,
+                    &runner,
+                )
+                .unwrap();
+                let full = legacy_tool_response_body(&result, true);
+                assert_eq!(outgoing.frame.body, full, "ledger source stays complete");
+                assert!(outgoing
+                    .tool_result_source_for_retention()
+                    .unwrap()
+                    .is_none());
+                let retained = outgoing.frame.clone();
+                outgoing.project_tool_result().unwrap();
+                assert_eq!(
+                    outgoing.frame.body,
+                    legacy_tool_response_body(&result, false)
+                );
+
+                let mut replay =
+                    WriterFrame::retained_tool_response(retained.clone(), (&runner).into(), None);
+                replay.project_tool_result().unwrap();
+                assert_eq!(replay.frame.body, outgoing.frame.body);
+                for (principal, mode) in [
+                    ("direct", CallMode::Classic),
+                    (principal, CallMode::Codemode),
+                ] {
+                    let mut consumer = result_route(Some(principal), "opencode", mode);
+                    Arc::get_mut(&mut consumer.0).unwrap().tool_result_body = false;
+                    let mut replay = WriterFrame::retained_tool_response(
+                        retained.clone(),
+                        (&consumer).into(),
+                        None,
+                    );
+                    replay.project_tool_result().unwrap();
+                    assert_eq!(replay.frame.body, full);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn runner_result_preserves_images_error_flags_and_error_codes() {
+        use subc_protocol::call_mode::CallMode;
+        let identity = result_route(Some("reserved:broca"), "broca", CallMode::Classic);
+        let result = ToolCallResult {
+            text: "image with an error".into(),
+            response: Response {
+                id: "image-id".into(),
+                success: false,
+                data: json!({
+                    "code": "HTTP-Error / 403",
+                    "attachments": [{"kind":"image", "data":"AQID", "mime":"image/png", "width":1, "height":1, "alt":"fixture.png"}],
+                    "metadata": {"diff": "private diff"},
+                }),
+                notices: Default::default(),
+            },
+        };
+        let slim = projected_result_body(&result, &identity);
+        assert_eq!(slim, br#"{"content":[{"type":"text","text":"image with an error"},{"type":"image","data":"AQID","mimeType":"image/png","width":1,"height":1,"alt":"fixture.png"}],"isError":true,"errorCode":"http_error_403"}"#);
+        let mut full: Value = serde_json::from_slice(&projected_result_body(
+            &result,
+            ToolResponsePolicy {
+                trust: BindTrust::FirstParty,
+                tool_result_body: true,
+                model_only: false,
+                output_scope: None,
+            },
+        ))
+        .unwrap();
+        full.as_object_mut().unwrap().remove("structuredContent");
+        assert_eq!(serde_json::from_slice::<Value>(&slim).unwrap(), full);
+
+        let mut untrusted = identity;
+        Arc::get_mut(&mut untrusted.0).unwrap().trust = BindTrust::Untrusted;
+        assert_eq!(
+            projected_result_body(&result, &untrusted),
+            projected_result_body(
+                &result,
+                ToolResponsePolicy {
+                    trust: BindTrust::Untrusted,
+                    tool_result_body: true,
+                    model_only: false,
+                    output_scope: None,
+                }
+            ),
+        );
+    }
+
+    #[test]
+    fn retained_results_follow_the_replaying_routes_policy() {
+        use subc_protocol::call_mode::CallMode;
+        let runner = result_route(Some("reserved:broca"), "opencode", CallMode::Classic);
+        let plugin = result_route(Some("direct"), "opencode", CallMode::Classic);
+        let codemode = result_route(Some("reserved:broca"), "broca", CallMode::Codemode);
+        for result in display_results() {
+            let mut outgoing = build_tool_response_frame(
+                PROTOCOL_VERSION,
+                route_key(7, 3),
+                42,
+                control_flags(),
+                &result,
+                &runner,
+            )
+            .unwrap();
+            let source = outgoing
+                .tool_result_source_for_retention()
+                .unwrap()
+                .unwrap();
+            for identity in [&runner, &plugin, &codemode] {
+                for with_source in [false, true] {
+                    let mut replay = WriterFrame::retained_tool_response_with_source(
+                        outgoing.frame.clone(),
+                        identity.into(),
+                        None,
+                        with_source.then(|| source.clone()),
+                    );
+                    replay.project_tool_result().unwrap();
+                    assert_eq!(replay.frame.body, projected_result_body(&result, identity));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custody_projection_keeps_nonrunner_bytes_and_slims_individual_late_entries() {
+        use subc_protocol::call_mode::CallMode;
+        let body = br#"{ "kind":"result", "result":{"content":[{"type":"text","text":"done"}],"isError":false,"errorCode":"tool_error","structuredContent":{"metadata":{"diff":"private diff"}}} }"#;
+        for (principal, mode) in [
+            ("direct", CallMode::Classic),
+            ("reserved:basal", CallMode::Flow),
+            ("reserved:broca", CallMode::Codemode),
+            ("reserved:broca", CallMode::Unknown("future-mode".into())),
+        ] {
+            let identity = result_route(Some(principal), "opencode", mode);
+            assert_eq!(
+                identity
+                    .reply_policy()
+                    .project_custody_body(body.to_vec())
+                    .unwrap(),
+                body
+            );
+        }
+        let runner = result_route(Some("reserved:broca"), "opencode", CallMode::Classic);
+        let slim = runner
+            .reply_policy()
+            .project_custody_body(body.to_vec())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&slim).unwrap(),
+            json!({
+                "kind":"result", "result":{"content":[{"type":"text","text":"done"}],"isError":false,"errorCode":"tool_error"}
+            })
+        );
+    }
+
+    #[test]
+    fn optimized_tool_response_body_matches_legacy_wire_at_production_shapes() {
+        for tool in ["read", "edit", "bash"] {
+            for payload_bytes in [1_024, 10 * 1_024, 50 * 1_024] {
+                let result = production_shape_result(tool, payload_bytes);
+                for trust in [BindTrust::Untrusted, BindTrust::FirstParty] {
+                    assert_tool_response_frame_matches_legacy(&result, trust);
+                }
+            }
+        }
+
+        let result = ToolCallResult {
+            text: r#"replacement text with \"escapes\"
+"#
+            .to_string(),
+            response: Response::success(
+                "outer-id",
+                json!({
+                    "id": "data-id",
+                    "success": false,
+                    "text": "ignored source text",
+                    "nested": [null, true, -7, "replacement text with \"escapes\"\n"],
+                }),
+            ),
+        };
+        assert_tool_response_frame_matches_legacy(&result, BindTrust::FirstParty);
+    }
+
+    fn median_duration(samples: &mut [Duration]) -> Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    fn time_envelope_builds(
+        results: &[ToolCallResult],
+        weights: &[usize],
+        legacy: bool,
+        iterations: usize,
+    ) -> Duration {
+        let started = Instant::now();
+        for _ in 0..iterations {
+            for (result, &weight) in results.iter().zip(weights) {
+                for _ in 0..weight {
+                    let body = if legacy {
+                        legacy_tool_response_body(std::hint::black_box(result), true)
+                    } else {
+                        serialize_tool_response_body(std::hint::black_box(result), true)
+                            .expect("serialize optimized tool response envelope")
+                    };
+                    std::hint::black_box(body);
+                }
+            }
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    #[ignore = "manual release-mode serving-plane performance probe"]
+    fn tool_response_envelope_perf_probe() {
+        let shapes = [
+            ("read", 1_024),
+            ("read", 10 * 1_024),
+            ("read", 50 * 1_024),
+            ("edit", 1_024),
+            ("edit", 10 * 1_024),
+            ("edit", 50 * 1_024),
+            ("bash", 1_024),
+            ("bash", 10 * 1_024),
+            ("bash", 50 * 1_024),
+        ];
+        // A 100-call production mix dominated by read/edit/bash, with periodic
+        // 50 KiB responses and most calls in the 1-10 KiB range.
+        let weights = [20, 15, 5, 15, 10, 5, 15, 10, 5];
+        let results: Vec<_> = shapes
+            .iter()
+            .map(|&(tool, payload_bytes)| production_shape_result(tool, payload_bytes))
+            .collect();
+        for result in &results {
+            assert_eq!(
+                serialize_tool_response_body(result, true).unwrap(),
+                legacy_tool_response_body(result, true)
+            );
+        }
+
+        let iterations = 40;
+        let calls_per_sample = iterations * weights.iter().sum::<usize>();
+        let mut legacy_samples = Vec::new();
+        let mut optimized_samples = Vec::new();
+        for _ in 0..7 {
+            legacy_samples.push(time_envelope_builds(&results, &weights, true, iterations));
+            optimized_samples.push(time_envelope_builds(&results, &weights, false, iterations));
+        }
+        let legacy = median_duration(&mut legacy_samples);
+        let optimized = median_duration(&mut optimized_samples);
+        let legacy_us = legacy.as_secs_f64() * 1_000_000.0 / calls_per_sample as f64;
+        let optimized_us = optimized.as_secs_f64() * 1_000_000.0 / calls_per_sample as f64;
+        let saved_percent = (legacy_us - optimized_us) / legacy_us * 100.0;
+        eprintln!(
+            "trusted mixed tool-response envelope: before={legacy_us:.3} us/call after={optimized_us:.3} us/call saved={saved_percent:.1}%; 7 run medians, {calls_per_sample} calls/run"
+        );
+        assert!(optimized < legacy, "optimized envelope regressed");
+    }
+
+    #[test]
+    fn tool_response_frame_carries_flat_standalone_shape_in_structured_content() {
+        use crate::protocol::Response;
+
+        // A response with sidecars the FIRST-PARTY plugin drives UI from
+        // (status_bar, bg_completions, code) plus a normal result field.
+        let response = Response::success(
+            "req-7",
+            json!({
+                "complete": true,
+                "matches": 3,
+                "status_bar": { "errors": 0, "warnings": 1 },
+                "bg_completions": [{ "task_id": "bash-abc" }],
+            }),
+        );
+        let result = ToolCallResult {
+            text: "rendered text".to_string(),
+            response,
+        };
+
+        // The flat shape must equal the standalone NDJSON `tool_call` body:
+        // {id, success, ...data, text}. Build the standalone expectation the
+        // same way commands::tool_call::response_with_text does.
+        let expected_flat = json!({
+            "id": "req-7",
+            "success": true,
+            "complete": true,
+            "matches": 3,
+            "status_bar": { "errors": 0, "warnings": 1 },
+            "bg_completions": [{ "task_id": "bash-abc" }],
+            "text": "rendered text",
+        });
+        assert_eq!(
+            serde_json::to_value(FlatToolResponse {
+                response: &result.response,
+                text: &result.text,
+            })
+            .unwrap(),
+            expected_flat,
+            "structuredContent must be byte-identical to the standalone flat response"
+        );
+
+        // The frame body carries the MCP surface for generic hosts AND the flat
+        // sidecar shape under structuredContent for the first-party plugin.
+        let frame = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            42,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+        )
+        .unwrap();
+        let expected_body = serde_json::to_vec(&json!({
+            "content": [{ "type": "text", "text": "rendered text" }],
+            "isError": false,
+            "structuredContent": expected_flat.clone(),
+        }))
+        .unwrap();
+        assert_eq!(
+            frame.body, expected_body,
+            "tool response wire bytes drifted"
+        );
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["isError"], json!(false));
+        assert_eq!(body["content"][0]["type"], json!("text"));
+        assert_eq!(body["content"][0]["text"], json!("rendered text"));
+        assert_eq!(body["structuredContent"], expected_flat);
+
+        // A failed response flips isError and still carries the flat shape
+        // (with success:false + code) for the plugin's error path.
+        let err = Response::error_with_data(
+            "req-8",
+            "ambiguous_match",
+            "batch: edits[0] match 'same' is ambiguous (2 occurrences, expected 1). Use 'occurrence' (1-based) to select one, or 'replaceAll': true to replace every occurrence.",
+            json!({
+                "occurrences": [
+                    { "occurrence": 1, "line": 1, "context": "same same" },
+                    { "occurrence": 2, "line": 1, "context": "same same" }
+                ]
+            }),
+        );
+        let err_result = ToolCallResult {
+            text: "batch: edits[0] match 'same' is ambiguous (2 occurrences, expected 1). Use 'occurrence' (1-based) to select one, or 'replaceAll': true to replace every occurrence.".to_string(),
+            response: err,
+        };
+        let err_frame = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            43,
+            control_flags(),
+            &err_result,
+            BindTrust::FirstParty,
+        )
+        .unwrap();
+        let err_body: Value = serde_json::from_slice(&err_frame.body).unwrap();
+        assert_eq!(err_body["isError"], json!(true));
+        assert_eq!(err_body["structuredContent"]["success"], json!(false));
+        assert_eq!(
+            err_body["structuredContent"]["code"],
+            json!("ambiguous_match")
+        );
+        assert_eq!(
+            err_body["structuredContent"]["occurrences"],
+            json!([
+                { "occurrence": 1, "line": 1, "context": "same same" },
+                { "occurrence": 2, "line": 1, "context": "same same" }
+            ])
+        );
+        let err_message = err_body["structuredContent"]["message"]
+            .as_str()
+            .expect("structured contract message");
+        assert!(err_message.contains("occurrence"));
+        assert!(err_message.contains("1-based"));
+        assert!(!err_message.contains("0-based"));
+        assert!(!err_message.contains("0-indexed"));
+        assert_eq!(err_body["structuredContent"]["text"], json!(err_message));
+
+        // UNTRUSTED (MCP) binds get text-only replies: no structuredContent
+        // key at all. Generic MCP hosts have no re-lift layer, and hosts like
+        // Claude Code feed structuredContent to the model verbatim when
+        // present, a raw JSON dump at a multiple of the token cost.
+        let untrusted_frame = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            44,
+            control_flags(),
+            &err_result,
+            BindTrust::Untrusted,
+        )
+        .unwrap();
+        let untrusted_body: Value = serde_json::from_slice(&untrusted_frame.body).unwrap();
+        let untrusted_message = untrusted_body["content"][0]["text"]
+            .as_str()
+            .expect("untrusted contract message");
+        assert!(untrusted_message.contains("occurrence"));
+        assert!(untrusted_message.contains("1-based"));
+        assert!(!untrusted_message.contains("0-based"));
+        assert!(!untrusted_message.contains("0-indexed"));
+        assert_eq!(untrusted_body["isError"], json!(true));
+        assert!(
+            untrusted_body.get("structuredContent").is_none(),
+            "untrusted binds must not receive structuredContent: {untrusted_body}"
+        );
+    }
+
+    fn patch_diff_budget_fixture(large: bool) -> ToolCallResult {
+        let dir = tempfile::tempdir().unwrap();
+        // Patch headers use resolved paths, not macOS temp symlinks or the
+        // Windows 8.3 spelling sometimes returned by tempdir().
+        let root = crate::path_identity::canonicalize_normalized(dir.path());
+        let deleted = root.join("deleted.txt");
+        let source = root.join("source.txt");
+        let moved = root.join("moved.txt");
+        let edited = root.join("edited.txt");
+        let original = if large {
+            // A 33,608,233-byte, 380,960-line deletion must not hide later outcomes.
+            let mut text = format!("{}\n", "x".repeat(33_608_233 - 380_959 * 88 - 1));
+            text.push_str(&format!("{}\n", "x".repeat(87)).repeat(380_959));
+            assert_eq!(text.len(), 33_608_233);
+            text
+        } else {
+            "deleted\n".to_owned()
+        };
+        std::fs::write(&deleted, &original).unwrap();
+        std::fs::write(&source, "old move\n").unwrap();
+        std::fs::write(&edited, "old edit\n").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Delete File: {}\n*** Update File: {}\n*** Move to: {}\n@@\n-old move\n+new move\n*** Update File: {}\n@@\n-old edit\n+new edit\n*** End Patch",
+            deleted.display(), source.display(), moved.display(), edited.display()
+        );
+        let ctx = crate::test_context(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(root.join("state")),
+                format_on_edit: false,
+                diagnostics_on_edit: false,
+                disabled_tools: vec![],
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(json!({
+            "id": "patch-diff-budget",
+            "command": "tool_call",
+            "name": "apply_patch",
+            "arguments": { "patchText": patch },
+        }))
+        .unwrap();
+        let mut response =
+            crate::commands::tool_call::handle_with_dispatch(&req, &ctx, &|req, ctx| {
+                assert_eq!(req.command, "apply_patch");
+                crate::commands::apply_patch::handle_apply_patch(&req, ctx)
+            });
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true);
+        assert!(!deleted.exists());
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_to_string(moved).unwrap(), "new move\n");
+        assert_eq!(std::fs::read_to_string(edited).unwrap(), "new edit\n");
+        let files = response.data["metadata"]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        for (file, kind, additions, deletions) in [
+            (&files[0], "delete", 0, if large { 380_960 } else { 1 }),
+            (&files[1], "move", 1, 1),
+            (&files[2], "update", 1, 1),
+        ] {
+            assert_eq!(file["type"], kind);
+            assert_eq!(file["additions"], additions);
+            assert_eq!(file["deletions"], deletions);
+        }
+        let text = response.data["text"].as_str().unwrap().to_owned();
+        assert!(text.contains("Deleted "));
+        assert!(text.contains("Updated and moved "));
+        assert!(text.contains("Updated "));
+        let standalone = serde_json::to_vec(&response).unwrap();
+        assert!(standalone.len() < crate::edit::DIFF_RESPONSE_BUDGET);
+        if large {
+            assert_eq!(
+                text.lines()
+                    .filter(|line| *line == crate::edit::DIFF_OMITTED_NOTICE)
+                    .count(),
+                1
+            );
+            assert!(response.data["metadata"].get("diff").is_none());
+            assert!(files.iter().all(|file| file.get("patch").is_none()));
+        } else {
+            assert!(response.data.get("diff_preview_omitted").is_none());
+            let golden = [
+                (deleted, "@@ -1 +0,0 @@\n-deleted\n"),
+                (root.join("moved.txt"), "@@ -1 +1 @@\n-old move\n+new move\n"),
+                (root.join("edited.txt"), "@@ -1 +1 @@\n-old edit\n+new edit\n"),
+            ].map(|(path, hunk)| {
+                let path = path.to_string_lossy().replace('\\', "/");
+                format!("Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n{hunk}")
+            });
+            for (file, expected) in files.iter().zip(&golden) {
+                assert_eq!(file["patch"], *expected);
+            }
+            assert_eq!(response.data["metadata"]["diff"], golden.join("\n"));
+        }
+        response.data.as_object_mut().unwrap().remove("text");
+        ToolCallResult { text, response }
+    }
+
+    #[test]
+    fn diff_budget_large_patch_preserves_standalone_and_subc_outcomes() {
+        let result = patch_diff_budget_fixture(true);
+        let frame = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            1291,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+        )
+        .unwrap();
+        assert!(frame.body.len() < crate::edit::DIFF_RESPONSE_BUDGET);
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["isError"], false);
+        assert_eq!(body["structuredContent"]["success"], true);
+        assert_eq!(body["structuredContent"]["complete"], true);
+        assert_eq!(
+            body["structuredContent"]["metadata"]["files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(body["content"][0]["text"], result.text);
+        assert_eq!(
+            body["structuredContent"]["metadata"],
+            result.response.data["metadata"]
+        );
+        assert!(body["structuredContent"].get("code").is_none());
+    }
+
+    #[test]
+    fn diff_budget_small_patch_is_byte_identical_through_both_paths() {
+        let result = patch_diff_budget_fixture(false);
+        assert_tool_response_frame_matches_legacy(&result, BindTrust::FirstParty);
+    }
+
+    #[test]
+    fn normal_response_is_byte_identical_with_the_size_guard_enabled() {
+        let result = production_shape_result("read", 1_024);
+        let default = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(5, 2),
+            76,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+        )
+        .expect("default response frame");
+        let guarded = build_tool_response_frame_with_limit(
+            PROTOCOL_VERSION,
+            route_key(5, 2),
+            76,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+            8 * 1_024,
+        )
+        .expect("guarded response frame");
+
+        assert_eq!(guarded.header.encode(), default.header.encode());
+        assert_eq!(guarded.body, default.body);
+    }
+
+    #[test]
+    fn oversized_rendered_text_is_utf8_safely_truncated_with_an_explicit_gap() {
+        const TEST_BODY_LIMIT: usize = 8 * 1_024;
+        let text = "é".repeat(3_000);
+        let result = ToolCallResult {
+            text: text.clone(),
+            response: Response::success("large-text", json!({ "text": text })),
+        };
+
+        let frame = build_tool_response_frame_with_limit(
+            PROTOCOL_VERSION,
+            route_key(5, 2),
+            77,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+            TEST_BODY_LIMIT,
+        )
+        .expect("truncated response frame");
+
+        assert!(frame.body.len() <= TEST_BODY_LIMIT);
+        let body: Value =
+            serde_json::from_slice(&frame.body).expect("valid truncated response JSON");
+        let rendered = body["content"][0]["text"]
+            .as_str()
+            .expect("rendered response text");
+        assert!(rendered.ends_with(
+            "[response truncated at 1 MiB: full output exceeds the transport frame limit; use offset/limit or write to a file]"
+        ));
+        assert!(rendered.len() < result.text.len());
+        assert_eq!(body["isError"], json!(false));
+        assert_eq!(body["structuredContent"]["success"], json!(true));
+        assert_eq!(body["structuredContent"]["complete"], json!(false));
+        assert_eq!(body["structuredContent"]["truncated"], json!(true));
+        assert_eq!(
+            body["structuredContent"]["truncation_reason"],
+            json!(TRANSPORT_TRUNCATION_REASON)
+        );
+        assert_eq!(body["structuredContent"]["text"], json!(rendered));
+    }
+
+    #[test]
+    fn oversized_structured_data_gets_a_correlated_response_too_large_fallback() {
+        const TEST_BODY_LIMIT: usize = 8 * 1_024;
+        let text_limit = tool_response_text_limit(TEST_BODY_LIMIT, true);
+        let between_threshold_and_limit = text_limit + 512;
+        assert!(between_threshold_and_limit < TEST_BODY_LIMIT);
+        let result = ToolCallResult {
+            text: "r".repeat(between_threshold_and_limit),
+            response: Response::success(
+                "large-structured",
+                json!({ "payload": "p".repeat(between_threshold_and_limit) }),
+            ),
+        };
+
+        let frame = build_tool_response_frame_with_limit(
+            PROTOCOL_VERSION,
+            route_key(9, 4),
+            88,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+            TEST_BODY_LIMIT,
+        )
+        .expect("response_too_large fallback frame");
+
+        assert_eq!(frame.header.ty, FrameType::Response);
+        assert_eq!(frame.header.channel, 9);
+        assert_eq!(frame.header.epoch, 4);
+        assert_eq!(frame.header.corr, 88);
+        assert!(frame.body.len() <= TEST_BODY_LIMIT);
+        let body: Value =
+            serde_json::from_slice(&frame.body).expect("valid fallback response JSON");
+        assert_eq!(body["isError"], json!(true));
+        assert_eq!(body["structuredContent"]["success"], json!(false));
+        assert_eq!(
+            body["structuredContent"]["code"],
+            json!(RESPONSE_TOO_LARGE_CODE)
+        );
+        assert_eq!(body["structuredContent"]["complete"], json!(false));
+        assert_eq!(body["structuredContent"]["truncated"], json!(true));
+        let message = body["structuredContent"]["message"]
+            .as_str()
+            .expect("fallback message");
+        assert!(message.contains("serialized to "));
+        assert!(message.contains("8192 bytes"));
+        assert!(message.contains("narrower range"));
+        assert!(message.contains("offset+limit paging"));
+        assert!(message.contains("output over 1 MiB cannot cross the daemon transport"));
+    }
+}

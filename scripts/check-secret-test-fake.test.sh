@@ -102,6 +102,7 @@ bad_manifest() {
 }
 
 bad_manifest default-test-support 'default enables a protected feature: test-support'
+bad_manifest default-runner-notice-fixtures 'default enables a protected feature: test-runner-notice-fixtures'
 bad_manifest default-forward 'default enables a protected feature: base/test-hooks'
 bad_manifest non-dev-edge 'non-dev dependency base requests protected feature test-support'
 bad_manifest external-forward 'test-hooks must forward aft-base/test-hooks to a declared protected feature of a workspace sibling'

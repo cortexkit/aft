@@ -1,4 +1,3 @@
-mod cli;
 mod standalone_input;
 
 #[cfg(test)]
@@ -55,6 +54,7 @@ use aft::lsp::child_registry::LspChildRegistry;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::response_finalize::{DispatchOutcome, PendingResponse, PendingResponses};
 use aft::runtime_registry::RuntimeRegistry;
+use aft_tools::cli;
 use standalone_input::{
     HeldInput, InputBudget, InputFrame, OversizedLine, MAX_HELD_BYTES, MAX_HELD_ITEMS,
     MAX_LINE_BYTES, MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS,
@@ -293,6 +293,7 @@ fn main() {
     aft::grammar::initialize_test_identity();
     aft::commands::policy_environment::register();
     aft::reader_floor::register_cache_hooks();
+    aft::commands::register_external_search();
     // Take the daemon handoff before any threads or children start. Standalone
     // mode never touches the inherited descriptors.
     let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
@@ -581,6 +582,7 @@ fn main() {
         startup_phase("context_start");
         aft::commands::configure::register_runtime_hooks();
         aft::commands::register_shell_handlers();
+        aft::subc::register_tool_callbacks();
         let app = App::default_shared();
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         startup_phase("context_done");
@@ -700,6 +702,7 @@ fn main() {
 
     aft::commands::configure::register_runtime_hooks();
     aft::commands::register_shell_handlers();
+    aft::subc::register_tool_callbacks();
     let app = App::default_shared();
     let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
     // Same catalog as in subc mode, written before the first request.

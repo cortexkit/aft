@@ -24,7 +24,7 @@ import subprocess
 import sys
 import tomllib
 
-PROTECTED = {"secret-test-fake", "test-hooks", "test-support"}
+PROTECTED = {"secret-test-fake", "test-hooks", "test-support", "test-scope-owner", "test-runner-notice-fixtures"}
 STRICT = PROTECTED - {"test-support"}
 ROOT = Path.cwd()
 errors = []
@@ -113,5 +113,5 @@ if errors:
     for error in errors:
         print(f"secret-test-fake guard: {error}", file=sys.stderr)
     sys.exit("secret-test-fake guard: FAILED")
-print(f"secret-test-fake guard: ok ({len(members) + len(others)} manifests, all three test-only features stay opt-in)")
+print(f"secret-test-fake guard: ok ({len(members) + len(others)} manifests, {len(PROTECTED)} test-only features stay opt-in)")
 PY

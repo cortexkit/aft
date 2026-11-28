@@ -10,6 +10,50 @@ if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[[:alnum:].-]+)?(\+[[:alnum:].-]+)?$
   exit 1
 fi
 
+# Older tags lack the split crates. Check the tagged checkout's tracked manifests
+# before version-sync or any upload so a broken split cannot publish partially.
+python3 - "$TAG" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+
+missing = {}
+for crate in ("aft-engine", "aft-tools", "aft-subc"):
+    manifest = Path("crates") / crate / "Cargo.toml"
+    if not manifest.is_file():
+        missing[crate] = manifest
+if not missing:
+    sys.exit(0)
+
+paths = subprocess.check_output(
+    ["git", "ls-files", "-z", "--", "Cargo.toml", ":(glob)**/Cargo.toml"], text=True
+)
+for path in filter(None, paths.split("\0")):
+    manifest_path = Path(path)
+    with manifest_path.open("rb") as source:
+        manifest = tomllib.load(source)
+    workspace = manifest.get("workspace", {})
+    names = {manifest.get("package", {}).get("name")}
+    local_paths = {
+        (manifest_path.parent / member).resolve()
+        for key in ("members", "default-members")
+        for member in workspace.get(key, [])
+    }
+    for table in (manifest, workspace, *manifest.get("target", {}).values()):
+        for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for name, spec in table.get(kind, {}).items():
+                if isinstance(spec, dict):
+                    name = spec.get("package", name)
+                    if "path" in spec:
+                        local_paths.add((manifest_path.parent / spec["path"]).resolve())
+                names.add(name)
+
+    for crate, missing_path in missing.items():
+        if crate in names or missing_path.parent.resolve() in local_paths:
+            sys.exit(f"::error::{sys.argv[1]} requires {crate} but is missing {missing_path} (declared in {path})")
+PY
+
 # Cargo must publish the requested tag's version, not a stale manifest version.
 GITHUB_REF_NAME="$TAG" node scripts/version-sync.mjs --from-tag
 TAG_VERSION="${TAG#v}"
@@ -37,8 +81,23 @@ cargo publish --package aft-db \
 sleep 30
 cargo publish --package aft-parse \
   || { ec=$?; cargo publish --package aft-parse --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+if [[ -f crates/aft-engine/Cargo.toml ]]; then
+  sleep 30
+  cargo publish --package aft-engine \
+    || { ec=$?; cargo publish --package aft-engine --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+fi
+if [[ -f crates/aft-tools/Cargo.toml ]]; then
+  sleep 30
+  cargo publish --package aft-tools \
+    || { ec=$?; cargo publish --package aft-tools --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+fi
+if [[ -f crates/aft-subc/Cargo.toml ]]; then
+  sleep 30
+  cargo publish --package aft-subc \
+    || { ec=$?; cargo publish --package aft-subc --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+fi
 
-# Allow the leaf versions to propagate to crates.io's sparse index before the
+# Allow the dependency versions to propagate to crates.io's sparse index before the
 # main crate's verification resolves them.
 sleep 30
 cargo publish --package agent-file-tools \

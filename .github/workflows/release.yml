@@ -71,7 +71,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - uses: actions/setup-node@v5
         with:
@@ -158,7 +159,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -267,7 +269,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -349,7 +352,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -422,7 +426,8 @@ jobs:
           package-manager-cache: false
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
 
       - uses: dtolnay/rust-toolchain@stable
@@ -574,7 +579,8 @@ jobs:
           package-manager-cache: false
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
 
       - uses: dtolnay/rust-toolchain@stable
@@ -684,7 +690,8 @@ jobs:
           toolchain: ${{ needs.build-darwin-arm64.outputs.rust_version }}
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
       - name: Sync versions from tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: node scripts/version-sync.mjs --from-tag
@@ -785,7 +792,8 @@ jobs:
           package-manager-cache: false
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: dtolnay/rust-toolchain@stable
         if: runner.environment == 'github-hosted'
@@ -861,7 +869,8 @@ jobs:
           toolchain: ${{ needs.build-linux-x64.outputs.rust_version }}
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
       - name: Sync versions from tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: node scripts/version-sync.mjs --from-tag
@@ -944,7 +953,8 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       # A released main version would make Cargo reject the dry run as already
       # published. Relabel only this checkout, not the built/tested binaries.
@@ -961,7 +971,12 @@ jobs:
       # Cargo's local registry overlay, without needing unpublished siblings on
       # crates.io. Stable Cargo >=1.90 supports this selection mode.
       - name: Rehearse crates.io publishing
-        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p agent-file-tools
+        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-engine -p aft-tools -p aft-subc -p agent-file-tools
+
+      # Cargo can discard the dry-run staging archives after verification.
+      # Keep a package copy for inspection without compiling the crates again.
+      - name: Materialize crate archives for inspection
+        run: cargo package --locked --allow-dirty --no-verify -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-engine -p aft-tools -p aft-subc -p agent-file-tools
 
       # Mirrors the inline 10 MiB check in scripts/release.sh (crates.io package
       # sizes). A publish dry run does not enforce the registry's upload limit.
@@ -971,15 +986,16 @@ jobs:
           import json
           from pathlib import Path
           import subprocess
+          import tarfile
+          import tomllib
 
           metadata = json.loads(subprocess.check_output([
               "cargo", "metadata", "--format-version", "1", "--no-deps",
           ], text=True))
           crate_dir = Path(metadata["target_directory"]) / "package"
-          # Multi-package publish stages archives in tmp-crate and tmp-registry;
-          # single-package packaging leaves them directly in the package folder.
+          # Check both top-level archives and any copies in Cargo's staging folders.
           crates = sorted(crate_dir.rglob("*.crate"))
-          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools"}
+          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-engine", "aft-tools", "aft-subc", "agent-file-tools"}
           filenames = {crate.name for crate in crates}
           found = {
               package["name"] for package in metadata["packages"]
@@ -993,6 +1009,19 @@ jobs:
               print(f"{crate.relative_to(crate_dir)}: {size} bytes ({size / limit:.1%} of 10 MiB)")
               if size >= limit:
                   raise SystemExit(f"::error::{crate.name} must be under {limit} bytes")
+
+          # Check Cargo's normalized manifest, not the workspace's path dependency.
+          version = next(p["version"] for p in metadata["packages"] if p["name"] == "agent-file-tools")
+          upper_package = f"agent-file-tools-{version}"
+          for crate in crates:
+              if crate.name != f"{upper_package}.crate":
+                  continue
+              with tarfile.open(crate, "r:gz") as archive:
+                  with archive.extractfile(f"{upper_package}/Cargo.toml") as manifest:
+                      pin = tomllib.load(manifest)["dependencies"].get("aft-engine", {}).get("version")
+              if pin != f"={version}":
+                  raise SystemExit(f"::error::{crate.name} must require aft-engine ={version}; found {pin!r}")
+              print(f"{crate.relative_to(crate_dir)}: requires aft-engine {pin}")
           PY
 
       - name: Download darwin-arm64 binary
@@ -1118,7 +1147,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - name: Download darwin-arm64 binary
         uses: actions/download-artifact@v4

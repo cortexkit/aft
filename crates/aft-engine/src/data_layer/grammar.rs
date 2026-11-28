@@ -1,0 +1,246 @@
+//! Dynamic parse gaps are recorded as typed AFT reasons.
+
+use crate::callgraph_store::join::ManifestJoinError;
+use crate::error::AftError;
+
+pub(crate) fn meaning_callgraph_off_reason(language: &str) -> String {
+    let name = crate::grammar_state::display_name(language);
+    let message = format!("{name} files are skipped by meaning search because the call-graph index is off (indexes.callgraph: false).");
+    serde_json::json!({"code": "callgraph_off", "language": language, "state": "callgraph_off", "message": message}).to_string()
+}
+
+#[doc(hidden)]
+pub fn prepare(ctx: &crate::context::AppContext, path: &std::path::Path) -> Result<(), AftError> {
+    if let Some(entry) = crate::grammar::manifest_for_path(path) {
+        crate::grammar::configure(&ctx.config());
+        if let Some(registry) = crate::grammar::registry(&entry.language) {
+            registry.request()?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn error_response(id: &str, error: &AftError) -> crate::protocol::Response {
+    let mut response = crate::protocol::Response::error(id, error.code(), error.to_string());
+    response.data = error.to_error_json();
+    if is_grammar_error(error) {
+        response.data["complete"] = false.into();
+    }
+    response
+}
+
+#[doc(hidden)]
+pub fn error_response_for_path(
+    id: &str,
+    error: &AftError,
+    path: &std::path::Path,
+) -> crate::protocol::Response {
+    let mut response = error_response(id, error);
+    if is_grammar_error(error) {
+        response.data["path"] = serde_json::json!(path);
+    }
+    response
+}
+
+#[doc(hidden)]
+pub fn is_grammar_error(error: &AftError) -> bool {
+    matches!(
+        error,
+        AftError::GrammarUnavailable { .. } | AftError::GrammarParseTimeout { .. }
+    )
+}
+
+#[doc(hidden)]
+pub fn downloaded_language(path: &std::path::Path) -> Option<&'static str> {
+    if !cfg!(feature = "wasm-grammars") {
+        return None;
+    }
+    Some(&crate::grammar::manifest_for_path(path)?.language)
+}
+
+/// Starting a scan's extraction is the download trigger. The parser
+/// itself remains stored-only, so unrelated parser users cannot download.
+pub(super) fn request(language: &str) -> Result<(), ManifestJoinError> {
+    if let Some(registry) = crate::grammar::registry(language) {
+        registry
+            .request()
+            .map_err(ManifestJoinError::GrammarUnavailable)?;
+    }
+    Ok(())
+}
+
+pub(super) const INVALID_UTF8_REASON: &str = r#"{"code":"invalid_utf8"}"#;
+
+/// Persist only stable codes. Messages, retry countdowns and timeout budgets
+/// belong to the handling process and are reconstructed when a reply is made.
+pub(super) fn reason(error: &ManifestJoinError) -> Option<String> {
+    let value = match error {
+        ManifestJoinError::GrammarUnavailable(error) => {
+            serde_json::json!({"code": "grammar_unavailable", "state": error.state})
+        }
+        ManifestJoinError::GrammarParseTimeout { .. } => {
+            serde_json::json!({"code": "grammar_parse_timeout", "state": "parse_timeout"})
+        }
+        ManifestJoinError::InvalidSourceEncoding => return Some(INVALID_UTF8_REASON.into()),
+        _ => return None,
+    };
+    let reason = value.to_string();
+    assert!(
+        reason.len() <= 512,
+        "host-owned grammar reason exceeds its bound"
+    );
+    Some(reason)
+}
+
+/// One non-blocking observation per grammar, shared by its gaps in a reply.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct GapReply {
+    unavailable: std::collections::BTreeMap<&'static str, crate::grammar::GrammarUnavailable>,
+}
+
+impl GapReply {
+    #[doc(hidden)]
+    pub fn capture() -> Self {
+        #[cfg(feature = "wasm-grammars")]
+        let unavailable = crate::grammar::manifests()
+            .iter()
+            .filter_map(|entry| {
+                let language = entry.language.as_str();
+                Some((
+                    language,
+                    crate::grammar::registry(language)?.status_snapshot()?,
+                ))
+            })
+            .collect();
+        #[cfg(not(feature = "wasm-grammars"))]
+        let unavailable = Default::default();
+        Self { unavailable }
+    }
+
+    #[doc(hidden)]
+    pub fn value(&self, stored: &str, path: &std::path::Path) -> Option<serde_json::Value> {
+        let saved: serde_json::Value = serde_json::from_str(stored).ok()?;
+        let mut value = match saved["code"].as_str()? {
+            "grammar_parse_timeout" => {
+                let language = &crate::grammar::manifest_for_path(path)?.language;
+                AftError::GrammarParseTimeout {
+                    path: path.display().to_string(),
+                    language: language.clone(),
+                    timeout_ms: crate::grammar::parse_deadline(language)?
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                }
+                .to_error_json()
+            }
+            "grammar_unavailable" => {
+                let language = &crate::grammar::manifest_for_path(path)?.language;
+                let state = serde_json::from_value(saved["state"].clone()).ok()?;
+                let error = self
+                    .unavailable
+                    .get(language.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| crate::grammar::GrammarUnavailable::new(language, state));
+                AftError::from(error).to_error_json()
+            }
+            "callgraph_off" => saved,
+            "invalid_utf8" => serde_json::json!({
+                "code": "invalid_utf8",
+                "message": crate::inspect::scanners::source_text::NOT_VALID_UTF8,
+            }),
+            _ => return None,
+        };
+        value["path"] = serde_json::json!(path);
+        if value["code"] == "grammar_parse_timeout" {
+            value["state"] = "parse_timeout".into();
+        }
+        Some(value)
+    }
+}
+
+pub(super) fn extract(
+    source: &[u8],
+    language: &str,
+) -> Result<aft_store::content::ContentRecord, ManifestJoinError> {
+    request(language)?;
+    #[cfg(any(test, feature = "test-support"))]
+    if extraction_for_test(source) == Some(TestExtraction::Failure) {
+        return Err(ManifestJoinError::UnsupportedLanguage(language.into()));
+    }
+    let record = super::content::extract(source, language);
+    #[cfg(any(test, feature = "test-support"))]
+    let record = record.map(|mut record| {
+        if extraction_for_test(source) == Some(TestExtraction::NoOutline) {
+            if let aft_store::content::RecordBody::Parsed { body, .. } = &mut record.data {
+                body.outline = None;
+            }
+        }
+        record
+    });
+    record
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod extraction_probe {
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum TestExtraction {
+        Failure,
+        NoOutline,
+        MarkersOnly,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use extraction_probe::TestExtraction;
+
+#[cfg(any(test, feature = "test-support"))]
+fn extraction_overrides(
+) -> &'static std::sync::Mutex<std::collections::HashMap<aft_store::ids::ContentKey, TestExtraction>>
+{
+    static OVERRIDES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<aft_store::ids::ContentKey, TestExtraction>>,
+    > = std::sync::LazyLock::new(Default::default);
+    &OVERRIDES
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn extraction_for_test(source: &[u8]) -> Option<TestExtraction> {
+    extraction_overrides()
+        .lock()
+        .unwrap()
+        .get(&aft_store::ids::ContentKey::of(source))
+        .copied()
+}
+
+#[cfg(all(
+    any(test, feature = "test-support"),
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
+pub(crate) fn override_extraction_for_test(source: &[u8], outcome: TestExtraction) -> impl Drop {
+    struct Guard(aft_store::ids::ContentKey);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            extraction_overrides().lock().unwrap().remove(&self.0);
+        }
+    }
+    let key = aft_store::ids::ContentKey::of(source);
+    extraction_overrides().lock().unwrap().insert(key, outcome);
+    Guard(key)
+}
+
+#[doc(hidden)]
+pub fn response(
+    id: &str,
+    reason: &str,
+    path: &std::path::Path,
+) -> Option<crate::protocol::Response> {
+    let data = GapReply::capture().value(reason, path)?;
+    let mut response =
+        crate::protocol::Response::error(id, data["code"].as_str()?, data["message"].as_str()?);
+    response.data = data;
+    response.data["complete"] = false.into();
+    response.data["path"] = serde_json::json!(path);
+    Some(response)
+}

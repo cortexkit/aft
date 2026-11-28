@@ -41,7 +41,8 @@ runs:
     - uses: oven-sh/setup-bun@v2
       if: inputs.platform == 'linux'
       with:
-        bun-version: latest
+        bun-version-file: .bun-version
+        token: ${{ github.token }}
         no-cache: ${{ runner.environment == 'self-hosted' }}
 
     # Install TypeScript 7's native server and the TypeScript 5 fallback server;

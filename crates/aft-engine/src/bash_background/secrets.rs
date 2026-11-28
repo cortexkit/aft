@@ -1,0 +1,489 @@
+//! Launch-only secret state. Credentials are attached to a prepared task in
+//! memory and applied at exec, never to its persisted environment snapshot.
+
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
+
+#[cfg(unix)]
+use crate::context::AppContext;
+use crate::protocol::Response;
+#[cfg(unix)]
+use crate::sandbox_spawn::SpawnPlan;
+#[cfg(unix)]
+use crate::sandbox_spawn::{RequestedSandboxTier, SandboxRequirement, SandboxTaskKind};
+use crate::secret::{SecretVault, UnavailableVault};
+#[cfg(unix)]
+use crate::secret_proxy::{ProxyConfig, SecretProxy};
+
+#[doc(hidden)]
+pub const REMOTE_REFUSED: &str = "Secret placeholders stay local; remote commands cannot use them.";
+#[doc(hidden)]
+pub const ENV_CONFLICT: &str =
+    "Secret placeholder commands cannot set proxy variables in env or bash.env.";
+#[cfg(unix)]
+pub(crate) const PROXY_UNAVAILABLE: &str =
+    "The secret proxy or its trust bundle could not be prepared; no command was started.";
+
+pub(crate) const PROXY_KEYS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+pub(crate) const REMOVE_KEYS: [&str; 4] = ["NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"];
+#[cfg(unix)]
+pub(crate) const TRUST_KEYS: [&str; 5] = [
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+];
+
+#[doc(hidden)]
+pub fn labels(command: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    for placeholder in secret_rules::placeholder::scan(command) {
+        if !labels.iter().any(|label| label == placeholder.label) {
+            labels.push(placeholder.label.to_owned());
+        }
+    }
+    labels
+}
+
+#[doc(hidden)]
+pub fn env_conflicts(env: &HashMap<String, String>) -> bool {
+    PROXY_KEYS
+        .iter()
+        .chain(REMOVE_KEYS.iter())
+        .any(|key| env.contains_key(*key))
+}
+
+#[doc(hidden)]
+pub fn vault() -> Arc<dyn SecretVault> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(vault) = TEST_VAULT.with(|slot| slot.borrow().clone()) {
+        return vault;
+    }
+    match crate::secret::transport::for_current_command() {
+        Some(transport) => Arc::new(crate::secret::SubcSecretVault::new(Arc::new(transport))),
+        None => Arc::new(UnavailableVault),
+    }
+}
+
+#[doc(hidden)]
+pub fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Response {
+    let vault = vault();
+    let scope = crate::context::call_context::current_secret_audit_scope()
+        .map(|scope| scope.to_scope_ref());
+    for label in labels {
+        let mut record = secret_rules::audit::AuditRecordV1::new(
+            crate::secret::now_ms(),
+            label,
+            secret_rules::audit::Decision::Refused,
+            secret_rules::audit::AuditReason::Refused,
+            id,
+            id,
+        );
+        record.scope = scope.clone();
+        let _ = vault.audit(&record);
+    }
+    Response::error(id, code, message)
+}
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub struct Preflight {
+    pub(crate) plan: SpawnPlan,
+    pub(crate) task: Option<super::persistence::ResolvedTask>,
+    requirement: SandboxRequirement,
+}
+
+#[cfg(unix)]
+impl Drop for Preflight {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.plan.cleanup_unspawned();
+            let _ = super::persistence::delete_resolved_task(&task);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn preflight(
+    ctx: &AppContext,
+    session: &str,
+    pty: bool,
+    background: bool,
+    requirement: SandboxRequirement,
+) -> Result<Preflight, String> {
+    let task = super::persistence::allocate_task_layout(&super::task_storage_dir(ctx), session)
+        .map_err(|error| {
+            requirement.refusal_message(format!(
+                "the task artifact directory could not be created: {error}"
+            ))
+        })?;
+    let principal = crate::sandbox_spawn::current_authenticated_principal();
+    let plan = crate::sandbox_spawn::resolve_command_sandbox_spawn(
+        ctx,
+        &principal,
+        RequestedSandboxTier::Native,
+        if pty {
+            SandboxTaskKind::BashPty
+        } else if background {
+            SandboxTaskKind::BashBackground
+        } else {
+            SandboxTaskKind::BashForeground
+        },
+        &task.paths.io_dir,
+        None,
+        Some(requirement),
+    );
+    let preflight = Preflight {
+        plan,
+        task: Some(task),
+        requirement,
+    };
+    if let Some(message) = preflight.plan.refusal_message() {
+        return Err(message.to_owned());
+    }
+    Ok(preflight)
+}
+
+#[cfg(unix)]
+pub(crate) type SharedRuntime = Arc<Mutex<Runtime>>;
+
+#[cfg(unix)]
+#[path = "secrets_types.rs"]
+pub(crate) mod secrets_types;
+#[cfg(unix)]
+pub(crate) use secrets_types::Runtime;
+#[cfg(unix)]
+impl Runtime {
+    pub(crate) fn approval_status(&self) -> Vec<String> {
+        self.proxy.approval_status()
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn address(&self) -> std::net::SocketAddr {
+        self.proxy.address()
+    }
+    pub(crate) fn arm(&mut self, pid: u32) -> Result<(), String> {
+        self.proxy.arm_command(pid).map_err(|reason| {
+            #[cfg(test)]
+            eprintln!("secret proxy arming failed: {reason:?}");
+            #[cfg(not(test))]
+            let _ = reason;
+            PROXY_UNAVAILABLE.to_owned()
+        })?;
+        self.armed = true;
+        Ok(())
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.proxy.stop();
+        let _ = std::fs::remove_file(&self.bundle);
+    }
+
+    pub(crate) fn exec_environment(&self) -> Vec<(String, String)> {
+        let url = self.proxy.proxy_url();
+        PROXY_KEYS
+            .iter()
+            .map(|key| ((*key).to_owned(), url.to_string()))
+            .chain(TRUST_KEYS.iter().map(|key| {
+                (
+                    (*key).to_owned(),
+                    self.bundle.to_string_lossy().into_owned(),
+                )
+            }))
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub struct Launch {
+    pub(crate) preflight: Preflight,
+    pub(crate) runtime: SharedRuntime,
+    adopted: bool,
+}
+
+#[cfg(unix)]
+impl Launch {
+    pub(crate) fn spawned(&mut self) {
+        self.adopted = self.runtime.lock().unwrap_or_else(|p| p.into_inner()).armed;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Launch {
+    fn drop(&mut self) {
+        let mut runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.adopted {
+            // Prepared payloads can retain runtime references after a failed
+            // launch. Only a successfully registered, armed spawn transfers
+            // ownership; arming before a later startup failure is not enough.
+            runtime.stop();
+            self.preflight.plan.cleanup_unspawned();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn authorize(
+    id: &str,
+    labels: &[String],
+    mut preflight: Preflight,
+    env: &HashMap<String, String>,
+) -> Result<Launch, Response> {
+    if env_conflicts(env) {
+        return Err(refusal(id, labels, "secrets_env_conflict", ENV_CONFLICT));
+    }
+    let (scopes, _) = crate::context::call_context::current_call_scopes().map_err(|reason| {
+        outcome_response(
+            id,
+            labels,
+            crate::secret::refuse_ineligible(&labels[0], reason),
+        )
+    })?;
+    let vault = vault();
+    let task = preflight.task.as_ref().expect("preflight owns layout");
+    let proxy = start_proxy(ProxyConfig::new(
+        vault,
+        scopes.authorization.clone(),
+        scopes.lifetime.clone(),
+        labels.to_vec(),
+        crate::context::call_context::current_secret_consent_context(),
+        {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                TEST_HTTPS_PORT.with(std::cell::Cell::get)
+            }
+            #[cfg(not(any(test, feature = "test-support")))]
+            {
+                None
+            }
+        },
+        task.paths.task_id.clone(),
+    ))
+    .map_err(|_| refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE))?;
+    preflight
+        .plan
+        .enable_secret_proxy(proxy.address().port())
+        .map_err(|_| {
+            refusal(
+                id,
+                labels,
+                "secrets_sandbox_required",
+                &preflight
+                    .requirement
+                    .refusal_message("the strict sandbox could not enable the vault proxy"),
+            )
+        })?;
+    let bundle = preflight
+        .plan
+        .temp_dir()
+        .ok_or_else(|| {
+            refusal(
+                id,
+                labels,
+                "secrets_sandbox_required",
+                &preflight.requirement.refusal_message(
+                    "the strict sandbox has no private temp directory for the vault trust bundle",
+                ),
+            )
+        })?
+        .join("secret-trust.pem");
+    write_bundle(&bundle, proxy.ca_pem())
+        .map_err(|_| refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE))?;
+    Ok(Launch {
+        preflight,
+        adopted: false,
+        runtime: Arc::new(Mutex::new(Runtime {
+            proxy,
+            bundle,
+            lifetime: scopes.lifetime,
+            authorization: scopes.authorization,
+            armed: false,
+        })),
+    })
+}
+
+#[cfg(all(unix, not(any(test, feature = "test-support"))))]
+fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::ProxyError> {
+    SecretProxy::start(config)
+}
+
+// Only test builds can inject this upstream config. Release launches always
+// call SecretProxy::start; neither a tool argument nor a test-only switch can
+// select this override.
+#[cfg(all(unix, any(test, feature = "test-support")))]
+fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::ProxyError> {
+    match TEST_UPSTREAM.with(|slot| slot.borrow().clone()) {
+        Some(upstream) => SecretProxy::start_for_test(config, upstream),
+        None => SecretProxy::start(config),
+    }
+}
+
+#[cfg(unix)]
+fn outcome_response(id: &str, labels: &[String], outcome: crate::secret::LabelOutcome) -> Response {
+    match outcome {
+        crate::secret::LabelOutcome::Refuse { code, message } => {
+            refusal(id, labels, code, &message)
+        }
+        _ => refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE),
+    }
+}
+
+#[cfg(unix)]
+fn write_bundle(path: &Path, ca: &str) -> Result<(), ()> {
+    let mut pem = Vec::new();
+    let native = zeroize::Zeroizing::new(native_roots()?);
+    append_public_certificates(&mut pem, &native)?;
+    for key in TRUST_KEYS {
+        // Only daemon-inherited trust paths are authority to read a file.
+        // Tool env values are replaced, not read on the caller's behalf.
+        if let Some(path) = std::env::var_os(key).map(PathBuf::from) {
+            let input = zeroize::Zeroizing::new(std::fs::read(path).map_err(|_| ())?);
+            append_public_certificates(&mut pem, &input)?;
+        }
+    }
+    append_public_certificates(&mut pem, ca.as_bytes())?;
+    crate::private_storage::write(path, pem).map_err(|_| ())
+}
+
+#[cfg(unix)]
+fn append_public_certificates(output: &mut Vec<u8>, input: &[u8]) -> Result<(), ()> {
+    use base64::Engine;
+    use rustls::pki_types::pem::PemObject;
+    let mut count = 0;
+    for certificate in rustls::pki_types::CertificateDer::pem_slice_iter(input) {
+        let certificate = certificate.map_err(|_| ())?;
+        // Extracting a trust anchor validates certificate structure without
+        // treating private-key blocks or arbitrary PEM text as public data.
+        rustls::RootCertStore::empty()
+            .add(certificate.clone())
+            .map_err(|_| ())?;
+        output.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
+        for line in encoded.as_bytes().chunks(64) {
+            output.extend_from_slice(line);
+            output.push(b'\n');
+        }
+        output.extend_from_slice(b"-----END CERTIFICATE-----\n");
+        count += 1;
+    }
+    if count == 0 {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn native_roots() -> Result<Vec<u8>, ()> {
+    for path in [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "/etc/ssl/cert.pem",
+    ] {
+        if let Ok(pem) = std::fs::read(path) {
+            if !pem.is_empty() {
+                return Ok(pem);
+            }
+        }
+    }
+    Err(())
+}
+
+#[cfg(target_os = "macos")]
+fn native_roots() -> Result<Vec<u8>, ()> {
+    let mut pem = Vec::new();
+    for keychain in [
+        "/System/Library/Keychains/SystemRootCertificates.keychain",
+        "/Library/Keychains/System.keychain",
+    ] {
+        let output = std::process::Command::new("/usr/bin/security")
+            .args(["find-certificate", "-a", "-p", keychain])
+            .output()
+            .map_err(|_| ())?;
+        if !output.status.success() {
+            return Err(());
+        }
+        pem.extend(output.stdout);
+        pem.push(b'\n');
+    }
+    if pem.is_empty() {
+        return Err(());
+    }
+    Ok(pem)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn native_roots() -> Result<Vec<u8>, ()> {
+    Err(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_HTTPS_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+    static TEST_VAULT: std::cell::RefCell<Option<Arc<dyn SecretVault>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static TEST_UPSTREAM: std::cell::RefCell<Option<rustls::ClientConfig>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod test_support {
+    use super::*;
+
+    #[cfg(unix)]
+    pub fn set_https_port(port: Option<u16>) {
+        TEST_HTTPS_PORT.with(|slot| slot.set(port));
+    }
+
+    pub fn replace_vault(vault: Option<Arc<dyn SecretVault>>) -> Option<Arc<dyn SecretVault>> {
+        TEST_VAULT.with(|slot| slot.replace(vault))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_upstream(config: rustls::ClientConfig) {
+        TEST_UPSTREAM.with(|slot| slot.replace(Some(config)));
+    }
+
+    #[cfg(unix)]
+    pub fn unarmed_runtime(
+        proxy: SecretProxy,
+        bundle: PathBuf,
+        lifetime: crate::secret::SecretScope,
+        authorization: crate::secret::SecretScope,
+    ) -> SharedRuntime {
+        Arc::new(Mutex::new(Runtime {
+            proxy,
+            bundle,
+            lifetime,
+            authorization,
+            armed: false,
+        }))
+    }
+
+    #[cfg(unix)]
+    pub fn native_roots() -> Result<Vec<u8>, ()> {
+        super::native_roots()
+    }
+
+    #[cfg(unix)]
+    pub fn write_bundle(path: &Path, ca: &str) -> Result<(), ()> {
+        super::write_bundle(path, ca)
+    }
+}

@@ -41,6 +41,7 @@ fi
 
 log="$run_root/real-daemon-tests.log"
 export AFT_REAL_DAEMON_RUN_ROOT="$TMPDIR/real-daemon-homes"
+export AFT_REAL_DAEMON_REPORTS="$run_root/reports"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="bash $repo/scripts/ci-real-daemon-test-runner.sh"
 
 bash "$repo/scripts/check-cmake.sh"
@@ -69,6 +70,15 @@ timeout 15m cargo nextest run --features wasm-grammars -p agent-file-tools --tes
 if (( rc != 0 )); then
   printf '==> Real-daemon gate FAILED (rc=%s); failing test names:\n' "$rc" >&2
   grep -E '(FAIL|TIMEOUT|LEAK) \[' "$log" >&2 || true
+  # A killed runner may not have exported its case before nextest stopped.
+  python3 "$repo/scripts/ci-real-daemon-diagnostics.py" remaining \
+    "$AFT_REAL_DAEMON_RUN_ROOT" "$AFT_REAL_DAEMON_REPORTS" || \
+    echo 'Could not collect remaining real-daemon diagnostics' >&2
+  if [[ -d "$AFT_REAL_DAEMON_REPORTS" ]]; then
+    destination="$base/aft-real-daemon-diagnostics"
+    (mkdir -p "$destination" && mv "$AFT_REAL_DAEMON_REPORTS" "$destination/${run_root##*/}") || \
+      echo 'Could not export real-daemon diagnostics' >&2
+  fi
 fi
 tail -n 60 "$log"
 exit "$rc"

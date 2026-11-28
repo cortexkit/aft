@@ -22,8 +22,8 @@
     {"id":"SURFACE-V049-DOC-TOOLS-001","path":"docs/tools.md","kind":"current tool reference","owner":"documentation","profiles":["REG-V049-OC-MIN","REG-V049-OC-REC","REG-V049-OC-ALL","REG-V049-PI-MIN","REG-V049-PI-REC","REG-V049-PI-ALL"],"prohibited":true},
     {"id":"SURFACE-V049-DOC-CONFIG-001","path":"docs/config.md","kind":"current configuration reference","owner":"documentation","profiles":["REG-V049-OC-MIN","REG-V049-OC-REC","REG-V049-OC-ALL","REG-V049-PI-MIN","REG-V049-PI-REC","REG-V049-PI-ALL"],"prohibited":true},
     {"id":"SURFACE-V049-PI-README-001","path":"packages/pi-plugin/README.md","kind":"plugin README","owner":"pi-plugin","profiles":["REG-V049-PI-MIN","REG-V049-PI-REC","REG-V049-PI-ALL"],"prohibited":true},
-    {"id":"SURFACE-V049-SUBC-SCHEMA-001","path":"crates/aft/src/subc_tool_schemas.json","kind":"generated subc manifest schema","owner":"subc-schema-generation","profiles":[],"prohibited":true},
-    {"id":"SURFACE-V049-HASHLINE-EDIT-SCHEMAS-001","path":"crates/aft/src/hashline_edit_schemas.json","kind":"generated governed dual-mode edit schemas","owner":"hashline-integration","profiles":["REG-V049-OC-MIN","REG-V049-OC-REC","REG-V049-OC-ALL","REG-V049-PI-MIN","REG-V049-PI-REC","REG-V049-PI-ALL"],"prohibited":false}
+    {"id":"SURFACE-V049-SUBC-SCHEMA-001","path":"crates/aft-subc/src/subc_tool_schemas.json","kind":"generated subc manifest schema","owner":"subc-schema-generation","profiles":[],"prohibited":true},
+    {"id":"SURFACE-V049-HASHLINE-EDIT-SCHEMAS-001","path":"crates/aft-engine/src/hashline_edit_schemas.json","kind":"generated governed dual-mode edit schemas","owner":"hashline-integration","profiles":["REG-V049-OC-MIN","REG-V049-OC-REC","REG-V049-OC-ALL","REG-V049-PI-MIN","REG-V049-PI-REC","REG-V049-PI-ALL"],"prohibited":false}
   ],
   "excluded_historical_surfaces": [
     {"path":"docs/v0.49-unified-tool-surface-spec.md","class":"normative_spec","reason":"The checked specification names retired spellings to define compatibility and audit scope."},

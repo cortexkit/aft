@@ -1,0 +1,696 @@
+//! Assemble status snapshots from engine state.
+
+use crate::context::{AppContext, SemanticIndexStatus};
+use crate::db::compression_events::CompressionAggregate;
+use crate::protocol::{StatusPayload, DEFAULT_SESSION_ID};
+
+#[cfg(test)]
+#[path = "status_cost_tests.rs"]
+pub(crate) mod cost_tests;
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CompressionStats {
+    pub project: CompressionAggregateSerde,
+    pub session: CompressionAggregateSerde,
+    /// True while the last exact totals await background revalidation, or
+    /// while another thread holds the database connection.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
+    #[serde(skip)]
+    unknown: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CompressionAggregateSerde {
+    pub events: u64,
+    pub original_tokens: u64,
+    pub compressed_tokens: u64,
+    pub savings_tokens: u64,
+}
+
+impl From<CompressionAggregate> for CompressionAggregateSerde {
+    fn from(agg: CompressionAggregate) -> Self {
+        Self {
+            events: agg.events,
+            original_tokens: agg.original_tokens,
+            compressed_tokens: agg.compressed_tokens,
+            savings_tokens: agg.savings_tokens(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum StatusSnapshotKind {
+    Explicit,
+    Push,
+    Operator,
+}
+
+impl AppContext {
+    pub fn build_status_snapshot(&self) -> StatusPayload {
+        self.build_status_snapshot_for_session(DEFAULT_SESSION_ID)
+    }
+
+    pub fn build_status_snapshot_for_session(&self, session_id: &str) -> StatusPayload {
+        self.build_status_snapshot_with_counts(
+            session_id,
+            self.status_bar_count_values(),
+            StatusSnapshotKind::Explicit,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn try_build_status_snapshot(&self) -> Option<StatusPayload> {
+        let counts = self.try_status_bar_count_values()?;
+        Some(self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Explicit,
+        ))
+    }
+
+    pub(crate) fn try_build_status_push_snapshot(&self) -> Option<StatusPayload> {
+        let counts = self.try_status_bar_count_values()?;
+        let snapshot = self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Push,
+        );
+        Some(crate::status_push::project(self, snapshot))
+    }
+
+    /// Operator status still reports index readiness when language-server
+    /// diagnostics are busy. Unknown counts stay absent on the operator wire.
+    /// Agent publishers retain their existing all-or-retry snapshot behavior.
+    #[doc(hidden)]
+    pub fn build_operator_status_snapshot(&self) -> StatusPayload {
+        let counts = self.try_status_bar_count_values().unwrap_or_default();
+        let snapshot = self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Operator,
+        );
+        crate::status_push::project(self, snapshot)
+    }
+
+    fn build_status_snapshot_with_counts(
+        &self,
+        session_id: &str,
+        status_bar_values: crate::context::StatusBarCountValues,
+        kind: StatusSnapshotKind,
+    ) -> StatusPayload {
+        #[cfg(test)]
+        let mut cost = cost_tests::PushCost::start();
+        #[cfg(test)]
+        self.status_emitter()
+            .snapshot_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let config = self.config();
+
+        // The text index's status comes from the index store's report below;
+        // until a checkout is probed it reads as loading, or disabled.
+        let search_index_info = serde_json::json!({
+            "status": if config.indexes.trigram { "loading" } else { "disabled" },
+        });
+
+        let semantic_status = self
+            .semantic_index_status()
+            .try_read()
+            .ok()
+            .map(|status| status.clone());
+        let embedding_backend = self.semantic_backend_health_snapshot();
+        let semantic_index_info = if !embedding_backend.available {
+            serde_json::json!({
+                "status": if embedding_backend.paused_until_ms.is_some() { "paused" } else { "backend_unavailable" },
+                "state": if embedding_backend.paused_until_ms.is_some() { "paused" } else { "backend_unavailable" },
+                "reason": embedding_backend.last_error,
+                "since_ms": embedding_backend.since_ms,
+                "next_retry_ms": embedding_backend.next_retry_ms,
+                "paused_until_ms": embedding_backend.paused_until_ms,
+                "backend": config.semantic_backend_label(),
+                "backend_url": config.semantic.base_url.as_deref(),
+                "model": config.semantic.model.as_str(),
+            })
+        } else {
+            match semantic_status {
+                None => serde_json::json!({ "status": "busy", "state": "busy" }),
+                Some(status) => match self.semantic_index().try_read() {
+                    Err(_) => serde_json::json!({ "status": "busy", "state": "busy" }),
+                    Ok(index) => {
+                        let refreshing_count = status.refreshing_count();
+                        match index.as_ref() {
+                            Some(idx) => {
+                                // The loaded index object cannot decide this
+                                // word on its own: it has no way to say
+                                // "failed", so a dead index used to report
+                                // `ready` here while every other surface said
+                                // otherwise.
+                                let status_label = idx.status_label(&status);
+                                serde_json::json!({
+                                    "status": status_label,
+                                    "state": status_label,
+                                    "refreshing_count": refreshing_count,
+                                    "entries": idx.entry_count(),
+                                    "dimension": idx.dimension(),
+                                    "skipped_chunks": idx.skipped_rows(),
+                                    "skipped_chunks_summary": idx.skipped_chunks_summary(),
+                                    "skipped_chunk_reason": if idx.skipped_rows() > 0 { Some(idx.skipped_chunk_reason()) } else { None },
+                                    "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
+                                    "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
+                                })
+                            }
+                            None => match status {
+                                SemanticIndexStatus::Disabled => serde_json::json!({
+                                    "status": "disabled",
+                                    "state": "disabled",
+                                    "refreshing_count": 0,
+                                    "backend": config.semantic_backend_label(),
+                                    "model": config.semantic.model.as_str(),
+                                }),
+                                SemanticIndexStatus::Building {
+                                    stage,
+                                    files,
+                                    entries_done,
+                                    entries_total,
+                                } => {
+                                    let mut snapshot = serde_json::json!({
+                                        "status": "loading",
+                                        "state": "loading",
+                                        "refreshing_count": 0,
+                                        "stage": stage,
+                                        "files": files,
+                                        "entries_done": entries_done,
+                                        "entries_total": entries_total,
+                                        "backend": config.semantic_backend_label(),
+                                        "model": config.semantic.model.as_str(),
+                                    });
+                                    if let Some(progress) = self.semantic_build_progress() {
+                                        let progress = progress.snapshot();
+                                        snapshot["embedded_chunks"] =
+                                            serde_json::json!(progress.embedded_chunks);
+                                        snapshot["total_chunks"] =
+                                            serde_json::json!(progress.total_chunks);
+                                        snapshot["current_batch"] =
+                                            serde_json::json!(progress.current_batch);
+                                        snapshot["total_batches"] =
+                                            serde_json::json!(progress.total_batches);
+                                    }
+                                    snapshot
+                                }
+                                SemanticIndexStatus::Ready { refreshing, .. } => {
+                                    serde_json::json!({
+                                        "status": "ready",
+                                        "state": "ready",
+                                        "refreshing_count": refreshing.len(),
+                                        "backend": config.semantic_backend_label(),
+                                        "model": config.semantic.model.as_str(),
+                                    })
+                                }
+                                SemanticIndexStatus::Failed(error)
+                                    if crate::semantic_admission::is_not_opened_status(
+                                        error.as_str(),
+                                    ) =>
+                                {
+                                    serde_json::json!({
+                                        "status": crate::semantic_admission::NOT_OPENED_LABEL,
+                                        "state": crate::semantic_admission::NOT_OPENED_LABEL,
+                                        "refreshing_count": 0,
+                                        "backend": config.semantic_backend_label(),
+                                        "model": config.semantic.model.as_str(),
+                                    })
+                                }
+                                SemanticIndexStatus::Failed(error) => serde_json::json!({
+                                    "status": "failed",
+                                    "state": "failed",
+                                    "refreshing_count": 0,
+                                    "error": error,
+                                    "backend": config.semantic_backend_label(),
+                                    "model": config.semantic.model.as_str(),
+                                }),
+                            },
+                        }
+                    }
+                },
+            }
+        };
+
+        // An index whose artifact a newer build wrote is refused, not rebuilt:
+        // report it as unavailable with the refusal instead of the loading or
+        // failed state the refused load left behind.
+        let refused_info = |plane| {
+            crate::feature_status::storage_refusal(self, plane).map(|refusal| {
+                serde_json::json!({
+                    "status": "unavailable",
+                    "state": "unavailable",
+                    "reason": refusal.to_string(),
+                })
+            })
+        };
+        let safety_disabled_info = || {
+            serde_json::json!({
+                "status": "disabled", "state": "disabled", "reason": "root_too_broad",
+            })
+        };
+        let search_index_info = if self.root_too_broad() {
+            safety_disabled_info()
+        } else if config.indexes.trigram {
+            refused_info(crate::feature_status::IndexPlane::Trigram).unwrap_or(search_index_info)
+        } else {
+            search_index_info
+        };
+        let semantic_index_info = if self.root_too_broad() {
+            safety_disabled_info()
+        } else if config.indexes.semantic {
+            refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
+        } else {
+            semantic_index_info
+        };
+
+        // Disk sizes. The trigram and semantic indexes used to live in
+        // `<cache_dir>/index/<key>/` and `<cache_dir>/semantic/<key>/`; from
+        // 0.64 every index lives in the index store, whose size the data layer
+        // adds as `data_store_bytes` (see `data_layer::surfaces::apply_to_status`).
+        // The old folders are never read and `aft cache prune-legacy` deletes
+        // them, so status no longer sizes them. The two byte fields stay, at 0,
+        // because plugins and the status push contract read them.
+        let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
+        let cache_dir = config.cache_storage_dir();
+        let disk_info = match (&cache_dir, &config.project_root) {
+            (Some(dir), Some(root)) => {
+                let key_root = self
+                    .canonical_cache_root_opt()
+                    .unwrap_or_else(|| root.clone());
+                // Passive read only: status must never trigger a key
+                // derivation (git probe).
+                serde_json::json!({
+                    "storage_dir": storage_dir,
+                    "cache_dir": dir.display().to_string(),
+                    "project_cache_key": self.cached_artifact_cache_key(&key_root),
+                    "trigram_disk_bytes": 0,
+                    "semantic_disk_bytes": 0,
+                })
+            }
+            (Some(dir), None) => serde_json::json!({
+                "storage_dir": storage_dir,
+                "cache_dir": dir.display().to_string(),
+                "project_cache_key": null,
+                "trigram_disk_bytes": 0,
+                "semantic_disk_bytes": 0,
+            }),
+            _ => serde_json::json!({
+                "storage_dir": null,
+                "project_cache_key": null,
+                "trigram_disk_bytes": 0,
+                "semantic_disk_bytes": 0,
+            }),
+        };
+
+        // LSP servers
+        let lsp_count = self.lsp_server_count();
+
+        // Symbol cache stats
+        let symbol_cache_stats = self.symbol_cache_stats();
+        #[cfg(test)]
+        cost.mark("indexes_config_symbols");
+
+        // Per-session undo/checkpoint counts (issue #14 — one shared bridge serves
+        // many sessions; surface both the global footprint and the current
+        // session's own slice so `/aft-status` can split them in the UI).
+        let backups_enabled =
+            kind != StatusSnapshotKind::Operator && config.backup.enabled.unwrap_or(true);
+        let (checkpoint_total, session_checkpoints) = if backups_enabled {
+            let mut store = self.checkpoint().lock();
+            let resident_total = store.total_count();
+            if kind == StatusSnapshotKind::Push {
+                let session = store.status_count(session_id);
+                // Refresh this session's slice without hydrating blobs. Other
+                // sessions retain their resident, in-memory freshness as before.
+                let total = session
+                    .map(|count| resident_total - store.resident_session_count(session_id) + count);
+                (total, session)
+            } else {
+                let session = store
+                    .list(session_id)
+                    .map(|checkpoints| checkpoints.len())
+                    .unwrap_or_else(|error| {
+                        crate::slog_warn!("status checkpoint hydration failed: {}", error);
+                        0
+                    });
+                (Some(resident_total), Some(session))
+            }
+        } else {
+            (Some(0), Some(0))
+        };
+        let session_tracked_files = if !backups_enabled {
+            0
+        } else if kind == StatusSnapshotKind::Push {
+            // Copy the inputs under the store mutex and scan the session's
+            // backup directory after releasing it, so edits never wait on a
+            // push. Unchanged metadata files are not re-read.
+            let inventory = self.backup().lock().status_inventory(session_id);
+            inventory.tracked_file_count()
+        } else {
+            self.backup().lock().tracked_files(session_id).len()
+        };
+        #[cfg(test)]
+        cost.mark("checkpoints_and_backup");
+        // Shell sidebar status consumes neither undo nor compression history.
+        // In particular, idle operator refreshes must not reacquire aft.db to
+        // hydrate aggregates unrelated to readiness and health counts.
+        let compression = if kind == StatusSnapshotKind::Operator {
+            CompressionStats::default()
+        } else {
+            self.compression_stats_for_session_kind(session_id, kind)
+        };
+        let compression_unknown = compression.unknown;
+        #[cfg(test)]
+        cost.mark("compression");
+
+        // Degraded-mode reasons recorded by `handle_configure` when the
+        // project root doesn't look like a real project (`home_root`). Heavy
+        // subsystems are auto-disabled in that mode; the plugin / TUI sidebar
+        // surface the reason so users know why and can decide whether to open a
+        // project subdirectory. Empty list = full-featured mode.
+        let mut degraded_reasons = self.degraded_reasons();
+        if let Some(reason) = self.cache_unavailable_reason() {
+            let code = crate::root_cache::cache_status_code(&reason);
+            if !degraded_reasons.iter().any(|reason| reason == code) {
+                degraded_reasons.push(code.into());
+            }
+        }
+        // Everything under the storage root that this build refused because a
+        // newer build wrote it (or the reader floor requires a newer reader).
+        let storage_root = crate::storage_path::storage_dir(config.storage_dir.as_deref());
+        // Push projection supplies only this project's refusals. Do not build
+        // the full-storage list that it would immediately discard.
+        let storage_refusals = if kind == StatusSnapshotKind::Explicit {
+            crate::persisted_format::refusals_under(&storage_root)
+        } else {
+            Vec::new()
+        };
+        // With the data layer on, its family store refuses a file a newer
+        // build wrote as today's stores refuse theirs, and is listed the
+        // same way, after them. Push projection adds it itself, with this
+        // project's other refusals.
+        // Explicit status runs on the standalone request loop. Like a push,
+        // it reports pending coverage instead of waiting for a background fill.
+        let data_store_report = crate::data_layer::surfaces::report_for_push(self);
+        #[cfg(test)]
+        cost.mark("data_report");
+        let data_store_refusal = data_store_report
+            .as_ref()
+            .and_then(|report| report.refusal.as_ref())
+            .filter(|_| kind == StatusSnapshotKind::Explicit);
+        for refusal in &storage_refusals {
+            // A single unreadable task does not disable bash for any other
+            // task or session. Health still lists it by path below; a floor
+            // refusal remains a storage-wide degraded-mode reason.
+            if refusal.store == crate::persisted_format::PersistedStore::BashTask
+                && refusal.source == crate::persisted_format::RefusalSource::Artifact
+            {
+                continue;
+            }
+            let reason = refusal.reason();
+            if !degraded_reasons.contains(&reason) {
+                degraded_reasons.push(reason);
+            }
+        }
+        if data_store_refusal.is_some() {
+            let reason = crate::data_layer::surfaces::refusal_reason();
+            if !degraded_reasons.contains(&reason) {
+                degraded_reasons.push(reason);
+            }
+        }
+        let storage_refusals = storage_refusals
+            .iter()
+            .map(|refusal| {
+                serde_json::json!({
+                    "code": crate::persisted_format::CODE,
+                    "store": refusal.store.name(),
+                    "path": refusal.path.display().to_string(),
+                    "found": refusal.found,
+                    "supported": refusal.supported,
+                    "message": refusal.to_string(),
+                })
+            })
+            .chain(data_store_refusal.map(crate::data_layer::surfaces::refusal_json))
+            .collect::<Vec<_>>();
+        // Git being off is a machine-wide, per-process fact rather than a
+        // property of this root, so it is added here instead of being
+        // recorded by configure. Status renderers print each reason as-is.
+        if !crate::developer_tools::git_usable() {
+            degraded_reasons
+                .push(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
+        }
+        let degraded = !degraded_reasons.is_empty();
+        // Index artifacts have no per-checkout owner: every checkout of a
+        // repository writes the one index store.
+        let artifact_owner = serde_json::Value::Null;
+
+        // Agent status-bar counts (the `[AFT E· W· | T·]` glance).
+        // Surfaced for the TUI sidebar so users see the same code-health view
+        // agents get. `None` until every count has a value at least once (so
+        // we never render fabricated zeros) — emitted as JSON null then, and
+        // the sidebar hides the section.
+        let status_bar = match status_bar_values.legacy_projection() {
+            Some(counts) => serde_json::json!({
+                "errors": counts.errors,
+                "warnings": counts.warnings,
+                "todos": counts.todos,
+            }),
+            None => serde_json::Value::Null,
+        };
+        // Per-category companion to `status_bar`: always an object once a
+        // snapshot exists, with each count either a number or null when its
+        // producer has not supplied a trustworthy value. `status_bar` stays
+        // null in that case for consumers that need the full set; renderers
+        // use this field to show what is known instead of claiming startup
+        // forever.
+        // Errors and warnings only exist once a language server has reported.
+        // With no server running (all disabled, none installed, or no file
+        // touched that one serves) nothing will ever report, and a bare null
+        // reads as "still loading" forever. `diagnostics` says which case it is:
+        // `no_language_server` when nothing can produce the counts, null while
+        // a running server has not reported yet or the counts are present.
+        let diagnostics_state = if let Some(state) = status_bar_values.diagnostics {
+            serde_json::json!(state)
+        } else if status_bar_values.errors.is_none()
+            && status_bar_values.warnings.is_none()
+            && self.lsp_server_count_if_available() == Some(0)
+        {
+            serde_json::json!("no_language_server")
+        } else {
+            serde_json::Value::Null
+        };
+        let diagnostics_gaps = status_bar_values.diagnostics_gaps.clone();
+        let diagnostics_reason = status_bar_values.diagnostics_reason;
+        let disabled_categories = status_bar_values.disabled_categories.clone();
+        let mut status_bar_values = serde_json::json!({
+            "errors": status_bar_values.errors,
+            "warnings": status_bar_values.warnings,
+            "diagnostics": diagnostics_state,
+            "diagnostics_gaps": diagnostics_gaps,
+            "todos": status_bar_values.todos,
+        });
+        if !disabled_categories.is_empty() {
+            status_bar_values["disabled_categories"] = serde_json::json!(disabled_categories);
+        }
+        // Present only while `diagnostics` is "pending": names what the
+        // counts are waiting for (see `StatusBarCountValues::diagnostics_reason`).
+        if let Some(reason) = diagnostics_reason {
+            status_bar_values["diagnostics_reason"] = serde_json::json!(reason);
+        }
+        let watcher = serde_json::to_value(self.watcher_counters().snapshot())
+            .unwrap_or(serde_json::Value::Null);
+        let runtime = serde_json::json!({
+            "live_watchers": self.app().watcher_count(),
+            "live_actor_roots": self.app().actor_root_count(),
+            "open_routes": self.app().open_route_count(),
+        });
+
+        let mut payload = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
+            "canonical_root": self.canonical_cache_root_opt().map(|p| p.display().to_string()),
+            // Machine field. Human renderers must treat worktree/read_only as a
+            // shared-index borrow, never as a degraded_reasons entry.
+            "cache_role": self.cache_role(),
+            "artifact_owner": artifact_owner,
+            "degraded": degraded,
+            "degraded_reasons": degraded_reasons,
+            "features": {
+                "format_on_edit": config.format_on_edit,
+                "validate_on_edit": config.validate_on_edit.as_deref().unwrap_or("off"),
+                "restrict_to_project_root": config.restrict_to_project_root,
+                "search_index": config.indexes.trigram,
+                "semantic_search": config.indexes.semantic,
+                "callgraph_store": config.indexes.callgraph,
+                "backup": backups_enabled,
+            },
+            "search_index": search_index_info,
+            "semantic_index": semantic_index_info,
+            "callgraph_refresh": serde_json::Value::Null,
+            "status_bar": status_bar,
+            "status_bar_values": status_bar_values,
+            "disk": disk_info,
+            "lsp_servers": lsp_count,
+            "symbol_cache": symbol_cache_stats,
+            "watcher": watcher,
+            "runtime": runtime,
+            "compression": compression,
+            "storage_dir": storage_dir,
+            "cache_dir": self.cache_dir(),
+            "cache_unavailable_reason": self.cache_unavailable_reason().map(|reason| crate::root_cache::unavailable_code(&reason)),
+            // Project-wide (all sessions): total in-memory checkpoint count.
+            "checkpoints_total": checkpoint_total,
+            // Current session slice: only when the caller passed `session_id`.
+            "session": {
+                "id": session_id,
+                "tracked_files": session_tracked_files,
+                "checkpoints": session_checkpoints,
+            },
+        });
+
+        // With the data layer on, its planes replace today's stores for text
+        // and the call graph on every status surface.
+        if compression_unknown {
+            payload["compression"]["project"] = serde_json::Value::Null;
+            payload["compression"]["session"] = serde_json::Value::Null;
+        }
+        #[cfg(test)]
+        cost.mark("payload");
+        if let Some(report) = &data_store_report {
+            if kind == StatusSnapshotKind::Operator {
+                crate::data_layer::surfaces::apply_to_status_operator(&mut payload, report);
+            } else if kind == StatusSnapshotKind::Push {
+                crate::data_layer::surfaces::apply_to_status_push(&mut payload, report);
+            } else {
+                crate::data_layer::surfaces::apply_to_status(&mut payload, report);
+            }
+        }
+        #[cfg(test)]
+        cost.mark("data_apply");
+        if kind != StatusSnapshotKind::Explicit {
+            // Read only this root's LSP applicability rather than cloning
+            // applicability for every root and the other lifecycle details.
+            let root = config.project_root.clone().unwrap_or_default();
+            let normalized = crate::path_identity::canonicalize_normalized(&root)
+                .display()
+                .to_string();
+            let mut roots = serde_json::Map::new();
+            if let Some(own) = self.app().lifecycle_lsp_applicability_for_root(&normalized) {
+                roots.insert(normalized, serde_json::json!(own));
+            }
+            payload["lsp"] = serde_json::json!({"applicability_by_root": roots});
+        } else {
+            // Process details belong to explicit reads only. In particular,
+            // memory attribution walks every registered project's context.
+            let memory_root = self
+                .canonical_cache_root_opt()
+                .or_else(|| config.project_root.clone());
+            // The allocator observation is cached; attribution still walks roots.
+            payload["memory"] = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
+                .unwrap_or(serde_json::Value::Null);
+            // The health worker publishes lifecycle details off the reply path.
+            let lifecycle = self.app().lifecycle_census_snapshot();
+            payload["lifecycle_snapshot_age_ms"] = serde_json::json!(lifecycle.measured_age_ms);
+            payload["lsp"] = serde_json::json!(lifecycle.lsp);
+            payload["threads"] = serde_json::json!(lifecycle.threads);
+            payload["sqlite"] = serde_json::json!(lifecycle.sqlite);
+            payload["children"] = serde_json::json!(lifecycle.children);
+            payload["fds"] = serde_json::json!(lifecycle.fds);
+            payload["storage_refusals"] = serde_json::json!(storage_refusals);
+            payload["git"] = crate::developer_tools::git_status_json();
+            let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
+                crate::backup::backup_skipped_totals();
+            payload["backup_skipped_too_large_total"] =
+                serde_json::json!(backup_skipped_too_large_total);
+            payload["backup_skipped_temp_path_total"] =
+                serde_json::json!(backup_skipped_temp_path_total);
+            let runtime = &mut payload["runtime"];
+            runtime["callgraph_commits_60s_total"] = serde_json::json!(0);
+            runtime["callgraph_pages_or_bytes_written_60s_total"] = serde_json::json!(0);
+            #[cfg(unix)]
+            {
+                runtime["bash_spawn"] = crate::posix_spawn::health();
+            }
+        }
+        #[cfg(test)]
+        cost.mark("lifecycle");
+        payload
+    }
+
+    fn compression_stats_for_session_kind(
+        &self,
+        session_id: &str,
+        kind: StatusSnapshotKind,
+    ) -> CompressionStats {
+        let mut compression = CompressionStats::default();
+        let Some(project_root) = self.config().project_root.clone() else {
+            return compression;
+        };
+        let Some(db) = self.db() else {
+            return compression;
+        };
+        let harness = self.harness().storage_segment();
+        let project_key = crate::path_identity::project_scope_key(&project_root);
+        let cache = self.compression_aggregate_cache();
+        // Status is polled with a short client timeout and must answer from
+        // memory. The connection mutex can be held for as long as another
+        // thread's statement waits on a different process's lock, so never
+        // block on it: fall back to the last totals this process computed.
+        let conn = match db.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                compression.stale = true;
+                if let Some((project, session)) =
+                    cache.cached_for_session(&harness, &project_key, session_id)
+                {
+                    compression.project = project.into();
+                    compression.session = session.into();
+                } else if kind == StatusSnapshotKind::Push {
+                    compression.unknown = true;
+                }
+                if kind == StatusSnapshotKind::Push {
+                    self.refresh_compression_for_status(
+                        harness,
+                        project_key,
+                        session_id.to_string(),
+                    );
+                }
+                return compression;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return compression,
+        };
+
+        let totals = if kind == StatusSnapshotKind::Push {
+            cache
+                .validated_for_status(&conn, &harness, &project_key, session_id)
+                .ok()
+                .flatten()
+        } else {
+            cache
+                .aggregates_for_session(&conn, &harness, &project_key, session_id)
+                .ok()
+        };
+        if let Some((project, session)) = totals {
+            compression.project = project.into();
+            compression.session = session.into();
+        } else if kind == StatusSnapshotKind::Push {
+            compression.stale = true;
+            if let Some((project, session)) =
+                cache.cached_for_session(&harness, &project_key, session_id)
+            {
+                compression.project = project.into();
+                compression.session = session.into();
+            } else {
+                compression.unknown = true;
+            }
+            drop(conn);
+            self.refresh_compression_for_status(harness, project_key, session_id.to_string());
+        }
+
+        compression
+    }
+}

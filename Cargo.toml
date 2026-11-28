@@ -4,13 +4,16 @@ members = [
     "crates/aft",
     "crates/aft-base",
     "crates/aft-db",
+    "crates/aft-engine",
     "crates/aft-parse",
     "crates/aft-store",
+    "crates/aft-subc",
     "crates/aft-tokenizer",
+    "crates/aft-tools",
     "crates/aft-fake-lsp",
     "crates/secret-rules",
 ]
-default-members = ["crates/aft", "crates/aft-base", "crates/aft-db", "crates/aft-parse", "crates/aft-tokenizer"]
+default-members = ["crates/aft", "crates/aft-base", "crates/aft-db", "crates/aft-engine", "crates/aft-parse", "crates/aft-subc", "crates/aft-tokenizer", "crates/aft-tools"]
 
 # MSRV contract: the locked oxc 0.126 dependency family requires rustc 1.92,
 # so `cargo check --locked` on an older toolchain dies with a transitive
@@ -28,8 +31,8 @@ rust-version = "1.92"
 # the shell, in order, joined with &&. Keep them in step with the gate flags.
 [workspace.metadata.motor]
 warm-commands = [
-  "cargo nextest run --no-run -p agent-file-tools --features test-hooks",
-  "cargo check --target x86_64-pc-windows-gnu -p agent-file-tools --tests --features test-hooks",
+  "cargo nextest run --no-run -p agent-file-tools -p aft-engine -p aft-tools -p aft-subc --features test-hooks",
+  "cargo check --target x86_64-pc-windows-gnu -p agent-file-tools -p aft-engine -p aft-tools -p aft-subc --tests --features test-hooks",
 ]
 
 [profile.release]

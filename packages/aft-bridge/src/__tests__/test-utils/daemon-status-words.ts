@@ -15,7 +15,7 @@ import { join } from "node:path";
 
 const DAEMON_SEMANTIC_INDEX_SOURCE = join(
   import.meta.dir,
-  "../../../../../crates/aft/src/semantic_index.rs",
+  "../../../../../crates/aft-engine/src/semantic_index.rs",
 );
 const ONNX_RUNTIME_PIN_SOURCE = join(
   import.meta.dir,

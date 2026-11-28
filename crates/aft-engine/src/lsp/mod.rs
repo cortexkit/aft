@@ -1,0 +1,89 @@
+mod analysis_progress;
+mod applicability_cache;
+pub mod child_registry;
+pub mod client;
+#[doc(hidden)]
+pub mod completed_rust_check;
+#[cfg(feature = "test-hooks")]
+pub use completed_rust_check::FingerprintProbe;
+mod diagnostic_registration;
+pub mod diagnostics;
+pub mod document;
+pub mod environmental;
+pub(crate) mod event_ingress;
+pub mod fresh_wait;
+pub mod jsonrpc;
+pub mod manager;
+pub mod pending_changes;
+pub mod position;
+pub mod pull_params;
+pub mod registry;
+pub mod roots;
+pub mod transport;
+pub mod tsconfig_membership;
+pub(crate) mod typescript_diagnostics;
+#[doc(hidden)]
+pub mod typescript_project;
+mod writer;
+
+/// LSP subsystem error type.
+#[derive(Debug)]
+pub enum LspError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    ServerNotReady(String),
+    ServerDisconnected(String),
+    TypeScriptSdkUnavailable(String),
+    Timeout(String),
+    ServerError { code: i32, message: String },
+    NotFound(String),
+    ProjectClosed,
+}
+
+impl std::fmt::Display for LspError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "I/O error: {err}"),
+            Self::Json(err) => write!(f, "JSON error: {err}"),
+            Self::ServerNotReady(message)
+            | Self::ServerDisconnected(message)
+            | Self::TypeScriptSdkUnavailable(message) => write!(f, "server not ready: {message}"),
+            Self::Timeout(message) => write!(f, "timeout: {message}"),
+            Self::ServerError { code, message } => {
+                write!(f, "server error {code}: {message}")
+            }
+            Self::NotFound(message) => write!(f, "not found: {message}"),
+            Self::ProjectClosed => write!(f, "project closed; reopen the project and retry"),
+        }
+    }
+}
+
+impl std::error::Error for LspError {}
+
+impl From<std::io::Error> for LspError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<serde_json::Error> for LspError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+
+fn check_lsp_initialization_options(
+    config: &crate::config::Config,
+    id: &str,
+) -> Result<(), LspError> {
+    if config
+        .invalid_lsp_initialization_options
+        .iter()
+        .any(|name| name == id)
+    {
+        return Err(LspError::ServerNotReady(format!(
+            "lsp.servers.{id}.initialization_options must contain valid JSON text"
+        )));
+    }
+    Ok(())
+}

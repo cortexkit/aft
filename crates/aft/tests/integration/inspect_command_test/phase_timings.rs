@@ -33,7 +33,7 @@ fn scoped_inspect_cold_checkout_phase_timings() {
         json!({
             "id": "cold-checkout-timings", "command": "inspect", "worker_session": true,
             "sections": "diagnostics",
-            "scope": ["crates/aft/src/commands/inspect.rs", "packages/opencode-plugin/src/tools/inspect.ts"]
+            "scope": ["crates/aft-tools/src/commands/inspect.rs", "packages/opencode-plugin/src/tools/inspect.ts"]
         }),
     );
     finished.store(true, std::sync::atomic::Ordering::Release);

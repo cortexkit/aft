@@ -10,7 +10,9 @@ use std::sync::RwLock;
 use crate::test_support::manifest_dir;
 
 fn assets() -> PathBuf {
-    manifest_dir().join("tests/store_diet")
+    manifest_dir()
+        .with_file_name("aft")
+        .join("tests/store_diet")
 }
 
 fn read_capture(path: impl AsRef<Path>) -> Vec<u8> {
@@ -107,7 +109,7 @@ fn store_diet_language_corpus_data_layer_answers() {
     for case in corpus_cases() {
         let name = case["name"].as_str().unwrap();
         let root = assets().join("corpus").join(name).canonicalize().unwrap();
-        let reader = crate::data_layer::trace_measure::memory_reader(&root);
+        let reader = aft_engine::test_bridge::display_data::callgraph_roots::memory_reader(&root);
         let cache = Arc::new(RwLock::new(SymbolCache::new()));
         for recorded in golden[name]["queries"].as_array().into_iter().flatten() {
             let file = recorded["file"].as_str().unwrap();

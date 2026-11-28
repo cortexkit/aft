@@ -70,14 +70,20 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run original stress volumes
         shell: bash
-        run: >-
-          cargo test --features wasm-grammars -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib --
-          views_incremental_random_sequences_equal_full_rebuild
-          tool_result_fixtures_release_descriptors
-          bash_changed_files_flush_native_no_false_complete_during_50k_activity
-          views_shared_checkout_presence_reads_no_payloads
-          repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts
-          repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission
+        run: |
+          args=(--features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-subc --lib --
+            views_incremental_random_sequences_equal_full_rebuild
+            tool_result_fixtures_release_descriptors
+            bash_changed_files_flush_native_no_false_complete_during_50k_activity
+            views_shared_checkout_presence_reads_no_payloads
+            repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts
+            repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission)
+          listing="$(cargo test "${args[@]}" --list)"
+          [[ "$listing" == *"bash_changed_files_flush_native_no_false_complete_during_50k_activity: test"* ]] || { echo 'missing changed-files stress test' >&2; exit 1; }
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            [[ "$listing" == *"subc::tool_result_tests::tool_result_fixtures_release_descriptors: test"* ]] || { echo 'missing aft-subc descriptor stress test' >&2; exit 1; }
+          fi
+          cargo test "${args[@]}"
 
   cost-gate:
     name: OSS index cost gate (Mac mini)

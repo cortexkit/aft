@@ -47,12 +47,18 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
         self.base_binary = self.folder / "aft-base-current.exe"
         self.base_binary.write_bytes(self.binary.read_bytes())
         self.base_binary.chmod(0o755)
+        self.engine_binary = self.folder / "aft-engine-current.exe"
+        self.engine_binary.write_bytes(self.binary.read_bytes())
+        self.engine_binary.chmod(0o755)
         self.metadata = {"rust-binaries": {
             "agent-file-tools": {
                 "binary-name": "aft", "kind": "lib", "binary-path": str(self.binary),
             },
             "aft-base": {
                 "binary-name": "aft_base", "kind": "lib", "binary-path": str(self.base_binary),
+            },
+            "aft-engine": {
+                "binary-name": "aft_engine", "kind": "lib", "binary-path": str(self.engine_binary),
             },
             "agent-file-tools::bin/aft": {
                 "binary-name": "aft", "kind": "bin", "binary-path": str(self.folder / "aft-bin.exe"),
@@ -68,6 +74,10 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
 
     def base_calls(self):
         path = self.base_binary.with_suffix(".calls")
+        return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
+
+    def engine_calls(self):
+        path = self.engine_binary.with_suffix(".calls")
         return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
 
     def archive(self, name="target/nextest/binaries-metadata.json", compressed=False):
@@ -100,7 +110,7 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
         (self.folder / "aft-stale.exe").write_text("stale")
         self.assertEqual(probes.library_harness(self.metadata), self.binary)
 
-    def test_cli_routes_tls_to_aft_and_the_moved_backtrace_to_base(self):
+    def test_cli_routes_tls_to_the_engine_and_backtrace_to_base(self):
         archive = self.archive()
         for probe in ("tls", "backtrace"):
             result = subprocess.run(
@@ -109,16 +119,21 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        for calls, probe in ((self.calls(), "tls"), (self.base_calls(), "backtrace")):
+        for calls, probe, cwd in (
+            (self.engine_calls(), "tls", ROOT / "crates/aft-engine"),
+            (self.base_calls(), "backtrace", ROOT / "crates/aft-base"),
+        ):
             self.assertEqual([call["args"] for call in calls], [
                 ["--list", "--exact", probes.PROBES[probe]],
                 ["--exact", probes.PROBES[probe]],
             ])
+            self.assertEqual([Path(call["cwd"]) for call in calls], [cwd] * 2)
+        self.assertFalse(self.calls())
         self.assertEqual(probes.library_harness(self.metadata), self.binary)
 
     def test_probe_filters_are_defined_in_the_expected_crate_sources(self):
         owners = {
-            "tls": ROOT / "crates/aft/src/semantic_index.rs",
+            "tls": ROOT / "crates/aft-engine/src/semantic_index.rs",
             "backtrace": ROOT / "crates/aft-base/src/logging.rs",
         }
         for probe, source in owners.items():
@@ -154,7 +169,7 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
             ["--exact", probes.PROBES["backtrace"]],
         ])
         self.assertEqual([Path(call["cwd"]) for call in calls],
-                         [ROOT / "crates/aft"] * 2 + [ROOT / "crates/aft-base"] * 2)
+                         [ROOT / "crates/aft-engine"] * 2 + [ROOT / "crates/aft-base"] * 2)
 
     def test_child_failure_is_not_treated_as_probe_success(self):
         with patch.dict(os.environ, {"FAKE_PROBE_EXIT": "17"}), contextlib.redirect_stdout(io.StringIO()):

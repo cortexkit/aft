@@ -1,0 +1,202 @@
+//! Caller-side client for the daemon's `exec-remote/v1` capability.
+//! This module does not choose execution policy or launch local commands.
+
+pub use cortexkit_exec_remote_types as types;
+use types::{Killed, Outcome, Ran, TerminalRecord};
+
+mod client;
+pub mod persistence;
+pub mod policy;
+pub(crate) mod read_only_note;
+mod reply;
+mod request;
+mod stream;
+pub(crate) use client::LaunchTimings;
+#[cfg(unix)]
+pub(crate) use client::RunDiagnostics;
+pub use client::{ExecRemoteClient, RemoteStream, StreamProgress};
+pub use reply::{decode_reply, grade_reply, Reply, ReplyVerdict};
+// Only the Unix remote-dispatch path filters environment names.
+#[cfg(unix)]
+pub(crate) use request::denied_environment_name;
+pub use request::{
+    build_request, return_max_bytes, FrozenParams, PresetParams, RootConfinement,
+    RETURN_TOTAL_CAP_BYTES,
+};
+#[doc(hidden)]
+pub use request::{
+    read_policy_unavailable, sibling_refusal, SiblingRefusal, SiblingValidationError,
+};
+pub use stream::{GapRecovery, OutputSink, ResumePoint, StreamConsumer};
+
+#[derive(Debug, Clone, Copy)]
+pub enum DirectoryKind {
+    WorkingDirectory,
+    ProjectFolder,
+}
+
+impl DirectoryKind {
+    pub fn canonicalize(self, path: &std::path::Path) -> Result<std::path::PathBuf, Error> {
+        path.canonicalize()
+            .map_err(|source| Error::ResolveDirectory {
+                kind: self,
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+}
+
+impl std::fmt::Display for DirectoryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::WorkingDirectory => "working directory",
+            Self::ProjectFolder => "project folder",
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Protocol(String),
+    #[cfg(unix)]
+    CancelledBeforeCapture,
+    ResolveDirectory {
+        kind: DirectoryKind,
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Sink(std::io::Error),
+    Transport(subc_client_rs::CallError),
+    Connection(subc_client_rs::ConsumerError),
+    /// The request needs a feature the runner does not advertise, found
+    /// before anything was submitted, so the command did not run.
+    /// `feature` is the bash argument that needs it.
+    MissingCapability {
+        feature: &'static str,
+        capability: &'static str,
+    },
+    /// No terminal proof is available. Query status and reattach when a job ID
+    /// is known; never turn a transport/decode failure into permission to rerun.
+    RecoveryRequired {
+        resume: Option<ResumePoint>,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(message) => write!(f, "remote execution protocol: {message}"),
+            #[cfg(unix)]
+            Self::CancelledBeforeCapture => write!(f, "remote capture cancelled before dispatch"),
+            Self::ResolveDirectory { kind, path, source } => {
+                write!(f, "could not resolve {kind} {}: {source}", path.display())
+            }
+            Self::Sink(error) => write!(f, "remote execution output sink: {error}"),
+            Self::Transport(error) => write!(f, "remote execution route: {error}"),
+            Self::Connection(error) => write!(f, "remote execution connection: {error}"),
+            Self::MissingCapability {
+                feature,
+                capability,
+            } => write!(
+                f,
+                "{feature} is unavailable: the build server doesn't offer copying files back yet (missing {capability})"
+            ),
+            Self::RecoveryRequired { reason, .. } => write!(
+                f,
+                "remote execution needs re-attach, not resubmission: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::Sink(error)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The executor proved no start. A later caller may run in AFT's local
+    /// sandbox and must tell the user; neither this client nor ck-motor does it.
+    RunLocally {
+        reason: types::RefusalReason,
+        refusal_detail: Option<String>,
+    },
+    Exited {
+        code: i64,
+    },
+    Signalled {
+        signal: i32,
+    },
+    Cancelled,
+    DeadlineKilled,
+    CancelKilled,
+    OutcomeUnknown,
+    HistoryExpired,
+}
+
+/// Grade the terminal proof without inferring missing execution metadata.
+/// Unknown `Ran` overrides even a familiar outcome: it cannot prove no start.
+/// Unknown kill reasons are unknown outcomes, not ordinary exits or cancels.
+/// The original terminal is delivered to the sink unchanged, including null
+/// `ran`, `tree_hash`, and `workspace_changes`; changed files are never copied.
+pub fn grade(terminal: &TerminalRecord) -> Verdict {
+    match &terminal.ran {
+        None | Some(Ran::Remote) | Some(Ran::None) => {}
+        Some(_) => return Verdict::OutcomeUnknown,
+    }
+    // Refusals and expired history remain authoritative before kill reasons.
+    match &terminal.outcome {
+        Outcome::RefusedBeforeStart { reason } => {
+            return Verdict::RunLocally {
+                reason: reason.clone(),
+                refusal_detail: terminal.refusal_detail().map(str::to_owned),
+            };
+        }
+        Outcome::OutcomeUnknown
+            if terminal.killed == Some(Killed::Cancel) && terminal.execution_ended() =>
+        {
+            // The runner can prove no process remains without knowing its exit status.
+            return Verdict::CancelKilled;
+        }
+        Outcome::OutcomeUnknown | Outcome::Unknown { .. } => return Verdict::OutcomeUnknown,
+        Outcome::HistoryExpired => return Verdict::HistoryExpired,
+        Outcome::Exit { .. }
+        | Outcome::WindowsExit { .. }
+        | Outcome::Signal { .. }
+        | Outcome::Cancelled => {}
+        _ => return Verdict::OutcomeUnknown,
+    }
+    match &terminal.killed {
+        Some(Killed::Deadline) => return Verdict::DeadlineKilled,
+        Some(Killed::Cancel) => return Verdict::CancelKilled,
+        Some(_) => return Verdict::OutcomeUnknown,
+        None => {}
+    }
+    match terminal.outcome {
+        Outcome::Exit { code } => Verdict::Exited {
+            code: i64::from(code),
+        },
+        Outcome::WindowsExit { code } => Verdict::Exited {
+            code: i64::from(code),
+        },
+        Outcome::Signal { signal } => Verdict::Signalled { signal },
+        Outcome::Cancelled => Verdict::Cancelled,
+        _ => Verdict::OutcomeUnknown,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+mod return_vector_fixture;
+#[cfg(test)]
+pub(crate) mod return_vectors;
+#[cfg(test)]
+mod tests;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod wire_fixture;
+#[cfg(test)]
+mod wire_tests;

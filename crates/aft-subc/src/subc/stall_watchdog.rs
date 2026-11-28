@@ -1,0 +1,2402 @@
+//! In-process stall watchdog for the subc daemon.
+//!
+//! A stall is a loop that owes work but has stopped taking turns: the whole
+//! daemon goes quiet while the subc daemon waits on route binds that nobody
+//! answers. The watchdog runs on its own OS thread and reads only atomics the
+//! watched loops publish and nonblocking diagnostic snapshots, so it keeps running when those loops are wedged on a
+//! lock or descheduled, and it can capture evidence while the stall is live.
+
+use std::io;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use super::health::DispatchPathMetrics;
+use crate::context::DispatchLoopLiveness;
+
+/// How long a loop may owe work without progressing before it is a stall.
+pub(super) const STALL_THRESHOLD: Duration = Duration::from_secs(15);
+/// A wedged subc frame loop cannot answer supervisor health requests. Fail
+/// after this much owed work without a new turn so the supervisor restarts it.
+pub(super) const FRAME_LOOP_EXIT_THRESHOLD: Duration = Duration::from_secs(30);
+/// Even host starvation must not suppress recovery forever: five minutes of
+/// continuously owed work is the unconditional restart ceiling.
+const FRAME_LOOP_HARD_CEILING: Duration = Duration::from_secs(5 * 60);
+/// Linux cold-mmap calibration: an 8 MiB sequential scan incurred one major
+/// fault (4 KiB pages, readahead); an idle 250 ms window incurred zero. More
+/// than eight faults in one stalled turn is a conservative paging signal,
+/// not an incident-derived rate. The hard ceiling bounds false deferrals.
+const PAGING_MAJFLT_THRESHOLD: u64 = 8;
+pub(super) const STALL_EXIT_CODE: i32 = 1;
+/// How often the watchdog samples the markers.
+pub(super) const WATCHDOG_TICK: Duration = Duration::from_secs(1);
+/// At most one evidence capture per this interval, however many stalls occur.
+pub(super) const CAPTURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// Capture files kept in the diagnostics directory; older ones are deleted.
+pub(super) const KEEP_CAPTURES: usize = 5;
+const CAPTURE_FILE_PREFIX: &str = "stall-";
+const CAPTURE_FILE_SUFFIX: &str = ".txt";
+
+/// Stall counters the health report reads. Written only by the watchdog.
+#[derive(Default)]
+pub(super) struct StallStats {
+    stall_count: AtomicU64,
+    last_stall_duration_ms: AtomicU64,
+    active_stalls: AtomicUsize,
+    captures: AtomicU64,
+}
+
+impl StallStats {
+    pub(super) fn stall_count(&self) -> u64 {
+        self.stall_count.load(Ordering::Relaxed)
+    }
+
+    /// Duration of the most recent finished stall, or `None` if none ended yet.
+    pub(super) fn last_stall_duration_ms(&self) -> Option<u64> {
+        match self.last_stall_duration_ms.load(Ordering::Relaxed) {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
+    pub(super) fn active_stalls(&self) -> usize {
+        self.active_stalls.load(Ordering::Relaxed)
+    }
+
+    /// Evidence captures attempted (spawned or written), successful or not.
+    pub(super) fn captures(&self) -> u64 {
+        self.captures.load(Ordering::Relaxed)
+    }
+}
+
+/// Where watchdog lines go. Production writes directly to stderr; tests record.
+pub(super) type StallLogSink = Arc<dyn Fn(&str) + Send + Sync>;
+pub(super) type StallExit = Arc<dyn Fn(i32) + Send + Sync>;
+
+#[cfg(unix)]
+fn process_major_faults() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage initializes the output on success; no references to it
+    // escape this thread. The syscall does not use the daemon's locks.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+        u64::try_from(unsafe { usage.assume_init() }.ru_majflt).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn process_major_faults() -> u64 {
+    // Windows has no ru_majflt equivalent; runtime parking still protects it.
+    0
+}
+
+/// What a capture produced.
+pub(super) enum CaptureStarted {
+    /// A profiler child is writing the file; the watchdog reaps it later.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Spawned(Child),
+    /// The evidence was written synchronously.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+    Written,
+    /// This platform has no capture; only the log line records the stall.
+    #[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
+    Unsupported,
+}
+
+/// Captures stack evidence of the process while it is stalled. Must not take
+/// any lock or need the executor or the async runtime: those are what stall.
+pub(super) trait StallCapture: Send + Sync {
+    fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted>;
+}
+
+/// macOS: a 3-second `sample` of this process. Linux: every thread's
+/// `/proc` stat line and kernel wait channel. Elsewhere: nothing.
+pub(super) struct PlatformCapture;
+
+impl StallCapture for PlatformCapture {
+    #[cfg(target_os = "macos")]
+    fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+        crate::private_storage::create(path)?;
+        let stderr = crate::private_storage::create(&path.with_extension("stderr"))?;
+        // `-mayDie` keeps `sample` from failing if the daemon exits mid-sample.
+        std::process::Command::new("/usr/bin/sample")
+            .arg(pid.to_string())
+            .arg("3")
+            .arg("-mayDie")
+            .arg("-file")
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .map(CaptureStarted::Spawned)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture(&self, _pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+        crate::private_storage::write(path, linux_thread_states()?)?;
+        Ok(CaptureStarted::Written)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn capture(&self, _pid: u32, _path: &Path) -> io::Result<CaptureStarted> {
+        Ok(CaptureStarted::Unsupported)
+    }
+}
+
+/// One block per thread: its stat line (state, CPU times) and the kernel
+/// function it is waiting in, which names the lock or I/O a blocked thread
+/// sits on.
+#[cfg(target_os = "linux")]
+fn linux_thread_states() -> io::Result<String> {
+    let mut tasks = std::fs::read_dir("/proc/self/task")?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    tasks.sort();
+    let mut out = String::new();
+    for task in tasks {
+        let read = |name: &str| {
+            std::fs::read_to_string(task.join(name))
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"))
+        };
+        out.push_str(&format!(
+            "task {}\nstat: {}\nwchan: {}\n\n",
+            task.display(),
+            read("stat").trim_end(),
+            read("wchan").trim_end(),
+        ));
+    }
+    Ok(out)
+}
+
+pub(super) struct StallWatchdogConfig {
+    pub(super) tick: Duration,
+    pub(super) threshold: Duration,
+    pub(super) capture_cooldown: Duration,
+    pub(super) keep_captures: usize,
+    /// `<storage>/diagnostics`.
+    pub(super) diagnostics_dir: PathBuf,
+    pub(super) pid: u32,
+    pub(super) capture: Arc<dyn StallCapture>,
+    pub(super) log: StallLogSink,
+    pub(super) frame_loop_exit_threshold: Duration,
+    pub(super) stderr: StallLogSink,
+    pub(super) exit: StallExit,
+    pub(super) major_faults: Arc<dyn Fn() -> u64 + Send + Sync>,
+    pub(super) now: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl StallWatchdogConfig {
+    pub(super) fn production(storage_dir: &Path) -> Self {
+        // Resolve the path before watching starts, never from a stalled exit
+        // path where the logger's control lock might be held by the runtime.
+        let log_path = crate::logging::daemon_log_path();
+        let output: StallLogSink = Arc::new(move |line| {
+            write_stderr_line(line);
+            let _ = crate::logging::write_watchdog_line(&log_path, line);
+        });
+        Self {
+            tick: WATCHDOG_TICK,
+            threshold: STALL_THRESHOLD,
+            capture_cooldown: CAPTURE_COOLDOWN,
+            keep_captures: KEEP_CAPTURES,
+            diagnostics_dir: storage_dir.join("diagnostics"),
+            pid: std::process::id(),
+            capture: Arc::new(PlatformCapture),
+            // Never wait for the logger's lock from the recovery thread: the
+            // frame loop may be stalled while holding that very lock.
+            log: Arc::clone(&output),
+            frame_loop_exit_threshold: FRAME_LOOP_EXIT_THRESHOLD,
+            stderr: output,
+            // No unwinding, registry locks, or native exit handlers. In
+            // particular, BgTaskRegistry/PTY drop glue must not kill detached
+            // bash children. Calling detach here would itself take task locks
+            // that the stalled loop might hold; bypassing all cleanup preserves
+            // the children and their already-persisted recovery records.
+            exit: Arc::new(|code| crate::ort_lifecycle::exit_without_native_teardown(code)),
+            major_faults: Arc::new(process_major_faults),
+            now: Arc::new(Instant::now),
+        }
+    }
+}
+
+fn write_stderr_line(line: &str) {
+    let line = format!("{line}\n");
+    #[cfg(unix)]
+    {
+        // SAFETY: the buffer remains valid for this write. Bypass Rust's stderr
+        // lock as well as the logger so a lock stall cannot prevent recovery.
+        unsafe { libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len()) };
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
+            fn WriteFile(
+                handle: *mut std::ffi::c_void,
+                bytes: *const u8,
+                len: u32,
+                written: *mut u32,
+                overlapped: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+        let Ok(len) = u32::try_from(line.len()) else {
+            return;
+        };
+        let mut written = 0;
+        // SAFETY: STD_ERROR_HANDLE (-12) is the inherited stderr handle, the
+        // buffer and byte-count pointer live through this synchronous write,
+        // and a null OVERLAPPED requests synchronous I/O. Like the Unix write,
+        // this does not acquire Rust's stderr or logger locks.
+        unsafe {
+            WriteFile(
+                GetStdHandle(-12_i32 as u32),
+                line.as_ptr(),
+                len,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::Write;
+        let _ = io::stderr().write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+pub(super) struct FrameLoopTestHooks {
+    pub(super) metrics: Arc<DispatchPathMetrics>,
+    pub(super) config: Option<StallWatchdogConfig>,
+    pub(super) before_frame: Arc<dyn Fn() + Send + Sync>,
+    pub(super) before_turn_work: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) writer_setup: Option<Arc<dyn Fn(super::WriterSender) + Send + Sync>>,
+}
+
+/// Handle to the watchdog thread. Dropping it stops the thread without
+/// waiting: joining could hang teardown if the log sink itself is wedged.
+pub(super) struct StallWatchdog {
+    stop_tx: Option<mpsc::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl StallWatchdog {
+    pub(super) fn spawn(
+        markers: Vec<Box<dyn LivenessMarker>>,
+        stats: Arc<StallStats>,
+        config: StallWatchdogConfig,
+    ) -> io::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let handle = thread::Builder::new()
+            .name("aft-stall-watchdog".to_string())
+            .spawn(move || run_watchdog(markers, stats, config, stop_rx))?;
+        Ok(Self {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn stop_and_join(mut self) {
+        drop(self.stop_tx.take());
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("stall watchdog thread");
+        }
+    }
+}
+
+impl Drop for StallWatchdog {
+    fn drop(&mut self) {
+        // Disconnecting the stop channel wakes the thread, which then exits.
+        drop(self.stop_tx.take());
+        drop(self.handle.take());
+    }
+}
+
+fn run_watchdog(
+    markers: Vec<Box<dyn LivenessMarker>>,
+    stats: Arc<StallStats>,
+    config: StallWatchdogConfig,
+    stop_rx: mpsc::Receiver<()>,
+) {
+    let mut detector = StallDetector::new(config.threshold, markers.len());
+    let mut expected_wake = (config.now)() + config.tick;
+    let mut last_capture_at: Option<Instant> = None;
+    let mut last_capture = "none".to_string();
+    let mut capture_children: Vec<CaptureChild> = Vec::new();
+    let mut previous_faults = (config.major_faults)();
+    let mut restart_watches: Vec<RestartWatch> =
+        markers.iter().map(|_| RestartWatch::default()).collect();
+    loop {
+        match stop_rx.recv_timeout(config.tick) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                for mut capture in capture_children.drain(..) {
+                    let _ = capture.child.kill();
+                    match capture.child.wait() {
+                        Ok(status) => finish_capture(
+                            &config,
+                            &capture.path,
+                            &capture.output_path,
+                            &status.to_string(),
+                            status.success(),
+                        ),
+                        Err(error) => (config.log)(&format!(
+                            "stall watchdog: capture wait failed path={} error={error}",
+                            capture.path.display()
+                        )),
+                    }
+                }
+                return;
+            }
+        }
+        let now = (config.now)();
+        // Reap finished profiler children so they do not linger as zombies.
+        reap_capture_children(&config, &mut capture_children);
+        // If the watchdog itself woke far later than it asked to, the whole
+        // process (not one loop) was not running; the log lines carry this so
+        // a stall can be told apart from process-wide descheduling.
+        let wake_late = now.saturating_duration_since(expected_wake);
+        expected_wake = now + config.tick;
+        let major_faults = (config.major_faults)();
+        for (index, marker) in markers.iter().enumerate() {
+            let pending = marker.has_pending_work();
+            let progress_age = marker.progress_age();
+            let restart = &mut restart_watches[index];
+            restart.observe_progress(marker.progress_token(), pending, previous_faults);
+            match detector.observe(index, pending, progress_age, now) {
+                None => {}
+                Some(StallTransition::Began { stalled_for, .. }) => {
+                    stats.stall_count.fetch_add(1, Ordering::Relaxed);
+                    stats.active_stalls.fetch_add(1, Ordering::Relaxed);
+                    // Capture before logging: the log sink takes the logger's
+                    // lock, and a wedged logger may be the very stall.
+                    let in_cooldown = last_capture_at.is_some_and(|at| {
+                        now.saturating_duration_since(at) < config.capture_cooldown
+                    });
+                    let capture = if in_cooldown {
+                        "skipped (cooldown)".to_string()
+                    } else {
+                        last_capture_at = Some(now);
+                        stats.captures.fetch_add(1, Ordering::Relaxed);
+                        last_capture =
+                            start_capture(&config, &mut capture_children, &marker.context());
+                        last_capture.clone()
+                    };
+                    (config.log)(&format!(
+                        "stall watchdog: stall detected marker={} stalled_for_ms={} {} watchdog_wake_late_ms={} capture={capture}",
+                        marker.name(),
+                        stalled_for.as_millis(),
+                        marker.context(),
+                        wake_late.as_millis(),
+                    ));
+                }
+                Some(StallTransition::Ended { total, .. }) => {
+                    let total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX).max(1);
+                    stats
+                        .last_stall_duration_ms
+                        .store(total_ms, Ordering::Relaxed);
+                    stats.active_stalls.fetch_sub(1, Ordering::Relaxed);
+                    (config.log)(&format!(
+                        "stall watchdog: stall ended marker={} total_ms={total_ms} watchdog_wake_late_ms={}",
+                        marker.name(),
+                        wake_late.as_millis(),
+                    ));
+                }
+            }
+            // Reuse the capture detector's pending run and the very same
+            // progress observation. Advancing turns reset progress_age, even
+            // during an arbitrarily long burst of ready frames; an idle or
+            // finished loop without an overdue promised wake owes nothing.
+            let stalled_for =
+                StallDetector::stalled_for(&detector.watches[index], progress_age, now);
+            if marker.restart_on_stall() && stalled_for >= config.frame_loop_exit_threshold {
+                let parked_for = marker.runtime_parked_for();
+                let majflt_delta = major_faults.saturating_sub(restart.faults_at_progress);
+                let reason = exit_deferral(
+                    stalled_for,
+                    config.frame_loop_exit_threshold,
+                    wake_late,
+                    parked_for,
+                    majflt_delta,
+                );
+                let evidence = format!(
+                    "runtime_parked={} parked_for_ms={} majflt_delta={majflt_delta}",
+                    parked_for.is_some(),
+                    parked_for.unwrap_or_default().as_millis(),
+                );
+                if let Some(reason) = reason {
+                    if !restart.deferral_logged {
+                        (config.log)(&format!(
+                            "stall watchdog: exit deferred marker={} because {reason} stalled_for_ms={} {} watchdog_wake_late_ms={} {evidence} capture={}",
+                            marker.name(), stalled_for.as_millis(), marker.context(),
+                            wake_late.as_millis(), last_capture,
+                        ));
+                        restart.deferral_logged = true;
+                    }
+                    continue;
+                }
+                (config.stderr)(&format!(
+                    "stall watchdog: exiting marker={} stalled_for_ms={} {} watchdog_wake_late_ms={} {evidence} capture={} exit_code={}",
+                    marker.name(),
+                    stalled_for.as_millis(),
+                    marker.context(),
+                    wake_late.as_millis(),
+                    last_capture,
+                    STALL_EXIT_CODE,
+                ));
+                (config.exit)(STALL_EXIT_CODE);
+                // Production exit never returns. An injected exit does, and
+                // must end this thread rather than repeatedly requesting exit.
+                return;
+            }
+        }
+        previous_faults = major_faults;
+    }
+}
+
+#[derive(Default)]
+struct RestartWatch {
+    progress_token: Option<u64>,
+    faults_at_progress: u64,
+    deferral_logged: bool,
+}
+
+impl RestartWatch {
+    fn observe_progress(&mut self, token: u64, pending: bool, previous_faults: u64) {
+        if !pending || self.progress_token != Some(token) {
+            // The preceding sample includes faults incurred between the last
+            // observed turn and this one, rather than losing the first tick of
+            // a page-in burst before the stalled turn was noticed.
+            self.faults_at_progress = previous_faults;
+            self.deferral_logged = false;
+        }
+        self.progress_token = Some(token);
+    }
+}
+
+fn exit_deferral(
+    stalled_for: Duration,
+    exit_threshold: Duration,
+    wake_late: Duration,
+    parked_for: Option<Duration>,
+    majflt_delta: u64,
+) -> Option<&'static str> {
+    if stalled_for >= FRAME_LOOP_HARD_CEILING {
+        None
+    } else if wake_late >= exit_threshold {
+        Some("watchdog itself woke late")
+    } else if parked_for.is_some() {
+        Some("its runtime is parked (host starvation)")
+    } else if majflt_delta > PAGING_MAJFLT_THRESHOLD {
+        Some("paging")
+    } else {
+        None
+    }
+}
+
+/// Starts one capture and describes the outcome for the log line.
+fn start_capture(
+    config: &StallWatchdogConfig,
+    children: &mut Vec<CaptureChild>,
+    context: &str,
+) -> String {
+    let path = config
+        .diagnostics_dir
+        .join(capture_file_name(SystemTime::now(), config.pid));
+    if let Err(error) = crate::private_storage::create_dir_all(&config.diagnostics_dir) {
+        return format!("failed ({}: {error})", config.diagnostics_dir.display());
+    }
+    // Make room first so the new file is one of the newest `keep_captures`.
+    prune_captures(
+        &config.diagnostics_dir,
+        config.keep_captures.saturating_sub(1),
+    );
+    // This in-process snapshot needs no permission to attach an external
+    // profiler. Store it separately from macOS `sample` output, which may be
+    // empty if that command fails.
+    if let Err(error) = crate::private_storage::write(
+        &path,
+        format!(
+            "AFT in-process stall snapshot pid={}\n{context}\n",
+            config.pid
+        ),
+    ) {
+        return format!("failed ({}: {error})", path.display());
+    }
+    let output_path = path.with_extension("profiler");
+    match config.capture.capture(config.pid, &output_path) {
+        Ok(CaptureStarted::Spawned(child)) => {
+            children.push(CaptureChild {
+                child,
+                path: path.clone(),
+                output_path,
+            });
+            path.display().to_string()
+        }
+        Ok(CaptureStarted::Written) => {
+            finish_capture(config, &path, &output_path, "written", true);
+            path.display().to_string()
+        }
+        Ok(CaptureStarted::Unsupported) => {
+            (config.log)(&format!(
+                "stall watchdog: profiler unsupported snapshot={}",
+                path.display()
+            ));
+            path.display().to_string()
+        }
+        Err(error) => {
+            (config.log)(&format!(
+                "stall watchdog: capture failed snapshot={} spawn_error={error}",
+                path.display()
+            ));
+            finish_capture(
+                config,
+                &path,
+                &output_path,
+                &format!("spawn_error={error}"),
+                false,
+            );
+            path.display().to_string()
+        }
+    }
+}
+
+struct CaptureChild {
+    child: Child,
+    path: PathBuf,
+    output_path: PathBuf,
+}
+
+fn reap_capture_children(config: &StallWatchdogConfig, children: &mut Vec<CaptureChild>) {
+    children.retain_mut(|capture| match capture.child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => {
+            finish_capture(
+                config,
+                &capture.path,
+                &capture.output_path,
+                &status.to_string(),
+                status.success(),
+            );
+            false
+        }
+        Err(error) => {
+            (config.log)(&format!(
+                "stall watchdog: capture wait failed path={} error={error}",
+                capture.path.display()
+            ));
+            true
+        }
+    });
+}
+
+fn finish_capture(
+    config: &StallWatchdogConfig,
+    path: &Path,
+    output_path: &Path,
+    status: &str,
+    success: bool,
+) {
+    let output = std::fs::read(output_path).unwrap_or_default();
+    let stderr_path = output_path.with_extension("stderr");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let outcome = if success && !output.is_empty() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let evidence = format!(
+        "profiler {outcome}: status={status} bytes={} stderr={stderr:?}\n",
+        output.len()
+    );
+    if let Err(error) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| {
+            file.write_all(evidence.as_bytes())?;
+            if success {
+                file.write_all(&output)?;
+            }
+            Ok(())
+        })
+    {
+        (config.log)(&format!(
+            "stall watchdog: capture append failed path={} error={error}",
+            path.display()
+        ));
+    }
+    (config.log)(&format!(
+        "stall watchdog: capture {outcome} path={} status={status} bytes={} stderr={stderr:?}",
+        path.display(),
+        output.len()
+    ));
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(stderr_path);
+}
+
+/// `stall-<UTC yyyymmddThhmmssZ>-<pid>.txt`. The timestamp leads so names sort
+/// oldest to newest.
+fn capture_file_name(at: SystemTime, pid: u32) -> String {
+    let seconds = at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
+    let (year, month, day) = crate::subc_format::civil_from_days(days);
+    let of_day = seconds % 86_400;
+    format!(
+        "{CAPTURE_FILE_PREFIX}{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z-{pid}{CAPTURE_FILE_SUFFIX}",
+        of_day / 3600,
+        (of_day % 3600) / 60,
+        of_day % 60,
+    )
+}
+
+/// Deletes all but the newest `keep` capture files in `dir`.
+fn prune_captures(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut captures = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(CAPTURE_FILE_PREFIX) && name.ends_with(CAPTURE_FILE_SUFFIX)
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    captures.sort();
+    let excess = captures.len().saturating_sub(keep);
+    for path in captures.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A progress signal of one loop. Implementations must read atomics only:
+/// the watchdog calls them while the loop may be holding, or blocked on, any
+/// lock it uses.
+pub(super) trait LivenessMarker: Send + Sync {
+    /// Stable name used in log lines and health output.
+    fn name(&self) -> &'static str;
+    /// Time since the loop last made progress.
+    fn progress_age(&self) -> Duration;
+    /// Whether the loop currently owes work. An idle loop owes nothing, so a
+    /// long `progress_age` alone never reads as a stall.
+    fn has_pending_work(&self) -> bool;
+    /// Only the supervisor-owned frame loop may force a module restart.
+    fn restart_on_stall(&self) -> bool {
+        false
+    }
+    fn runtime_parked_for(&self) -> Option<Duration> {
+        None
+    }
+    fn progress_token(&self) -> u64 {
+        0
+    }
+    fn context(&self) -> String {
+        "phase=unknown frame=unknown".to_string()
+    }
+}
+
+/// The subc module (frame) loop. It shares a current-thread runtime with the
+/// frame reader and writer tasks, so when this loop stops taking turns the
+/// socket stops being read and nothing is answered.
+pub(super) struct FrameLoopMarker(
+    pub(super) Arc<DispatchPathMetrics>,
+    pub(super) Arc<crate::lock_diagnostics::LockDiagnostics>,
+);
+
+impl LivenessMarker for FrameLoopMarker {
+    fn name(&self) -> &'static str {
+        "subc_frame_loop"
+    }
+
+    fn progress_age(&self) -> Duration {
+        self.0.warn_unanswered_tools();
+        self.0.frame_loop_progress_age()
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.0.frame_loop_has_pending_work()
+    }
+
+    fn restart_on_stall(&self) -> bool {
+        true
+    }
+
+    fn runtime_parked_for(&self) -> Option<Duration> {
+        self.0.frame_loop_runtime_parked_for()
+    }
+
+    fn progress_token(&self) -> u64 {
+        self.0.frame_loop_last_tick_ms.load(Ordering::Relaxed)
+    }
+
+    fn context(&self) -> String {
+        format!(
+            "{} scheduler_{}",
+            self.0.frame_loop_context(),
+            self.1.snapshot()
+        )
+    }
+}
+
+/// The executor scheduler loop, which hands every tool call and maintenance
+/// job to a worker.
+pub(super) struct DispatchLoopMarker(pub(super) Arc<DispatchLoopLiveness>);
+
+impl LivenessMarker for DispatchLoopMarker {
+    fn name(&self) -> &'static str {
+        "executor_dispatch_loop"
+    }
+
+    fn progress_age(&self) -> Duration {
+        self.0.progress_age()
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.0.has_pending_work()
+    }
+}
+
+/// A change in one marker's stall state, reported once per edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StallTransition {
+    /// The marker has owed work without progress for `stalled_for`.
+    Began {
+        marker: usize,
+        stalled_for: Duration,
+    },
+    /// The marker progressed again (or stopped owing work); `total` spans
+    /// from its last progress before the stall to its first progress after.
+    Ended { marker: usize, total: Duration },
+}
+
+#[derive(Default)]
+struct MarkerWatch {
+    /// When the watchdog first saw the marker owe work in the current
+    /// uninterrupted pending run.
+    pending_observed_at: Option<Instant>,
+    /// Estimated start of the active stall, if one is active.
+    stall_started_at: Option<Instant>,
+}
+
+/// Pure stall detection over periodic observations. Time is passed in so the
+/// state machine is testable without sleeping.
+pub(super) struct StallDetector {
+    threshold: Duration,
+    watches: Vec<MarkerWatch>,
+}
+
+impl StallDetector {
+    pub(super) fn new(threshold: Duration, marker_count: usize) -> Self {
+        Self {
+            threshold,
+            watches: (0..marker_count).map(|_| MarkerWatch::default()).collect(),
+        }
+    }
+
+    /// Feeds one observation of marker `index`.
+    ///
+    /// A marker counts as stalled for the shorter of its progress age and the
+    /// time the watchdog has continuously seen it owe work. The second bound
+    /// matters when an idle loop is handed work: its progress age is large,
+    /// but it has only owed work since just now.
+    pub(super) fn observe(
+        &mut self,
+        index: usize,
+        pending: bool,
+        progress_age: Duration,
+        now: Instant,
+    ) -> Option<StallTransition> {
+        let watch = &mut self.watches[index];
+        if pending {
+            watch.pending_observed_at.get_or_insert(now);
+        } else {
+            watch.pending_observed_at = None;
+        }
+        let stalled_for = Self::stalled_for(watch, progress_age, now);
+
+        match watch.stall_started_at {
+            None if stalled_for >= self.threshold => {
+                watch.stall_started_at = Some(now.checked_sub(stalled_for).unwrap_or(now));
+                Some(StallTransition::Began {
+                    marker: index,
+                    stalled_for,
+                })
+            }
+            Some(started_at) if stalled_for < self.threshold => {
+                watch.stall_started_at = None;
+                let since_start = now.saturating_duration_since(started_at);
+                // Progress resumed `progress_age` ago; if the marker merely
+                // stopped owing work without progressing, the stall ends now.
+                let ended_at = if progress_age < since_start {
+                    now.checked_sub(progress_age).unwrap_or(now)
+                } else {
+                    now
+                };
+                Some(StallTransition::Ended {
+                    marker: index,
+                    total: ended_at.saturating_duration_since(started_at),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn stalled_for(watch: &MarkerWatch, progress_age: Duration, now: Instant) -> Duration {
+        watch
+            .pending_observed_at
+            .map_or(Duration::ZERO, |observed| {
+                progress_age.min(now.saturating_duration_since(observed))
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    const THRESHOLD: Duration = Duration::from_secs(15);
+
+    /// Thresholds scaled down so the thread tests run in well under a second
+    /// per phase while keeping the production ratio of tick to threshold.
+    const TEST_TICK: Duration = Duration::from_millis(20);
+    const TEST_THRESHOLD: Duration = Duration::from_millis(300);
+
+    #[derive(Clone, Default)]
+    struct RecordedLog(Arc<Mutex<Vec<String>>>);
+
+    impl RecordedLog {
+        fn sink(&self) -> StallLogSink {
+            let lines = Arc::clone(&self.0);
+            Arc::new(move |line| lines.lock().unwrap().push(line.to_string()))
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Records capture requests instead of running a profiler.
+    #[derive(Default)]
+    struct RecordingCapture(Mutex<Vec<(u32, PathBuf)>>);
+
+    impl StallCapture for RecordingCapture {
+        fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+            self.0.lock().unwrap().push((pid, path.to_path_buf()));
+            std::fs::write(path, "recorded stall capture")?;
+            Ok(CaptureStarted::Written)
+        }
+    }
+
+    impl RecordingCapture {
+        fn calls(&self) -> Vec<(u32, PathBuf)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    const TEST_PID: u32 = 4242;
+
+    #[test]
+    fn frame_loop_context_names_decoded_tool_and_request() {
+        use super::super::*;
+        let metrics = DispatchPathMetrics::new();
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            125,
+            1,
+            892,
+            b"{}".to_vec(),
+        )
+        .unwrap();
+        metrics.mark_frame_loop_frame(&frame);
+        metrics.mark_frame_loop_tool("read", frame.header.corr);
+        let context = metrics.frame_loop_context();
+        assert!(
+            context.contains(
+                "entry=handle_tool_call command=\"read\" request_id=892 step_elapsed_ms="
+            ),
+            "{context}"
+        );
+    }
+
+    #[test]
+    fn frame_loop_context_names_control_operation_root_and_session() {
+        use super::super::*;
+        let metrics = DispatchPathMetrics::new();
+        let request = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 125,
+                epoch: 1,
+                target: subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    "runner".to_string(),
+                    "sidekick-session".to_string(),
+                ),
+                principal: None,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(PathBuf::from("/isolated/root"));
+
+            bind
+        };
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            133,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        metrics.mark_frame_loop_frame(&frame);
+        metrics.mark_frame_loop_control(&serde_json::from_value(request).unwrap(), &frame);
+        let diagnostics = crate::lock_diagnostics::LockDiagnostics::new("executor_holder.rs");
+        let _held = diagnostics.hold();
+        metrics.mark_frame_loop_wait(
+            "executor.scheduler/actor_context",
+            Some(diagnostics.clone()),
+        );
+        let context = metrics.frame_loop_context();
+        assert!(context.contains("op=route_bind"), "{context}");
+        assert!(context.contains("root=\"/isolated/root\""), "{context}");
+        assert!(
+            context.contains("session=\"sidekick-session\""),
+            "{context}"
+        );
+        assert!(
+            context.contains("awaited=executor.scheduler/actor_context holder=executor_holder.rs:"),
+            "{context}"
+        );
+        assert!(context.contains("held_for_ms="), "{context}");
+    }
+
+    #[test]
+    fn scheduler_wait_context_names_live_holder_without_taking_scheduler_lock() {
+        use super::super::*;
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let frame = Frame::build(FrameType::Ping, control_flags(), 0, 0, 99, Vec::new()).unwrap();
+        metrics.mark_frame_loop_frame(&frame);
+        metrics.mark_frame_loop_wait(
+            "executor.scheduler",
+            Some(executor.scheduler_lock_diagnostics()),
+        );
+        executor.hold_state_lock_for_test(|| {
+            let context = metrics.frame_loop_context();
+            assert!(names_executor_scheduler_holder(&context), "{context}");
+            assert!(context.contains("held_for_ms="), "{context}");
+        });
+        assert!(metrics.frame_loop_context().contains("holder=none"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_profiler_records_status_stderr_and_preserves_in_process_snapshot() {
+        struct FailedProfiler;
+        impl StallCapture for FailedProfiler {
+            fn capture(&self, _pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+                crate::private_storage::create(path)?;
+                let stderr = crate::private_storage::create(&path.with_extension("stderr"))?;
+                std::process::Command::new("sh")
+                    .args(["-c", "printf 'task_for_pid denied' >&2; exit 7"])
+                    .stderr(stderr)
+                    .spawn()
+                    .map(CaptureStarted::Spawned)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = RecordedLog::default();
+        let mut config = test_config(&log, &Arc::new(RecordingCapture::default()), dir.path());
+        config.capture = Arc::new(FailedProfiler);
+        let mut children = Vec::new();
+        let snapshot = start_capture(
+            &config,
+            &mut children,
+            "op=route_bind root=isolated session=sidekick awaited=executor.scheduler",
+        );
+        assert_eq!(children.len(), 1);
+        let status = children[0].child.wait().unwrap();
+        assert_eq!(status.code(), Some(7));
+        reap_capture_children(&config, &mut children);
+        assert!(children.is_empty());
+        let evidence = std::fs::read_to_string(&snapshot).unwrap();
+        assert!(evidence.contains("op=route_bind"), "{evidence}");
+        assert!(
+            evidence.contains(
+                "profiler failed: status=exit status: 7 bytes=0 stderr=\"task_for_pid denied\""
+            ),
+            "{evidence}"
+        );
+        let lines = log.lines();
+        assert!(
+            lines.iter().any(|line| line.contains("capture failed")
+                && line.contains("status=exit status: 7")
+                && line.contains("task_for_pid denied")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "only the nonempty snapshot remains"
+        );
+    }
+
+    /// Whether a diagnostic line names the executor's scheduler lock site as
+    /// the current holder. The site is the executor's `file!()`, which the
+    /// compiler spells with the host's path separator
+    /// (`crates\aft-base\src\executor\handle.rs` on Windows), so the separators are
+    /// normalized here, at the comparison, rather than in the diagnostic.
+    fn names_executor_scheduler_holder(line: &str) -> bool {
+        line.split_whitespace().any(|token| {
+            token.strip_prefix("holder=").is_some_and(|site| {
+                site.replace('\\', "/")
+                    .starts_with("crates/aft-base/src/executor/handle.rs:")
+            })
+        })
+    }
+
+    fn test_config(
+        log: &RecordedLog,
+        capture: &Arc<RecordingCapture>,
+        diagnostics_dir: &Path,
+    ) -> StallWatchdogConfig {
+        StallWatchdogConfig {
+            tick: TEST_TICK,
+            threshold: TEST_THRESHOLD,
+            capture_cooldown: CAPTURE_COOLDOWN,
+            keep_captures: KEEP_CAPTURES,
+            diagnostics_dir: diagnostics_dir.to_path_buf(),
+            pid: TEST_PID,
+            capture: Arc::clone(capture) as Arc<dyn StallCapture>,
+            log: log.sink(),
+            frame_loop_exit_threshold: TEST_THRESHOLD * 2,
+            stderr: log.sink(),
+            exit: Arc::new(|_| panic!("unexpected frame loop exit")),
+            major_faults: Arc::new(|| 0),
+            now: Arc::new(Instant::now),
+        }
+    }
+
+    fn daemon_markers(
+        metrics: &Arc<DispatchPathMetrics>,
+        executor: &crate::context::Executor,
+    ) -> Vec<Box<dyn LivenessMarker>> {
+        vec![
+            Box::new(FrameLoopMarker(
+                Arc::clone(metrics),
+                executor.scheduler_lock_diagnostics(),
+            )),
+            Box::new(DispatchLoopMarker(executor.dispatch_loop_liveness())),
+        ]
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A real module loop on its own current-thread runtime, as in production.
+    /// Its watchdog uses shorter deadlines and records exits instead of killing
+    /// the test process. The daemon end remains on the test runtime, so its
+    /// deadlines still run while the module thread is deliberately parked.
+    struct FrameLoopFixture {
+        daemon: tokio::io::DuplexStream,
+        module: JoinHandle<Result<super::super::ModuleLoopExit, super::super::SubcError>>,
+        metrics: Arc<DispatchPathMetrics>,
+        stderr: RecordedLog,
+        exits: Arc<Mutex<Vec<(i32, Vec<String>)>>>,
+        capture: Arc<RecordingCapture>,
+        executor: Arc<crate::context::Executor>,
+        log: RecordedLog,
+        _storage: tempfile::TempDir,
+    }
+
+    impl FrameLoopFixture {
+        async fn start(before_frame: Arc<dyn Fn() + Send + Sync>) -> Self {
+            Self::start_with_turn_hook(before_frame, None).await
+        }
+
+        async fn start_with_turn_hook(
+            before_frame: Arc<dyn Fn() + Send + Sync>,
+            before_turn_work: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) -> Self {
+            use super::super::*;
+            let storage = tempfile::tempdir().unwrap();
+            let path = storage.path().to_path_buf();
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let stderr = RecordedLog::default();
+            let capture = Arc::new(RecordingCapture::default());
+            let exits = Arc::new(Mutex::new(Vec::new()));
+            let log = RecordedLog::default();
+            let mut config = test_config(&log, &capture, &path.join("diagnostics"));
+            config.stderr = stderr.sink();
+            let recorded_exits = Arc::clone(&exits);
+            let exit_stderr = stderr.clone();
+            config.exit = Arc::new(move |code| {
+                recorded_exits
+                    .lock()
+                    .unwrap()
+                    .push((code, exit_stderr.lines()));
+            });
+            let hooks = FrameLoopTestHooks {
+                metrics: Arc::clone(&metrics),
+                config: Some(config),
+                before_frame,
+                before_turn_work,
+                writer_setup: None,
+            };
+            let (mut daemon, module_stream) = tokio::io::duplex(64 * 1024);
+            let executor = Arc::new(crate::context::Executor::new());
+            let module_executor = Arc::clone(&executor);
+            let module = thread::spawn(move || {
+                let runtime = hooks.metrics.frame_loop_runtime().unwrap();
+                let (read, write) = tokio::io::split(module_stream);
+                runtime.block_on(run_module_loop(
+                    read,
+                    write,
+                    &path.join("absent-connection.json"),
+                    crate::test_app(),
+                    module_executor,
+                    |request, _| Response::success(request.id, json!({})),
+                    Some(path.join("absent-user-config.json")),
+                    false,
+                    usize::MAX,
+                    None,
+                    &path,
+                    QuiescedLsp::ReapInBackground,
+                    None,
+                    None,
+                    Some(hooks),
+                ))
+            });
+            let hello = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut daemon))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(hello.header.ty, FrameType::Hello);
+            let ack = Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &ack).await.unwrap();
+            Self {
+                daemon,
+                module,
+                metrics,
+                stderr,
+                exits,
+                capture,
+                executor,
+                log,
+                _storage: storage,
+            }
+        }
+
+        async fn send_ping(&mut self, corr: u64) {
+            use super::super::*;
+            let ping =
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, corr, Vec::new()).unwrap();
+            write_frame(&mut self.daemon, &ping).await.unwrap();
+        }
+
+        async fn ping(&mut self, corr: u64) {
+            use super::super::*;
+            self.send_ping(corr).await;
+            let pong = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut self.daemon))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, corr));
+        }
+
+        fn finish(self) {
+            drop(self.daemon);
+            self.module.join().unwrap().unwrap();
+        }
+    }
+
+    fn stderr_ping_probe(test_name: &str, action: &'static str, subc: bool) {
+        const PROBE: &str = "AFT_TEST_SUBC_STDERR_PROBE";
+        // libtest's exact names omit the crate prefix from module_path!().
+        let test_name = test_name.split_once("::").unwrap().1;
+        if std::env::var(PROBE).ok().as_deref() != Some(test_name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture", "--color=never"])
+                .env(PROBE, test_name)
+                .env("RUST_LOG", "off")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "stderr probe failed: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use super::super::*;
+            use std::io::Write;
+            if subc {
+                crate::logging::init_subc();
+            } else {
+                crate::logging::init();
+            }
+            let tee = Arc::new(Mutex::new(crate::logging::subc_stderr_tee_for_test()));
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let before_frame_armed = Arc::clone(&armed);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let mut fixture = FrameLoopFixture::start(Arc::new(move || {
+                if !before_frame_armed.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                let mut tee = tee.lock().unwrap();
+                entered_tx.send(()).unwrap();
+                match action {
+                    "write" => tee.write_all(b"[aft] WARN held stderr probe\n").unwrap(),
+                    "flush" => tee.flush().unwrap(),
+                    _ => unreachable!(),
+                }
+            }))
+            .await;
+            fixture.ping(90).await;
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = thread::spawn(move || {
+                let stderr = std::io::stderr();
+                let _held = stderr.lock();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            armed.store(true, Ordering::Relaxed);
+            fixture.send_ping(891).await;
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+            let pong =
+                tokio::time::timeout(Duration::from_secs(1), read_frame(&mut fixture.daemon)).await;
+            let _ = release_tx.send(());
+            holder.join().unwrap();
+            fixture.finish();
+            entered.expect("stderr probe callback never entered");
+            if subc {
+                let pong = pong
+                    .expect("stderr callback blocked frame-loop Ping")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 891));
+            } else {
+                assert!(pong.is_err(), "standalone stderr stopped being synchronous");
+            }
+        });
+    }
+
+    #[test]
+    fn subc_stderr_write_keeps_ping_live() {
+        stderr_ping_probe(
+            concat!(module_path!(), "::subc_stderr_write_keeps_ping_live"),
+            "write",
+            true,
+        );
+    }
+
+    #[test]
+    fn subc_stderr_flush_keeps_ping_live() {
+        stderr_ping_probe(
+            concat!(module_path!(), "::subc_stderr_flush_keeps_ping_live"),
+            "flush",
+            true,
+        );
+    }
+
+    #[test]
+    fn standalone_stderr_write_preserves_synchronous_delivery() {
+        stderr_ping_probe(
+            concat!(
+                module_path!(),
+                "::standalone_stderr_write_preserves_synchronous_delivery"
+            ),
+            "write",
+            false,
+        );
+    }
+
+    #[test]
+    fn standalone_stderr_flush_preserves_synchronous_delivery() {
+        stderr_ping_probe(
+            concat!(
+                module_path!(),
+                "::standalone_stderr_flush_preserves_synchronous_delivery"
+            ),
+            "flush",
+            false,
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_loop_answers_ping_while_watch_diagnostic_database_is_locked() {
+        use super::super::*;
+        let (storage, root) = test_support::test_root("watch-diagnostic-disk-lock");
+        let ctx = Arc::new(crate::test_context(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(storage.path().join("storage")),
+                ..Default::default()
+            },
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        ctx.bash_background().set_db_pool(Arc::clone(&db));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let mut subscriptions = BgSubsBySession::new();
+        subscriptions.insert(
+            (
+                root.clone(),
+                crate::subc::test_support::route_identity(&root, "watch-session").task_identity(),
+            ),
+            HashSet::from([route_key(125, 1)]),
+        );
+        let held = db.lock().unwrap();
+        let mut fixture = FrameLoopFixture::start_with_turn_hook(
+            Arc::new(|| {}),
+            Some(Arc::new(move || {
+                metrics.warn_stuck_pending_watches(&executor, &subscriptions);
+            })),
+        )
+        .await;
+        fixture.send_ping(891).await;
+        // The lock stays held until the read ends, so a frame loop that waits
+        // on it never answers. A generous bound still proves that, without
+        // failing when a loaded runner takes longer than one stall threshold.
+        let reply =
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut fixture.daemon)).await;
+        drop(held);
+        fixture.finish();
+        let pong = reply
+            .expect("frame loop waited on the watch diagnostic's SQLite mutex")
+            .unwrap()
+            .unwrap();
+        assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 891));
+    }
+
+    #[tokio::test]
+    async fn stalled_turn_work_snapshot_names_entry_without_waiting_for_loop() {
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let fixture = FrameLoopFixture::start_with_turn_hook(
+            Arc::new(|| {}),
+            Some(Arc::new(move || {
+                if !first.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                parked_tx.send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(90));
+            })),
+        )
+        .await;
+        parked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The watchdog fires one threshold after the step parks, but on a
+        // loaded runner its thread may run much later. Wait for the exit
+        // line while the step is still held rather than for a fixed time.
+        let waited = Instant::now();
+        while fixture.stderr.lines().is_empty() && waited.elapsed() < Duration::from_secs(60) {
+            tokio::time::sleep(TEST_THRESHOLD).await;
+        }
+        let terminal = fixture.stderr.lines();
+        let snapshots: Vec<_> = fixture
+            .capture
+            .calls()
+            .iter()
+            .map(|(_, path)| std::fs::read_to_string(path.with_extension("txt")).unwrap())
+            .collect();
+        release_tx.send(()).unwrap();
+        fixture.finish();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "snapshot and watchdog exit must finish while the step is held"
+        );
+        assert_eq!(snapshots.len(), 1);
+        for text in terminal.iter().chain(snapshots.iter()) {
+            assert!(text.contains("phase=turn_work"), "{text}");
+            assert!(text.contains("entry=logging::perf_tick"), "{text}");
+            let elapsed: u64 = text
+                .split("step_elapsed_ms=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(elapsed >= TEST_THRESHOLD.as_millis() as u64, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_route_bind_capture_names_operation_resource_and_scheduler_holder() {
+        use super::super::*;
+        let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
+        fixture.ping(90).await;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let executor = Arc::clone(&fixture.executor);
+        let holder = thread::spawn(move || {
+            executor.hold_state_lock_for_test(|| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            })
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let root = fixture._storage.path().to_path_buf();
+        let request = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 125,
+                epoch: 1,
+                target: subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    "runner".to_string(),
+                    "sidekick-session".to_string(),
+                ),
+                principal: None,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(root.clone());
+
+            bind
+        };
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            133,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut fixture.daemon, &frame).await.unwrap();
+        tokio::time::sleep(TEST_THRESHOLD * 5).await;
+        let lines = fixture.log.lines();
+        let terminal = fixture.stderr.lines();
+        let capture = fixture
+            .capture
+            .calls()
+            .first()
+            .map(|(_, path)| std::fs::read_to_string(path.with_extension("txt")).unwrap());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        fixture.finish();
+        let detected = lines
+            .iter()
+            .find(|line| line.contains("stall detected"))
+            .expect("detected stall");
+        assert_eq!(terminal.len(), 1, "{terminal:?}");
+        for line in [
+            detected,
+            &terminal[0],
+            &capture.expect("in-process snapshot"),
+        ] {
+            assert!(line.contains("op=route_bind"), "{line}");
+            assert!(
+                line.contains(&format!("root={:?}", root.to_string_lossy())),
+                "{line}"
+            );
+            assert!(line.contains("session=\"sidekick-session\""), "{line}");
+            assert!(
+                line.contains("awaited=executor.scheduler/register_actor"),
+                "{line}"
+            );
+            assert!(names_executor_scheduler_holder(line), "{line}");
+            assert!(line.contains("held_for_ms="), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_loop_restart_parked_frame_exits_nonzero_after_stderr_with_capture() {
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut fixture = FrameLoopFixture::start(Arc::new(move || {
+            parked_tx.send(()).unwrap();
+            // Bounded even on the broken baseline, so the test cannot hang.
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        }))
+        .await;
+        fixture.send_ping(91).await;
+        parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        tokio::time::sleep(TEST_THRESHOLD * 5).await;
+        let exits = fixture.exits.lock().unwrap().clone();
+        let stderr = fixture.stderr.lines();
+        let calls = fixture
+            .capture
+            .calls()
+            .into_iter()
+            .map(|(pid, path)| (pid, path.with_extension("txt")))
+            .collect::<Vec<_>>();
+        let capture_written = calls.first().is_some_and(|(_, path)| path.is_file());
+        release_tx.send(()).unwrap();
+        fixture.finish();
+
+        assert_eq!(
+            exits.len(),
+            1,
+            "watchdog must request one nonzero exit: {exits:?}"
+        );
+        assert_eq!(exits[0].0, 1, "exit 0 would suppress supervisor restart");
+        assert_eq!(exits[0].1, stderr, "stderr must be written before exiting");
+        assert_eq!(stderr.len(), 1, "one terminal stall line");
+        assert_eq!(calls.len(), 1);
+        assert!(capture_written, "a capture was actually written");
+        let line = &stderr[0];
+        eprintln!("captured terminal stderr: {line}");
+        assert!(
+            line.contains("entry=run_module_loop/handle_frame"),
+            "{line}"
+        );
+        assert!(line.contains("command=\"ping\" request_id=91"), "{line}");
+        assert!(line.contains("step_elapsed_ms="), "{line}");
+        assert!(
+            line.starts_with("stall watchdog: exiting marker=subc_frame_loop stalled_for_ms="),
+            "{line}"
+        );
+        assert!(
+            line.contains("phase=handle_frame") && line.contains("channel=0 epoch=0 corr=91"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("capture={} exit_code=1", calls[0].1.display())),
+            "{line}"
+        );
+        let duration_ms: u128 = line
+            .split("stalled_for_ms=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            duration_ms >= (TEST_THRESHOLD * 2).as_millis(),
+            "must honor the exit bound: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_loop_restart_idle_past_bound_does_not_exit() {
+        let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
+        fixture.ping(1).await; // Prove the loop has started before measuring idle.
+        let tick_before = fixture
+            .metrics
+            .frame_loop_last_tick_ms
+            .load(Ordering::Relaxed);
+        tokio::time::sleep(TEST_THRESHOLD * 5).await;
+        let tick_after = fixture
+            .metrics
+            .frame_loop_last_tick_ms
+            .load(Ordering::Relaxed);
+        let exits = fixture.exits.lock().unwrap().clone();
+        let stderr = fixture.stderr.lines();
+        fixture.ping(2).await; // An idle loop must still serve new frames.
+        fixture.finish();
+        assert!(
+            tick_after > tick_before,
+            "idle drain-timer turns count as progress"
+        );
+        assert!(exits.is_empty(), "idle loop must not exit: {exits:?}");
+        assert!(stderr.is_empty(), "{stderr:?}");
+
+        // Also exercise the unarmed idle signal (no promised timer turn). An
+        // old progress timestamp alone must never qualify for capture or exit.
+        let start = Instant::now();
+        let mut detector = StallDetector::new(STALL_THRESHOLD, 1);
+        for second in 0..=60 {
+            let now = start + secs(second);
+            assert_eq!(detector.observe(0, false, secs(second), now), None);
+            assert_eq!(
+                StallDetector::stalled_for(&detector.watches[0], secs(second), now),
+                Duration::ZERO
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_loop_restart_long_fast_frame_burst_does_not_exit() {
+        let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
+        let started = Instant::now();
+        let mut frames = 0;
+        // Keep sending until the burst is both long in time and long in
+        // frames. A 2 ms sleep lasts a whole timer tick (about 15.6 ms) on
+        // Windows, and a loaded runner stretches each ping further, so time
+        // alone can end the loop after too few frames to be a real burst.
+        while started.elapsed() < TEST_THRESHOLD * 5 || frames <= 50 {
+            frames += 1;
+            fixture.ping(frames).await;
+            // Use I/O and a paced stream of frames, not synthetic CPU load.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let exits = fixture.exits.lock().unwrap().clone();
+        let stderr = fixture.stderr.lines();
+        fixture.finish();
+        assert!(
+            frames > 50,
+            "a genuinely long burst, not a single slow frame"
+        );
+        assert!(exits.is_empty(), "advancing burst must not exit: {exits:?}");
+        assert!(stderr.is_empty(), "{stderr:?}");
+
+        // Stress the other sampling extreme deterministically: every sample
+        // sees owed work throughout a two-minute burst, but each frame starts a
+        // new turn. This must remain safe even without seeing idle gaps between
+        // fast frames or renewed future timer deadlines.
+        let start = Instant::now();
+        let mut detector = StallDetector::new(STALL_THRESHOLD, 1);
+        for second in 0..=120 {
+            let now = start + secs(second);
+            assert_eq!(detector.observe(0, true, Duration::ZERO, now), None);
+            assert_eq!(
+                StallDetector::stalled_for(&detector.watches[0], Duration::ZERO, now),
+                Duration::ZERO
+            );
+        }
+    }
+
+    #[test]
+    fn production_frame_loop_restart_bound_and_exit_code_are_fixed() {
+        let storage = tempfile::tempdir().unwrap();
+        let config = StallWatchdogConfig::production(storage.path());
+        assert_eq!(config.frame_loop_exit_threshold, Duration::from_secs(30));
+        assert_eq!(STALL_EXIT_CODE, 1);
+    }
+
+    #[test]
+    fn held_dispatch_loop_is_captured_once_and_logged_with_its_marker_and_end() {
+        let executor = crate::context::Executor::new();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let log = RecordedLog::default();
+        let capture = Arc::new(RecordingCapture::default());
+        let storage = tempfile::tempdir().expect("storage dir");
+        let diagnostics = storage.path().join("diagnostics");
+        let watchdog = StallWatchdog::spawn(
+            daemon_markers(&metrics, &executor),
+            Arc::clone(&metrics.stall_stats),
+            test_config(&log, &capture, &diagnostics),
+        )
+        .expect("spawn watchdog");
+
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = executor.hold_dispatch_loop_for_test(release_rx);
+        wait_until("stall detection", || metrics.stall_stats.stall_count() > 0);
+        // Stay stalled for several more thresholds: detection must not repeat.
+        thread::sleep(TEST_THRESHOLD * 3);
+        release_tx.send(()).expect("release hold");
+        holder.join().expect("hold thread");
+        wait_until("stall end", || metrics.stall_stats.active_stalls() == 0);
+
+        // A second stall inside the cooldown is logged but not captured.
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = executor.hold_dispatch_loop_for_test(release_rx);
+        wait_until("second stall", || metrics.stall_stats.stall_count() == 2);
+        release_tx.send(()).expect("release second hold");
+        holder.join().expect("second hold thread");
+        wait_until("second stall end", || {
+            metrics.stall_stats.active_stalls() == 0
+        });
+        watchdog.stop_and_join();
+
+        let calls = capture
+            .calls()
+            .into_iter()
+            .map(|(pid, path)| (pid, path.with_extension("txt")))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1, "exactly one capture attempted: {calls:?}");
+        let (pid, path) = &calls[0];
+        assert_eq!(*pid, TEST_PID);
+        assert_eq!(path.parent(), Some(diagnostics.as_path()));
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            file_name.starts_with("stall-") && file_name.ends_with(&format!("-{TEST_PID}.txt")),
+            "{file_name}"
+        );
+        assert_eq!(metrics.stall_stats.captures(), 1);
+
+        let lines = log.lines();
+        let detected = lines
+            .iter()
+            .filter(|line| line.contains("stall detected"))
+            .collect::<Vec<_>>();
+        assert_eq!(detected.len(), 2, "one line per stall: {lines:?}");
+        assert!(
+            detected[0].contains("marker=executor_dispatch_loop")
+                && detected[0].contains("stalled_for_ms=")
+                && detected[0].contains(&format!("capture={}", path.display())),
+            "{lines:?}"
+        );
+        assert!(
+            detected[1].contains("marker=executor_dispatch_loop")
+                && detected[1].contains("capture=skipped (cooldown)"),
+            "{lines:?}"
+        );
+        let ended = lines
+            .iter()
+            .filter(|line| line.contains("stall ended marker=executor_dispatch_loop total_ms="))
+            .count();
+        assert_eq!(ended, 2, "{lines:?}");
+        assert_eq!(metrics.stall_stats.stall_count(), 2);
+        assert!(metrics.stall_stats.last_stall_duration_ms().is_some());
+    }
+
+    #[test]
+    fn first_stall_duration_covers_the_whole_hold() {
+        let executor = crate::context::Executor::new();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let log = RecordedLog::default();
+        let capture = Arc::new(RecordingCapture::default());
+        let storage = tempfile::tempdir().expect("storage dir");
+        let watchdog = StallWatchdog::spawn(
+            daemon_markers(&metrics, &executor),
+            Arc::clone(&metrics.stall_stats),
+            test_config(&log, &capture, &storage.path().join("diagnostics")),
+        )
+        .expect("spawn watchdog");
+
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = executor.hold_dispatch_loop_for_test(release_rx);
+        wait_until("stall detection", || metrics.stall_stats.stall_count() > 0);
+        thread::sleep(TEST_THRESHOLD * 3);
+        release_tx.send(()).expect("release hold");
+        holder.join().expect("hold thread");
+        wait_until("stall end", || metrics.stall_stats.active_stalls() == 0);
+        watchdog.stop_and_join();
+
+        let last = metrics
+            .stall_stats
+            .last_stall_duration_ms()
+            .expect("finished stall duration");
+        assert!(
+            last >= u64::try_from((TEST_THRESHOLD * 4).as_millis()).unwrap(),
+            "threshold plus three more thresholds of hold: {last}ms"
+        );
+    }
+
+    #[test]
+    fn idle_daemon_past_the_threshold_is_never_a_stall() {
+        let executor = crate::context::Executor::new();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let log = RecordedLog::default();
+        let capture = Arc::new(RecordingCapture::default());
+        let storage = tempfile::tempdir().expect("storage dir");
+        let watchdog = StallWatchdog::spawn(
+            daemon_markers(&metrics, &executor),
+            Arc::clone(&metrics.stall_stats),
+            test_config(&log, &capture, &storage.path().join("diagnostics")),
+        )
+        .expect("spawn watchdog");
+
+        // Both loops have been idle since creation: the scheduler is parked
+        // in recv() and the frame loop has promised no wake. Their progress
+        // ages grow far past the threshold while they owe nothing.
+        thread::sleep(TEST_THRESHOLD * 4);
+        watchdog.stop_and_join();
+
+        assert!(
+            executor.dispatch_loop_liveness().progress_age() > TEST_THRESHOLD,
+            "the idle loop really went unprogressed past the threshold"
+        );
+        assert_eq!(log.lines(), Vec::<String>::new());
+        assert_eq!(capture.calls(), Vec::new());
+        assert_eq!(metrics.stall_stats.stall_count(), 0);
+    }
+
+    #[test]
+    fn capture_file_names_sort_by_utc_time() {
+        // 2026-09-24T12:01:55Z
+        let at = UNIX_EPOCH + Duration::from_secs(1_790_251_315);
+        assert_eq!(
+            capture_file_name(at, 36755),
+            "stall-20260924T120155Z-36755.txt"
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_only_the_newest_capture_files() {
+        let dir = tempfile::tempdir().expect("diagnostics dir");
+        for second in 0..8 {
+            std::fs::write(
+                dir.path()
+                    .join(format!("stall-20260924T12000{second}Z-1.txt")),
+                "x",
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("unrelated.txt"), "keep").unwrap();
+
+        prune_captures(dir.path(), KEEP_CAPTURES - 1);
+
+        let mut left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "stall-20260924T120004Z-1.txt",
+                "stall-20260924T120005Z-1.txt",
+                "stall-20260924T120006Z-1.txt",
+                "stall-20260924T120007Z-1.txt",
+                "unrelated.txt",
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "runs /usr/bin/sample against the test process for about 3 seconds"]
+    fn macos_platform_capture_writes_a_sample_file() {
+        let dir = tempfile::tempdir().expect("diagnostics dir");
+        let path = dir.path().join("stall-test.txt");
+        let started = PlatformCapture
+            .capture(std::process::id(), &path)
+            .expect("spawn sample");
+        let CaptureStarted::Spawned(mut child) = started else {
+            panic!("macOS capture spawns sample");
+        };
+        assert!(child.wait().expect("wait sample").success());
+        assert!(std::fs::metadata(&path).expect("sample file").len() > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_platform_capture_writes_every_thread_state() {
+        let dir = tempfile::tempdir().expect("diagnostics dir");
+        let path = dir.path().join("stall-test.txt");
+        assert!(matches!(
+            PlatformCapture.capture(std::process::id(), &path),
+            Ok(CaptureStarted::Written)
+        ));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("stat: ") && text.contains("wchan: "),
+            "{text}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_pause_probe_child() {
+        let Ok(probe_dir) = std::env::var("AFT_TEST_WATCHDOG_PAUSE_PROBE_DIR") else {
+            let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
+            fixture.ping(42).await;
+            assert!(fixture.exits.lock().unwrap().is_empty());
+            fixture.finish();
+            return;
+        };
+        let dir = PathBuf::from(probe_dir);
+        let release = dir.join("release");
+        let hook_release = release.clone();
+        let mut fixture = FrameLoopFixture::start(Arc::new(move || {
+            wait_until("promised frame-loop wake release", || hook_release.exists());
+        }))
+        .await;
+        fixture.send_ping(42).await;
+        wait_until("watchdog observed pending frame-loop work", || {
+            fixture
+                .log
+                .lines()
+                .iter()
+                .any(|line| line.contains("stall detected marker=subc_frame_loop"))
+        });
+        std::fs::write(dir.join("ready"), b"ready").unwrap();
+        let wedged = std::env::var("AFT_TEST_WATCHDOG_PAUSE_PROBE_CASE").unwrap() == "wedged";
+        if wedged {
+            wait_until("wedged loop exit", || {
+                !fixture.exits.lock().unwrap().is_empty()
+            });
+            std::fs::write(&release, b"release").unwrap();
+        }
+        let pong = tokio::time::timeout(
+            Duration::from_secs(5),
+            subc_transport::read_frame(&mut fixture.daemon),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(pong.header.ty, subc_protocol::FrameType::Pong);
+        let exits = fixture.exits.lock().unwrap().len();
+        let deferrals = fixture
+            .log
+            .lines()
+            .iter()
+            .filter(|line| {
+                line.contains("exit deferred") && line.contains("watchdog_wake_late_ms=")
+            })
+            .count();
+        let exit_wake_late_ms = fixture.stderr.lines().iter().find_map(|line| {
+            line.split("watchdog_wake_late_ms=")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        });
+        std::fs::write(dir.join("result"), serde_json::to_vec(&serde_json::json!({
+            "exits": exits, "deferrals": deferrals, "captures": fixture.capture.calls().len(), "exit_wake_late_ms": exit_wake_late_ms,
+        })).unwrap()).unwrap();
+        fixture.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_pause_with_promised_frame_wake_does_not_restart_healthy_loop() {
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    unsafe {
+                        libc::kill(child.id() as libc::pid_t, libc::SIGCONT);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        for case in ["healthy", "healthy", "healthy", "healthy", "wedged"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = ChildGuard(Some(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "subc::stall_watchdog::tests::process_pause_probe_child",
+                        "--nocapture",
+                    ])
+                    .env("AFT_TEST_WATCHDOG_PAUSE_PROBE_DIR", dir.path())
+                    .env("AFT_TEST_WATCHDOG_PAUSE_PROBE_CASE", case)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            ));
+            wait_until("child pending-wake observation", || {
+                dir.path().join("ready").exists()
+            });
+            let pid = child.0.as_ref().unwrap().id() as libc::pid_t;
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            let mut state = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut state, libc::WUNTRACED) },
+                pid
+            );
+            assert!(libc::WIFSTOPPED(state));
+            // Both watchdog and frame runtime are stopped past the exit bound.
+            // Release the promised wake before resume; only the control stays wedged.
+            std::thread::sleep(TEST_THRESHOLD * 3);
+            if case == "healthy" {
+                std::fs::write(dir.path().join("release"), b"release").unwrap();
+            }
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("result")).unwrap()).unwrap();
+            let exits = result["exits"].as_u64().unwrap();
+            assert_eq!(
+                exits,
+                u64::from(case == "wedged"),
+                "resume case {case}: {exits} exits"
+            );
+            assert!(result["captures"].as_u64().unwrap() > 0);
+            if case == "wedged" {
+                assert!(
+                    result["deferrals"].as_u64().unwrap() > 0,
+                    "late tick must explain the deferred exit: {result}"
+                );
+                assert!(
+                    result["exit_wake_late_ms"].as_u64().unwrap()
+                        < (TEST_THRESHOLD * 2).as_millis() as u64,
+                    "wedged control must exit on a punctual tick: {result}"
+                );
+            }
+        }
+    }
+
+    fn secs(value: u64) -> Duration {
+        Duration::from_secs(value)
+    }
+
+    #[test]
+    fn current_thread_runtime_event_wait_reports_parked_and_clears_on_wake() {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let worker_metrics = Arc::clone(&metrics);
+        let (wake, wait) = tokio::sync::oneshot::channel();
+        let worker = thread::spawn(move || {
+            let runtime = worker_metrics.frame_loop_runtime().unwrap();
+            runtime.block_on(async {
+                wait.await.unwrap();
+                assert_eq!(worker_metrics.frame_loop_runtime_parked_for(), None);
+            });
+        });
+        wait_until("runtime event wait park hook", || {
+            metrics.frame_loop_runtime_parked_for().is_some()
+        });
+        thread::sleep(Duration::from_millis(10));
+        assert!(metrics.frame_loop_runtime_parked_for().unwrap() >= Duration::from_millis(10));
+        wake.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    struct InjectedMarker {
+        clock_ms: AtomicU64,
+        last_turn_ms: AtomicU64,
+        parked: std::sync::atomic::AtomicBool,
+        observations: AtomicUsize,
+    }
+
+    impl LivenessMarker for Arc<InjectedMarker> {
+        fn name(&self) -> &'static str {
+            "subc_frame_loop"
+        }
+        fn progress_age(&self) -> Duration {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            Duration::from_millis(
+                self.clock_ms
+                    .load(Ordering::SeqCst)
+                    .saturating_sub(self.last_turn_ms.load(Ordering::SeqCst)),
+            )
+        }
+        fn has_pending_work(&self) -> bool {
+            true
+        }
+        fn restart_on_stall(&self) -> bool {
+            true
+        }
+        fn runtime_parked_for(&self) -> Option<Duration> {
+            self.parked
+                .load(Ordering::SeqCst)
+                .then(|| self.progress_age())
+        }
+        fn progress_token(&self) -> u64 {
+            self.last_turn_ms.load(Ordering::SeqCst)
+        }
+    }
+
+    struct InjectedWatchdog {
+        marker: Arc<InjectedMarker>,
+        faults: Arc<AtomicU64>,
+        log: RecordedLog,
+        stderr: RecordedLog,
+        exits: Arc<AtomicUsize>,
+        watchdog: StallWatchdog,
+        _dir: tempfile::TempDir,
+    }
+
+    impl InjectedWatchdog {
+        fn start(parked: bool) -> Self {
+            let marker = Arc::new(InjectedMarker {
+                clock_ms: AtomicU64::new(0),
+                last_turn_ms: AtomicU64::new(0),
+                parked: std::sync::atomic::AtomicBool::new(parked),
+                observations: AtomicUsize::new(0),
+            });
+            let log = RecordedLog::default();
+            let stderr = RecordedLog::default();
+            let faults = Arc::new(AtomicU64::new(100));
+            let exits = Arc::new(AtomicUsize::new(0));
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(&log, &Arc::new(RecordingCapture::default()), dir.path());
+            config.tick = Duration::from_millis(1);
+            config.threshold = STALL_THRESHOLD;
+            config.frame_loop_exit_threshold = FRAME_LOOP_EXIT_THRESHOLD;
+            config.stderr = stderr.sink();
+            let exit_count = Arc::clone(&exits);
+            config.exit = Arc::new(move |code| {
+                assert_eq!(code, STALL_EXIT_CODE);
+                exit_count.fetch_add(1, Ordering::SeqCst);
+            });
+            let fault_count = Arc::clone(&faults);
+            config.major_faults = Arc::new(move || fault_count.load(Ordering::SeqCst));
+            let clock = Arc::clone(&marker);
+            let origin = Instant::now();
+            config.now = Arc::new(move || {
+                origin + Duration::from_millis(clock.clock_ms.load(Ordering::SeqCst))
+            });
+            let watchdog = StallWatchdog::spawn(
+                vec![Box::new(Arc::clone(&marker))],
+                Arc::new(StallStats::default()),
+                config,
+            )
+            .unwrap();
+            wait_until("first watchdog observation", || {
+                marker.observations.load(Ordering::SeqCst) >= 2
+            });
+            Self {
+                marker,
+                faults,
+                log,
+                stderr,
+                exits,
+                watchdog,
+                _dir: dir,
+            }
+        }
+
+        fn advance(&self, seconds: u64) {
+            let observed = self.marker.observations.load(Ordering::SeqCst);
+            self.marker
+                .clock_ms
+                .fetch_add(seconds * 1000, Ordering::SeqCst);
+            wait_until("injected watchdog tick", || {
+                self.marker.observations.load(Ordering::SeqCst) >= observed + 4
+                    || self.exits.load(Ordering::SeqCst) != 0
+            });
+        }
+
+        fn deferrals(&self) -> Vec<String> {
+            self.log
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains("exit deferred"))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn parked_runtime_defers_once_per_stall_then_exits_at_hard_ceiling() {
+        let probe = InjectedWatchdog::start(true);
+        probe.advance(29);
+        probe.advance(1);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
+        let lines = probe.deferrals();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("because its runtime is parked (host starvation)"));
+        assert!(lines[0].contains("runtime_parked=true parked_for_ms=30000 majflt_delta=0"));
+        probe.advance(1);
+        assert_eq!(probe.deferrals().len(), 1);
+
+        // Starting a new turn ends the stall and permits one fresh diagnostic.
+        probe.marker.last_turn_ms.store(31_000, Ordering::SeqCst);
+        probe.advance(1);
+        probe.advance(28);
+        probe.advance(1);
+        assert_eq!(probe.deferrals().len(), 2);
+        probe.advance(270);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        let exits = probe.stderr.lines();
+        assert_eq!(exits.len(), 1);
+        assert!(exits[0].contains("stalled_for_ms=300000"), "{exits:?}");
+        assert!(exits[0].contains("runtime_parked=true"));
+        probe.watchdog.stop_and_join();
+    }
+
+    #[test]
+    fn unparked_runtime_without_faults_exits_at_normal_bound() {
+        let probe = InjectedWatchdog::start(false);
+        probe.advance(29);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
+        probe.advance(1);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        assert!(probe.deferrals().is_empty());
+        let lines = probe.stderr.lines();
+        assert!(lines[0].contains("runtime_parked=false parked_for_ms=0 majflt_delta=0"));
+        probe.watchdog.stop_and_join();
+    }
+
+    #[test]
+    fn unparked_runtime_with_fault_burst_defers_until_ceiling() {
+        let probe = InjectedWatchdog::start(false);
+        probe
+            .faults
+            .store(100 + PAGING_MAJFLT_THRESHOLD + 1, Ordering::SeqCst);
+        probe.advance(29);
+        probe.advance(1);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
+        let lines = probe.deferrals();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("because paging"));
+        assert!(lines[0].contains("runtime_parked=false parked_for_ms=0 majflt_delta=9"));
+        probe.advance(270);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.deferrals().len(), 1);
+        probe.watchdog.stop_and_join();
+    }
+
+    #[test]
+    fn process_wide_late_wake_defers_but_next_punctual_tick_exits() {
+        let probe = InjectedWatchdog::start(false);
+        probe.advance(31);
+        // Only the first tick is late. Subsequent ticks at the frozen clock
+        // are punctual and may request exit before advance returns to this test.
+        assert_eq!(probe.deferrals().len(), 1);
+        assert!(probe.deferrals()[0].contains("because watchdog itself woke late"));
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        assert!(probe.stderr.lines()[0].contains("watchdog_wake_late_ms=0"));
+        probe.watchdog.stop_and_join();
+    }
+
+    #[test]
+    fn paging_threshold_is_strict_and_hard_ceiling_overrides_all_deferrals() {
+        assert_eq!(
+            exit_deferral(secs(30), secs(30), secs(0), None, PAGING_MAJFLT_THRESHOLD),
+            None
+        );
+        assert_eq!(
+            exit_deferral(
+                secs(30),
+                secs(30),
+                secs(0),
+                None,
+                PAGING_MAJFLT_THRESHOLD + 1
+            ),
+            Some("paging")
+        );
+        assert_eq!(
+            exit_deferral(
+                FRAME_LOOP_HARD_CEILING,
+                secs(30),
+                secs(300),
+                Some(secs(300)),
+                1000
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_marker_with_old_progress_never_stalls() {
+        let start = Instant::now();
+        let mut detector = StallDetector::new(THRESHOLD, 1);
+        for second in 0..120 {
+            assert_eq!(
+                detector.observe(0, false, secs(second), start + secs(second)),
+                None,
+                "an idle loop is not a stalled loop"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_marker_stalls_once_and_reports_the_end_with_total_duration() {
+        let start = Instant::now();
+        let mut detector = StallDetector::new(THRESHOLD, 1);
+        // Last progress at `start`; the loop owes work from then on.
+        let mut began = Vec::new();
+        for second in 0..=20 {
+            if let Some(transition) = detector.observe(0, true, secs(second), start + secs(second))
+            {
+                began.push((second, transition));
+            }
+        }
+        assert_eq!(
+            began,
+            vec![(
+                15,
+                StallTransition::Began {
+                    marker: 0,
+                    stalled_for: secs(15)
+                }
+            )]
+        );
+
+        // The loop progresses at start+56s; the watchdog observes it at 57s.
+        assert_eq!(
+            detector.observe(0, true, secs(1), start + secs(57)),
+            Some(StallTransition::Ended {
+                marker: 0,
+                total: secs(56)
+            })
+        );
+        assert_eq!(detector.observe(0, false, secs(2), start + secs(58)), None);
+    }
+
+    #[test]
+    fn newly_handed_work_is_measured_from_when_it_was_first_observed() {
+        let start = Instant::now();
+        let mut detector = StallDetector::new(THRESHOLD, 1);
+        // Idle for ten minutes, then work arrives: progress age is huge but the
+        // loop has only owed work since the first pending observation.
+        assert_eq!(detector.observe(0, true, secs(600), start), None);
+        assert_eq!(detector.observe(0, true, secs(614), start + secs(14)), None);
+        assert!(matches!(
+            detector.observe(0, true, secs(615), start + secs(15)),
+            Some(StallTransition::Began { .. })
+        ));
+    }
+
+    #[test]
+    fn markers_are_tracked_independently() {
+        let start = Instant::now();
+        let mut detector = StallDetector::new(THRESHOLD, 2);
+        for second in 0..=15 {
+            let now = start + secs(second);
+            let frame = detector.observe(0, true, secs(second), now);
+            let dispatch = detector.observe(1, false, secs(second), now);
+            assert_eq!(dispatch, None);
+            if second == 15 {
+                assert!(matches!(
+                    frame,
+                    Some(StallTransition::Began { marker: 0, .. })
+                ));
+            }
+        }
+    }
+}

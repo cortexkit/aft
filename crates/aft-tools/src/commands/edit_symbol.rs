@@ -1,0 +1,587 @@
+//! Handler for the `edit_symbol` command: symbol-level editing with
+//! resolve → backup → edit → validate cycle.
+
+use std::path::Path;
+
+use crate::context::AppContext;
+use crate::edit;
+use crate::lsp_hints;
+use crate::protocol::{RawRequest, Response};
+use crate::symbols::Range;
+
+/// Handle an `edit_symbol` request.
+///
+/// Params:
+///   - `file` (string, required) — target file path
+///   - `symbol` (string, required) — symbol name to edit
+///   - `operation` (string, required) — one of: replace, delete, insert_before, insert_after
+///   - `content` (string, optional) — replacement/insertion content (required for replace/insert_*)
+///   - `scope` (string, optional) — scope qualifier to disambiguate (e.g. "ClassName")
+///
+/// Returns on success: `{ file, symbol, operation, range, new_range?, syntax_valid?, backup_id }`.
+/// `syntax_valid` is absent when syntax validation could not run.
+/// Returns on ambiguity: `{ code: "ambiguous_symbol", candidates: [...] }`
+pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
+    let file = match req.params.get("file").and_then(|v| v.as_str()) {
+        Some(f) => f,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "edit_symbol: missing required param 'file'",
+            );
+        }
+    };
+    if super::github_comments::is_github_resource_path(file) {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "edit: GitHub resources support only edits[] find/replace entries",
+        );
+    }
+
+    let symbol_name = match req.params.get("symbol").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "edit_symbol: missing required param 'symbol'",
+            );
+        }
+    };
+
+    let operation = match req.params.get("operation").and_then(|v| v.as_str()) {
+        Some(op) => op,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "edit_symbol: missing required param 'operation'",
+            );
+        }
+    };
+
+    // Validate operation
+    if !["replace", "delete", "insert_before", "insert_after"].contains(&operation) {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "edit_symbol: invalid operation '{}', expected: replace, delete, insert_before, insert_after",
+                operation
+            ),
+        );
+    }
+
+    let content = req.params.get("content").and_then(|v| v.as_str());
+    let scope = req.params.get("scope").and_then(|v| v.as_str());
+
+    // Content is required for replace, insert_before, insert_after
+    if operation != "delete" && content.is_none() {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "edit_symbol: 'content' is required for operation '{}'",
+                operation
+            ),
+        );
+    }
+
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    if !path.exists() {
+        return Response::error(
+            &req.id,
+            "file_not_found",
+            format!("file not found: {}", file),
+        );
+    }
+
+    // Resolve symbol
+    let matches = match ctx.provider().resolve_symbol(&path, symbol_name) {
+        Ok(m) => m,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
+
+    // Disambiguation
+    let filtered = if matches.len() > 1 {
+        if let Some(scope_filter) = scope {
+            let narrowed: Vec<_> = matches
+                .into_iter()
+                .filter(|m| {
+                    m.symbol.scope_chain.iter().any(|s| s == scope_filter)
+                        || m.symbol.parent.as_deref() == Some(scope_filter)
+                })
+                .collect();
+            narrowed
+        } else {
+            matches
+        }
+    } else {
+        matches
+    };
+
+    // LSP-enhanced disambiguation (S03)
+    let filtered = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
+        lsp_hints::apply_lsp_disambiguation(
+            filtered,
+            &hints,
+            &ctx.resolve_relative_path(Path::new(".")),
+        )
+    } else {
+        filtered
+    };
+
+    if filtered.len() > 1 {
+        // Return structured disambiguation response
+        let candidates: Vec<serde_json::Value> = filtered
+            .iter()
+            .map(|m| {
+                let sym = &m.symbol;
+                let qualified = if sym.scope_chain.is_empty() {
+                    sym.name.clone()
+                } else {
+                    format!("{}::{}", sym.scope_chain.join("::"), sym.name)
+                };
+                let kind_str = serde_json::to_value(&sym.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| format!("{:?}", sym.kind).to_lowercase());
+                serde_json::json!({
+                    "name": sym.name,
+                    "qualified": qualified,
+                    "line": sym.range.start_line + 1,
+                    "kind": kind_str,
+                })
+            })
+            .collect();
+
+        return Response::error_with_data(
+            &req.id,
+            "ambiguous_symbol",
+            format!(
+                "multiple symbols match '{}'; use scope to disambiguate",
+                symbol_name
+            ),
+            serde_json::json!({ "candidates": candidates }),
+        );
+    }
+
+    if filtered.is_empty() {
+        return Response::error(
+            &req.id,
+            "symbol_not_found",
+            format!("symbol '{}' not found in {}", symbol_name, file),
+        );
+    }
+
+    let target = &filtered[0].symbol;
+
+    // Read file content
+    let (source, observation) = match edit::read_edit_source(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
+        }
+    };
+
+    let symbol_end_byte =
+        edit::line_col_to_byte(&source, target.range.end_line, target.range.end_col);
+    let (original_range, multiple_declarators) =
+        match callable_declaration_edit_range(&path, &source, &target.range, symbol_end_byte) {
+            Ok(resolved) => resolved,
+            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        };
+
+    if (operation == "replace" || operation == "delete") && multiple_declarators {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "edit_symbol: cannot {} symbol '{}' because its declaration contains multiple declarators",
+                operation, symbol_name
+            ),
+        );
+    }
+
+    // Convert the edit-specific range to byte offsets.
+    let start_byte =
+        edit::line_col_to_byte(&source, original_range.start_line, original_range.start_col);
+    let end_byte = edit::line_col_to_byte(&source, original_range.end_line, original_range.end_col);
+
+    // Apply operation
+    let replacement_content = if operation == "replace" {
+        match content {
+            Some(content) => Some(content),
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "edit_symbol: 'content' is required for operation 'replace'",
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let insertion_content = if operation == "insert_before" || operation == "insert_after" {
+        match content {
+            Some(content) => Some(content),
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "edit_symbol: 'content' is required for operation '{}'",
+                        operation
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // Explicit indentation replaces the old indentation. Otherwise leave the
+    // source prefix alone, whether it is indentation or neighboring code.
+    let replaced_indent = replacement_content
+        .filter(|text| text.starts_with([' ', '\t']))
+        .and_then(|_| source.get(..start_byte))
+        .and_then(|prefix| prefix.rsplit('\n').next())
+        .filter(|prefix| {
+            prefix.len() == original_range.start_col as usize
+                && prefix.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+        })
+        .map_or(0, str::len);
+    let (start_byte, end_byte) = if operation == "delete" || replacement_content == Some("") {
+        whole_line_removal_range(&source, start_byte, end_byte)
+    } else {
+        (start_byte - replaced_indent, end_byte)
+    };
+
+    let new_source = match operation {
+        "replace" => {
+            let replacement = replacement_content.unwrap_or_default();
+            edit::replace_byte_range(&source, start_byte, end_byte, replacement)
+        }
+        "delete" => edit::replace_byte_range(&source, start_byte, end_byte, ""),
+        "insert_before" => {
+            let insertion = insertion_content.unwrap_or_default();
+            let insert_text = format!("{}\n", insertion);
+            edit::replace_byte_range(&source, start_byte, start_byte, &insert_text)
+        }
+        "insert_after" => {
+            let insertion = insertion_content.unwrap_or_default();
+            let insert_text = format!("\n{}", insertion);
+            edit::replace_byte_range(&source, end_byte, end_byte, &insert_text)
+        }
+        _ => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("edit_symbol: unsupported operation: {}", operation),
+            )
+        }
+    };
+    let new_source = match new_source {
+        Ok(updated) => updated,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
+
+    if edit::wants_preview(&req.params) {
+        let mut result = serde_json::json!({
+            "file": file,
+            "symbol": symbol_name,
+            "operation": operation,
+            "range": original_range,
+            "formatted": false,
+        });
+        if source == new_source {
+            result["no_op"] = serde_json::json!(true);
+        }
+        edit::attach_preview_diff(&mut result, &req.params, file, &source, &new_source);
+        return Response::success(&req.id, result);
+    }
+
+    if source == new_source {
+        return edit::no_change_response(&req.id);
+    }
+
+    let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
+
+    // Auto-backup before writing
+    let backup_id = match edit::auto_backup_observed(
+        ctx,
+        req.session(),
+        &path,
+        &format!("edit_symbol: {} {}", operation, symbol_name),
+        Some(&op_id),
+        &observation,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
+
+    // Write, format, and validate via shared pipeline
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+    let mut write_result = match edit::write_format_validate_observed(
+        tool_policy,
+        &path,
+        &new_source,
+        &ctx.config(),
+        &req.params,
+        &source,
+        &observation,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.backup()
+                .lock()
+                .discard_operation_entries(req.session(), &op_id);
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
+
+    if write_result.rolled_back {
+        ctx.backup()
+            .lock()
+            .discard_operation_entries(req.session(), &op_id);
+    }
+
+    if let Some(final_content) = write_result.final_content(&path) {
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, final_content, &req.params);
+    }
+
+    log::debug!("edit_symbol: {} in {}", symbol_name, file);
+
+    // Compute new range for replace and insert operations
+    let new_range = match operation {
+        "replace" => {
+            let replacement = replacement_content.unwrap_or_default();
+            let start_col = original_range.start_col - replaced_indent as u32;
+            let new_lines = replacement.lines().count() as u32;
+            let last_line_len = replacement
+                .lines()
+                .last()
+                .map(|l| l.len() as u32)
+                .unwrap_or(0);
+            Some(Range {
+                start_line: original_range.start_line,
+                start_col,
+                end_line: original_range.start_line + new_lines.saturating_sub(1),
+                end_col: if new_lines <= 1 {
+                    start_col + last_line_len
+                } else {
+                    last_line_len
+                },
+            })
+        }
+        _ => None,
+    };
+
+    let mut result = serde_json::json!({
+        "file": file,
+        "symbol": symbol_name,
+        "operation": operation,
+        "range": original_range,
+        "formatted": write_result.formatted,
+    });
+
+    if let Some(valid) = write_result.syntax_valid {
+        result["syntax_valid"] = serde_json::json!(valid);
+    }
+
+    if let Some(ref reason) = write_result.format_skipped_reason {
+        result["format_skipped_reason"] = serde_json::json!(reason);
+    }
+
+    if write_result.validate_requested {
+        result["validation_errors"] = serde_json::json!(write_result.validation_errors);
+    }
+    if let Some(ref reason) = write_result.validate_skipped_reason {
+        result["validate_skipped_reason"] = serde_json::json!(reason);
+    }
+
+    if let Some(ref nr) = new_range {
+        if let Ok(new_range_json) = serde_json::to_value(nr) {
+            result["new_range"] = new_range_json;
+        }
+    }
+
+    if let Some(ref id) = backup_id {
+        result["backup_id"] = serde_json::json!(id);
+    }
+    edit::attach_backup_skipped_reason(
+        &mut result,
+        ctx,
+        req.session(),
+        &op_id,
+        Some(path.as_path()),
+    );
+
+    // Include surrounding context for replace/insert ops so the agent can
+    // detect issues like duplicated attributes or misplaced decorators.
+    if operation == "replace" || operation == "insert_before" || operation == "insert_after" {
+        if let Some(new_content) = write_result.final_content(&path) {
+            let lines: Vec<&str> = new_content.lines().collect();
+            let start = original_range.start_line as usize;
+            let end = if let Some(ref nr) = new_range {
+                (nr.end_line as usize + 1).min(lines.len())
+            } else {
+                (original_range.end_line as usize + 1).min(lines.len())
+            };
+            let (context_before, context_after) = symbol_context(&lines, start, end);
+
+            result["context_before"] = serde_json::json!(context_before);
+            result["context_after"] = serde_json::json!(context_after);
+        }
+    }
+
+    write_result.append_lsp_diagnostics_to(&mut result);
+    write_result.append_reformatted_excerpt_to(&mut result);
+
+    // Read final content once for both no_op detection and diff info.
+    // Honest reporting: when the symbol replacement produced byte-identical
+    // file content (e.g. replacing a symbol with its own body, or formatter
+    // normalized the change away), surface `no_op: true`. See GitHub #45.
+    let final_content = write_result.final_content(&path).unwrap_or_default();
+    if source == final_content {
+        result["no_op"] = serde_json::json!(true);
+    }
+
+    edit::attach_edit_diff(&mut result, &req.params, file, &source, final_content);
+    Response::success(&req.id, result)
+}
+
+fn symbol_context<'a>(lines: &[&'a str], start: usize, end: usize) -> (Vec<&'a str>, Vec<&'a str>) {
+    // Formatting may remove lines before the original symbol location.
+    let start = start.min(lines.len());
+    let end = end.min(lines.len());
+    (
+        lines[start.saturating_sub(3)..start].to_vec(),
+        lines[end..end.saturating_add(3).min(lines.len())].to_vec(),
+    )
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn symbol_context_survives_formatter_shortening() {
+        assert_eq!(
+            symbol_context(&["formatted"], 99, 100),
+            (vec!["formatted"], vec![])
+        );
+    }
+
+    #[test]
+    fn symbol_rollback_discards_operation_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.ts");
+        let original = "export function ok() { return 1; }\n";
+        std::fs::write(&path, original).unwrap();
+        let ctx = crate::test_context(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "rollback", "command": "edit_symbol", "file": path, "symbol": "ok", "operation": "replace", "content": "function { broken"})).unwrap();
+        let response = handle_edit_symbol(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["rolled_back"], true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths(req.session())
+            .is_err());
+    }
+}
+
+fn whole_line_removal_range(source: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {
+    let line_start = source[..start_byte]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let line_end = source[end_byte..]
+        .find('\n')
+        .map_or(source.len(), |index| end_byte + index + 1);
+
+    // Consume indentation and the final line ending only when both boundary
+    // lines contain no other code. Inline neighbors must retain their spacing.
+    if source[line_start..start_byte].trim().is_empty()
+        && source[end_byte..line_end].trim().is_empty()
+    {
+        (line_start, line_end)
+    } else {
+        (start_byte, end_byte)
+    }
+}
+
+fn callable_declaration_edit_range(
+    path: &Path,
+    source: &str,
+    range: &Range,
+    end_byte: usize,
+) -> Result<(Range, bool), crate::error::AftError> {
+    use crate::parser::{
+        detect_language, node_range, node_range_with_decorators, FileParser, LangId,
+    };
+
+    let Some(lang @ (LangId::TypeScript | LangId::Tsx | LangId::JavaScript)) =
+        detect_language(path)
+    else {
+        return Ok((range.clone(), false));
+    };
+    let tree = FileParser::parse_source(path, source, lang)?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(end_byte.saturating_sub(1), end_byte);
+    while let Some(current) = node {
+        if current.kind() == "variable_declarator"
+            && node_range(&current) == *range
+            && current.child_by_field_name("value").is_some_and(|value| {
+                matches!(
+                    value.kind(),
+                    "arrow_function" | "function_expression" | "generator_function"
+                )
+            })
+        {
+            if let Some(declaration) = current.parent().filter(|parent| {
+                matches!(
+                    parent.kind(),
+                    "lexical_declaration" | "variable_declaration"
+                )
+            }) {
+                let mut cursor = declaration.walk();
+                let multiple_declarators = declaration
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "variable_declarator")
+                    .count()
+                    > 1;
+                // Expand only the edit range so navigation and semantic chunking
+                // retain the parser's symbol ranges. Include export wrappers and docs.
+                return Ok((
+                    node_range_with_decorators(&declaration, source, lang),
+                    multiple_declarators,
+                ));
+            }
+            break;
+        }
+        node = current.parent();
+    }
+    Ok((range.clone(), false))
+}

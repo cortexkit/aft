@@ -41,7 +41,7 @@
     "packages/pi-plugin/src/tools/hoisted.ts",
     "packages/pi-plugin/src/tools/reading.ts",
     "packages/pi-plugin/src/tools/fs.ts",
-    "crates/aft/src/subc_tool_schemas.json",
+    "crates/aft-subc/src/subc_tool_schemas.json",
     "packages/opencode-plugin/src/subc-tool-schemas.ts"
   ],
   "canonical_path_property_inventory": {
@@ -172,7 +172,7 @@
   },
   "subc_capability_inventory": {
     "inventory_id": "INV-V049-SUBC-CAPABILITY-001",
-    "artifact": "crates/aft/src/subc_tool_schemas.json",
+    "artifact": "crates/aft-subc/src/subc_tool_schemas.json",
     "schema_owner": "packages/opencode-plugin/src/subc-tool-schemas.ts",
     "translation_boundaries": [
       {"id": "SUBC-CAP-V049-001", "bind": "trusted", "stage": "before manifest-schema validation", "required": true, "status": "contractual; implementation owned by later slice"},
@@ -180,7 +180,7 @@
     ],
     "artifact_capabilities": [
       {"id": "SUBC-CAP-V049-003", "capability": "24 bare manifest names are serialized in fixed order", "evidence": "BARE_TOOL_ORDER in packages/opencode-plugin/src/subc-tool-schemas.ts", "status": "checked"},
-      {"id": "SUBC-CAP-V049-004", "capability": "schemas are loaded by Rust manifest translation", "evidence": "crates/aft/src/subc/manifest.rs include_str!", "status": "checked"},
+      {"id": "SUBC-CAP-V049-004", "capability": "schemas are loaded by Rust manifest translation", "evidence": "crates/aft-subc/src/subc/manifest.rs include_str!", "status": "checked"},
       {"id": "SUBC-CAP-V049-005", "capability": "schema bytes can be regenerated from host definitions", "evidence": "packages/opencode-plugin/scripts/build-tool-schemas.ts", "status": "checked; regeneration prohibited in S0"},
       {"id": "SUBC-CAP-V049-006", "capability": "trusted and untrusted binds share canonical compatibility rules", "evidence": "v0.49 specification contract", "status": "target; boundary tests owned by later slices"}
     ],

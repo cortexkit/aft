@@ -49,7 +49,10 @@ jobs:
     name: Cargo test archive (Linux)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    # Warm builds from main's cache take 16-19 minutes. A run whose crate
+    # layout or manifests differ from main's cache key compiles cold and needs
+    # about 26-30 minutes on this runner, so the budget covers a cold build.
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -88,6 +91,32 @@ jobs:
 
       - name: Build nextest archive (Linux Rust suite)
         run: cargo nextest archive --features wasm-grammars --features test-hooks --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
+        env:
+          LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
+      - name: Audit native compiler inputs (Linux)
+        run: |
+          cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$RUNNER_TEMP/aft-engine-build.jsonl"
+          python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
+      - name: Audit packaged library test inputs
+        run: |
+          cargo check --locked -p aft-engine -p aft-tools -p aft-subc --lib \
+            --features aft-engine/test-support,aft-engine/test-hooks,aft-tools/test-support,aft-tools/test-hooks,aft-subc/test-hooks,aft-subc/test-runner-notice-fixtures \
+            --message-format=json > "$RUNNER_TEMP/aft-engine-packaged-build.jsonl"
+          python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-packaged-build.jsonl" --packaged
+      - name: Engine source and shell registration guards (default features)
+        run: |
+          output="$RUNNER_TEMP/engine-source-guards.txt"
+          if ! cargo test -p aft-engine --lib -- engine_source_guard_tests > "$output" 2>&1; then
+            cat "$output"
+            exit 1
+          fi
+          cat "$output"
+          if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed;' "$output"; then
+            echo '::error::No engine source or registration guard tests ran'
+            exit 1
+          fi
+      - name: Engine source and shell registration guards (nextest archive)
+        run: python3 scripts/check-shell-registration.py --archive-file "$LINUX_NEXTEST_ARCHIVE"
         env:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
 
@@ -224,7 +253,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - uses: actions/setup-node@v5
         with:
@@ -385,6 +415,14 @@ jobs:
       - uses: ./.github/actions/setup-nextest
       - name: Run ignored real-daemon tool-provider tests
         run: bash scripts/ci-real-daemon-tests.sh
+      - name: Upload real-daemon diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: real-daemon-diagnostics-linux
+          path: ${{ runner.temp }}/aft-real-daemon-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3
 
   plugin-e2e-linux:
     name: Plugin e2e (${{ matrix.suite }}, Linux)
@@ -425,7 +463,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
@@ -536,10 +575,14 @@ jobs:
         run: cargo build --features wasm-grammars -p agent-file-tools --bin aft
       - name: Run worker broker host policy and rendered socket rule regressions
         run: |
-          cargo test --features wasm-grammars -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- gh_shim --test-threads=1
-          binary_listing="$(cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --bin aft -- --list)"
-          [[ "$binary_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]]
-          cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
+          broker=(--features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-subc --lib -- gh_shim)
+          seatbelt=(--features wasm-grammars,test-hooks -p aft-tools --lib -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition)
+          broker_listing="$(cargo test "${broker[@]}" --list)"
+          [[ "$broker_listing" == *"subc::gh_relay_wait::gh_shim_relay_tests::cancellation_and_drain_interrupt_the_reply_wait_with_one_terminal: test"* ]] || { echo 'missing aft-subc worker broker regression' >&2; exit 1; }
+          seatbelt_listing="$(cargo test "${seatbelt[@]}" --list)"
+          [[ "$seatbelt_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]] || { echo 'missing aft-tools seatbelt regression' >&2; exit 1; }
+          cargo test "${broker[@]}" --test-threads=1
+          cargo test "${seatbelt[@]}" --test-threads=1
       - name: Require worker-read test inventory and run the native gate
         shell: bash
         run: |
@@ -780,7 +823,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -824,7 +868,12 @@ jobs:
         run: python3 scripts/ci-macos-integration-archive.py list --output "$AFT_CI_ARCHIVE_DIR/macos-integration-inventory.json"
 
       - name: Capture doctest inventory
-        run: cargo test --features wasm-grammars --workspace --doc -- --list > "$AFT_CI_ARCHIVE_DIR/macos-doctest-inventory.txt" 2>&1
+        run: |
+          inventory="$AFT_CI_ARCHIVE_DIR/macos-doctest-inventory.txt"
+          if ! cargo test --features wasm-grammars --workspace --doc -- --list > "$inventory" 2> "$inventory.stderr"; then
+            cat "$inventory.stderr" >&2
+            exit 1
+          fi
         env:
           CARGO_TERM_COLOR: never
 
@@ -843,6 +892,7 @@ jobs:
             ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-nextest.tar.zst
             ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-integration-inventory.json
             ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-doctest-inventory.txt
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-doctest-inventory.txt.stderr
           compression-level: 0
           if-no-files-found: error
 
@@ -872,7 +922,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -930,6 +981,12 @@ jobs:
           path: target/cargo-timings/
           if-no-files-found: error
 
+      - name: Audit native compiler inputs (macOS)
+        run: |
+          # Keep the archive's codegen setting so Cargo can reuse its libtest build.
+          cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/aft-engine-build.jsonl"
+          python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
+
       - name: Run the serial backtrace probe with local debug objects
         run: cargo test --features wasm-grammars -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
 
@@ -974,7 +1031,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1056,7 +1114,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1170,7 +1229,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1199,7 +1259,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1228,7 +1289,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1267,7 +1329,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1364,7 +1427,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1398,7 +1462,12 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Capture watcher inventory for the split proof
-        run: cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$AFT_CI_ARCHIVE_DIR/macos-watcher-inventory.txt" 2>&1
+        run: |
+          inventory="$AFT_CI_ARCHIVE_DIR/macos-watcher-inventory.txt"
+          if ! cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$inventory" 2> "$inventory.stderr"; then
+            cat "$inventory.stderr" >&2
+            exit 1
+          fi
         env:
           CARGO_TERM_COLOR: never
 
@@ -1428,7 +1497,9 @@ jobs:
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-watcher-inventory
-          path: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-watcher-inventory.txt
+          path: |
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-watcher-inventory.txt
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-watcher-inventory.txt.stderr
           if-no-files-found: warn
 
   unit-macos-conformance:
@@ -1454,7 +1525,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1632,7 +1704,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1673,6 +1746,13 @@ jobs:
         shell: pwsh
         env:
           WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
+
+      - name: Audit native engine compiler inputs (Windows)
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$env:RUNNER_TEMP/aft-engine-build.jsonl"
+          python crates/aft-engine/checks/source-inputs.py "$env:RUNNER_TEMP/aft-engine-build.jsonl"
 
       # Run the exact archive-built harness while its local PDB still exists.
       # A package-scoped cargo test --features wasm-grammars changes workspace feature unification and
@@ -1767,7 +1847,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1854,7 +1935,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1927,7 +2009,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1955,7 +2038,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1983,7 +2067,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -2022,7 +2107,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -2118,7 +2204,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:

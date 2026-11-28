@@ -69,13 +69,13 @@ SH
 case "$1" in
   rev-parse) printf '0000000000000000000000000000000000000000\n' ;;
   diff) : ;;
-  ls-files) printf 'crates/aft/src/search_index.rs\0' ;;
+  ls-files) printf 'crates/aft-engine/src/search_index.rs\0crates/aft-tools/src/commands/grep.rs\0crates/aft-subc/src/subc/health.rs\0' ;;
 esac
 SH
   chmod +x "$temp/uname" "$temp/git"
   output=$(PATH="$temp:$PATH" bash "$script" --plan 2>&1)
-  [[ "$output" == *'--lib search_index::'* && "$output" != *'--features test-hooks'* ]] || fail "${FUNCNAME[0]}"
-  [[ "$output" == *'-p agent-file-tools -p aft-base -p aft-db --lib'* ]] || fail "${FUNCNAME[0]} library owners"
+  [[ "$output" == *'--lib search_index::'* && "$output" == *'--lib commands::'* && "$output" == *'--lib subc::'* && "$output" != *'--features test-hooks'* ]] || fail "${FUNCNAME[0]}"
+  [[ "$output" == *'-p agent-file-tools -p aft-base -p aft-db -p aft-engine -p aft-tools -p aft-subc --lib'* ]] || fail "${FUNCNAME[0]} library owners"
   output=$(PATH="$temp:$PATH" bash "$script" --plan --test-target integration --features test-timing-hooks 2>&1)
   [[ "$output" == *'--test integration --features test-hooks --features test-timing-hooks'* ]] || fail "${FUNCNAME[0]} integration hooks"
   rm -rf "$temp"

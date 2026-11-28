@@ -3,7 +3,7 @@
 // The daemon pushes a status snapshot whenever its own state changes (an
 // index finishing, a Tier-2 count arriving). Those pushes answer no session's
 // request, so the daemon strips the session-scoped fields from them
-// (`status_push_payload` in crates/aft/src/protocol.rs). This follows such a
+// (`status_push_payload` in crates/aft-base/src/protocol.rs). This follows such a
 // push through the plugin's RPC registration into the OpenCode 2 sidebar and
 // footer refresh for an empty project, whose semantic index finishes with zero
 // entries: the TUI must end on ready, 0 entries and the real disk size, and a

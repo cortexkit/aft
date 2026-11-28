@@ -7,7 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import runpy
 import shlex
@@ -34,6 +34,19 @@ GATE_TEXT = (Path(__file__).resolve().parents[2] / "scripts/rust-test-gate.sh").
 PROOF_TEXT = (Path(__file__).resolve().parents[2] / "scripts/rust-test-inventory-proof.py").read_text()
 
 
+ENGINE_SOURCE_AUDIT = re.compile(
+    r'cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json'
+    r'(?: --config "\$LIBTEST_CARGO_CONFIG")? > "(?P<json>\$(?:env:)?RUNNER_TEMP/aft-engine-build\.jsonl)"\n'
+    r'python(?:3)? crates/aft-engine/checks/source-inputs\.py "(?P=json)"'
+)
+
+
+def cargo_test_execution_lines(run: str) -> list[str]:
+    lines = run.splitlines()
+    return [line for i, line in enumerate(lines) if "cargo test" in line
+            and not ENGINE_SOURCE_AUDIT.fullmatch("\n".join(lines[i:i + 2]))]
+
+
 def workflow_job(job_id: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(job_id)}:\n(.*?)(?=^  [a-z0-9_-]+:\n|\Z)",
@@ -42,6 +55,85 @@ def workflow_job(job_id: str) -> str:
     if match is None:
         raise AssertionError(f"workflow job {job_id!r} is missing")
     return match.group(1)
+
+
+class BunSetupWorkflowTests(unittest.TestCase):
+    def test_setup_bun_uses_only_the_committed_version_file_and_workflow_token(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        github = root / ".github"
+        pin = ".bun-version"
+        self.assertRegex((root / pin).read_text().strip(), r"\A\d+\.\d+\.\d+\Z")
+        definitions = {
+            path: workflow_gates.parse_workflow(str(path))
+            for directory in (github / "workflows", github / "actions")
+            for pattern in ("*.yml", "*.yaml")
+            for path in directory.rglob(pattern)
+        }
+        groups = {
+            (path, name): job.get("steps", [])
+            for path, config in definitions.items()
+            for name, job in config.get("jobs", {"composite": config.get("runs", {})}).items()
+        }
+
+        def ordered_steps(path, group, ancestors=()):
+            self.assertNotIn(path, ancestors, f"recursive composite action: {path}")
+            for index, step in enumerate(groups[path, group]):
+                yield (path, group, index), step
+                action = step.get("uses", "")
+                if action.startswith("./.github/actions/"):
+                    for name in ("action.yml", "action.yaml"):
+                        nested = root / action / name
+                        if (nested, "composite") in groups:
+                            yield from ordered_steps(nested, "composite", (*ancestors, path))
+                            break
+
+        setup_action = "oven-sh/setup-bun@"
+        expected_sites = {
+            (path, group, index)
+            for (path, group), steps in groups.items()
+            for index, step in enumerate(steps)
+            if step.get("uses", "").startswith(setup_action)
+        }
+        workflow_refs = {
+            "",
+            "${{ github.sha }}",
+            # Landing policy validates the original PR head when there is one.
+            "${{ github.event.pull_request.head.sha || github.sha }}",
+        }
+        seen_sites = set()
+        for path, job in groups:
+            if not path.is_relative_to(github / "workflows"):
+                continue
+            checkout_pins = set()
+            # Composite steps use the caller's workspace and earlier checkouts.
+            for site, step in ordered_steps(path, job):
+                action = step.get("uses", "")
+                inputs = step.get("with") or {}
+                if action.startswith("actions/checkout@"):
+                    checkout_pin = PurePosixPath(inputs.get("path", ".")) / pin
+                    checkout_pins.discard(checkout_pin)
+                    # Do not rely on a checkout of another repository or an
+                    # arbitrary ref such as a release tag that predates the pin.
+                    if (
+                        not step.get("if")
+                        and not inputs.get("sparse-checkout")
+                        and inputs.get("repository", "${{ github.repository }}") == "${{ github.repository }}"
+                        and inputs.get("ref", "") in workflow_refs
+                    ):
+                        checkout_pins.add(checkout_pin)
+                if action.startswith(setup_action):
+                    seen_sites.add(site)
+                    with self.subTest(workflow=path.relative_to(root), job=job, step=site):
+                        self.assertNotIn("bun-version", inputs, "direct versions, including latest, override .bun-version")
+                        self.assertNotIn("bun-download-url", inputs, "custom URLs bypass the shared version pin")
+                        self.assertEqual(inputs.get("token"), "${{ github.token }}")
+                        self.assertIn(
+                            PurePosixPath(inputs.get("bun-version-file") or ""), checkout_pins,
+                            f"Bun must read {pin} from a preceding checkout of the workflow source; "
+                            f"valid paths: {[str(p) for p in sorted(checkout_pins)]}",
+                        )
+        self.assertTrue(expected_sites, "no Bun setup sites found")
+        self.assertEqual(seen_sites, expected_sites, "a Bun setup site was not checked in its caller's job")
 
 
 class ReleaseDebugArtifactWorkflowTests(unittest.TestCase):
@@ -410,6 +502,52 @@ class CISpeedWorkflowTests(unittest.TestCase):
             self.assertNotIn("$RUNNER_TEMP", call)
             self.assertNotIn('"$archive"', call)
 
+    @unittest.skipIf(os.name == "nt", "uses POSIX executables for curl and tar stubs")
+    def test_nextest_dns_fallback_still_checks_the_archive_before_extraction(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        action = workflow_gates.parse_workflow(str(root / ".github/actions/setup-nextest/action.yml"))
+        install = next(step for step in action["runs"]["steps"] if step.get("name") == "Download and install cargo-nextest")
+        primary = "https://get.nexte.st/0.9.138/mac"
+        fallback = ("https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.138/"
+                    "cargo-nextest-0.9.138-universal-apple-darwin.tar.gz")
+        for valid in (True, False):
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as tmp:
+                fixture = Path(tmp)
+                curl = fixture / "curl"
+                curl.write_text(textwrap.dedent("""\
+                    #!/bin/bash
+                    for arg in "$@"; do
+                      if [[ "$output_next" == 1 ]]; then output="$arg"; output_next=0; fi
+                      if [[ "$arg" == --output ]]; then output_next=1; fi
+                    done
+                    url="${!#}"
+                    printf '%s\\n' "$url" >> "$DOWNLOADS"
+                    case "$url" in
+                      https://get.nexte.st/*) exit 6 ;;
+                      *) printf '%s\\n' "$PAYLOAD" > "$output" ;;
+                    esac
+                    """))
+                curl.chmod(0o755)
+                tar = fixture / "tar"
+                tar.write_text('#!/bin/bash\nprintf "%s\\n" "$1" >> "$EXTRACTIONS"\necho cargo-nextest\n')
+                tar.chmod(0o755)
+                downloads, tar_calls = fixture / "downloads", fixture / "tar-calls"
+                env = dict(os.environ, PATH=f"{fixture}:{os.environ['PATH']}", HOME=tmp, RUNNER_TEMP=tmp,
+                           RUNNER_ENVIRONMENT="github-hosted", NEXTEST_VERSION="0.9.138", NEXTEST_RUNNER_OS="macOS",
+                           DOWNLOADS=str(downloads), EXTRACTIONS=str(tar_calls),
+                           PAYLOAD="fixture archive" if valid else "corrupt archive")
+                # Keep the actual checksum command but give it a small, known payload.
+                pin = "124baa34d160355fa8a8bed053856270cfcf132659e76a0bc8bbcdfc093266b7"
+                script = install["run"].replace(pin, hashlib.sha256(b"fixture archive\n").hexdigest())
+                result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(downloads.read_text().splitlines(), [primary, fallback], result.stderr)
+                if valid:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(tar_calls.read_text().splitlines(), ["-tzf", "-xzf"])
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(tar_calls.exists(), "a mismatched fallback may not reach tar")
+
     def test_tool_downloads_are_never_piped_to_tar(self) -> None:
         root = Path(__file__).resolve().parents[2] / ".github"
         violations = []
@@ -431,7 +569,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
         download_sites = [
             path.relative_to(root).as_posix()
             for path in github.rglob("*.yml")
-            if "get.nexte.st/" in path.read_text()
+            if re.search(r"get\.nexte\.st/|github\.com/nextest-rs/nextest/releases/download/", path.read_text())
         ]
         self.assertEqual(download_sites, [".github/actions/setup-nextest/action.yml"])
 
@@ -588,6 +726,11 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
         self.assertIn({"uses": "./.github/actions/setup-nextest"}, job["steps"])
         self.assertIn({"name": "Run ignored real-daemon tool-provider tests",
                        "run": "bash scripts/ci-real-daemon-tests.sh"}, job["steps"])
+        upload = next(step for step in job["steps"] if step.get("name") == "Upload real-daemon diagnostics on failure")
+        self.assertEqual(upload["if"], "failure()")
+        self.assertEqual(upload["uses"], "./.github/actions/upload-artifact-retry")
+        self.assertEqual(upload["with"]["path"], "${{ runner.temp }}/aft-real-daemon-diagnostics/")
+        self.assertLessEqual(int(upload["with"]["retention-days"]), 3)
         root = Path(__file__).resolve().parents[2]
         script = (root / "scripts/ci-real-daemon-tests.sh").read_text()
         for required in (
@@ -629,6 +772,66 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
                 self.assertFalse(fixture.exists(), "runner must clean up even after a failure")
                 homes.append(paths[0])
             self.assertNotEqual(*homes)
+
+    @unittest.skipUnless(sys.platform == "linux", "daemon runner uses GNU stat")
+    def test_real_daemon_gate_exports_only_safe_case_diagnostics_on_failure(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        runner = root / "scripts/ci-real-daemon-test-runner.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            case = base / "fake-case"
+            case.write_text(textwrap.dedent('''\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                mkdir -p "$TMPDIR/.tmpfake/logs" "$TMPDIR/.tmpfake/runtime"
+                printf 'cookie-unseen\n' > "$TMPDIR/.tmpfake/runtime/subc-connection.json"
+                {
+                  printf '%s image_deploy_start\n' "$(date +%s%3N)"
+                  printf '%s daemon_connection_published\n' "$(date +%s%3N)"
+                  printf '%s daemon_route_accepted_aft\n' "$(date +%s%3N)"
+                } >> "$AFT_REAL_DAEMON_CASE_DIR/timeline"
+                printf '%s INFO control.rs:10 module=aft code=- reason=- route.open accepted\n' "$(date +%s%3N)" > "$AFT_REAL_DAEMON_CASE_DIR/daemon.log"
+                printf 'unrecognized daemon message cookie-unseen\n' >> "$AFT_REAL_DAEMON_CASE_DIR/daemon.log"
+                stamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+                {
+                  printf '%s [aft-startup] pid=42 phase=nonce_capture_start elapsed_ms=0\n' "$stamp"
+                  printf '%s [aft] INFO subc attach: authenticated to daemon via cookie-unseen\n' "$stamp"
+                  printf '%s [aft] INFO readiness: flipped ready after 10 ms (cookie-unseen)\n' "$stamp"
+                  for ((i=0; i<3000; i++)); do printf '%s oversized module message cookie-unseen\n' "$stamp"; done
+                  printf '%s [aft] WARN cookie-unseen\n' "$stamp"
+                } > "$TMPDIR/.tmpfake/logs/aft.stderr.log"
+                printf "thread 'case' (42) panicked at crates/aft/tests/tool_provider_subc_e2e.rs:1:2:\\nmodule_warming live=false cookie-unseen\\n" >&2
+                exit "$FIXTURE_EXIT"
+                '''))
+            cargo = base / "cargo"
+            cargo.write_text(textwrap.dedent(f'''\
+                #!/usr/bin/env bash
+                if [[ $2 == --version ]]; then echo 'cargo-nextest fixture'; exit 0; fi
+                exec bash {shlex.quote(str(runner))} bash {shlex.quote(str(case))} tool_provider_subc_e2e::fixture_case
+                '''))
+            cargo.chmod(0o755)
+            env = {**os.environ, "PATH": str(base) + os.pathsep + os.environ["PATH"], "RUNNER_TEMP": directory}
+            export = base / "aft-real-daemon-diagnostics"
+            for code in (0, 7):
+                result = subprocess.run(["bash", str(root / "scripts/ci-real-daemon-tests.sh")],
+                                        capture_output=True, text=True, env={**env, "FIXTURE_EXIT": str(code)})
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertNotIn("cookie-unseen", result.stdout + result.stderr)
+                self.assertFalse(list(base.glob("aft-real-daemon.*")), "raw fixture must be removed")
+                if not code:
+                    self.assertFalse(export.exists(), "do not retain reports from passing gates")
+            logs = {file.name: file.read_text() for file in export.glob("*/*/*") if file.is_file()}
+            self.assertEqual(set(logs), {"daemon.log", "modules.log", "test.stderr.log", "timeline.log"})
+            self.assertIn("route.open accepted", logs["daemon.log"])
+            self.assertIn("panic at tool_provider_subc_e2e.rs:1:2", logs["test.stderr.log"])
+            self.assertIn("module_warming", logs["test.stderr.log"])
+            self.assertIn("aft_stderr WARN (details omitted)", logs["modules.log"])
+            for phase in ("test_start", "image_deploy_start", "daemon_connection_published", "aft_authenticated",
+                          "aft_ready", "daemon_route_accepted_aft", "test_exit 7"):
+                self.assertIn(phase, logs["timeline.log"])
+            for log in logs.values():
+                self.assertNotIn("cookie-unseen", log)
+                self.assertLessEqual(len(log.encode()), 128 * 1024)
 
     @unittest.skipUnless(sys.platform == "linux", "daemon runner uses GNU stat")
     def test_real_daemon_gate_rejects_insecure_ancestors_before_running_tests(self) -> None:
@@ -763,11 +966,24 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
             for job_id in suite["jobs"]:
                 if job_id.startswith("unit-windows-") and job_id != "unit-windows-nextest-archive":
                     self.assertNotIn("ci-windows-probes.py", workflow_job(job_id))
-        self.assertFalse(any(line.startswith("cargo test ") for command in commands for line in command.splitlines()))
+        for command in commands:
+            self.assertEqual(cargo_test_execution_lines(command), [], command)
+        audit = next(step for step in archive["steps"] if step.get("name") == "Audit native engine compiler inputs (Windows)")
+        self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
+        self.assertNotIn("CARGO_TARGET_DIR", audit.get("env", {}))
         python = next(i for i, step in enumerate(archive["steps"]) if step.get("uses") == "actions/setup-python@v6")
         tls = next(i for i, step in enumerate(archive["steps"]) if "--probe tls" in step.get("run", ""))
         self.assertEqual(archive["steps"][python]["with"]["python-version"], "3.14")
         self.assertLess(python, tls)
+
+    def test_only_compile_only_cargo_test_followed_by_engine_audit_is_allowed(self) -> None:
+        build = ('cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks '
+                 '--message-format=json > "$env:RUNNER_TEMP/aft-engine-build.jsonl"')
+        audit = 'python crates/aft-engine/checks/source-inputs.py "$env:RUNNER_TEMP/aft-engine-build.jsonl"'
+        self.assertEqual(cargo_test_execution_lines(f"{build}\n{audit}"), [])
+        executes = build.replace(" --no-run", "")
+        self.assertEqual(cargo_test_execution_lines(f"{executes}\n{audit}"), [executes])
+        self.assertEqual(cargo_test_execution_lines(build), [build])
 
     def test_windows_libtest_shards_select_only_archive_partitions(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -935,7 +1151,7 @@ class UnitShardPartitionCountTests(unittest.TestCase):
             "os": os,
             "sys": __import__("sys"),
             "NextestEntry": object,
-            "run_command": lambda command, merge_stderr=True: list_calls.append(command) or "",
+            "run_command": lambda command: list_calls.append(command) or "",
             "parse_nextest_list": lambda output, kinds=None, matching_tests_only=False: [],
         }
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), namespace)
@@ -968,12 +1184,13 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         proof["partition_nextest_entries"](["cargo", "nextest", "list"])
         self.assertEqual([call[-1] for call in calls], ["hash:1/3", "hash:2/3", "hash:3/3"])
 
-    def test_proof_cargo_list_ignores_msvc_linker_warnings(self) -> None:
+    def test_proof_cargo_list_captures_stdout_separately_from_diagnostics(self) -> None:
         import ast
 
-        # The wasm-grammars build makes MSVC print LNK4217 warnings for the Wasm
-        # runtime's C API between cargo's `Running` line and the test names.
-        wanted_functions = {"parse_cargo_list", "suite_name_from_artifact"}
+        wanted_functions = {
+            "resolve_shell_command", "capture_command", "run_cargo_list", "parse_cargo_list",
+            "suite_name_from_artifact",
+        }
         nodes = [
             node
             for node in ast.parse(PROOF_TEXT).body
@@ -992,32 +1209,54 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {module.__name__: module}):
             exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), module.__dict__)
         namespace = module.__dict__
-        output = (
-            "     Running unittests src\\lib.rs (target\\debug\\deps\\agent_file_tools-0123abcd.exe)\n"
-            "         LINK : warning LNK4217: symbol 'wasm_engine_delete' defined in 'libwasmtime_c_api.rlib' is imported\n"
-            # Cargo's unused-dependency manifest lint ends with a bare `help:` line.
+        stdout = (
+            "parser::tests::parses: test\n"
+            "\n"
+            "1 test, 0 benchmarks\n"
+            "0 tests, 0 benchmarks\n"
+            "src/lib.rs - documented (line 1): test\n"
+            "1 test, 0 benchmarks\n"
+        )
+        stderr = (
+            # The hosted Windows manifest lint ends with an unindented help line.
             "warning: unused dependency `rustc-demangle`\n"
             "  --> crates\\aft-base\\Cargo.toml:39:1\n"
             "   |\n"
             "   = note: `cargo::unused_dependencies` is set to `warn` by default\n"
             "help: consider removing the dependency on `rustc-demangle`\n"
-            "parser::tests::parses: test\n"
-            "\n"
-            "1 test, 0 benchmarks\n"
+            "     Running unittests src\\lib.rs (target\\debug\\deps\\aft_engine-0123abcd.exe)\n"
+            "         LINK : warning LNK4217: symbol 'wasm_engine_delete' is imported\n"
+            "     Running unittests src\\main.rs (target\\debug\\deps\\aft-1234abcd.exe)\n"
+            "   Doc-tests aft_engine\n"
         )
-        entries = namespace["parse_cargo_list"](output)
-        self.assertEqual([(entry.kind, entry.name) for entry in entries], [("lib", "parser::tests::parses")])
+        command = ["cargo", "test", "--", "--list"]
+        completed = subprocess.CompletedProcess(command, 0, stdout, stderr)
+        with unittest.mock.patch("subprocess.run", return_value=completed) as run:
+            entries = namespace["run_cargo_list"](command)
+        self.assertEqual(run.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(
+            [(entry.kind, entry.suite, entry.name) for entry in entries],
+            [("lib", "aft_engine", "parser::tests::parses"),
+             ("doc", "aft_engine", "src/lib.rs - documented (line 1)")],
+        )
+        with self.assertRaisesRegex(RuntimeError, "unrecognized cargo list line: unexpected"):
+            namespace["parse_cargo_list"]("unexpected\n" + stdout, stderr)
+        with self.assertRaisesRegex(RuntimeError, "unrecognized cargo list line: help:"):
+            namespace["parse_cargo_list"]("help: consider removing the dependency\n" + stdout, stderr)
+        with self.assertRaisesRegex(RuntimeError, "lists 1 tests, expected 2"):
+            namespace["parse_cargo_list"](stdout.replace("1 test,", "2 tests,", 1), stderr)
 
     def test_inventory_proof_resolves_bash_before_starting_it(self) -> None:
         import ast
         import types
 
-        wanted = {"resolve_shell_command", "run_command"}
+        wanted = {"resolve_shell_command", "capture_command", "run_command"}
         nodes: list[ast.stmt] = [
             node for node in ast.parse(PROOF_TEXT).body
             if isinstance(node, ast.FunctionDef) and node.name in wanted
         ]
-        self.assertEqual(len(nodes), 2)
+        self.assertEqual(len(nodes), len(wanted))
         run = unittest.mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""))
         which = unittest.mock.Mock(return_value="C:/Program Files/Git/bin/bash.exe")
         namespace = {
@@ -1040,6 +1279,46 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, "bash.*PATH"):
             namespace["run_command"](["bash", "scripts/check-cmake.sh"])
         run.assert_called_once()
+
+    def test_systemd_scope_gate_checks_each_owner_and_counts_only_its_parent_harness(self) -> None:
+        workflow = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/tests.yml"))
+        step = next(
+            step for step in workflow["jobs"]["unit-linux-task-scopes"]["steps"]
+            if step.get("name") == "Run every user-manager test, with no skips"
+        )
+        self.assertEqual(step["run"], "bash scripts/check-systemd-task-scopes.sh")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            cargo = folder / "cargo"
+            cargo.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+if [[ $1 == --version ]]; then echo 'cargo fixture'; exit 0; fi
+case "$*" in
+  *' -p aft-engine --lib '*) count=20 ;;
+  *' -p aft-tools --lib '*) count=1 ;;
+  *) echo "unexpected test selection: $*" >&2; exit 9 ;;
+esac
+if [[ $* == *' --list' ]]; then
+  if [[ ${EMPTY_TASK_SCOPE_FIXTURE:-0} == 1 && $count == 1 ]]; then count=0; fi
+  for ((i=0; i<count; i++)); do printf 'task_scope_case_%s: test\n' "$i"; done
+else
+  if [[ $count == 20 ]]; then
+    echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out'
+  fi
+  printf 'test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' "$count"
+fi
+''')
+            cargo.chmod(0o755)
+            env = {**os.environ, "PATH": str(folder) + os.pathsep + os.environ["PATH"],
+                   "RUNNER_TEMP": str(folder), "EMPTY_TASK_SCOPE_FIXTURE": "0"}
+            command = ["bash", "-c", step["run"]]
+            result = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Systemd task-scope gate passed: 21 tests ran, zero skipped", result.stdout)
+            result = subprocess.run(command, cwd=REPO_ROOT, env={**env, "EMPTY_TASK_SCOPE_FIXTURE": "1"},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("aft-tools: expected 1 systemd user-manager tests, found 0", result.stderr)
 
     def test_proof_remaps_every_archive_list_and_partition_to_the_consumer(self) -> None:
         import ast
@@ -1101,9 +1380,13 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertEqual(job["timeout-minutes"], "140")
         cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
         build_steps = [command for command in cargo_steps if re.search(r"\bcargo (nextest|test)\b", command)]
-        self.assertEqual(len(build_steps), 3)
+        self.assertEqual(len(build_steps), 4)
         for command in build_steps:
             self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
+        audit = next(step for step in job["steps"] if step.get("name") == "Audit native compiler inputs (macOS)")
+        self.assertIn(audit["run"], build_steps)
+        self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
+        self.assertNotIn("CARGO_TARGET_DIR", audit.get("env", {}))
         archive = next(command for command in build_steps if "nextest archive" in command)
         self.assertIn("--timings", archive)
         self.assertIn('/usr/bin/time -l cargo nextest archive', archive)
@@ -1779,10 +2062,11 @@ while [[ "$1" != --output ]]; do shift; done
                     else:
                         self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}", name)
                     self.assertRegex(run, r"cargo (build|rustc|check|nextest (archive|list)|test)|ci-macos-integration-archive.py", name)
-                if any(command in run for command in (
+                runs_tests = cargo_test_execution_lines(run) or any(command in run for command in (
                     "rust-test-gate.sh", "ci-windows-probes.py", "bun run test:unit", "bun test ",
-                    "tests/macos-e2e/run.sh", "tests/windows-e2e/run.ps1", "cargo test",
-                )) and not ("-- --list" in run and "-- --exact" not in run):
+                    "tests/macos-e2e/run.sh", "tests/windows-e2e/run.ps1",
+                ))
+                if runs_tests and not ("-- --list" in run and "-- --exact" not in run):
                     checked += 1
                     self.assertNotIn("CARGO_TARGET_DIR", env, name)
                     self.assertNotIn("CARGO_BUILD_TARGET_DIR", env, name)

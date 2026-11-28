@@ -45,9 +45,9 @@ print("cargo-nextest fake")
         result, arguments = self.run_hunt()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         selected = [arguments[index + 1] for index, value in enumerate(arguments) if value == "-p"]
-        self.assertEqual(selected, ["agent-file-tools", "aft-base", "aft-db"])
+        self.assertEqual(selected, ["agent-file-tools", "aft-base", "aft-db", "aft-engine", "aft-tools", "aft-subc"])
         self.assertIn("bounded_io::", arguments)
-        self.assertIn("package: agent-file-tools + aft-base + aft-db", result.stdout)
+        self.assertIn("package: agent-file-tools + aft-base + aft-db + aft-engine + aft-tools + aft-subc", result.stdout)
 
     def test_explicit_package_still_selects_only_that_package(self):
         result, arguments = self.run_hunt(package="aft-base")

@@ -75,7 +75,7 @@ fn shipped_threshold_path() -> PathBuf {
     workspace_root().join(CONFIDENCE_THRESHOLD_RELATIVE_PATH)
 }
 
-/// The product embeds its own copy of the threshold (crates/aft/assets) so a
+/// The product embeds its own copy of the threshold (crates/aft-tools/assets) so a
 /// product build never reaches into benchmarks/; the benchmark keeps the
 /// original. Neither may drift from the other.
 #[test]
@@ -85,7 +85,7 @@ fn pinned_threshold_is_byte_identical_to_the_benchmark_fixture() {
     assert_eq!(
         confidence::PINNED_CONFIDENCE_THRESHOLD_JSON,
         benchmark,
-        "crates/aft/assets/search-confidence-threshold.pinned.json must equal {}",
+        "crates/aft-tools/assets/search-confidence-threshold.pinned.json must equal {}",
         CONFIDENCE_THRESHOLD_RELATIVE_PATH
     );
 }

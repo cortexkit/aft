@@ -1,5 +1,7 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
   existsSync,
   mkdirSync,
@@ -212,16 +214,31 @@ export function githubLayoutTests(installer: Installer): void {
             layout: "standalone",
           }),
         );
-        // A loaded CI machine can take longer than the 2 s production budget
-        // just to start the script; the check must run to completion here.
-        const result = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch, {
-          __smokeTimeoutMsForTests: 30_000,
-        });
-        expect(result.cachedBinDirs).not.toContain(dirname(binary));
-        await result.installsComplete;
-        expect(result.cachedBinDirs).toContain(dirname(binary));
-        expect(await result.getCachedBinDirs()).toContain(dirname(binary));
-        expect(readFileSync(`${binary}.runs`, "utf8")).toBe("x");
+        // Deliver the smoke process's exit explicitly so the test controls
+        // publication order without waiting for a shell to start or exit.
+        const child = new EventEmitter() as childProcess.ChildProcess;
+        const realSpawn = childProcess.spawn;
+        const mockSpawn = ((...args: Parameters<typeof realSpawn>) => {
+          if (args[0] === binary) return child;
+          return Reflect.apply(realSpawn, childProcess, args);
+        }) as typeof realSpawn;
+        const spawnSmoke = spyOn(childProcess, "spawn").mockImplementation(mockSpawn);
+        try {
+          const result = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+          expect(spawnSmoke.mock.calls.filter(([path]) => path === binary)).toHaveLength(1);
+          expect(result.cachedBinDirs).not.toContain(dirname(binary));
+          child.emit("exit", 0, null);
+          await result.installsComplete;
+          expect(result.cachedBinDirs).toContain(dirname(binary));
+          expect(await result.getCachedBinDirs()).toContain(dirname(binary));
+          const meta = JSON.parse(
+            readFileSync(join(dirname(binary), "..", ".aft-installed"), "utf8"),
+          );
+          expect(meta.smoke).toEqual({ binarySha256: digest, verdict: "passed" });
+        } finally {
+          if (child.listenerCount("exit") > 0) child.emit("exit", 0, null);
+          spawnSmoke.mockRestore();
+        }
       });
     },
   );

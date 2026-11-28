@@ -12,7 +12,7 @@ pub(super) const CASES: [&str; 5] = [
 
 pub(super) fn fixture() -> ToolVersionFixture {
     let schemas: Value =
-        serde_json::from_str(include_str!("../../src/subc_tool_schemas.json")).unwrap();
+        serde_json::from_str(include_str!("../../../aft-subc/src/subc_tool_schemas.json")).unwrap();
     let mut older = schemas["read"].clone();
     let properties = older["properties"].as_object_mut().unwrap();
     let path = properties.remove("path").unwrap();

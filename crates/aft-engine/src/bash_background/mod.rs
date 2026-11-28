@@ -1,0 +1,2403 @@
+//! Background bash task management: spawning detached tasks, the watchdog that
+//! reaps them, output buffering/compression, and on-disk persistence so tasks
+//! survive a bridge restart.
+
+#[doc(hidden)]
+pub mod frames;
+
+pub mod buffer;
+pub(crate) mod counted_mutex;
+mod exit_observer;
+mod gc_cursor;
+mod gc_memo;
+mod memory_limit;
+#[cfg(feature = "test-support")]
+pub(crate) use memory_limit::MemoryPolicy as MemoryPolicyForTest;
+pub mod output;
+pub mod persistence;
+pub mod process;
+pub(crate) mod pty_input;
+pub mod pty_process;
+pub mod pty_runtime;
+pub mod registry;
+#[doc(hidden)]
+pub mod runner_notice_scheduler;
+#[doc(hidden)]
+pub mod scoped_tasks;
+#[doc(hidden)]
+pub mod shell_metadata;
+#[doc(hidden)]
+pub mod store_writes;
+pub(crate) mod task_scope;
+mod temp_cleanup;
+#[doc(hidden)]
+pub mod viewed_task;
+pub use crate::task_watch_lines as watch_lines;
+pub mod watchdog;
+pub use crate::task_watches as watches;
+pub(crate) mod windows_waiter;
+#[doc(hidden)]
+pub mod worker_thread;
+
+use crate::bash_permissions::PermissionAsk;
+use crate::context::AppContext;
+use crate::protocol::Response;
+#[cfg(unix)]
+use crate::sandbox_spawn::native_sandbox_enforced;
+use crate::sandbox_spawn::{
+    current_authenticated_principal, HostEscalationAttempt, RequestedSandboxTier, SandboxTaskKind,
+};
+use persistence::BgMode;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+pub use gc_memo::{persisted_gc_health, PersistedGcFailure, PersistedGcHealth, PersistedGcSummary};
+pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry, WatchdogPassCause};
+
+#[cfg(all(test, unix))]
+mod slot_limit_tests;
+
+/// A shell startup has a reply budget even before it has an executor worker.
+/// The short state lock fences process creation against a deadline refusal;
+/// no filesystem operation, process creation, or registry lock runs under it.
+///
+/// The state leaves `Pending` exactly once, under that lock: either the
+/// startup commits (a task record exists and process creation follows, or an
+/// in-process rewrite is about to run) or the reply deadline refuses it. Both
+/// end states are final, so a caller told "refused" can rely on the command
+/// never starting later, and a caller told "committed" gets the task id.
+#[doc(hidden)]
+pub struct SpawnReceipt {
+    changed_files_deadline: std::sync::OnceLock<crate::bash_changed_files::SharedCallDeadline>,
+    state: std::sync::Mutex<SpawnReceiptState>,
+    deadline: std::time::Instant,
+    reply_clock: crate::blocking_wait::ReplyBudget,
+    startup_steps: std::sync::Mutex<StartupSteps>,
+    #[cfg(feature = "test-timing-hooks")]
+    startup_clock_for_test: Option<StartupClockForTest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum BashStartupStep {
+    Admission,
+    Setup,
+    Environment,
+    GitPolicy,
+    Profile,
+    TaskDirectory,
+    ControlFiles,
+    SpawnPreparation,
+}
+
+impl BashStartupStep {
+    const ALL: [Self; 8] = [
+        Self::Admission,
+        Self::Setup,
+        Self::Environment,
+        Self::GitPolicy,
+        Self::Profile,
+        Self::TaskDirectory,
+        Self::ControlFiles,
+        Self::SpawnPreparation,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Admission => 0,
+            Self::Setup => 1,
+            Self::Environment => 2,
+            Self::GitPolicy => 3,
+            Self::Profile => 4,
+            Self::TaskDirectory => 5,
+            Self::ControlFiles => 6,
+            Self::SpawnPreparation => 7,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Setup => "setup",
+            Self::Environment => "environment",
+            Self::GitPolicy => "git_policy",
+            Self::Profile => "profile",
+            Self::TaskDirectory => "task_directory",
+            Self::ControlFiles => "control_files",
+            Self::SpawnPreparation => "spawn_prep",
+        }
+    }
+
+    #[doc(hidden)]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Admission => "executor admission",
+            Self::Setup => "request setup",
+            Self::Environment => "environment build",
+            Self::GitPolicy => "Git policy discovery",
+            Self::Profile => "sandbox profile build",
+            Self::TaskDirectory => "task directory creation",
+            Self::ControlFiles => "task and control-file creation",
+            Self::SpawnPreparation => "spawn preparation",
+        }
+    }
+}
+
+const STARTUP_STEP_COUNT: usize = BashStartupStep::ALL.len();
+
+#[derive(Clone, Copy)]
+struct StartupSteps {
+    completed: [std::time::Duration; STARTUP_STEP_COUNT],
+    seen: u16,
+    current: BashStartupStep,
+    entered_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct BashStartupStepSnapshot {
+    completed: [std::time::Duration; STARTUP_STEP_COUNT],
+    seen: u16,
+    current: BashStartupStep,
+    running_for: std::time::Duration,
+}
+
+impl StartupSteps {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            completed: [std::time::Duration::ZERO; STARTUP_STEP_COUNT],
+            seen: 1 << BashStartupStep::Admission.index(),
+            current: BashStartupStep::Admission,
+            entered_at: started_at,
+        }
+    }
+
+    fn enter(&mut self, step: BashStartupStep, now: std::time::Instant) {
+        if self.current == step {
+            return;
+        }
+        let index = self.current.index();
+        self.completed[index] += now.saturating_duration_since(self.entered_at);
+        self.current = step;
+        self.entered_at = now;
+        self.seen |= 1 << step.index();
+    }
+
+    fn snapshot(self, now: std::time::Instant) -> BashStartupStepSnapshot {
+        BashStartupStepSnapshot {
+            completed: self.completed,
+            seen: self.seen,
+            current: self.current,
+            running_for: now.saturating_duration_since(self.entered_at),
+        }
+    }
+}
+
+impl BashStartupStepSnapshot {
+    #[doc(hidden)]
+    pub fn current(self) -> BashStartupStep {
+        self.current
+    }
+
+    #[doc(hidden)]
+    pub fn format_steps(self) -> String {
+        use std::fmt::Write as _;
+
+        let mut formatted = String::with_capacity(128);
+        for step in BashStartupStep::ALL {
+            if self.seen & (1 << step.index()) == 0 {
+                continue;
+            }
+            if !formatted.is_empty() {
+                formatted.push(',');
+            }
+            let elapsed = self.completed[step.index()]
+                + if step == self.current {
+                    self.running_for
+                } else {
+                    std::time::Duration::ZERO
+                };
+            let _ = write!(formatted, "{}:{}ms", step.label(), elapsed.as_millis());
+            if step == self.current {
+                formatted.push_str("(running)");
+            }
+        }
+        formatted
+    }
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[derive(Clone, Copy)]
+/// Fixture clock shared by the startup reply timer and receipt commit fence.
+/// Freezing time never overrides an already refused or committed receipt.
+#[doc(hidden)]
+pub enum StartupClockForTest {
+    Frozen,
+    Expired,
+}
+
+#[derive(Default)]
+enum SpawnReceiptState {
+    #[default]
+    Pending,
+    Refused,
+    Committed(String),
+    /// A bash rewrite is executing the command inside this process (for
+    /// example an append turned into a file edit). It has no task id, so the
+    /// only way to learn its outcome is to wait for its reply.
+    CommittedInline,
+}
+
+/// What the reply deadline found when it settled a startup's receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum StartupOutcome {
+    /// Nothing had committed; the receipt is now refused and the command can
+    /// never start under it.
+    Refused,
+    /// A task record exists and its process is being (or has been) created.
+    Task(String),
+    /// The command is running inside this process as a bash rewrite.
+    Inline,
+}
+
+impl SpawnReceipt {
+    #[doc(hidden)]
+    pub fn with_reply_clock(mut self, clock: crate::blocking_wait::ReplyBudget) -> Self {
+        self.reply_clock = clock;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn bind_changed_files_deadline(
+        &self,
+        deadline: crate::bash_changed_files::SharedCallDeadline,
+    ) {
+        let _ = self.changed_files_deadline.set(deadline);
+    }
+    #[doc(hidden)]
+    pub fn limit_changed_files_deadline(&self, deadline: std::time::Instant) {
+        if let Some(shared) = self.changed_files_deadline.get() {
+            let mut bound = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // None means the foreground reply no longer needs this deadline;
+            // late spawn completion must not reactivate it.
+            if let Some(current) = bound.as_mut() {
+                *current = (*current).min(deadline);
+            }
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new(deadline: std::time::Instant) -> Self {
+        Self::new_with_start_time(deadline, std::time::Instant::now())
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_start_time(
+        deadline: std::time::Instant,
+        startup_started_at: std::time::Instant,
+    ) -> Self {
+        Self {
+            state: std::sync::Mutex::new(SpawnReceiptState::Pending),
+            changed_files_deadline: std::sync::OnceLock::new(),
+            deadline,
+            reply_clock: crate::blocking_wait::ReplyBudget::new(startup_started_at, None),
+            startup_steps: std::sync::Mutex::new(StartupSteps::new(startup_started_at)),
+            #[cfg(feature = "test-timing-hooks")]
+            startup_clock_for_test: match std::env::var("AFT_TEST_SUBC_BASH_STARTUP_CLOCK")
+                .as_deref()
+            {
+                Ok("frozen") => Some(StartupClockForTest::Frozen),
+                Ok("expired") => Some(StartupClockForTest::Expired),
+                _ => None,
+            },
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn enter_startup_step(&self, step: BashStartupStep) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*state, SpawnReceiptState::Pending) || self.reply_clock.now() >= self.deadline
+        {
+            return;
+        }
+        self.startup_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .enter(step, std::time::Instant::now());
+    }
+
+    #[doc(hidden)]
+    pub fn startup_step_snapshot(&self) -> BashStartupStepSnapshot {
+        self.startup_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(std::time::Instant::now())
+    }
+
+    #[cfg(feature = "test-timing-hooks")]
+    #[doc(hidden)]
+    pub fn startup_clock_for_test(&self) -> Option<StartupClockForTest> {
+        self.startup_clock_for_test
+    }
+
+    /// Settles the receipt at the reply deadline. A pending receipt becomes
+    /// refused under the same lock every commit takes, so it is impossible
+    /// for this to return `Refused` and for a commit to succeed afterwards.
+    #[doc(hidden)]
+    pub fn expire(&self) -> StartupOutcome {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            SpawnReceiptState::Committed(id) => StartupOutcome::Task(id.clone()),
+            SpawnReceiptState::CommittedInline => StartupOutcome::Inline,
+            SpawnReceiptState::Pending | SpawnReceiptState::Refused => {
+                *state = SpawnReceiptState::Refused;
+                StartupOutcome::Refused
+            }
+        }
+    }
+
+    fn commit(&self, committed: SpawnReceiptState) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.reply_clock.now();
+        #[cfg(feature = "test-timing-hooks")]
+        let now = match self.startup_clock_for_test {
+            Some(StartupClockForTest::Frozen) => self.deadline - std::time::Duration::from_nanos(1),
+            Some(StartupClockForTest::Expired) => self.deadline,
+            None => now,
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        let now = SPAWN_COMMIT_TIME_FOR_TEST.with(|clock| clock.get().unwrap_or(now));
+        if !matches!(*state, SpawnReceiptState::Pending) || now >= self.deadline {
+            // A second commit on one receipt is a bug; refusing it keeps an
+            // earlier commit's answer intact instead of overwriting it.
+            if matches!(*state, SpawnReceiptState::Pending) {
+                *state = SpawnReceiptState::Refused;
+            }
+            return Err(
+                "bash startup deadline expired before process creation; command was not started"
+                    .into(),
+            );
+        }
+        *state = committed;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn refused(&self) -> bool {
+        matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SpawnReceiptState::Refused
+        )
+    }
+}
+
+fn spawn_receipt_committed() -> bool {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|receipt| {
+            matches!(
+                *receipt
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                SpawnReceiptState::Committed(_)
+            )
+        })
+    })
+}
+
+thread_local! {
+    static CURRENT_SPAWN_RECEIPT: std::cell::RefCell<Option<std::sync::Arc<SpawnReceipt>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static SPAWN_COMMIT_TIME_FOR_TEST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Overrides only the receipt's clock on this thread, leaving other startups
+/// and the real process/persistence path untouched.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn with_spawn_commit_time_for_test<T>(
+    now: std::time::Instant,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::time::Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPAWN_COMMIT_TIME_FOR_TEST.with(|clock| clock.set(self.0));
+        }
+    }
+    let previous = SPAWN_COMMIT_TIME_FOR_TEST.with(|clock| clock.replace(Some(now)));
+    let _restore = Restore(previous);
+    run()
+}
+
+#[doc(hidden)]
+pub fn with_spawn_receipt<T>(receipt: std::sync::Arc<SpawnReceipt>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<std::sync::Arc<SpawnReceipt>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_SPAWN_RECEIPT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = CURRENT_SPAWN_RECEIPT.with(|slot| slot.replace(Some(receipt)));
+    let _restore = Restore(previous);
+    run()
+}
+pub(crate) fn changed_files_deadline_for_spawn(
+) -> Option<crate::bash_changed_files::SharedCallDeadline> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        slot.borrow()
+            .as_ref()?
+            .changed_files_deadline
+            .get()
+            .cloned()
+    })
+}
+
+pub(crate) fn provider_startup_remaining() -> Option<std::time::Duration> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        let receipt = slot.borrow();
+        let receipt = receipt.as_ref()?;
+        Some(
+            receipt
+                .deadline
+                .saturating_duration_since(receipt.reply_clock.now()),
+        )
+    })
+}
+
+pub(crate) fn enter_bash_startup_step(step: BashStartupStep) {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        if let Some(receipt) = slot.borrow().as_ref() {
+            receipt.enter_startup_step(step);
+        }
+    });
+}
+
+/// Called only after the starting record and every control/output file exist,
+/// immediately before process creation. Once committed, the caller can always
+/// get the task id, including while running-record persistence is blocked.
+pub(crate) fn commit_spawn_receipt(task_id: &str) -> Result<(), String> {
+    enter_bash_startup_step(BashStartupStep::SpawnPreparation);
+    CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
+        Some(receipt) => receipt.commit(SpawnReceiptState::Committed(task_id.into())),
+        None => Ok(()),
+    })
+}
+
+/// Called by a bash rewrite immediately before it executes the command inside
+/// this process. A rewrite can mutate files (an append becomes an edit), so it
+/// is fenced exactly like process creation: once the deadline has refused the
+/// startup, the rewrite must not run.
+pub(crate) fn commit_spawn_receipt_inline() -> Result<(), String> {
+    enter_bash_startup_step(BashStartupStep::SpawnPreparation);
+    CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
+        Some(receipt) => receipt.commit(SpawnReceiptState::CommittedInline),
+        None => Ok(()),
+    })
+}
+
+#[cfg(test)]
+mod spawn_receipt_tests {
+    use super::{SpawnReceipt, SpawnReceiptState, StartupOutcome};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    fn far_future() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    fn commit_task(receipt: &SpawnReceipt) -> Result<(), String> {
+        receipt.commit(SpawnReceiptState::Committed("bgb-task".into()))
+    }
+
+    #[test]
+    fn refused_receipt_never_commits_and_committed_receipt_is_never_refused() {
+        let refused = SpawnReceipt::new(far_future());
+        assert_eq!(refused.expire(), StartupOutcome::Refused);
+        assert!(commit_task(&refused).is_err());
+        assert!(refused.commit(SpawnReceiptState::CommittedInline).is_err());
+        assert_eq!(refused.expire(), StartupOutcome::Refused);
+
+        let committed = SpawnReceipt::new(far_future());
+        assert!(commit_task(&committed).is_ok());
+        assert_eq!(committed.expire(), StartupOutcome::Task("bgb-task".into()));
+        // A second commit must not overwrite the first one's answer.
+        assert!(commit_task(&committed).is_err());
+        assert_eq!(committed.expire(), StartupOutcome::Task("bgb-task".into()));
+
+        let inline = SpawnReceipt::new(far_future());
+        assert!(inline.commit(SpawnReceiptState::CommittedInline).is_ok());
+        assert_eq!(inline.expire(), StartupOutcome::Inline);
+    }
+
+    #[test]
+    fn commit_after_the_deadline_is_refused_even_before_the_timer_settles_it() {
+        let receipt = SpawnReceipt::new(Instant::now());
+        assert!(commit_task(&receipt).is_err());
+        assert_eq!(receipt.expire(), StartupOutcome::Refused);
+    }
+
+    #[test]
+    fn startup_receipt_refuses_commit_at_resume_before_timer_dispatch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let suspend = Box::leak(Box::new(AtomicU64::new(0)));
+        let now = Instant::now();
+        let clock = crate::blocking_wait::ReplyBudget::new(now, None).with_suspend_clock(suspend);
+        let receipt =
+            SpawnReceipt::new(now + std::time::Duration::from_secs(15)).with_reply_clock(clock);
+        suspend.store(60_000, Ordering::SeqCst);
+        assert!(commit_task(&receipt).is_err());
+        assert_eq!(receipt.expire(), StartupOutcome::Refused);
+    }
+
+    #[test]
+    fn racing_commit_and_expire_always_agree() {
+        // Start both sides together many times. Whichever takes the receipt
+        // lock first decides; the two answers must describe the same fact.
+        for _ in 0..2000 {
+            let receipt = Arc::new(SpawnReceipt::new(far_future()));
+            let start = Arc::new(Barrier::new(2));
+            let committer = {
+                let receipt = Arc::clone(&receipt);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    commit_task(&receipt)
+                })
+            };
+            start.wait();
+            let outcome = receipt.expire();
+            let committed = committer.join().unwrap();
+            match outcome {
+                StartupOutcome::Task(id) => {
+                    assert_eq!(id, "bgb-task");
+                    assert!(committed.is_ok());
+                }
+                StartupOutcome::Refused => assert!(committed.is_err()),
+                StartupOutcome::Inline => panic!("no inline commit in this race"),
+            }
+        }
+    }
+}
+
+/// Who started a background task and the key they gave the call, recorded on
+/// the task so a consumer can find the task its own call started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCallKey {
+    /// The principal of the route the call arrived on (`direct`,
+    /// `reserved:<module>`, `unverified`, or `absent`), or `first-party` for
+    /// a call with no subc route (standalone mode).
+    pub requester: String,
+    /// The consumer's `call_key`, or the task id when it sent none.
+    pub key: String,
+    /// True when the consumer sent no key and the task id AFT minted stands
+    /// in for it, so a reader can tell a fallback from a key the consumer chose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub minted: bool,
+}
+
+pub use crate::protocol::TaskIdentity;
+
+thread_local! {
+    static CURRENT_TASK_IDENTITY: std::cell::RefCell<Option<TaskIdentity>> = const { std::cell::RefCell::new(None) };
+}
+
+#[doc(hidden)]
+pub struct TaskIdentityScope(Option<TaskIdentity>);
+
+impl Drop for TaskIdentityScope {
+    fn drop(&mut self) {
+        CURRENT_TASK_IDENTITY.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+/// Keep task delivery scoped during ordinary tool calls and their response
+/// finalizers, which do not need to install shell-spawn authority.
+#[doc(hidden)]
+pub fn task_identity_scope(identity: Option<TaskIdentity>) -> TaskIdentityScope {
+    TaskIdentityScope(CURRENT_TASK_IDENTITY.with(|slot| slot.replace(identity)))
+}
+
+#[doc(hidden)]
+pub trait TaskIdentityAuth: Sized {
+    fn current() -> Option<Self>;
+    fn from_principal(principal: &crate::sandbox_spawn::AuthenticatedPrincipal) -> Option<Self>;
+    fn allows_current(owner: Option<&Self>) -> bool;
+}
+
+impl TaskIdentityAuth for TaskIdentity {
+    fn current() -> Option<Self> {
+        if let Some(identity) = CURRENT_TASK_IDENTITY.with(|slot| slot.borrow().clone()) {
+            return Some(identity);
+        }
+        Self::from_principal(&current_authenticated_principal())
+    }
+
+    fn from_principal(principal: &crate::sandbox_spawn::AuthenticatedPrincipal) -> Option<Self> {
+        match principal {
+            crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+                principal_id,
+                harness,
+                session_id,
+                ..
+            } => Some(Self {
+                principal: principal_id.clone(),
+                harness: harness
+                    .parse::<crate::harness::Harness>()
+                    .map(|harness| harness.wire_label())
+                    .unwrap_or_else(|_| harness.clone()),
+                session: session_id.clone(),
+            }),
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => None,
+        }
+    }
+
+    fn allows_current(owner: Option<&Self>) -> bool {
+        // Records from before ownership was persisted keep session-only access for
+        // tasks in flight across the upgrade. Standalone's single client and
+        // provider-internal lifecycle work have no route and retain their access.
+        owner.is_none_or(|owner| {
+            Self::current()
+                .as_ref()
+                .is_none_or(|caller| caller == owner)
+        })
+    }
+}
+
+thread_local! {
+    /// The `call_key` of the tool call whose dispatch is running on this
+    /// thread. Installed around the dispatch like the authenticated principal
+    /// (see [`with_call_key`]), because the bash handler that creates the task
+    /// only sees the tool's own arguments, which the agent controls.
+    static CURRENT_CALL_KEY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// The call-ledger carrier to record as a new task's requester when it is
+    /// not the authenticated principal's id (see [`with_call_requester`]).
+    static CURRENT_CALL_REQUESTER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static CURRENT_REMOTE: std::cell::RefCell<Option<RemoteLaunch>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_RUNON_TIMINGS: std::cell::RefCell<Option<crate::exec_remote::LaunchTimings>> = const { std::cell::RefCell::new(None) };
+    /// True only while dispatching a bash call admitted under the catalog's
+    /// worker preset. Plugin worker-session flags do not set this marker.
+    static CURRENT_WORKER_PRESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Request-side timings stay scoped to this dispatch thread until the remote
+/// worker takes ownership of them. Early refusals discard the unfinished log.
+#[doc(hidden)]
+pub struct RunonTimingScope(Option<crate::exec_remote::LaunchTimings>);
+
+impl RunonTimingScope {
+    #[doc(hidden)]
+    pub fn start(started: std::time::Instant) -> Self {
+        Self(CURRENT_RUNON_TIMINGS.with(|current| {
+            current.replace(Some(crate::exec_remote::LaunchTimings::new(
+                started,
+                "secret_preflight",
+            )))
+        }))
+    }
+}
+
+impl Drop for RunonTimingScope {
+    fn drop(&mut self) {
+        CURRENT_RUNON_TIMINGS.with(|current| {
+            current.replace(self.0.take());
+        });
+    }
+}
+
+#[doc(hidden)]
+pub fn enter_runon_phase(phase: &'static str) {
+    CURRENT_RUNON_TIMINGS.with(|current| {
+        if let Some(timings) = current.borrow_mut().as_mut() {
+            timings.enter(phase);
+        }
+    });
+}
+
+#[cfg(unix)]
+fn take_runon_timings() -> crate::exec_remote::LaunchTimings {
+    CURRENT_RUNON_TIMINGS.with(|current| {
+        current.borrow_mut().take().unwrap_or_else(|| {
+            crate::exec_remote::LaunchTimings::new(std::time::Instant::now(), "task_setup")
+        })
+    })
+}
+
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct RemoteLaunch {
+    pub requested_platform: Option<crate::exec_remote::types::Platform>,
+    pub params: crate::exec_remote::FrozenParams,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub explicit_runon: bool,
+    // Remote dispatch runs only on Unix; Windows carries the policy but never dials.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub connection_file: Option<PathBuf>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub harness: String,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub session: String,
+    pub requested_vcpus: Option<u32>,
+    pub requested_memory_mib: Option<u64>,
+    pub requested_network: bool,
+    /// Configured `bash.env` names carried in the launch environment, with the
+    /// map they came from. The remote request drops those names from the shell
+    /// environment before it is sent, so only `bash.runon_env` can send a user
+    /// value; see `commands::bash_remote_env`.
+    pub configured_env_names: Vec<String>,
+    /// Files to copy back after the command, relative to its workdir. Set
+    /// only for an explicit `runon` call that passed `return_paths`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub return_paths: Vec<String>,
+}
+
+/// Decide where a bash call that set `runon` runs, before anything is spawned.
+///
+/// The call names the remote runner itself; nothing about the command line
+/// is inspected. Every reason it cannot run remotely is a refusal naming that
+/// reason, never a silent local run. `runon` is the caller's demand, `pty`,
+/// `powershell` and `host_sandbox` describe the rest of the call, and the
+/// session's remote policy is the one installed by [`with_remote_policy`].
+#[doc(hidden)]
+pub fn remote_for_runon(
+    config: &crate::config::Config,
+    runon: &str,
+    pty: bool,
+    powershell: bool,
+    host_sandbox: bool,
+) -> Result<RemoteLaunch, String> {
+    if !config.remote_exec.enabled && !config.remote_exec.project_off {
+        return Err("runon is disabled by the user setting remote_exec.enabled".into());
+    }
+    if cfg!(not(unix)) {
+        return Err(
+            "runon is not available on Windows: remote runs need AFT on macOS or Linux".into(),
+        );
+    }
+    if pty {
+        return Err("runon cannot be combined with pty:true: a remote run has no terminal".into());
+    }
+    if powershell {
+        return Err(
+            "runon cannot run PowerShell: the remote runner runs the line with bash".into(),
+        );
+    }
+    if host_sandbox {
+        return Err("runon cannot be combined with sandbox: \"host\"; the command runs on the remote server, not on this host".into());
+    }
+    // An unknown demand is named before anything else is decided about it.
+    let requested = runon.trim();
+    if !requested.is_empty() {
+        crate::exec_remote::policy::parse_demand(requested)?;
+    }
+    if config.remote_exec.project_off {
+        return Err("remote runs are off for this project".into());
+    }
+    let mut launch = CURRENT_REMOTE
+        .with(|s| s.borrow().clone())
+        .filter(|launch| {
+            launch
+                .params
+                .remote_exec
+                .as_ref()
+                .is_some_and(|policy| policy.enabled)
+        })
+        .ok_or_else(|| "this session has no remote runner".to_string())?;
+    let resolved = crate::exec_remote::policy::resolve_demand(
+        runon,
+        launch
+            .params
+            .remote_exec
+            .as_ref()
+            .and_then(|policy| policy.default_demand.as_deref()),
+    )?;
+    launch.requested_vcpus = resolved.weight_hint;
+    launch.requested_memory_mib = resolved.memory_mib;
+    launch.requested_platform = resolved.platform;
+    launch.requested_network = resolved.network;
+    launch.explicit_runon = true;
+    Ok(launch)
+}
+
+/// Preserve automatic routing only for deployed plans carrying a prefix list.
+#[doc(hidden)]
+pub fn remote_for_legacy_command(
+    config: &crate::config::Config,
+    command: &str,
+    pty: bool,
+    powershell: bool,
+) -> Option<RemoteLaunch> {
+    if !cfg!(unix) || powershell || config.remote_exec.project_off {
+        return None;
+    }
+    CURRENT_REMOTE
+        .with(|current| current.borrow().clone())
+        .filter(|launch| {
+            launch.params.remote_exec.as_ref().is_some_and(|policy| {
+                crate::exec_remote::policy::matches(policy, command, pty, false)
+            })
+        })
+        .map(|mut launch| {
+            launch.explicit_runon = false;
+            launch
+        })
+}
+
+#[doc(hidden)]
+pub fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<RemoteLaunch>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_REMOTE.with(|s| *s.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(CURRENT_REMOTE.with(|s| s.replace(policy)));
+    run()
+}
+
+#[doc(hidden)]
+pub fn with_worker_preset<T>(worker_preset: bool, run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_WORKER_PRESET.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(CURRENT_WORKER_PRESET.with(|current| current.replace(worker_preset)));
+    run()
+}
+
+#[doc(hidden)]
+pub fn worker_preset_active() -> bool {
+    CURRENT_WORKER_PRESET.with(std::cell::Cell::get)
+}
+
+/// Run `run` with `call_key` as the current call's key, restoring the
+/// previous one afterwards, even if `run` panics.
+#[doc(hidden)]
+pub fn with_call_key<T>(call_key: Option<String>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CURRENT_CALL_KEY.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let previous = CURRENT_CALL_KEY.with(|slot| slot.replace(call_key));
+    let _restore = Restore(Some(previous));
+    run()
+}
+
+/// Run `run` with `requester` recorded as the requester of any task it
+/// creates, instead of the authenticated principal's id. A codemode
+/// program's shell call runs with its head agent's principal while its
+/// call-ledger row belongs to the run route that sent it; the task must name
+/// that same requester so the ledger can find it. `None` keeps the
+/// principal's id.
+#[doc(hidden)]
+pub fn with_call_requester<T>(requester: Option<String>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CURRENT_CALL_REQUESTER.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let previous = CURRENT_CALL_REQUESTER.with(|slot| slot.replace(requester));
+    let _restore = Restore(Some(previous));
+    run()
+}
+
+thread_local! {
+    /// The v1 `bash` schema pin of the tool call whose dispatch runs on this
+    /// thread, if any. Installed around the dispatch like the call key (see
+    /// [`with_call_key`]), because the spawn path that records the task only
+    /// sees the tool's own arguments. A pinless call leaves no pin, and so
+    /// no view record, even when view writing is enabled.
+    static CURRENT_SCHEMA_PIN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run` with `schema_pin` recorded as the pin of any task it creates,
+/// restoring the previous one afterwards, even if `run` panics.
+#[doc(hidden)]
+pub fn with_schema_pin<T>(schema_pin: Option<String>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CURRENT_SCHEMA_PIN.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let previous = CURRENT_SCHEMA_PIN.with(|slot| slot.replace(schema_pin));
+    let _restore = Restore(Some(previous));
+    run()
+}
+
+/// The schema pin to record on a task being created now, if its call
+/// carried one.
+pub(crate) fn current_schema_pin() -> Option<String> {
+    CURRENT_SCHEMA_PIN.with(|slot| slot.borrow().clone())
+}
+
+/// The requester and key to record on a task being created now: the
+/// consumer's key when the call carried one, otherwise the task id.
+pub(crate) fn call_key_for_new_task(task_id: &str) -> TaskCallKey {
+    let requester = CURRENT_CALL_REQUESTER.with(|slot| slot.borrow().clone());
+    let requester = requester.unwrap_or_else(|| match current_authenticated_principal() {
+        crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => "first-party".to_string(),
+        crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+            principal_id.unwrap_or_else(|| "absent".to_string())
+        }
+    });
+    match CURRENT_CALL_KEY.with(|slot| slot.borrow().clone()) {
+        Some(key) => TaskCallKey {
+            requester,
+            key,
+            minted: false,
+        },
+        None => TaskCallKey {
+            requester,
+            key: task_id.to_string(),
+            minted: true,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BashShell {
+    #[default]
+    Bash,
+    Powershell,
+}
+
+impl BashShell {
+    #[doc(hidden)]
+    pub fn is_powershell(self) -> bool {
+        matches!(self, Self::Powershell)
+    }
+
+    #[doc(hidden)]
+    pub fn command_text(self, command: &str) -> String {
+        if self.is_powershell() {
+            // Match Pi's optional tool: both .NET and PowerShell's pipeline use
+            // UTF-8 before user code runs, so redirected native output remains
+            // readable across macOS, Linux, and Windows.
+            format!(
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
+            )
+        } else {
+            command.to_string()
+        }
+    }
+}
+
+fn resolve_powershell_path_with(
+    lookup: impl FnOnce(&str) -> Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let candidate = "pwsh.exe";
+    #[cfg(not(windows))]
+    let candidate = "pwsh";
+    // The command is refused rather than handed to bash: a script written for
+    // PowerShell rarely means the same thing under bash, so running it anyway
+    // would be worse than a clear refusal. The message names both ways out.
+    lookup(candidate)
+        .ok_or_else(|| powershell_missing_message(crate::host_tool_names::DEFAULT_SHELL_TOOL))
+}
+
+/// The refusal for a PowerShell command on a host without `pwsh`. `shell_tool`
+/// is the name the host registered AFT's command tool under, which is what the
+/// agent has to call again (`bash`, or `shell` on OpenCode 2).
+#[doc(hidden)]
+pub fn powershell_missing_message(shell_tool: &str) -> String {
+    format!(
+        "PowerShell (pwsh) is not installed or is not on PATH, so this command was not run. \
+         Rewrite it in bash syntax and call the {shell_tool} tool without `shell: \"powershell\"`, \
+         or install PowerShell 7+: https://aka.ms/powershell"
+    )
+}
+
+/// Whether a PowerShell command could run on this host right now: the same
+/// `pwsh` lookup the executor performs before spawning. The subc manifest uses
+/// it to advertise the `powershell` tool only where it can actually run.
+///
+/// Tool admission asks on every call, on the subc runtime thread, and the
+/// lookup stats each `PATH` directory. So the answer is kept for as long as
+/// this process's `PATH` is unchanged; a changed `PATH` (for example after
+/// startup fills it from the login shell) looks again.
+#[doc(hidden)]
+pub fn powershell_available() -> bool {
+    static LAST: std::sync::Mutex<Option<(Option<std::ffi::OsString>, bool)>> =
+        std::sync::Mutex::new(None);
+    let path = std::env::var_os("PATH");
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((seen, available)) = last.as_ref() {
+        if *seen == path {
+            return *available;
+        }
+    }
+    let available = resolve_powershell_path_with(|candidate| which::which(candidate).ok()).is_ok();
+    *last = Some((path, available));
+    available
+}
+
+#[doc(hidden)]
+pub fn resolve_shell_path(pty: bool, shell: BashShell) -> Result<PathBuf, String> {
+    if shell.is_powershell() {
+        return resolve_powershell_path_with(|candidate| which::which(candidate).ok());
+    }
+
+    #[cfg(unix)]
+    {
+        // One interpreter for both modes: the tool is named `bash`, the model
+        // writes bash syntax, and a PTY only changes how the child's terminal is
+        // wired, not which shell reads the command. Resolving the PTY launcher
+        // from $SHELL (fish on many machines) made `$?` and `&&` fail only when
+        // `pty: true` was set, which read as a flaky tool rather than a syntax
+        // mismatch.
+        let _ = pty;
+        Ok(registry::resolve_posix_shell())
+    }
+    #[cfg(windows)]
+    {
+        let _ = pty;
+        Ok(PathBuf::from("cmd.exe"))
+    }
+}
+
+pub(crate) use crate::process_spawn::format_spawn_failure;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BgTaskInfo {
+    pub task_id: String,
+    pub status: BgTaskStatus,
+    pub command: String,
+    pub mode: BgMode,
+    pub started_at: u64,
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+}
+
+#[doc(hidden)]
+pub const PTY_EXIT_STATUS_UNKNOWN_REASON: &str = "AFT could not read how it ended";
+pub use crate::protocol::BgTaskStatus;
+
+/// When a background bash task is killed for running too long (its hard kill).
+///
+/// Every spawn names one explicitly, so no caller can drop the default by
+/// passing an empty timeout by accident. There is deliberately no "never"
+/// variant: a delegated worker that blocked on a command with no hard kill once
+/// sat behind a stuck test run for fifteen hours. Instead a worker's wait is
+/// capped (`bash.worker_wait_max_ms`), and each wait it makes pushes a
+/// [`HardKill::Default`] task's kill later (see
+/// [`registry::BgTaskRegistry::renew_hard_kill`]), so a long build the worker
+/// keeps watching runs to completion while one it stops watching is still
+/// killed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardKill {
+    /// The registry's default, [`registry::DEFAULT_BG_TIMEOUT`] (30 minutes),
+    /// extended by a delegated worker's waits on the task.
+    Default,
+    /// Killed once it has run this long (the caller's explicit `timeout`).
+    /// Never extended: the caller chose the limit.
+    After(Duration),
+}
+
+impl HardKill {
+    /// The hard kill for an optional caller timeout in milliseconds, falling
+    /// back to [`HardKill::Default`].
+    pub fn from_timeout_ms(timeout_ms: Option<u64>) -> Self {
+        timeout_ms.map_or(Self::Default, |ms| Self::After(Duration::from_millis(ms)))
+    }
+
+    /// How long the task may run before its first renewal.
+    pub fn limit(self) -> Duration {
+        match self {
+            Self::Default => registry::DEFAULT_BG_TIMEOUT,
+            Self::After(limit) => limit,
+        }
+    }
+
+    /// Whether a delegated worker's wait may push the kill later. Only the
+    /// implicit default is; an explicit timeout is the caller's own limit.
+    pub fn renewable(self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
+/// Whether a launch takes one of the project root's background-task slots
+/// (`max_background_bash_tasks`). A project root's registry is shared by every
+/// session working in that root, so the slots are too; another root has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSlot {
+    /// An ordinary foreground command. It always starts, even when every
+    /// background slot is taken: the cap exists to stop runaway detached work,
+    /// not to block the command an agent is waiting on. It holds no slot while
+    /// its caller waits on it. If it outlives its wait window and is promoted
+    /// to a background task, it is still promoted (it is already running, and
+    /// killing or refusing it then would lose its work) and holds a slot from
+    /// then on, so the number of slot holders can briefly exceed the cap until
+    /// tasks finish.
+    Foreground,
+    /// A launch that runs in the background from the start (`background:
+    /// true`, or a PTY). Refused when `max` background tasks are already
+    /// running in this project root. Local and remote tasks share these slots.
+    Background { max: usize },
+}
+
+impl TaskSlot {
+    /// Whether a task launched this way holds a background slot from the start.
+    pub fn holds_slot(self) -> bool {
+        matches!(self, Self::Background { .. })
+    }
+}
+
+/// Spawn a bash command as a task. Returns a task_id immediately.
+///
+/// `require_background_flag` marks a background launch: it needs the
+/// background feature and takes a background slot. A foreground command
+/// (`false`, and not a PTY) always starts; see [`TaskSlot::Foreground`].
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn spawn_with_secrets(
+    request_id: &str,
+    session_id: &str,
+    command: &str,
+    shell: BashShell,
+    shell_path: PathBuf,
+    workdir: Option<PathBuf>,
+    env: Option<HashMap<String, String>>,
+    hard_kill: HardKill,
+    ctx: &AppContext,
+    require_background_flag: bool,
+    notify_on_completion: bool,
+    compressed: bool,
+    pty: bool,
+    pty_rows: u16,
+    pty_cols: u16,
+    scanner_report: Vec<PermissionAsk>,
+    scanner_requires_approval: bool,
+    host_escalation: Option<HostEscalationAttempt>,
+    remote: Option<RemoteLaunch>,
+    #[cfg(unix)] mut secret_launch: Option<secrets::Launch>,
+) -> Response {
+    enter_runon_phase("spawn_setup");
+    if require_background_flag && !ctx.config().experimental_bash_background {
+        return Response::error(
+            request_id,
+            "feature_disabled",
+            "background bash is disabled; set `bash: { background: true }` (or `bash: true`) in aft.jsonc",
+        );
+    }
+
+    let workdir = workdir.unwrap_or_else(|| {
+        ctx.config().project_root.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        })
+    });
+    let storage_dir = task_storage_dir(ctx);
+    let max_running = ctx.config().max_background_bash_tasks;
+    let slot = if require_background_flag || pty {
+        TaskSlot::Background { max: max_running }
+    } else {
+        TaskSlot::Foreground
+    };
+    let project_root = ctx
+        .config()
+        .project_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
+
+    enter_runon_phase("child_environment");
+    enter_bash_startup_step(BashStartupStep::Environment);
+    let mut env = env.unwrap_or_default();
+    let config = ctx.config();
+    let child_storage_root = self::storage_dir(config.storage_dir.as_deref());
+    // The ticket lets this command's `gh` shim relay bot writes for the
+    // session that spawned it. Dropping it on any early return revokes it; a
+    // spawned task's terminal transition revokes it after `bind_task`.
+    let gh_shim_ticket = crate::gh_shim_ticket::PendingTicket::issue_for_project(
+        session_id,
+        project_root.as_deref(),
+    );
+    let _speech_ticket = crate::gh_shim_ticket::spawn_ticket_guard(gh_shim_ticket.value());
+    crate::gh_shim_ticket::mark_spawn_background(require_background_flag || pty);
+    let mut start_view = None;
+    let mut provider_failure = None;
+    let local_provider =
+        config.shell.env_provider.is_some() && remote.is_none() && host_escalation.is_none();
+    let prepare_environment = |plan: &mut crate::sandbox_spawn::SpawnPlan,
+                               env: &mut HashMap<String, String>|
+     -> Result<_, String> {
+        let failure = crate::shell_env_provider::apply(
+            config
+                .shell
+                .env_provider
+                .as_ref()
+                .filter(|_| host_escalation.is_none()),
+            plan,
+            &workdir,
+            env,
+            remote.is_some(),
+        );
+        crate::agent_child_env::inject(
+            config.as_ref(),
+            &child_storage_root,
+            env,
+            gh_shim_ticket.value(),
+        )?;
+        let view = crate::gh_shim_speech::start_view::inject(
+            gh_shim_ticket.value(),
+            env,
+            &child_storage_root,
+        );
+        if worker_preset_active() {
+            crate::agent_child_env::inject_worker_test_threads(
+                project_root.as_deref().unwrap_or(&workdir),
+                env,
+            );
+        }
+        crate::sandbox_spawn::apply_worker_jail_environment(
+            env,
+            crate::sandbox_spawn::effective_sandbox_mode(
+                ctx,
+                &crate::sandbox_spawn::current_authenticated_principal(),
+            ),
+        );
+        #[cfg(target_os = "linux")]
+        if !pty && config.bash.linux_scope {
+            env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
+        }
+        Ok((view, failure))
+    };
+    // With no provider, preserve the original preparation order: profile builders
+    // inspect generated hooks and shim files. Providers need those files ready
+    // too, but their environment export must precede AFT's own added values.
+    if !local_provider {
+        match prepare_environment(&mut crate::sandbox_spawn::SpawnPlan::Unsandboxed, &mut env) {
+            Ok((view, failure)) => {
+                start_view = view;
+                provider_failure = failure;
+            }
+            Err(error) => {
+                return Response::error(request_id, "child_environment_unavailable", error)
+            }
+        }
+    } else if let Err(error) =
+        crate::agent_child_env::maintain(config.as_ref(), &child_storage_root)
+    {
+        return Response::error(request_id, "child_environment_unavailable", error);
+    }
+    ctx.bash_background().configure_task_scope_runtime(
+        ctx.is_daemon_mode(),
+        Duration::from_secs(config.bash.linux_scope_max_runtime_secs),
+    );
+    env.remove(registry::LINUX_SCOPE_ENV);
+    enter_runon_phase("sandbox_preflight");
+    let task_kind = if pty {
+        SandboxTaskKind::BashPty
+    } else if require_background_flag {
+        SandboxTaskKind::BashBackground
+    } else {
+        SandboxTaskKind::BashForeground
+    };
+    let principal = current_authenticated_principal();
+    let sandbox_requirement = crate::sandbox_spawn::SandboxRequirement::for_command(command);
+    let requested_tier = if host_escalation.is_some() {
+        RequestedSandboxTier::Host
+    } else if sandbox_requirement.is_some() || crate::sandbox_spawn::sandbox_required(ctx) {
+        RequestedSandboxTier::Native
+    } else {
+        RequestedSandboxTier::Disabled
+    };
+    let session_dir = persistence::session_tasks_dir(&storage_dir, session_id);
+    #[cfg(unix)]
+    let (spawn_plan, unregistered_task) = if secret_launch.is_some()
+        || sandbox_requirement.is_some()
+        || (native_sandbox_enforced(ctx, &principal) && host_escalation.is_none())
+    {
+        enter_bash_startup_step(BashStartupStep::TaskDirectory);
+        let task = match secret_launch
+            .as_mut()
+            .and_then(|launch| launch.preflight.task.take())
+            .map(Ok)
+            .unwrap_or_else(|| persistence::allocate_task_layout(&storage_dir, session_id))
+        {
+            Ok(task) => task,
+            Err(error) => {
+                return Response::error(
+                    request_id,
+                    "sandbox_unavailable",
+                    format!(
+                        "native sandbox failed to create the task artifact directory: {error}; select sandbox.profile off to disable native sandboxing"
+                    ),
+                );
+            }
+        };
+        enter_bash_startup_step(BashStartupStep::Profile);
+        let mut plan = secret_launch
+            .as_ref()
+            .map(|launch| launch.preflight.plan.clone())
+            .unwrap_or_else(|| {
+                crate::sandbox_spawn::resolve_command_sandbox_spawn(
+                    ctx,
+                    &principal,
+                    requested_tier,
+                    task_kind,
+                    &task.paths.io_dir,
+                    None,
+                    sandbox_requirement,
+                )
+            });
+        if plan.refusal_code().is_some() {
+            (plan, Some(task))
+        } else {
+            if local_provider {
+                match prepare_environment(&mut plan, &mut env) {
+                    Ok((view, failure)) => {
+                        start_view = view;
+                        provider_failure = failure;
+                    }
+                    Err(error) => {
+                        let _ = persistence::delete_resolved_task(&task);
+                        return Response::error(request_id, "child_environment_unavailable", error);
+                    }
+                }
+            }
+            let root = project_root.as_deref().unwrap_or(&workdir);
+            provision_worker_read_broker(
+                &plan,
+                remote.is_some(),
+                &gh_shim_ticket,
+                &task.paths.task_id,
+                std::time::Instant::now() + hard_kill.limit(),
+                ctx.bash_background().clone(),
+                &mut env,
+                config.github.shim,
+            );
+            enter_bash_startup_step(BashStartupStep::Environment);
+            let environment = crate::sandbox_spawn::approved_environment_for_plan(&plan, &env);
+            enter_bash_startup_step(BashStartupStep::ControlFiles);
+            match crate::sandbox_spawn::prepare_task_payload(
+                &task,
+                command.as_bytes(),
+                root,
+                &workdir,
+                &principal,
+                &shell_path,
+                &environment,
+            ) {
+                Ok(prepared) => {
+                    if let Some(launch) = secret_launch.as_ref() {
+                        prepared.set_secret_runtime(launch.runtime.clone());
+                    }
+                    (plan.with_prepared_task(prepared), Some(task))
+                }
+                Err(error) => {
+                    let _ = persistence::delete_resolved_task(&task);
+                    return Response::error(
+                        request_id,
+                        "sandbox_unavailable",
+                        format!("native sandbox failed to materialize task payload: {error}"),
+                    );
+                }
+            }
+        }
+    } else {
+        enter_bash_startup_step(BashStartupStep::Profile);
+        let mut plan = crate::sandbox_spawn::resolve_command_sandbox_spawn(
+            ctx,
+            &principal,
+            requested_tier,
+            task_kind,
+            &session_dir,
+            host_escalation.as_ref(),
+            sandbox_requirement,
+        );
+        if local_provider && plan.refusal_code().is_none() {
+            match prepare_environment(&mut plan, &mut env) {
+                Ok((view, failure)) => {
+                    start_view = view;
+                    provider_failure = failure;
+                }
+                Err(error) => {
+                    return Response::error(request_id, "child_environment_unavailable", error)
+                }
+            }
+        }
+        (plan, None)
+    };
+    #[cfg(not(unix))]
+    enter_bash_startup_step(BashStartupStep::Profile);
+    #[cfg(not(unix))]
+    let mut spawn_plan = crate::sandbox_spawn::resolve_command_sandbox_spawn(
+        ctx,
+        &principal,
+        requested_tier,
+        task_kind,
+        &session_dir,
+        host_escalation.as_ref(),
+        sandbox_requirement,
+    );
+    #[cfg(not(unix))]
+    if local_provider && spawn_plan.refusal_code().is_none() {
+        match prepare_environment(&mut spawn_plan, &mut env) {
+            Ok((view, failure)) => {
+                start_view = view;
+                provider_failure = failure;
+            }
+            Err(error) => {
+                return Response::error(request_id, "child_environment_unavailable", error)
+            }
+        }
+    }
+    if let Some(code) = spawn_plan.refusal_code() {
+        #[cfg(unix)]
+        if let Some(task) = unregistered_task.as_ref() {
+            let _ = persistence::delete_resolved_task(task);
+        }
+        let message = spawn_plan
+            .refusal_message()
+            .unwrap_or("bash process creation refused by sandbox policy");
+        return match spawn_plan.refusal_mismatch_class() {
+            Some(class) => Response::error_with_data(
+                request_id,
+                code,
+                message,
+                json!({ "mismatch_class": class }),
+            ),
+            None => Response::error(request_id, code, message),
+        };
+    }
+
+    // The launcher can also carry off or relaxed profiles. Only the resolved
+    // containment policy can replace a pending permission approval.
+    if scanner_requires_approval && !spawn_plan.enforces_shell_containment() {
+        spawn_plan.cleanup_unspawned();
+        #[cfg(unix)]
+        if let Some(task) = unregistered_task.as_ref() {
+            let _ = persistence::delete_resolved_task(task);
+        }
+        return Response::error_with_data(
+            request_id,
+            crate::protocol::ERROR_PERMISSION_REQUIRED,
+            "bash command requires permission",
+            json!({ "asks": scanner_report }),
+        );
+    }
+
+    let cleanup_plan = spawn_plan.clone();
+    // Record which saved folder grants this command's sandbox allows, so
+    // revoking one of them can stop it. A build-server job runs under no
+    // local sandbox and records none.
+    let recorded_folder_grants = if remote.is_none() {
+        registry::folder_grants::for_plan(ctx, &spawn_plan)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    registry::folder_grants::run_after_record_hook();
+    let _folder_grants = registry::folder_grants::spawn_guard(recorded_folder_grants.clone());
+    // The watchdog compresses this task's output through the shared filter
+    // handle, which reads the registry as it is. An idle-evicted root has
+    // released its registry, so load it again before the task can finish.
+    ctx.reload_released_filter_registry();
+    enter_runon_phase("changed_files_baseline");
+    let _changed_files =
+        crate::bash_changed_files::Capture::start_for_spawn(ctx, request_id, &spawn_plan)
+            .map(|capture| crate::bash_changed_files::scope(Some(capture)));
+    #[cfg(unix)]
+    ctx.bash_background()
+        .set_db_schema_hints(ctx.config().bash.db_schema_hints);
+    #[cfg(unix)]
+    let remote_result = remote.map(|launch| {
+        ctx.bash_background().spawn_remote_typed(
+            launch,
+            spawn_plan.clone(),
+            command,
+            shell_path.clone(),
+            session_id.to_string(),
+            workdir.clone(),
+            env.clone(),
+            hard_kill,
+            config.bash.memory_limit_mib,
+            storage_dir.clone(),
+            slot,
+            notify_on_completion,
+            compressed,
+            project_root.clone(),
+            config.bash.linux_scope,
+        )
+    });
+    #[cfg(not(unix))]
+    let remote_result: Option<Result<String, registry::RegistryError>> = {
+        let _ = remote;
+        None
+    };
+    let spawn_result = if let Some(result) = remote_result {
+        result
+    } else if pty {
+        // A PTY always runs in the background, so it always takes a slot.
+        ctx.bash_background().spawn_pty_with_shell_typed(
+            spawn_plan,
+            command,
+            shell,
+            shell_path,
+            session_id.to_string(),
+            workdir,
+            env,
+            hard_kill,
+            config.bash.memory_limit_mib,
+            storage_dir,
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root,
+            pty_rows,
+            pty_cols,
+        )
+    } else {
+        ctx.bash_background().spawn_with_shell_in_slot_typed(
+            spawn_plan,
+            command,
+            shell,
+            shell_path,
+            session_id.to_string(),
+            workdir,
+            env,
+            hard_kill,
+            config.bash.memory_limit_mib,
+            storage_dir,
+            slot,
+            notify_on_completion,
+            compressed,
+            project_root,
+            config.bash.linux_scope,
+        )
+    };
+    #[cfg(unix)]
+    let provider_preflight = cleanup_plan
+        .prepared_task()
+        .and_then(|task| task.take_provider_preflight());
+    #[cfg(unix)]
+    if spawn_result.is_ok() {
+        if let Some(launch) = secret_launch.as_mut() {
+            launch.spawned();
+        }
+    } else {
+        if let Some(task) = cleanup_plan.prepared_task() {
+            ctx.bash_background()
+                .stop_secret_proxy(&task.resolved_task().paths.task_id);
+        }
+    }
+
+    match spawn_result {
+        Ok(task_id) => {
+            #[cfg(unix)]
+            ctx.bash_background()
+                .bind_provider_preflight(&task_id, provider_preflight);
+            // A revoke scans the running commands right after it deletes the
+            // grant. One whose sandbox was built before that delete but which
+            // registered after the scan was missed, so check the grants again
+            // now that it is registered.
+            if recorded_folder_grants.is_some() {
+                ctx.bash_background()
+                    .stop_if_folder_grant_revoked(&task_id, session_id, ctx.db());
+            }
+            ctx.bash_background().bind_start_view(&task_id, start_view);
+            gh_shim_ticket.bind_task(&task_id);
+            // A command that finishes very quickly can be terminal before the
+            // ticket was bound to it, in which case its terminal write found
+            // nothing to revoke.
+            if ctx.bash_background().is_task_terminal(&task_id) {
+                crate::gh_shim_ticket::revoke_task(&task_id);
+            }
+            if let Err(error) =
+                ctx.bash_background()
+                    .record_scanner_report(&task_id, session_id, scanner_report)
+            {
+                crate::slog_warn!("{error}");
+            }
+            let mut response =
+                successful_spawn_response(request_id, session_id, &task_id, pty, ctx);
+            if let Some(failure) = provider_failure {
+                response.data["_bash_env_provider_failure"] = json!(failure);
+            }
+            response
+        }
+        Err(registry::RegistryError::TaskLimit(message)) => {
+            cleanup_plan.cleanup_unspawned();
+            #[cfg(unix)]
+            if let Some(task) = unregistered_task.as_ref() {
+                let _ = persistence::delete_resolved_task(task);
+            }
+            Response::error(request_id, "background_task_limit_exceeded", message)
+        }
+        Err(error) => {
+            let startup_deadline = matches!(error, registry::RegistryError::StartupDeadline(_));
+            let message = error.to_string();
+            // A deadline may already have handed the starting task id to its
+            // caller. Keep its terminal failure record available to status.
+            if !spawn_receipt_committed() {
+                cleanup_plan.cleanup_unspawned();
+            }
+            #[cfg(unix)]
+            if let Some(task) = unregistered_task
+                .as_ref()
+                .filter(|_| !spawn_receipt_committed())
+            {
+                let _ = persistence::delete_resolved_task(task);
+            }
+            if startup_deadline {
+                Response::error(request_id, "bash_start_deadline", message)
+            } else {
+                execution_error_response(request_id, cleanup_plan.is_native_launcher(), message)
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn(
+    request_id: &str,
+    session_id: &str,
+    command: &str,
+    shell: BashShell,
+    shell_path: PathBuf,
+    workdir: Option<PathBuf>,
+    env: Option<HashMap<String, String>>,
+    hard_kill: HardKill,
+    ctx: &AppContext,
+    require_background_flag: bool,
+    notify_on_completion: bool,
+    compressed: bool,
+    pty: bool,
+    pty_rows: u16,
+    pty_cols: u16,
+    scanner_report: Vec<PermissionAsk>,
+    scanner_requires_approval: bool,
+    host_escalation: Option<HostEscalationAttempt>,
+    remote: Option<RemoteLaunch>,
+) -> Response {
+    spawn_with_secrets(
+        request_id,
+        session_id,
+        command,
+        shell,
+        shell_path,
+        workdir,
+        env,
+        hard_kill,
+        ctx,
+        require_background_flag,
+        notify_on_completion,
+        compressed,
+        pty,
+        pty_rows,
+        pty_cols,
+        scanner_report,
+        scanner_requires_approval,
+        host_escalation,
+        remote,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+/// Decide, in one place, whether a jailed worker's shell receives the host-local
+/// GitHub read broker (socket, capability file and shim state directory in its
+/// private task temp). Strict and relaxed native launches both go through
+/// here, so their broker behaviour cannot drift apart. A remote launch or a
+/// profile that cannot protect the broker removes any broker paths from the
+/// child environment and logs the reason; provisioning failures are logged by
+/// `provision_optional`. Head shells are not workers and get no broker.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn provision_worker_read_broker(
+    plan: &crate::sandbox_spawn::SpawnPlan,
+    remote: bool,
+    ticket: &crate::gh_shim_ticket::PendingTicket,
+    task_id: &str,
+    deadline: std::time::Instant,
+    tasks: BgTaskRegistry,
+    env: &mut HashMap<String, String>,
+    shim_enabled: bool,
+) {
+    if !crate::sandbox_spawn::worker_jail_active() {
+        return;
+    }
+    // A host-local socket is not delegated to remote execution or its later
+    // local fallback. Neither path requires broker setup.
+    let skipped = if remote {
+        Some("remote launch or local fallback has no host broker")
+    } else {
+        plan.worker_read_broker_unavailable()
+    };
+    if let Some(reason) = skipped {
+        for key in [
+            crate::gh_shim_worker_broker::SOCKET_ENV,
+            crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+            crate::gh_shim_worker_broker::STATE_ENV,
+        ] {
+            env.remove(key);
+        }
+        crate::gh_shim_worker_broker::log_unavailable(task_id, reason);
+        return;
+    }
+    crate::gh_shim_worker_broker::provision_optional(
+        ticket,
+        task_id,
+        plan.temp_dir(),
+        deadline,
+        tasks,
+        env,
+        shim_enabled,
+    );
+}
+
+fn execution_error_response(request_id: &str, native: bool, message: String) -> Response {
+    if message.starts_with("failed to start PTY reader:")
+        || message.starts_with("failed to start PTY waiter:")
+    {
+        // A failure to create a helper thread does not mean the sandbox failed.
+        // The spawned child may already have executed, so do not claim it never
+        // ran or advise disabling sandbox protection.
+        Response::error(request_id, "internal_error", message)
+    } else if native {
+        Response::error(
+            request_id,
+            "sandbox_unavailable",
+            format!("native sandbox failed before command execution: {message}; select sandbox.profile off to disable native sandboxing"),
+        )
+    } else {
+        Response::error(request_id, "execution_failed", message)
+    }
+}
+
+#[cfg(test)]
+mod worker_admission_response_tests {
+    use super::*;
+
+    #[test]
+    fn approved_pty_worker_error_is_not_misreported_as_sandbox_failure() {
+        for native in [true, false] {
+            let response = execution_error_response(
+                "worker-refused",
+                native,
+                "failed to start PTY reader: injected worker admission failure".into(),
+            );
+            let wire = serde_json::to_value(response).unwrap();
+            assert_eq!(wire["code"], "internal_error");
+            assert!(!wire["message"]
+                .as_str()
+                .unwrap()
+                .contains("before command execution"));
+            assert!(!wire["message"]
+                .as_str()
+                .unwrap()
+                .contains("disable native sandboxing"));
+        }
+    }
+}
+
+pub(crate) fn successful_spawn_response(
+    request_id: &str,
+    session_id: &str,
+    task_id: &str,
+    pty: bool,
+    ctx: &AppContext,
+) -> Response {
+    // Remote launch replies use running as an internal handoff to the capture
+    // and foreground wait paths. Those paths publish acceptance or terminal
+    // output themselves, even if submission has already finished here.
+    let status = if ctx.bash_background().is_remote_task(task_id, session_id) {
+        BgTaskStatus::Running
+    } else {
+        ctx.bash_background()
+            .observed_status(task_id, session_id, 0)
+            .map(|snapshot| snapshot.info.status)
+            .unwrap_or(BgTaskStatus::Running)
+    };
+    Response::success(
+        request_id,
+        json!({
+            "task_id": task_id,
+            "status": status,
+            "mode": if pty { "pty" } else { "pipes" },
+        }),
+    )
+}
+
+// A root context is shared by routes from different harnesses. Determine a
+// command's owner from its route binding, not the last harness to configure the root.
+#[doc(hidden)]
+pub fn route_harness() -> Option<crate::harness::Harness> {
+    TaskIdentity::current()?.harness.parse().ok()
+}
+
+#[doc(hidden)]
+pub fn task_storage_dir(ctx: &AppContext) -> PathBuf {
+    let config = ctx.config();
+    let root = storage_dir(config.storage_dir.as_deref());
+    route_harness()
+        .or_else(|| config.harness.clone())
+        .as_ref()
+        .map(|harness| root.join(harness.storage_segment()))
+        .unwrap_or(root)
+}
+
+/// Resolve the process-state storage root exactly once for every Rust entry point.
+/// The environment override is checked here so it wins over a stale plugin wire
+/// value, while both plugin-less fallback and plugin-injected paths share one root.
+///
+/// Last re-derived 2026-09-06 against subconscious d5e09914b0791a66f2a5a00a9bb3422860ade95e:
+/// compare the ordered variables, platform gates, and empty-value guards below with
+/// `subc-core/src/daemon_config.rs::default_data_home`, resolve its named constants,
+/// then preserve the documented Windows cache-class divergence.
+/// AFT now uses `storage_root` for background tasks: start this process's
+/// one pass over it that sends runner cancels saved paused tasks still owe
+/// (`BgTaskRegistry::start_owed_cancel_pass`), on its own thread. Called
+/// where each mode first learns its storage root: as a SubC module starts
+/// (before any project binds) and by `configure` (the first configure of a
+/// standalone process; later and SubC configures find the pass started).
+/// Repeated calls for the same root do nothing.
+#[doc(hidden)]
+pub fn note_storage_root(storage_root: &std::path::Path) {
+    // A test process must never send cancels for a developer's real store:
+    // test builds start the pass only for temporary storage roots.
+    #[cfg(test)]
+    {
+        let temp = std::env::temp_dir();
+        let temp = temp.canonicalize().unwrap_or(temp);
+        let root = storage_root
+            .canonicalize()
+            .unwrap_or_else(|_| storage_root.to_path_buf());
+        if !root.starts_with(&temp) {
+            return;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let _ = registry::BgTaskRegistry::start_owed_cancel_pass(storage_root);
+    }
+    #[cfg(not(unix))]
+    let _ = storage_root;
+}
+
+pub use crate::storage_path::{cache_artifact_root, storage_dir};
+
+pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::harness::Harness) {
+    repair_legacy_root_tasks_with(storage_root, harness, legacy_root_tasks_quiescent);
+}
+
+fn repair_legacy_root_tasks_with(
+    storage_root: &std::path::Path,
+    harness: crate::harness::Harness,
+    quiescent: impl FnOnce(&std::path::Path) -> std::io::Result<bool>,
+) {
+    let root_tasks = storage_root.join("bash-tasks");
+    if !dir_has_entries(&root_tasks) {
+        return;
+    }
+    let harness_tasks = storage_root
+        .join(harness.storage_segment())
+        .join("bash-tasks");
+    // A populated destination prevents migration regardless of writer liveness.
+    // Check it before reading every legacy task on each session's configure.
+    if dir_has_entries(&harness_tasks) {
+        return;
+    }
+    // Detached writers retain both open output handles and absolute marker paths.
+    // Even a same-volume rename can strand their later path-based writes. Keep
+    // the entire legacy tree readable in place until every task is quiescent.
+    if !quiescent(&root_tasks).unwrap_or(false) {
+        return;
+    }
+
+    // The destination may have been populated while quiescence was checked.
+    if dir_has_entries(&harness_tasks) {
+        return;
+    }
+    if let Some(parent) = harness_tasks.parent() {
+        if let Err(error) = crate::private_storage::create_dir_all(parent) {
+            crate::slog_warn!(
+                "failed to create harness bash task dir {}: {}",
+                parent.display(),
+                error
+            );
+            return;
+        }
+    }
+    if harness_tasks.exists() {
+        let _ = std::fs::remove_dir(&harness_tasks);
+    }
+
+    // The harness folder and the root normally share a volume, but a move
+    // that crosses volumes falls back to a copy instead of failing.
+    match crate::cross_volume::move_path(&root_tasks, &harness_tasks) {
+        Ok(moved) => {
+            moved.warn_if_incomplete(&root_tasks, &harness_tasks);
+            crate::slog_info!(
+                "moved legacy root bash tasks into harness namespace: {}",
+                harness_tasks.display()
+            );
+        }
+        Err(error) => {
+            crate::slog_warn!(
+                "failed to move legacy root bash tasks into {}: {}; trying child merge",
+                harness_tasks.display(),
+                error
+            );
+            if let Err(error) = crate::private_storage::create_dir_all(&harness_tasks) {
+                crate::slog_warn!(
+                    "legacy root bash tasks kept in {}: cannot create {}: {}",
+                    root_tasks.display(),
+                    harness_tasks.display(),
+                    error
+                );
+                return;
+            }
+            if let Ok(entries) = std::fs::read_dir(&root_tasks) {
+                for entry in entries.flatten() {
+                    let source = entry.path();
+                    let target = harness_tasks.join(entry.file_name());
+                    if target.exists() {
+                        continue;
+                    }
+                    match crate::cross_volume::move_path(&source, &target) {
+                        Ok(moved) => moved.warn_if_incomplete(&source, &target),
+                        Err(error) => {
+                            // A task that cannot be moved stays readable in the
+                            // root `bash-tasks/` folder; log the move failure
+                            // instead of dropping it.
+                            crate::slog_warn!(
+                                "legacy bash task {} kept in place: cannot move it to {}: {}",
+                                source.display(),
+                                target.display(),
+                                error
+                            );
+                        }
+                    }
+                }
+            }
+            // Removes the legacy folder only when every task left it.
+            let _ = std::fs::remove_dir(&root_tasks);
+        }
+    }
+}
+
+fn legacy_root_tasks_quiescent(root: &std::path::Path) -> std::io::Result<bool> {
+    legacy_root_tasks_quiescent_with(root, || {})
+}
+
+fn legacy_root_tasks_quiescent_with(
+    root: &std::path::Path,
+    mut before_metadata_read: impl FnMut(),
+) -> std::io::Result<bool> {
+    use persistence::{discover_task_ids, read_exit_marker, read_task_at, resolve_task_layout};
+    for session in std::fs::read_dir(root)? {
+        let session = session?;
+        if !session.file_type()?.is_dir() {
+            return Ok(false);
+        }
+        let (ids, invalid) = discover_task_ids(&session.path())?;
+        if !invalid.is_empty() {
+            return Ok(false);
+        }
+        for id in ids {
+            let task = resolve_task_layout(&session.path(), &id)?;
+            before_metadata_read();
+            let metadata = read_task_at(&task)?;
+            if read_exit_marker(&task.paths)?.is_some() {
+                continue;
+            }
+            if !metadata.is_terminal() {
+                return Ok(false);
+            }
+            if metadata.child_pid.is_none() && metadata.pgid.is_none() {
+                continue;
+            }
+            #[cfg(unix)]
+            if let Some(pgid) = metadata.pgid.filter(|pgid| *pgid > 0) {
+                // Only ESRCH proves that no group member can still write. A
+                // permission error or an unsupported probe keeps the task put.
+                if unsafe { libc::kill(-pgid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    continue;
+                }
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn dir_has_entries(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod storage_root_tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    struct NonPanickingCleanup<F: FnOnce()> {
+        cleanup: Option<F>,
+    }
+
+    impl<F: FnOnce()> NonPanickingCleanup<F> {
+        fn new(cleanup: F) -> Self {
+            Self {
+                cleanup: Some(cleanup),
+            }
+        }
+    }
+
+    impl<F: FnOnce()> Drop for NonPanickingCleanup<F> {
+        fn drop(&mut self) {
+            let Some(cleanup) = self.cleanup.take() else {
+                return;
+            };
+            // A cleanup panic while the test is already unwinding aborts the whole
+            // libtest process, so cleanup failures must remain contained here.
+            let _ = catch_unwind(AssertUnwindSafe(cleanup));
+        }
+    }
+
+    #[test]
+    fn powershell_absence_has_an_honest_install_remedy() {
+        let error = super::resolve_powershell_path_with(|_| None).expect_err("pwsh is absent");
+        assert!(error.contains("PowerShell (pwsh) is not installed"));
+        assert!(error.contains("https://aka.ms/powershell"));
+        // The refusal must name the no-install fix too, not only installation.
+        assert!(error.contains("bash tool without `shell: \"powershell\"`"));
+        // A host that registered the command tool under another name gets that
+        // name in the same sentence.
+        assert!(super::powershell_missing_message("shell")
+            .contains("call the shell tool without `shell: \"powershell\"`"));
+    }
+
+    #[test]
+    fn cleanup_panic_during_unwind_does_not_abort_libtest() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cleanup_ran = AtomicBool::new(false);
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _cleanup = NonPanickingCleanup::new(|| {
+                cleanup_ran.store(true, Ordering::SeqCst);
+                panic!("forced cleanup failure");
+            });
+            panic!("primary test failure");
+        }));
+
+        assert!(cleanup_ran.load(Ordering::SeqCst));
+        assert_eq!(
+            unwind
+                .expect_err("primary panic must escape the inner scope")
+                .downcast_ref::<&str>(),
+            Some(&"primary test failure")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shell_resolution_tests {
+    use super::{resolve_shell_path, BashShell};
+
+    /// `pty: true` must not change which shell reads the command. The model
+    /// writes bash for a tool named `bash`; a fish `$SHELL` on the host used to
+    /// make only the PTY path interpret it, so `$?` and `&&` failed there and
+    /// nowhere else.
+    #[test]
+    fn pty_and_pipe_modes_resolve_the_same_shell_regardless_of_shell_env() {
+        let _env = crate::test_env::process_env_lock();
+        let previous = std::env::var_os("SHELL");
+        // A path that exists on every macOS/Linux box so the old $SHELL-first
+        // resolver would have accepted it; the assertion below is what proves
+        // the resolver no longer looks.
+        std::env::set_var("SHELL", "/bin/sh");
+
+        let pty = resolve_shell_path(true, BashShell::Bash).expect("pty shell resolves");
+        let pipe = resolve_shell_path(false, BashShell::Bash).expect("pipe shell resolves");
+
+        match previous {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+
+        assert_eq!(
+            pty, pipe,
+            "PTY and pipe modes must launch the same interpreter"
+        );
+        assert_ne!(
+            pty.file_name().and_then(|name| name.to_str()),
+            Some("sh"),
+            "the PTY launcher must come from the bash resolver, not from $SHELL"
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_root_task_repair_tests {
+    use std::fs;
+
+    use crate::harness::Harness;
+    use crate::walk_boundary::simulated_volumes::simulate;
+
+    #[test]
+    fn legacy_root_tasks_in_populated_harness_do_not_rescan() {
+        let storage = tempfile::tempdir().unwrap();
+        let legacy = storage.path().join("bash-tasks/session");
+        let modern = storage
+            .path()
+            .join(Harness::Opencode.storage_segment())
+            .join("bash-tasks/session");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&modern).unwrap();
+        fs::write(legacy.join("kept"), "legacy").unwrap();
+        fs::write(modern.join("kept"), "modern").unwrap();
+
+        let mut scans = 0;
+        for _ in 0..2 {
+            super::repair_legacy_root_tasks_with(storage.path(), Harness::Opencode, |_| {
+                scans += 1;
+                Ok(true)
+            });
+        }
+        assert_eq!(scans, 0, "a populated destination prevents migration");
+        assert_eq!(fs::read(legacy.join("kept")).unwrap(), b"legacy");
+        assert_eq!(fs::read(modern.join("kept")).unwrap(), b"modern");
+
+        // Emptying the destination must allow migration on the next repair call.
+        fs::remove_dir_all(modern.parent().unwrap()).unwrap();
+        super::repair_legacy_root_tasks_with(storage.path(), Harness::Opencode, |_| {
+            scans += 1;
+            Ok(true)
+        });
+        assert_eq!(scans, 1);
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(modern.join("kept")).unwrap(), b"legacy");
+    }
+
+    #[test]
+    #[ignore = "creates 5000 persisted task bundles to measure configure legacy repair"]
+    fn legacy_root_tasks_populated_harness_measurement() {
+        use super::persistence::*;
+        let storage = tempfile::tempdir().unwrap();
+        let project = std::path::Path::new(crate::test_support::manifest_dir())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        for index in 0..5000 {
+            let session = format!("history-{}", index % 100);
+            let id = format!("bash-{index:016x}");
+            let task = create_task_layout(storage.path(), &session, &id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                id,
+                session,
+                "finished checkout task".into(),
+                project.into(),
+                None,
+                None,
+                true,
+                false,
+            );
+            metadata.mark_terminal(super::BgTaskStatus::Completed, Some(0), None);
+            write_task_at(&task, &metadata).unwrap();
+        }
+        fs::create_dir_all(
+            storage
+                .path()
+                .join(Harness::Opencode.storage_segment())
+                .join("bash-tasks/current-session"),
+        )
+        .unwrap();
+        for run in 0..3 {
+            let start = std::time::Instant::now();
+            let mut scans = 0;
+            let mut reads = 0;
+            super::repair_legacy_root_tasks_with(storage.path(), Harness::Opencode, |root| {
+                scans += 1;
+                super::legacy_root_tasks_quiescent_with(root, || reads += 1)
+            });
+            println!(
+                "legacy_repair run={run} checkout={} sessions=100 task_bundles=5000 scans={scans} task_metadata_reads={reads} elapsed_us={}",
+                project.display(), start.elapsed().as_micros()
+            );
+            assert_eq!(reads, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_background_legacy_live_writer_survives_cross_volume_repair_and_replay() {
+        use super::persistence::*;
+        use super::registry::BgTaskRegistry;
+        use super::BgTaskStatus;
+        use std::process::{Command, Stdio};
+
+        let storage = tempfile::tempdir().unwrap();
+        let session = "legacy-live-writer";
+        let id = "bash-0123456789abcdef";
+        let task = create_task_layout(storage.path(), session, id).unwrap();
+        let handles = TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
+        let release = storage.path().join("release");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!("printf before; {}; printf after; printf error-after >&2; printf 37 > \"$2\"; exit 37", crate::test_gate::gate("\"$1\"", "sleep 0.02")),
+            "legacy-writer",
+        ]);
+        command.arg(&release).arg(&task.paths.exit);
+        command.stdout(Stdio::from(
+            handles.clone_file(TaskArtifact::Stdout).unwrap(),
+        ));
+        command.stderr(Stdio::from(
+            handles.clone_file(TaskArtifact::Stderr).unwrap(),
+        ));
+        super::process::start_new_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut metadata = PersistedTask::starting(
+            id.into(),
+            session.into(),
+            "legacy writer".into(),
+            storage.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.mark_running(child.id(), child.id() as i32);
+        write_task_at(&task, &metadata).unwrap();
+        let harness = storage.path().join(Harness::Opencode.storage_segment());
+        fs::create_dir_all(&harness).unwrap();
+        let _volume = simulate(&harness, u64::MAX - 20);
+
+        super::repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+        let registry = BgTaskRegistry::default();
+        registry.replay_session(&harness, session).unwrap();
+        let running = registry.status(id, session, None, None, 4096).unwrap();
+        let replay_exit = registry.task_exit_path(id, session);
+        // Release even on the broken implementation so no child is left waiting.
+        fs::write(&release, b"finish").unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(37));
+        assert_eq!(running.info.status, BgTaskStatus::Running);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let completed = loop {
+            let snapshot = registry.status(id, session, None, None, 4096).unwrap();
+            if snapshot.info.status.is_terminal() {
+                break snapshot;
+            }
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(completed.exit_code, Some(37));
+        assert_eq!(completed.info.status, BgTaskStatus::Failed);
+        assert_eq!(replay_exit, Some(task.paths.exit.clone()));
+        assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"beforeafter");
+        assert_eq!(fs::read(&task.paths.stderr).unwrap(), b"error-after");
+        assert!(task.paths.exit.exists());
+        registry.repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+        assert!(
+            task.paths.exit.exists(),
+            "repeated configure must retain pinned paths"
+        );
+        registry.detach();
+        drop(registry);
+        drop(handles);
+        drop(task);
+
+        super::repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+        assert!(!storage.path().join("bash-tasks").exists());
+        let moved = resolve_task(&harness, session, id).unwrap();
+        assert_eq!(read_task_at(&moved).unwrap().exit_code, Some(37));
+        assert_eq!(fs::read(&moved.paths.stdout).unwrap(), b"beforeafter");
+        assert_eq!(
+            read_exit_marker(&moved.paths).unwrap(),
+            Some(ExitMarker::Code(37))
+        );
+    }
+
+    #[test]
+    fn legacy_root_tasks_move_into_a_harness_folder_on_another_volume() {
+        use super::persistence::*;
+        let storage = tempfile::tempdir().unwrap();
+        let root_tasks = storage.path().join("bash-tasks");
+        let id = "bash-0123456789abcdef";
+        let task = create_task_layout(storage.path(), "terminal", id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            id.into(),
+            "terminal".into(),
+            "done".into(),
+            storage.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.mark_terminal(super::BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&task, &metadata).unwrap();
+        drop(task);
+        let harness_dir = storage.path().join(Harness::Opencode.storage_segment());
+        fs::create_dir_all(&harness_dir).unwrap();
+        // Every rename from the root into the harness folder now fails with EXDEV.
+        let _volume = simulate(&harness_dir, u64::MAX - 20);
+
+        super::repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+
+        assert_eq!(
+            read_task_at(&resolve_task(&harness_dir, "terminal", id).unwrap())
+                .unwrap()
+                .exit_code,
+            Some(0),
+            "the task must reach the harness folder"
+        );
+        assert!(
+            !root_tasks.exists(),
+            "the legacy folder is removed after the copy"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) use registry::push_projection_fixture;
+#[doc(hidden)]
+pub mod progress;
+#[doc(hidden)]
+pub mod secrets;
+#[doc(hidden)]
+pub use pty_input::{PtyWriteError, INPUT_DEADLINE};

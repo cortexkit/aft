@@ -1,0 +1,1572 @@
+//! The call graph's queries over file slices.
+//!
+//! Each query reads the slices of the files it needs, found through a few
+//! lookups a [`SliceSource`] provides (which files call a target, which use
+//! a name), and answers with the filters and order today's SQLite queries
+//! used, so commands built on them answer the same. Where a row needs
+//! another file's data (a target's node, whether a construction targets a
+//! function), it reads that file's slice.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use super::slice::{EdgeView, FileSlice, NodeView, RefView, TargetLookup};
+use crate::callgraph::{self, TraceToSymbolCandidate};
+use crate::callgraph_store::{
+    lang_from_label, lang_label, normalize_file_path, relative_path, CallGraphRead,
+    CallGraphStoreError, EntryFacts, Result, StoreCallSite, StoreCallersResult, StoreImpactResult,
+    StoreNode, StoreRefSite, StoreUnresolvedCall, StoredEdge, UNRESOLVED_CALL_SITE_COUNT_LIMIT,
+};
+use crate::error::AftError;
+use crate::parser::LangId;
+
+#[cfg(test)]
+mod impact_budget_tests {
+    use super::*;
+
+    #[test]
+    fn audit_resolution_luau_callers_count_luau_unresolved_sites() {
+        use crate::data_layer::{callgraph::resolve_checkout, incremental_tests::checkout};
+
+        let root = tempfile::tempdir().unwrap();
+        let inputs = checkout(
+            &[(
+                "calls.ts",
+                "function target() {}\nfunction caller() { unknown.missing(); }\n",
+            )],
+            &[],
+        );
+        let (_, parse) = inputs.parses.read("calls.ts").unwrap();
+        let mut parse = (*parse).clone();
+        let mut resolutions = resolve_checkout(&inputs, 1).unwrap();
+        parse.language = "luau".into();
+        // Model an already stored Luau record without downloading its grammar.
+        let mut slices = MemorySlices::default();
+        slices.insert(FileSlice::build(
+            "calls.luau",
+            "test",
+            &parse,
+            &resolutions.remove("calls.ts").unwrap(),
+        ));
+        let reader = SliceReader::new(slices, root.path().to_path_buf(), "test".into());
+        assert_eq!(
+            reader
+                .unresolved_call_site_count(LangId::Luau, true)
+                .unwrap(),
+            1
+        );
+        let result = crate::data_layer::callgraph_store_adapter::callers_result(
+            &reader,
+            &root.path().join("calls.luau"),
+            "target",
+            1,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 0);
+        let note = result
+            .incomplete
+            .expect("Luau caller answer must report incomplete coverage");
+        assert_eq!(note.unresolved_call_sites, 1);
+        assert!(note.incomplete_reason.contains("Luau"));
+    }
+
+    fn graph() -> (tempfile::TempDir, SliceReader<MemorySlices>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\npub fn b() {}\npub fn caller() { a(); a(); b(); let f = a; f(); }\npub fn other() { b(); a(); }\n").unwrap();
+        let reader = crate::data_layer::trace_measure::memory_reader(dir.path());
+        (dir, reader)
+    }
+
+    #[test]
+    fn impact_batch_scan_preserves_legacy_sites_and_counts() {
+        let (_dir, reader) = graph();
+        let targets = vec![
+            ("src/lib.rs".to_string(), "a".to_string()),
+            ("src/lib.rs".to_string(), "b".to_string()),
+            ("src/lib.rs".to_string(), "missing".to_string()),
+        ];
+        let batch = reader.direct_callers_for_symbols(&targets).unwrap();
+        let counts = reader.direct_caller_counts_of(&targets).unwrap();
+        for key in targets {
+            let legacy = reader
+                .callers_of_target(&key.0, &key.1)
+                .into_iter()
+                .map(|(_, site)| site)
+                .collect::<Vec<_>>();
+            let count = legacy
+                .iter()
+                .map(|site| (&site.caller.file, site.line, &site.kind))
+                .collect::<BTreeSet<_>>()
+                .len();
+            assert_eq!(batch[&key], legacy);
+            assert_eq!(counts[&key], count);
+        }
+        assert!(!batch[&("src/lib.rs".into(), "a".into())].is_empty());
+    }
+
+    #[test]
+    fn impact_reader_budget_stops_within_one_hub_adjacency() {
+        let (_dir, reader) = graph();
+        let targets = vec![("src/lib.rs".to_string(), "a".to_string())];
+        let all = reader.direct_callers_for_symbols(&targets).unwrap();
+        let total = all[&targets[0]].len();
+        assert!(total > 1);
+        for limit in [0, 1, total, total + 1] {
+            let (found, exhausted, examined) =
+                reader.direct_callers_bounded(&targets, limit).unwrap();
+            assert_eq!(examined, limit.min(total));
+            assert_eq!(found[&targets[0]].len(), examined);
+            assert_eq!(exhausted, total > limit);
+            if !exhausted {
+                assert_eq!(found, all);
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_calls_walk_the_call_edges_of_a_slice_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("calls.ts"),
+            "function defined() {}\nexport function entry() { defined(); missingA(); missingB(); }\n",
+        )
+        .unwrap();
+        let reader = crate::data_layer::trace_measure::memory_reader(dir.path());
+        let nodes = reader.nodes_scoped_exactly("calls.ts", "entry");
+        assert_eq!(nodes.len(), 1);
+        let slice = reader.source.slice("calls.ts").unwrap();
+        assert!(slice.edges().len() > 0);
+        super::super::slice::EDGE_WALKS.with(|walks| walks.set(0));
+        assert_eq!(reader.unresolved_calls_of(&nodes[0]).unwrap().len(), 2);
+        assert_eq!(
+            super::super::slice::EDGE_WALKS.with(std::cell::Cell::get),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_site_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::callgraph_store::{MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND};
+
+    /// Counts how many slices queries read.
+    struct Counting {
+        inner: MemorySlices,
+        reads: AtomicUsize,
+    }
+
+    impl aft_store::heap::HeapBytes for Counting {
+        fn heap_bytes(&self, _seen: &mut aft_store::heap::Seen) -> usize {
+            0
+        }
+    }
+
+    impl SliceSource for Counting {
+        fn slice(&self, path: &str) -> Option<Arc<FileSlice>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.slice(path)
+        }
+        fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String> {
+            self.inner.caller_files(target_file, target_symbol)
+        }
+        fn files_with_ref_name(&self, short_name: &str) -> BTreeSet<String> {
+            self.inner.files_with_ref_name(short_name)
+        }
+        fn files_with_symbol_name(&self, name: &str) -> BTreeSet<String> {
+            self.inner.files_with_symbol_name(name)
+        }
+        fn files_of_language(&self, language: &str) -> BTreeSet<String> {
+            self.inner.files_of_language(language)
+        }
+        fn files(&self) -> Vec<String> {
+            self.inner.files()
+        }
+    }
+
+    const FILES: usize = 40;
+
+    /// `dsl_target` is mentioned inside a macro tree-sitter cannot parse in
+    /// each of `FILES` files.
+    fn mentions() -> (tempfile::TempDir, SliceReader<Counting>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src/dsl")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn dsl_target() {}\n").unwrap();
+        for index in 0..FILES {
+            std::fs::write(
+                dir.path().join(format!("src/dsl/m{index:03}.rs")),
+                "pub fn f() {\n    my_dsl! { when ready then dsl_target @ 3 }\n}\n",
+            )
+            .unwrap();
+        }
+        let reader = crate::data_layer::trace_measure::memory_reader(dir.path());
+        let counting = Counting {
+            inner: reader.source().clone(),
+            reads: AtomicUsize::new(0),
+        };
+        let reader = SliceReader::new(counting, dir.path().to_path_buf(), "test".to_string());
+        (dir, reader)
+    }
+
+    fn reads(reader: &SliceReader<Counting>) -> usize {
+        reader.source().reads.swap(0, Ordering::Relaxed)
+    }
+
+    /// A limited lookup stops reading slices once it holds its limit, rather
+    /// than reading every file of the name and trimming afterwards.
+    #[test]
+    fn ref_sites_named_stops_reading_slices_at_its_limit() {
+        let (_dir, reader) = mentions();
+        let lookup = |limit| {
+            reader
+                .ref_sites_named("dsl_target", &[(MACRO_MENTION_REF_KIND, limit)])
+                .unwrap()
+                .remove(0)
+        };
+        let all = lookup(usize::MAX);
+        assert_eq!(all.len(), FILES);
+        assert_eq!(reads(&reader), FILES);
+
+        let first = lookup(5);
+        assert_eq!(first, all[..5]);
+        assert_eq!(
+            reads(&reader),
+            5,
+            "a lookup limited to 5 sites read more slices than it kept"
+        );
+    }
+
+    /// `callers` asks for two kinds of one name; asked together they read
+    /// each file once, where two lookups read it twice.
+    #[test]
+    fn ref_sites_named_reads_each_file_once_for_every_kind() {
+        let (_dir, reader) = mentions();
+        let kinds = [
+            (MACRO_BODY_CALL_REF_KIND, 51),
+            (MACRO_MENTION_REF_KIND, 101),
+        ];
+        let separate = kinds
+            .iter()
+            .map(|kind| {
+                reader
+                    .ref_sites_named("dsl_target", std::slice::from_ref(kind))
+                    .unwrap()
+                    .remove(0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads(&reader), 2 * FILES);
+
+        let together = reader.ref_sites_named("dsl_target", &kinds).unwrap();
+        assert_eq!(together, separate);
+        assert_eq!(reads(&reader), FILES);
+    }
+}
+
+/// Where queries find slices and the lookups that narrow which to read.
+/// Every source can say what it holds in memory, so the memory census can
+/// count a checkout's call graph through the source it serves.
+#[doc(hidden)]
+pub trait SliceSource: aft_store::heap::HeapBytes {
+    fn slice(&self, path: &str) -> Option<Arc<FileSlice>>;
+    /// Every file with an edge to `target_symbol` in `target_file`.
+    fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String>;
+    /// Every file with a reference of this short name.
+    fn files_with_ref_name(&self, short_name: &str) -> BTreeSet<String>;
+    /// Every file declaring a symbol with this name, scoped name, or (Rust)
+    /// scoped name after ` for `.
+    fn files_with_symbol_name(&self, name: &str) -> BTreeSet<String>;
+    /// Every file parsed as `language`.
+    fn files_of_language(&self, language: &str) -> BTreeSet<String>;
+    /// Every file, in path order.
+    fn files(&self) -> Vec<String>;
+}
+
+impl<T: SliceSource + ?Sized> SliceSource for Arc<T> {
+    fn slice(&self, path: &str) -> Option<Arc<FileSlice>> {
+        (**self).slice(path)
+    }
+    fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String> {
+        (**self).caller_files(target_file, target_symbol)
+    }
+    fn files_with_ref_name(&self, short_name: &str) -> BTreeSet<String> {
+        (**self).files_with_ref_name(short_name)
+    }
+    fn files_with_symbol_name(&self, name: &str) -> BTreeSet<String> {
+        (**self).files_with_symbol_name(name)
+    }
+    fn files_of_language(&self, language: &str) -> BTreeSet<String> {
+        (**self).files_of_language(language)
+    }
+    fn files(&self) -> Vec<String> {
+        (**self).files()
+    }
+}
+
+/// Slices kept in memory, with their lookups.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MemorySlices {
+    slices: BTreeMap<String, Arc<FileSlice>>,
+    callers: HashMap<(String, String), BTreeSet<String>>,
+    ref_names: HashMap<String, BTreeSet<String>>,
+    symbol_names: HashMap<String, BTreeSet<String>>,
+    languages: HashMap<String, BTreeSet<String>>,
+}
+
+/// The lookup keys one slice is filed under.
+#[derive(Debug, Default)]
+struct SliceKeys {
+    callers: Vec<(String, String)>,
+    ref_names: Vec<String>,
+    symbol_names: BTreeSet<String>,
+    language: String,
+}
+
+impl SliceKeys {
+    fn of(slice: &FileSlice) -> Self {
+        Self {
+            callers: slice
+                .edges()
+                .map(|edge| {
+                    (
+                        edge.target_file().to_string(),
+                        edge.target_symbol().to_string(),
+                    )
+                })
+                .collect(),
+            ref_names: slice
+                .references()
+                .filter_map(|reference| reference.short_name().map(str::to_string))
+                .collect(),
+            symbol_names: symbol_keys(slice),
+            language: slice.language().to_string(),
+        }
+    }
+}
+
+impl MemorySlices {
+    /// Adds or replaces the slice of its file.
+    pub(crate) fn insert(&mut self, slice: FileSlice) {
+        let keys = SliceKeys::of(&slice);
+        let path = slice.path().to_string();
+        self.file(&path, &keys);
+        self.slices.insert(path, Arc::new(slice));
+    }
+
+    /// Files `path` under `keys`, removing it from the keys of the slice it
+    /// replaces first.
+    fn file(&mut self, path: &str, keys: &SliceKeys) {
+        self.remove(path);
+        for key in &keys.callers {
+            self.callers
+                .entry(key.clone())
+                .or_default()
+                .insert(path.to_string());
+        }
+        for name in &keys.ref_names {
+            self.ref_names
+                .entry(name.clone())
+                .or_default()
+                .insert(path.to_string());
+        }
+        for name in &keys.symbol_names {
+            self.symbol_names
+                .entry(name.clone())
+                .or_default()
+                .insert(path.to_string());
+        }
+        self.languages
+            .entry(keys.language.clone())
+            .or_default()
+            .insert(path.to_string());
+    }
+
+    /// Removes the slice of `path`.
+    pub(crate) fn remove(&mut self, path: &str) {
+        let Some(slice) = self.slices.remove(path) else {
+            return;
+        };
+        let keys = SliceKeys::of(&slice);
+        for key in &keys.callers {
+            if let Some(files) = self.callers.get_mut(key) {
+                files.remove(path);
+                if files.is_empty() {
+                    self.callers.remove(key);
+                }
+            }
+        }
+        for name in &keys.ref_names {
+            if let Some(files) = self.ref_names.get_mut(name) {
+                files.remove(path);
+            }
+        }
+        for name in &keys.symbol_names {
+            if let Some(files) = self.symbol_names.get_mut(name) {
+                files.remove(path);
+            }
+        }
+        if let Some(files) = self.languages.get_mut(&keys.language) {
+            files.remove(path);
+        }
+    }
+}
+
+/// The names a slice's symbols can be found by.
+pub(crate) fn symbol_keys(slice: &FileSlice) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for node in slice.nodes() {
+        keys.insert(node.name().to_string());
+        keys.insert(node.scoped_name().to_string());
+        if slice.language() == "rust" {
+            if let Some((_, implementation)) = node.scoped_name().split_once(" for ") {
+                keys.insert(implementation.to_string());
+            }
+        }
+    }
+    keys
+}
+
+impl SliceSource for MemorySlices {
+    fn slice(&self, path: &str) -> Option<Arc<FileSlice>> {
+        self.slices.get(path).cloned()
+    }
+    fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String> {
+        self.callers
+            .get(&(target_file.to_string(), target_symbol.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn files_with_ref_name(&self, short_name: &str) -> BTreeSet<String> {
+        self.ref_names.get(short_name).cloned().unwrap_or_default()
+    }
+    fn files_with_symbol_name(&self, name: &str) -> BTreeSet<String> {
+        self.symbol_names.get(name).cloned().unwrap_or_default()
+    }
+    fn files_of_language(&self, language: &str) -> BTreeSet<String> {
+        self.languages.get(language).cloned().unwrap_or_default()
+    }
+    fn files(&self) -> Vec<String> {
+        self.slices.keys().cloned().collect()
+    }
+}
+
+/// A call-graph reader over slices.
+#[doc(hidden)]
+pub struct SliceReader<S> {
+    source: S,
+    project_root: PathBuf,
+    project_key: String,
+}
+
+impl<S: SliceSource> SliceReader<S> {
+    #[doc(hidden)]
+    pub fn new(source: S, project_root: PathBuf, project_key: String) -> Self {
+        Self {
+            source,
+            project_root,
+            project_key,
+        }
+    }
+
+    pub(crate) fn source(&self) -> &S {
+        &self.source
+    }
+
+    fn rel(&self, file_rel: &Path) -> Result<String> {
+        let absolute = normalize_file_path(&self.project_root, file_rel)?;
+        relative_path(&self.project_root, &absolute).ok_or_else(|| {
+            AftError::FileNotFound {
+                path: absolute.display().to_string(),
+            }
+            .into()
+        })
+    }
+}
+
+fn store_node(slice: &FileSlice, node: NodeView<'_>) -> StoreNode {
+    StoreNode::from_parts(
+        node.id().to_string(),
+        slice.path().to_string(),
+        node.scoped_name().to_string(),
+        node.name().to_string(),
+        node.kind().to_string(),
+        node.start_line().saturating_add(1),
+        node.end_line().saturating_add(1),
+        node.signature(),
+        node.exported(),
+        node.entry_point(),
+        lang_from_label(slice.language()).unwrap_or(LangId::TypeScript),
+    )
+    .with_entry(EntryFacts {
+        is_test: node.is_test(),
+        program_start: node.program_start(),
+        entry_attribute: node.entry_attribute().map(str::to_string),
+        default_export: node.is_default_export(),
+    })
+}
+
+/// The scoped name after ` for `, with generic arguments removed.
+fn implementation_name(scoped: &str) -> String {
+    let suffix = scoped
+        .split_once(" for ")
+        .map_or(scoped, |(_, implementation)| implementation);
+    let mut depth = 0usize;
+    suffix
+        .chars()
+        .filter(|ch| match ch {
+            '<' => {
+                depth += 1;
+                false
+            }
+            '>' if depth > 0 => {
+                depth -= 1;
+                false
+            }
+            _ => depth == 0,
+        })
+        .collect()
+}
+
+/// Whether `node` matches a symbol query as the database's node queries do.
+fn matches_symbol(slice: &FileSlice, node: NodeView<'_>, symbol: &str) -> bool {
+    let scoped = node.scoped_name();
+    if symbol.contains("::") {
+        scoped == symbol
+            || (slice.language() == "rust"
+                && scoped
+                    .split_once(" for ")
+                    .is_some_and(|(_, implementation)| implementation == symbol))
+    } else {
+        scoped == symbol || node.name() == symbol
+    }
+}
+
+/// `ORDER BY scoped_name, start_line, start_col`.
+fn node_order(a: &NodeView<'_>, b: &NodeView<'_>) -> std::cmp::Ordering {
+    (a.scoped_name(), a.start_line(), a.start_col()).cmp(&(
+        b.scoped_name(),
+        b.start_line(),
+        b.start_col(),
+    ))
+}
+
+/// A reference as an unresolved call of `caller`, named by its short name,
+/// else by its full name.
+fn unresolved_call(caller: &StoreNode, reference: RefView<'_>) -> StoreUnresolvedCall {
+    let full_ref = reference.full_ref();
+    StoreUnresolvedCall {
+        caller: caller.clone(),
+        symbol: reference
+            .short_name()
+            .or(full_ref.as_deref())
+            .unwrap_or_default()
+            .to_string(),
+        full_ref,
+        line: reference.line(),
+        byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+        byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+    }
+}
+
+impl<S: SliceSource> SliceReader<S> {
+    fn nodes_in_file(&self, file: &str, symbol: &str) -> Vec<StoreNode> {
+        let Some(slice) = self.source.slice(file) else {
+            return Vec::new();
+        };
+        let mut nodes = slice
+            .nodes()
+            .filter(|node| matches_symbol(&slice, *node, symbol))
+            .collect::<Vec<_>>();
+        nodes.sort_by(node_order);
+        let matched = nodes
+            .into_iter()
+            .map(|node| store_node(&slice, node))
+            .collect::<Vec<_>>();
+        if symbol.contains("::") && matched.is_empty() {
+            let short = symbol.rsplit("::").next().unwrap_or(symbol);
+            return self
+                .nodes_in_file(file, short)
+                .into_iter()
+                .filter(|node| {
+                    node.lang == LangId::Rust && implementation_name(&node.symbol) == symbol
+                })
+                .collect();
+        }
+        matched
+    }
+
+    fn all_nodes_matching(&self, symbol: &str) -> Vec<StoreNode> {
+        let mut nodes = Vec::new();
+        for file in self.source.files_with_symbol_name(symbol) {
+            let Some(slice) = self.source.slice(&file) else {
+                continue;
+            };
+            let mut found = slice
+                .nodes()
+                .filter(|node| matches_symbol(&slice, *node, symbol))
+                .collect::<Vec<_>>();
+            found.sort_by(node_order);
+            nodes.extend(found.into_iter().map(|node| store_node(&slice, node)));
+        }
+        nodes
+    }
+
+    /// Nodes of `file` whose scoped name is exactly `symbol`, ordered as
+    /// the batched node lookup orders them.
+    fn nodes_scoped_exactly(&self, file: &str, symbol: &str) -> Vec<StoreNode> {
+        let Some(slice) = self.source.slice(file) else {
+            return Vec::new();
+        };
+        let mut nodes = slice
+            .nodes()
+            .filter(|node| node.scoped_name() == symbol)
+            .collect::<Vec<_>>();
+        nodes.sort_by(|a, b| {
+            (
+                a.scoped_name(),
+                a.start_line(),
+                a.end_line(),
+                a.start_col(),
+                a.range_ordinal(),
+            )
+                .cmp(&(
+                    b.scoped_name(),
+                    b.start_line(),
+                    b.end_line(),
+                    b.start_col(),
+                    b.range_ordinal(),
+                ))
+        });
+        nodes
+            .into_iter()
+            .map(|node| store_node(&slice, node))
+            .collect()
+    }
+
+    /// The node an edge or reference targets, when its file is indexed and
+    /// the node survives there.
+    fn target_of(
+        &self,
+        file: &str,
+        symbol: &str,
+        lookup: TargetLookup,
+    ) -> (Option<String>, Option<StoreNode>) {
+        let Some(slice) = self.source.slice(file) else {
+            return (None, None);
+        };
+        let Some(handle) = slice.target_node(symbol, lookup) else {
+            return (None, None);
+        };
+        let node = slice.node(handle).map(|node| store_node(&slice, node));
+        (Some(slice.node_id(handle).to_string()), node)
+    }
+
+    /// An edge's kind as stored: a construction is a call when its target
+    /// is a function or method, otherwise a value reference.
+    fn edge_kind(&self, edge: EdgeView<'_>) -> &'static str {
+        if edge.kind() != "construction" {
+            return edge.kind();
+        }
+        let target_is_callable = self.source.slice(edge.target_file()).is_some_and(|slice| {
+            slice
+                .target_node(edge.target_symbol(), edge.lookup())
+                .and_then(|handle| slice.node_kind(handle))
+                .is_some_and(|kind| matches!(kind, "function" | "method"))
+        });
+        if target_is_callable {
+            "call"
+        } else {
+            "value_ref"
+        }
+    }
+
+    /// Direct callers of one target, in the database's order for one target.
+    fn callers_of_target(
+        &self,
+        target_file: &str,
+        target_symbol: &str,
+    ) -> Vec<(CallerKey, StoreCallSite)> {
+        let mut sites = Vec::new();
+        for file in self.source.caller_files(target_file, target_symbol) {
+            let Some(slice) = self.source.slice(&file) else {
+                continue;
+            };
+            // A slice without both strings has no edge to the target.
+            let (Some(file_index), Some(symbol_index)) = (
+                slice.find_string(target_file),
+                slice.find_string(target_symbol),
+            ) else {
+                continue;
+            };
+            for edge in slice.edges() {
+                if !edge.targets(file_index, symbol_index) {
+                    continue;
+                }
+                let kind = self.edge_kind(edge);
+                if !matches!(kind, "call" | "callback_ref") {
+                    continue;
+                }
+                let Some(reference) = edge.reference() else {
+                    continue;
+                };
+                let Some(source) = slice.node(edge.source()) else {
+                    continue;
+                };
+                let (target_node, target) =
+                    self.target_of(target_file, target_symbol, edge.lookup());
+                sites.push((
+                    CallerKey {
+                        source_node: source.id().to_string(),
+                        byte_start: reference.byte_start(),
+                        line: reference.line(),
+                        ref_id: reference.ref_id(),
+                        target_node: target_node.clone(),
+                        provenance: edge.provenance(),
+                        kind,
+                    },
+                    StoreCallSite {
+                        kind: kind.to_string(),
+                        caller_is_test: source.is_test(),
+                        caller: store_node(&slice, source),
+                        target_file: target_file.to_string(),
+                        target_symbol: target_symbol.to_string(),
+                        target,
+                        line: edge.line(),
+                        byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+                        byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+                        resolved: reference.resolved(),
+                        provenance: edge.provenance().to_string(),
+                    },
+                ));
+            }
+        }
+        sites.sort_by(|a, b| a.0.cmp(&b.0));
+        sites
+    }
+
+    /// Scan each candidate file once for the whole frontier. Targets shared by
+    /// many call sites are resolved once, rather than once per matching edge.
+    fn callers_of_targets(
+        &self,
+        targets: &[(String, String)],
+        limit: usize,
+    ) -> (HashMap<(String, String), Vec<StoreCallSite>>, bool, usize) {
+        let wanted = targets
+            .iter()
+            .map(|(file, symbol)| (file.as_str(), symbol.as_str()))
+            .collect::<BTreeSet<_>>();
+        let mut files = BTreeSet::new();
+        let mut grouped: BTreeMap<_, Vec<(CallerKey, StoreCallSite)>> = BTreeMap::new();
+        for &(file, symbol) in &wanted {
+            files.extend(self.source.caller_files(file, symbol));
+            grouped.insert((file.to_string(), symbol.to_string()), Vec::new());
+        }
+        let mut resolved_targets = HashMap::new();
+        let mut examined = 0;
+        let mut exhausted = false;
+        'files: for file in files {
+            let Some(slice) = self.source.slice(&file) else {
+                continue;
+            };
+            for edge in slice.edges() {
+                if !wanted.contains(&(edge.target_file(), edge.target_symbol())) {
+                    continue;
+                }
+                if !matches!(edge.kind(), "call" | "callback_ref" | "construction") {
+                    continue;
+                }
+                let key = (
+                    edge.target_file().to_string(),
+                    edge.target_symbol().to_string(),
+                );
+                let (target_node, target) = resolved_targets
+                    .entry((key.clone(), matches!(edge.lookup(), TargetLookup::Scoped)))
+                    .or_insert_with(|| self.target_of(&key.0, &key.1, edge.lookup()));
+                let kind = if edge.kind() == "construction" {
+                    if target
+                        .as_ref()
+                        .is_some_and(|node| matches!(node.kind.as_str(), "function" | "method"))
+                    {
+                        "call"
+                    } else {
+                        "value_ref"
+                    }
+                } else {
+                    edge.kind()
+                };
+                if !matches!(kind, "call" | "callback_ref") {
+                    continue;
+                }
+                let (Some(reference), Some(source)) = (edge.reference(), slice.node(edge.source()))
+                else {
+                    continue;
+                };
+                if examined >= limit {
+                    exhausted = true;
+                    break 'files;
+                }
+                examined += 1;
+                grouped.get_mut(&key).expect("requested target").push((
+                    CallerKey {
+                        source_node: source.id().to_string(),
+                        byte_start: reference.byte_start(),
+                        line: reference.line(),
+                        ref_id: reference.ref_id(),
+                        target_node: target_node.clone(),
+                        provenance: edge.provenance(),
+                        kind,
+                    },
+                    StoreCallSite {
+                        kind: kind.to_string(),
+                        caller_is_test: source.is_test(),
+                        caller: store_node(&slice, source),
+                        target_file: key.0,
+                        target_symbol: key.1,
+                        target: target.clone(),
+                        line: edge.line(),
+                        byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+                        byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+                        resolved: reference.resolved(),
+                        provenance: edge.provenance().to_string(),
+                    },
+                ));
+            }
+        }
+        let result = grouped
+            .into_iter()
+            .map(|(key, mut sites)| {
+                sites.sort_by(|a, b| a.0.cmp(&b.0));
+                (key, sites.into_iter().map(|(_, site)| site).collect())
+            })
+            .collect();
+        (result, exhausted, examined)
+    }
+
+    /// Edges whose source is `node`, of kind `call`, in the database's
+    /// outgoing order, with their target nodes.
+    fn outgoing_of(&self, node: &StoreNode) -> Vec<(OutgoingKey, StoreCallSite)> {
+        let Some(slice) = self.source.slice(&node.file) else {
+            return Vec::new();
+        };
+        // No edge has a source the slice does not hold.
+        let Some(source) = slice.handle_of(node.node_id()) else {
+            return Vec::new();
+        };
+        let mut calls = Vec::new();
+        for edge in slice.edges() {
+            if edge.source() != source || self.edge_kind(edge) != "call" {
+                continue;
+            }
+            let Some(reference) = edge.reference() else {
+                continue;
+            };
+            let (target_node, target) =
+                self.target_of(edge.target_file(), edge.target_symbol(), edge.lookup());
+            calls.push((
+                OutgoingKey {
+                    byte_start: reference.byte_start(),
+                    line: reference.line(),
+                    ref_id: reference.ref_id(),
+                    target_file: edge.target_file().to_string(),
+                    target_symbol: edge.target_symbol().to_string(),
+                    target_node,
+                    provenance: edge.provenance(),
+                },
+                StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: None,
+                    caller: node.clone(),
+                    target_file: edge.target_file().to_string(),
+                    target_symbol: edge.target_symbol().to_string(),
+                    target,
+                    line: edge.line(),
+                    byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+                    byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+                    resolved: reference.resolved(),
+                    provenance: edge.provenance().to_string(),
+                },
+            ));
+        }
+        calls.sort_by(|a, b| a.0.cmp(&b.0));
+        calls
+    }
+
+    /// References already represented by a call edge. Do not read another
+    /// file to classify a construction unless the query wants its reference.
+    fn call_edge_references(&self, slice: &FileSlice, wanted: &[RefView<'_>]) -> HashSet<u32> {
+        let mut remaining = wanted.iter().map(RefView::index).collect::<HashSet<_>>();
+        let mut found = HashSet::new();
+        if !remaining.is_empty() {
+            for edge in slice.edges() {
+                let Some(reference) = edge.reference_index() else {
+                    continue;
+                };
+                if remaining.contains(&reference) && self.edge_kind(edge) == "call" {
+                    found.insert(reference);
+                    remaining.remove(&reference);
+                    if remaining.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Unresolved call or construction references of `language`, one per
+    /// caller file and byte span, as the unresolved-site queries group them:
+    /// each span's references by their position in the slice.
+    fn unresolved_spans(
+        &self,
+        language: &str,
+        name: Option<&str>,
+        member_call: bool,
+    ) -> Vec<(String, u64, u64, Vec<u32>, Arc<FileSlice>)> {
+        let mut spans = Vec::new();
+        self.visit_unresolved_spans(
+            language,
+            name,
+            member_call,
+            |file, span, references, slice| {
+                spans.push((
+                    file.to_string(),
+                    span.0,
+                    span.1,
+                    references.to_vec(),
+                    Arc::clone(slice),
+                ));
+                ControlFlow::Continue(())
+            },
+        );
+        spans
+    }
+
+    /// Calls `visit` with each span [`Self::unresolved_spans`] lists, in
+    /// the same order, until it breaks. Reads files one at a time, so a
+    /// caller that stops early reads no further.
+    fn visit_unresolved_spans(
+        &self,
+        language: &str,
+        name: Option<&str>,
+        member_call: bool,
+        mut visit: impl FnMut(&str, (u64, u64), &[u32], &Arc<FileSlice>) -> ControlFlow<()>,
+    ) {
+        // The named count matches the name exactly, an empty one included;
+        // the method-site query treats an empty name as every site.
+        let name = name.filter(|name| !(member_call && name.is_empty()));
+        let files = match name {
+            Some(name) => self
+                .source
+                .files_with_ref_name(name)
+                .intersection(&self.source.files_of_language(language))
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            _ => self.source.files_of_language(language),
+        };
+        for file in files {
+            let Some(slice) = self.source.slice(&file) else {
+                continue;
+            };
+            // A slice without the name has no reference of it.
+            let name_index = match name {
+                Some(name) => match slice.find_string(name) {
+                    Some(index) => Some(index),
+                    None => continue,
+                },
+                None => None,
+            };
+            // Each reference's edges, so the call-edge check below reads only
+            // the reference's own.
+            let mut edges_by_ref = HashMap::<u32, Vec<EdgeView<'_>>>::new();
+            for edge in slice.edges() {
+                if let Some(reference) = edge.reference_index() {
+                    edges_by_ref.entry(reference).or_default().push(edge);
+                }
+            }
+            let mut groups = BTreeMap::<(u64, u64), Vec<u32>>::new();
+            for reference in slice.references() {
+                if !matches!(reference.kind(), "call" | "construction") || reference.resolved() {
+                    continue;
+                }
+                if name_index.is_some() {
+                    if reference.short_name_index() != name_index {
+                        continue;
+                    }
+                    if member_call && !reference.full_ref().is_some_and(|full| full.contains('.')) {
+                        continue;
+                    }
+                }
+                let has_call_edge = edges_by_ref
+                    .get(&reference.index())
+                    .is_some_and(|edges| edges.iter().any(|edge| self.edge_kind(*edge) == "call"));
+                if has_call_edge {
+                    continue;
+                }
+                groups
+                    .entry((reference.byte_start(), reference.byte_end()))
+                    .or_default()
+                    .push(reference.index());
+            }
+            for (span, references) in groups {
+                if visit(&file, span, &references, &slice).is_break() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The database's order for direct callers of one target.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CallerKey {
+    source_node: String,
+    byte_start: u64,
+    line: u32,
+    ref_id: String,
+    target_node: Option<String>,
+    provenance: &'static str,
+    kind: &'static str,
+}
+
+/// The database's order for outgoing calls of one node.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OutgoingKey {
+    byte_start: u64,
+    line: u32,
+    ref_id: String,
+    target_file: String,
+    target_symbol: String,
+    target_node: Option<String>,
+    provenance: &'static str,
+}
+
+fn unused(operation: &str) -> CallGraphStoreError {
+    CallGraphStoreError::Unavailable(format!(
+        "{operation} is composed by the call-graph command adapter from the store's direct lookups"
+    ))
+}
+
+impl<S: SliceSource> CallGraphRead for SliceReader<S> {
+    fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    fn project_key(&self) -> &str {
+        &self.project_key
+    }
+
+    fn sqlite_path(&self) -> &Path {
+        Path::new("")
+    }
+
+    fn is_current(&self) -> bool {
+        true
+    }
+
+    fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
+        let mut edges = BTreeSet::new();
+        for file in self.source.files() {
+            let Some(slice) = self.source.slice(&file) else {
+                continue;
+            };
+            for edge in slice.edges() {
+                let Some(source) = slice.node(edge.source()) else {
+                    continue;
+                };
+                edges.insert(StoredEdge {
+                    source_file: file.clone(),
+                    source_symbol: source.scoped_name().to_string(),
+                    target_file: edge.target_file().to_string(),
+                    target_symbol: edge.target_symbol().to_string(),
+                    kind: self.edge_kind(edge).to_string(),
+                    line: edge.line(),
+                });
+            }
+        }
+        Ok(edges)
+    }
+
+    fn indexed_file_count(&self) -> Result<usize> {
+        Ok(self.source.files().len())
+    }
+
+    fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
+        let rel = self.rel(file_rel)?;
+        let candidates = self.nodes_in_file(&rel, symbol);
+        match candidates.as_slice() {
+            [candidate] => Ok(candidate.clone()),
+            [] => Err(AftError::SymbolNotFound {
+                name: symbol.to_string(),
+                file: rel,
+            }
+            .into()),
+            _ => Err(AftError::AmbiguousSymbol {
+                name: symbol.to_string(),
+                candidates: candidates
+                    .iter()
+                    .map(|candidate| candidate.symbol.clone())
+                    .collect(),
+            }
+            .into()),
+        }
+    }
+
+    fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
+        let rel = self.rel(file_rel)?;
+        Ok(self.nodes_in_file(&rel, symbol))
+    }
+
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        Ok(self.nodes_in_file(file, symbol))
+    }
+
+    fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
+        Ok(self
+            .source
+            .slice(file)
+            .map(|slice| slice.record_key().to_string()))
+    }
+
+    fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
+        Ok(self.all_nodes_matching(symbol))
+    }
+
+    fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
+        let rel = self.rel(file_rel)?;
+        Ok(self
+            .callers_of_target(&rel, symbol)
+            .into_iter()
+            .map(|(_, site)| site)
+            .collect())
+    }
+
+    fn direct_callers_for_symbols(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        Ok(self.callers_of_targets(targets, usize::MAX).0)
+    }
+
+    fn direct_caller_counts_of(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), usize>> {
+        Ok(self
+            .callers_of_targets(targets, usize::MAX)
+            .0
+            .into_iter()
+            .map(|(target, sites)| {
+                let groups = sites
+                    .into_iter()
+                    .map(|site| (site.caller.file, site.line, site.kind))
+                    .collect::<BTreeSet<_>>();
+                (target, groups.len())
+            })
+            .collect())
+    }
+
+    fn direct_callers_bounded(
+        &self,
+        targets: &[(String, String)],
+        limit: usize,
+    ) -> Result<(HashMap<(String, String), Vec<StoreCallSite>>, bool, usize)> {
+        Ok(self.callers_of_targets(targets, limit))
+    }
+
+    fn outgoing_calls_for_symbols(
+        &self,
+        sources: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        let mut by_source = HashMap::new();
+        for source in sources.iter().cloned().collect::<BTreeSet<_>>() {
+            let nodes = self.nodes_scoped_exactly(&source.0, &source.1);
+            let mut calls = Vec::new();
+            // Each source node's calls in its outgoing order, nodes in the
+            // order the node lookup returns them.
+            for node in &nodes {
+                calls.extend(self.outgoing_of(node).into_iter().map(|(_, call)| call));
+            }
+            // Calls whose target node the edge did not name take the first
+            // node of the target's file and scoped name.
+            for call in &mut calls {
+                if call.target.is_none() {
+                    call.target = self
+                        .nodes_scoped_exactly(&call.target_file, &call.target_symbol)
+                        .into_iter()
+                        .next();
+                }
+            }
+            by_source.insert(source, calls);
+        }
+        Ok(by_source)
+    }
+
+    fn callers_of(&self, _: &Path, _: &str, _: usize) -> Result<StoreCallersResult> {
+        Err(unused("callers_of"))
+    }
+
+    fn impact_of(&self, _: &Path, _: &str, _: usize) -> Result<StoreImpactResult> {
+        Err(unused("impact_of"))
+    }
+
+    fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        Ok(self
+            .outgoing_of(node)
+            .into_iter()
+            .map(|(_, call)| call)
+            .collect())
+    }
+
+    fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        let Some(slice) = self.source.slice(&node.file) else {
+            return Ok(Vec::new());
+        };
+        // No reference has a caller the slice does not hold.
+        let Some(caller) = slice.handle_of(node.node_id()) else {
+            return Ok(Vec::new());
+        };
+        let wanted = slice
+            .references()
+            .filter(|reference| {
+                reference.caller() == Some(caller)
+                    && reference.kind() == "call"
+                    && reference.resolved()
+                    && reference
+                        .target()
+                        .is_some_and(|(file, symbol)| file == node.file && symbol == node.symbol)
+            })
+            .collect::<Vec<_>>();
+        let call_edges = self.call_edge_references(&slice, &wanted);
+        let mut calls = Vec::new();
+        for reference in wanted {
+            if call_edges.contains(&reference.index()) {
+                continue;
+            }
+            let (_, target) = self.target_of(&node.file, &node.symbol, TargetLookup::Ordinary);
+            calls.push((
+                (reference.byte_start(), reference.line(), reference.ref_id()),
+                StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: None,
+                    caller: node.clone(),
+                    target_file: node.file.clone(),
+                    target_symbol: node.symbol.clone(),
+                    target,
+                    line: reference.line(),
+                    byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+                    byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+                    resolved: true,
+                    provenance: crate::callgraph_store::PROVENANCE_TREESITTER.to_string(),
+                },
+            ));
+        }
+        calls.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(calls.into_iter().map(|(_, call)| call).collect())
+    }
+
+    fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        let Some(slice) = self.source.slice(&node.file) else {
+            return Ok(Vec::new());
+        };
+        let Some(caller) = slice.handle_of(node.node_id()) else {
+            return Ok(Vec::new());
+        };
+        let wanted = slice
+            .references()
+            .filter(|reference| {
+                reference.caller() == Some(caller)
+                    && reference.kind() == "call"
+                    && !reference.resolved()
+            })
+            .collect::<Vec<_>>();
+        let call_edges = self.call_edge_references(&slice, &wanted);
+        let mut calls = wanted
+            .into_iter()
+            .filter(|reference| !call_edges.contains(&reference.index()))
+            .map(|reference| {
+                (
+                    (reference.byte_start(), reference.line(), reference.ref_id()),
+                    unresolved_call(node, reference),
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(calls.into_iter().map(|(_, call)| call).collect())
+    }
+
+    fn macro_template_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        let Some(slice) = self.source.slice(&node.file) else {
+            return Ok(Vec::new());
+        };
+        let Some(caller) = slice.handle_of(node.node_id()) else {
+            return Ok(Vec::new());
+        };
+        let mut calls = slice
+            .references()
+            .filter(|reference| {
+                reference.caller() == Some(caller)
+                    && reference.kind() == crate::callgraph_store::MACRO_BODY_CALL_REF_KIND
+            })
+            .map(|reference| {
+                (
+                    (reference.byte_start(), reference.line(), reference.ref_id()),
+                    unresolved_call(node, reference),
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(calls.into_iter().map(|(_, call)| call).collect())
+    }
+
+    fn ref_sites_named(
+        &self,
+        short_name: &str,
+        kinds: &[(&str, usize)],
+    ) -> Result<Vec<Vec<StoreRefSite>>> {
+        let mut found: Vec<Vec<(_, StoreRefSite)>> = kinds.iter().map(|_| Vec::new()).collect();
+        // Files come in path order and each kind's answer is in (file, line,
+        // ref id) order, so once every kind holds its limit no later file can
+        // add a site that would be kept: stop reading slices there.
+        for file in self.source.files_with_ref_name(short_name) {
+            if found
+                .iter()
+                .zip(kinds)
+                .all(|(sites, (_, limit))| sites.len() >= *limit)
+            {
+                break;
+            }
+            let Some(slice) = self.source.slice(&file) else {
+                continue;
+            };
+            // A slice without the name has no reference of it.
+            let Some(name) = slice.find_string(short_name) else {
+                continue;
+            };
+            let starts = found.iter().map(Vec::len).collect::<Vec<_>>();
+            for reference in slice.references() {
+                if reference.short_name_index() != Some(name) {
+                    continue;
+                }
+                let Some(slot) = kinds.iter().position(|(kind, _)| reference.kind() == *kind)
+                else {
+                    continue;
+                };
+                if starts[slot] >= kinds[slot].1 {
+                    continue;
+                }
+                let caller = reference.caller().and_then(|handle| slice.node(handle));
+                found[slot].push((
+                    (reference.line(), reference.ref_id()),
+                    StoreRefSite {
+                        is_test: caller.and_then(|node| node.is_test()),
+                        file: file.clone(),
+                        caller_symbol: caller.map(|node| node.scoped_name().to_string()),
+                        line: reference.line(),
+                        local_name: reference.local_name().map(str::to_string),
+                    },
+                ));
+            }
+            for (sites, start) in found.iter_mut().zip(starts) {
+                sites[start..].sort_by(|a, b| a.0.cmp(&b.0));
+            }
+        }
+        Ok(found
+            .into_iter()
+            .zip(kinds)
+            .map(|(mut sites, (_, limit))| {
+                sites.truncate(*limit);
+                sites.into_iter().map(|(_, site)| site).collect()
+            })
+            .collect())
+    }
+
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        Ok(self
+            .unresolved_spans(lang_label(language), Some(name), true)
+            .into_iter()
+            .map(|(file, _, _, references, slice)| {
+                // One row per span. Several references share a span when a
+                // call inside a nested function is also credited to the
+                // functions around it. The extractor writes the innermost
+                // caller's reference first, and the row names it, as the
+                // database's GROUP BY did when it read a group in insertion
+                // order.
+                let first = references
+                    .iter()
+                    .map(|index| slice.reference(*index as usize))
+                    .min_by_key(|reference| reference.ordinal())
+                    .expect("a span has a reference");
+                let caller = first.caller().and_then(|handle| slice.node(handle));
+                StoreRefSite {
+                    is_test: caller.and_then(|node| node.is_test()),
+                    file,
+                    caller_symbol: caller.map(|node| node.scoped_name().to_string()),
+                    line: first.line(),
+                    local_name: None,
+                }
+            })
+            .collect())
+    }
+
+    fn unresolved_call_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+        limit: usize,
+    ) -> Result<(usize, Vec<StoreRefSite>)> {
+        let mut total = 0;
+        let mut sites = Vec::new();
+        self.visit_unresolved_spans(
+            lang_label(language),
+            Some(name),
+            false,
+            |file, _, references, slice| {
+                let first = references
+                    .iter()
+                    .map(|index| slice.reference(*index as usize))
+                    .filter(|reference| {
+                        include_tests
+                            || (!crate::inspect::job::is_test_file(file)
+                                && !reference
+                                    .caller()
+                                    .and_then(|handle| slice.node(handle))
+                                    .and_then(|node| node.is_test())
+                                    .unwrap_or(false))
+                    })
+                    .min_by_key(|reference| reference.ordinal());
+                if let Some(first) = first {
+                    total += 1;
+                    // The visitor walks sorted paths and byte spans, so this
+                    // bounded prefix is also ordered by path and line.
+                    if sites.len() < limit {
+                        let caller = first.caller().and_then(|handle| slice.node(handle));
+                        sites.push(StoreRefSite {
+                            is_test: caller.and_then(|node| node.is_test()),
+                            file: file.to_string(),
+                            caller_symbol: caller.map(|node| node.scoped_name().to_string()),
+                            line: first.line(),
+                            local_name: None,
+                        });
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        Ok((total, sites))
+    }
+
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        Ok(self.count_unresolved(language, include_tests, None))
+    }
+
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        Ok(self.count_unresolved(language, include_tests, Some(name)))
+    }
+
+    fn call_tree(&self, _: &Path, _: &str, _: usize) -> Result<callgraph::CallTreeNode> {
+        Err(unused("call_tree"))
+    }
+
+    fn trace_to(&self, _: &Path, _: &str, _: usize) -> Result<callgraph::TraceToResult> {
+        Err(unused("trace_to"))
+    }
+
+    fn trace_to_symbol_candidates(&self, to_symbol: &str) -> Result<Vec<TraceToSymbolCandidate>> {
+        let mut by_file = BTreeMap::<String, u32>::new();
+        for node in self.all_nodes_matching(to_symbol) {
+            by_file
+                .entry(node.file)
+                .and_modify(|line| *line = (*line).min(node.line))
+                .or_insert(node.line);
+        }
+        Ok(by_file
+            .into_iter()
+            .map(|(file, line)| TraceToSymbolCandidate { file, line })
+            .collect())
+    }
+
+    fn trace_to_symbol(
+        &self,
+        _: &Path,
+        _: &str,
+        _: &str,
+        _: Option<&Path>,
+        _: usize,
+    ) -> Result<callgraph::TraceToSymbolResult> {
+        Err(unused("trace_to_symbol"))
+    }
+}
+
+impl<S: SliceSource> SliceReader<S> {
+    /// Counts unresolved spans up to the limit, and stops reading files
+    /// once it is reached, as the database query stops at its `LIMIT`.
+    fn count_unresolved(&self, language: LangId, include_tests: bool, name: Option<&str>) -> usize {
+        let mut count = 0;
+        self.visit_unresolved_spans(
+            lang_label(language),
+            name,
+            false,
+            |file, _, references, slice| {
+                let counted = include_tests
+                    || references.iter().any(|index| {
+                        let caller_is_test = slice
+                            .reference(*index as usize)
+                            .caller()
+                            .and_then(|handle| slice.node(handle))
+                            .and_then(|node| node.is_test())
+                            .unwrap_or(false);
+                        !caller_is_test && !crate::file_kind::is_test_file(file)
+                    });
+                if counted {
+                    count += 1;
+                    if count == UNRESOLVED_CALL_SITE_COUNT_LIMIT {
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        count
+    }
+}
+aft_store::heap_bytes_of_fields!(MemorySlices {
+    slices,
+    callers,
+    ref_names,
+    symbol_names,
+    languages,
+});
+
+/// How long a call-graph command waits for recorded edits to be resolved
+/// before it answers that the call graph is still building. The call graph
+/// is refreshed lazily, so the first read after a stretch of edits pays for
+/// all of them in one update (seconds at worst on AFT's own checkout); the
+/// command waits for it rather than answering from a graph that misses
+/// them, and gives up only if the update takes far longer than that.
+#[doc(hidden)]
+pub const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(30);

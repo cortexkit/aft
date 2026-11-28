@@ -1,0 +1,110 @@
+[package]
+name = "aft-tools"
+version = "0.68.1"
+edition = "2021"
+description = "Tool handlers and the dispatch pipeline for Agent Foundational Toolkit"
+license = "MIT"
+repository = "https://github.com/cortexkit/aft"
+rust-version.workspace = true
+exclude = ["tests/", "examples/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
+autotests = false
+
+[lib]
+name = "aft_tools"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
+
+[features]
+wasm-grammars = ["aft-engine/wasm-grammars"]
+test-timing-hooks = ["aft-engine/test-timing-hooks", "aft-base/test-timing-hooks", "aft-db/test-timing-hooks", "aft-parse/test-timing-hooks"]
+test-hooks = ["aft-engine/test-hooks", "aft-engine/test-support", "aft-base/test-hooks", "aft-base/test-support", "aft-db/test-hooks", "aft-db/test-support", "aft-parse/test-hooks", "aft-parse/test-support"]
+test-support = ["aft-engine/test-support", "aft-base/test-support", "dep:tempfile"]
+
+[dependencies]
+tempfile = { version = "3", optional = true }
+aft-engine = { path = "../aft-engine", version = "=0.68.1" }
+aft-base = { path = "../aft-base", version = "0.68.1" }
+aft-db = { path = "../aft-db", version = "0.68.1" }
+aft-parse = { path = "../aft-parse", version = "0.68.1" }
+aft-store = { path = "../aft-store", version = "0.68.1" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+lsp-types = "0.97"
+crossbeam-channel = "0.5"
+vt100 = "0.16"
+parking_lot = "0.12"
+libc = "0.2"
+tree-sitter = "=0.26.7"
+tree-sitter-rust = "0.24"
+dekobon-tree-sitter-groovy = "0.2.2"
+similar = "2"
+ast-grep-core = "0.41"
+streaming-iterator = "0.1"
+ignore = "0.4"
+notify = "8"
+regex = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+sha2 = { version = "0.10", features = ["compress"] }
+blake3 = "1"
+rustc-demangle = "0.1"
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
+# Shared secret placeholder and audit record types.
+secret-rules = { path = "../secret-rules", version = "0.68.1", package = "aft-secret-rules" }
+bytes = "1"
+futures-util = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
+# Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).
+# Lives in github.com/cortexkit/commons (product-neutral, used without subc);
+# its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
+cortexkit-paths = "0.1"
+glob = "0.3"
+which = "7"
+url = "2"
+content_inspector = "0.2.4"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+memchr = "2"
+rayon = "1"
+# Use rustls-platform-verifier for per-connection OS trust checks instead of
+# enumerating native roots while every reqwest client is built.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Local embedding backend (all-MiniLM-L6-v2) driven directly through ort, so we
+# control intra-op thread count (fastembed hardcoded all-cores). hf-hub fetches
+# the model on fresh installs; ureq feature = sync + rustls (no native-tls, for
+# clean cross-platform builds).
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic", "half"] }
+cortexkit-role-tool-provider = "=0.15.18"
+subc-protocol = "=0.37.4"
+subc-client-rs = "=0.41.4"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+aft-engine = { path = "../aft-engine", version = "=0.68.1", features = ["test-support"] }
+aft-base = { path = "../aft-base", version = "0.68.1", features = ["test-support"] }
+aft-db = { path = "../aft-db", version = "0.68.1", features = ["test-support"] }
+aft-parse = { path = "../aft-parse", version = "0.68.1", features = ["test-support"] }
+cortexkit-role-tool-provider = { version = "=0.15.18", features = ["test-vectors"] }
+tokio = { version = "1", features = ["test-util"] }
+tempfile = "3"
+filetime = "0.2"

@@ -272,7 +272,7 @@ fn unattributed_index_builds_record_nothing() {
 
 #[test]
 fn b2_path_fence_rejects_second_semantic_index_record_site() {
-    let source = include_str!("../src/semantic_index.rs");
+    let source = include_str!("../../aft-engine/src/semantic_index.rs");
     let embed_query_start = source
         .find("pub fn embed_query_cached")
         .expect("embed_query_cached definition");

@@ -15,7 +15,7 @@ Options:
   -h, --help   Show this help.
 
 Environment:
-  AFT_FLAKE_HUNT_PACKAGE   Cargo package override (default: agent-file-tools, aft-base and aft-db).
+  AFT_FLAKE_HUNT_PACKAGE   Cargo package override (default: facade, base, db, engine, tools and subc).
   AFT_FLAKE_HUNT_LOG_DIR   Directory for per-iteration logs and results.tsv
                            (default: target/flake-hunt/<timestamp>-<pid>).
   AFT_FLAKE_HUNT_HOGS      Default hog count for --pressure (max 4).
@@ -103,8 +103,8 @@ package="${AFT_FLAKE_HUNT_PACKAGE:-}"
 if [[ -n "$package" ]]; then
   package_args=(-p "$package")
 else
-  package="agent-file-tools + aft-base + aft-db"
-  package_args=(-p agent-file-tools -p aft-base -p aft-db)
+  package="agent-file-tools + aft-base + aft-db + aft-engine + aft-tools + aft-subc"
+  package_args=(-p agent-file-tools -p aft-base -p aft-db -p aft-engine -p aft-tools -p aft-subc)
 fi
 timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
 log_dir="${AFT_FLAKE_HUNT_LOG_DIR:-target/flake-hunt/${timestamp}-$$}"

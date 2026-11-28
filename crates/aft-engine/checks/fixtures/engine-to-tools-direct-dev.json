@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {"id": "path+file:///workspace/crates/aft-engine#0.1.0", "name": "aft-engine"},
+    {"id": "path+file:///workspace/crates/aft-tools#0.1.0", "name": "aft-tools"}
+  ],
+  "workspace_members": ["path+file:///workspace/crates/aft-engine#0.1.0", "path+file:///workspace/crates/aft-tools#0.1.0"],
+  "resolve": {"nodes": [
+    {"id": "path+file:///workspace/crates/aft-engine#0.1.0", "deps": [
+      {"pkg": "path+file:///workspace/crates/aft-tools#0.1.0", "dep_kinds": [{"kind": "dev", "target": "cfg(windows)"}]}
+    ]},
+    {"id": "path+file:///workspace/crates/aft-tools#0.1.0", "deps": []}
+  ]}
+}

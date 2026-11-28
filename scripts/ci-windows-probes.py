@@ -18,6 +18,12 @@ PROBES = {
     "tls": "semantic_index::tests::platform_verifier_tls_client_subprocess",
     "backtrace": "logging::tests::panic_hook_preserves_default_backtrace_behavior_and_persists",
 }
+# Each probe runs from the library harness of the crate that defines it, in that
+# crate's package directory, as `cargo test -p <crate> --lib` would.
+PROBE_CRATES = {
+    "tls": ("aft_engine", "crates/aft-engine"),
+    "backtrace": ("aft_base", "crates/aft-base"),
+}
 # nextest gave these probes a 10-minute slow-test kill when it ran them. A probe
 # whose spawned trust check hangs must end the step well before the archive
 # job's 25-minute limit, or no downstream shard ever receives the archive.
@@ -85,7 +91,7 @@ def run_probe(binary: Path, probe: str, timeout_s: float = PROBE_TIMEOUT_S) -> i
     name = PROBES[probe]
     # Cargo normally runs library tests from their package directory. Preserve
     # that working directory while using nextest's exact already-linked binary.
-    cwd = ROOT / ("crates/aft-base" if probe == "backtrace" else "crates/aft")
+    cwd = ROOT / PROBE_CRATES[probe][1]
     listing = subprocess.run(
         [str(binary), "--list", "--exact", name], cwd=cwd,
         capture_output=True, text=True, check=True, timeout=LIST_TIMEOUT_S,
@@ -102,7 +108,7 @@ def main() -> int:
     parser.add_argument("--probe", choices=PROBES, required=True)
     args = parser.parse_args()
     print(f"Windows serial probe runner: Python {platform.python_version()}", flush=True)
-    binary = archive_library_harness(args.archive_file, "aft_base" if args.probe == "backtrace" else "aft")
+    binary = archive_library_harness(args.archive_file, PROBE_CRATES[args.probe][0])
     return run_probe(binary, args.probe)
 
 

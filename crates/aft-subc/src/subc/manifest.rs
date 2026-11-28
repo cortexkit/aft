@@ -1,0 +1,1738 @@
+//! Manifest, lane classification, and control-surface helpers exposed over subc.
+
+use super::{
+    json, Bindings, Concurrency, ConsumerRole, Flags, IdentityBinding, IdentityScope, Lane,
+    LazyLock, ManagementOperation, ManagementOperationKind, ModuleManifest, Priority, ProviderRole,
+    StorageBinding, StorageKind, StorageScope, Tool, TrustTier, Value,
+    MODULE_CONTROL_OP_HEALTH_CHECK, PROTOCOL_VERSION,
+};
+
+#[cfg(test)]
+use subc_protocol::manifest::ExecutionMode;
+
+pub(super) const FLOW_OPERATIONS: &[&str] = &[super::diagnostics_findings::OPERATION];
+/// Management queries whose reply is a stream that ends only on cancel.
+const SHELLS_STREAM_OPERATIONS: &[&str] = &["shells.watch", "shells.output"];
+
+pub(super) fn is_bash_family_tool(name: &str) -> bool {
+    name == "bash" || name == "powershell" || name.starts_with("bash_")
+}
+
+pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
+    crate::subc_translate::supports_tool(name)
+}
+
+pub(crate) use crate::host_tool_names::{is_native_plumbing_call, is_subc_native_plumbing_tool};
+
+pub(super) use aft_tools::command_lane_policy::command_lane_explicit;
+pub(super) fn command_lane(command: &str) -> Lane {
+    command_lane_explicit(command).unwrap_or(Lane::Mutating)
+}
+
+static SUBC_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../subc_tool_schemas.json"))
+        .unwrap_or_else(|e| panic!("subc_tool_schemas.json: {e}"))
+});
+
+/// JSON Schema extension key the generator
+/// (`packages/opencode-plugin/src/subc-tool-schemas.ts`) puts on a property
+/// that AFT's own plugins set and the model never should. The marker lives on
+/// the property itself, so the generator is the only place that decides which
+/// properties are consumer-only; the manifest strips every marked property
+/// before serving, and the runtime still reads the values when a plugin sends
+/// them.
+const CONSUMER_ONLY_MARKER: &str = "x-aft-consumer-only";
+
+fn is_consumer_only(property: &Value) -> bool {
+    property.get(CONSUMER_ONLY_MARKER).and_then(Value::as_bool) == Some(true)
+}
+
+/// Enabled-only bash overrides are separate from the default artifacts, so
+/// neither the default manifest nor a session without a remote policy advertises
+/// an argument that it cannot use.
+static SUBC_REMOTE_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../subc_tool_remote_schemas.json"))
+        .unwrap_or_else(|e| panic!("subc_tool_remote_schemas.json: {e}"))
+});
+
+/// The remote-enabled bash schema and description for a catalog preset.
+/// Only sessions admitted with an enabled policy may select this override.
+pub(super) fn remote_tool(preset: Option<&str>, name: &str) -> Option<(Value, Option<String>)> {
+    let mut schema = SUBC_REMOTE_TOOL_SCHEMAS
+        .get(preset.unwrap_or("head"))?
+        .get(name)?
+        .clone();
+    let description = schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    strip_consumer_only_properties(&mut schema);
+    Some((schema, description))
+}
+
+/// Enabled-only `read`, `outline` and `zoom` schemas carrying the `ref`
+/// (git revision) argument. Kept apart from the default artifacts for the
+/// same reason as the remote bash overrides: a session whose
+/// `revision_reads` is off must never be offered an argument it cannot use.
+static SUBC_REVISION_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../subc_tool_revision_schemas.json"))
+        .unwrap_or_else(|e| panic!("subc_tool_revision_schemas.json: {e}"))
+});
+
+/// The schema and description `name` is served with in a session whose
+/// `revision_reads` is on. No preset rewords these tools, so one override
+/// serves every preset.
+pub(super) fn revision_tool(name: &str) -> Option<(Value, Option<String>)> {
+    let mut schema = SUBC_REVISION_TOOL_SCHEMAS.get(name)?.clone();
+    let description = schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    strip_consumer_only_properties(&mut schema);
+    Some((schema, description))
+}
+
+/// Removes consumer-only properties (and their `required` entries) so a
+/// consumer handing the catalog to a model does not invite it to set them.
+fn strip_consumer_only_properties(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let mut removed = Vec::new();
+    if let Some(Value::Object(properties)) = object.get_mut("properties") {
+        properties.retain(|name, property| {
+            let keep = !is_consumer_only(property);
+            if !keep {
+                removed.push(name.clone());
+            }
+            keep
+        });
+    }
+    if let Some(Value::Array(required)) = object.get_mut("required") {
+        required.retain(|name| {
+            name.as_str()
+                .is_none_or(|name| !removed.iter().any(|removed| removed == name))
+        });
+    }
+}
+
+fn tool_schema(name: &str) -> Value {
+    let mut schema = SUBC_TOOL_SCHEMAS.get(name).cloned().unwrap_or_else(|| {
+        log::warn!(
+            "subc build_manifest: missing embedded schema for tool {name:?}; using placeholder"
+        );
+        json!({ "type": "object" })
+    });
+    strip_consumer_only_properties(&mut schema);
+    // The generated artifact keeps each tool's description at the schema root
+    // because that is where `tool_description` reads it from. The manifest
+    // already serves it as `Tool::description`; leaving a second copy in the
+    // schema would double the description text a consumer hands a model.
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("description");
+    }
+    schema
+}
+
+/// The generated description of `name`, with its references to other AFT
+/// tools as the OpenCode plugin spells them (`aft_zoom`). The tool catalog
+/// renders these for the exact tool set it serves.
+pub(super) fn tool_description(name: &str) -> Option<String> {
+    SUBC_TOOL_SCHEMAS
+        .get(name)
+        .and_then(|schema| schema.get("description"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The description the HELLO manifest serves for `name`. A consumer may take
+/// any subset of the manifest's tools by name, so the text cannot count on a
+/// sibling tool being offered beside it: references to other AFT tools are
+/// dropped, and a reference to the tool itself takes its manifest name. The
+/// tool catalog renders from the full text instead, because it knows exactly
+/// which tools it serves.
+fn manifest_tool_description(name: &str) -> Option<String> {
+    tool_description(name)
+        .map(|text| super::tool_provider::resolve_tool_references(&text, &[name.to_string()]))
+}
+
+/// Generated by the same generator as `subc_tool_schemas.json`
+/// (`packages/opencode-plugin/src/subc-tool-schemas.ts`,
+/// `buildSubcToolPresets`): per tool-provider catalog preset, the tool schemas
+/// that preset serves in place of the base ones, plus the tools only it
+/// serves. Kept apart from the base artifact so the base catalog, the HELLO
+/// manifest and every legacy consumer stay byte-for-byte what they were.
+static SUBC_TOOL_PRESETS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../subc_tool_presets.json"))
+        .unwrap_or_else(|e| panic!("subc_tool_presets.json: {e}"))
+});
+
+/// The schema (consumer-only properties stripped) and description that catalog
+/// preset `preset` serves for `name`, when the preset overrides or adds it.
+pub(super) fn preset_tool(preset: &str, name: &str) -> Option<(Value, Option<String>)> {
+    let mut schema = SUBC_TOOL_PRESETS.get(preset)?.get(name)?.clone();
+    let description = schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    strip_consumer_only_properties(&mut schema);
+    Some((schema, description))
+}
+
+/// AFT's subc-mode capability manifest. It uses bare internal tool names
+/// because the gateway adds any `aft_` prefix for agent-facing displays; AFT
+/// schedules concurrent calls itself; the gateway runs AFT directly without a
+/// sandbox. The manifest lists every tool an agent can call over subc.
+pub(super) fn build_manifest() -> ModuleManifest {
+    build_manifest_for_host(crate::bash_background::powershell_available())
+}
+
+/// [`build_manifest`] minus every tool whose canonical name is in `disabled`,
+/// so a consumer that builds its tool surface from the catalog never offers
+/// them. The list
+/// is the one read when the module connects; dispatch still refuses a disabled
+/// tool that is called anyway.
+pub(super) fn build_manifest_without(disabled: &[String]) -> ModuleManifest {
+    filter_manifest_tools(build_manifest(), disabled)
+}
+
+/// Attach the provenance AFT declares on its HELLO. `None` (no launch nonce)
+/// leaves the manifest without a provenance block, as before.
+pub(super) fn declare_provenance(
+    manifest: &mut ModuleManifest,
+    provenance: Option<subc_protocol::manifest::ManifestProvenance>,
+) {
+    if provenance.is_some() {
+        manifest.provenance = provenance;
+    }
+}
+
+pub(super) fn filter_manifest_tools(
+    mut manifest: ModuleManifest,
+    disabled: &[String],
+) -> ModuleManifest {
+    for role in &mut manifest.provides {
+        if let ProviderRole::ToolProvider { tools, .. } = role {
+            tools.retain(|tool| crate::tool_gate::catalog_keeps(&tool.name, disabled));
+        }
+    }
+    manifest
+}
+
+pub(crate) use crate::host_tool_names::{tool_call_is_mutating, tool_execution_mode};
+
+/// Builds the manifest for a host where PowerShell is or is not runnable.
+///
+/// The `powershell` tool is advertised only when `pwsh` resolves, checked when
+/// the catalog is served rather than baked into the generated schema artifact:
+/// a model shown a tool that cannot run on the host will call it and fail. A
+/// call that arrives anyway (the tool stays routable) is refused with an error
+/// naming the fix rather than silently run under bash.
+pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManifest {
+    let tool = |name: &str| Tool {
+        name: name.to_string(),
+        description: manifest_tool_description(name),
+        execution_mode: tool_execution_mode(name),
+        schema: tool_schema(name),
+    };
+    // execution_mode keys on externally-observable side effects, NOT internal
+    // ctx mutation: the readers warm AFT's own index/cache/symbol artifacts
+    // (internal), not the user's workspace, so they are Pure. Bash is Mutating
+    // because spawning a detached process changes external state, and edit/write
+    // produce observable file writes. Unfenceable stays unused here because AFT
+    // schedules bash internally and releases the Mutating worker after spawn.
+    //
+    // AFT registers not-ready: the daemon answers new route opens with
+    // `module_warming` until `subc::readiness` flips it with a
+    // `catalog.update { ready: true }`, which it always does within a fixed
+    // budget. A daemon that predates the field ignores it and treats the
+    // module as ready, which is the behaviour before readiness existed.
+    //
+    // `capabilities.provides` lists `tool-provider/v1` so agent startup can
+    // discover AFT and build a worker's tool-fetch plan. Without that plan,
+    // worker calls name no preset and use the default `head` agent catalog.
+    //
+    // `call-modes/v1` requests the bind mode and run deadline. AFT checks
+    // each tool's modes and confirms a run scope has ended before killing
+    // its processes.
+    //
+    // `session-notices/v1` lets a session runner start an idle session's run
+    // with one of AFT's notices; only completions may do that (see
+    // `tool_provider::SESSION_NOTICES`).
+    //
+    // `call-yield/v1` promises `tool.yield`: a runner may hand back a head's
+    // waiting `bash` or `bash_watch` call when a person sends a message (see
+    // `call_yield`).
+    //
+    // `worker-runs/v1` admits worker runs: codemode runs that carry
+    // `on_behalf_of_agent` and no `agent_id`. Declaring it promises that AFT
+    // runs such a call with only its worker's own access (see `codemode`) and
+    // treats `on_behalf_of_agent` as attribution: it never acts as, asks for,
+    // or hands out the tasks or handles of the attributed agent.
+    //
+    // `scope-on-behalf-of/v1` promises the same for every scope, not only
+    // worker runs: `on_behalf_of_agent` is attribution and never authority.
+    // Declaring it makes the daemon keep that field in AFT's bind stamps and
+    // scope describe replies instead of stripping it. The Rich UI carrier needs
+    // it to tell a session's own head from one working for another agent: a
+    // carried head scope is trusted with head calls only when its stamp is
+    // known to carry no `on_behalf_of_agent` (see `rich_ui::session`).
+    //
+    // `permissions/v1` lets the permissions pages list the person's saved
+    // folder-access answers and revoke them, through Cingulate's
+    // `permissions.list` and `permissions.revoke` calls (see `permissions`).
+    // Nothing goes in `requires`.
+    //
+    // The builder leaves `self_signals` and `provenance` unset; `provenance`
+    // is added at HELLO time by `declare_provenance`, because where the launch
+    // nonce came from is a fact about the running process, not the build.
+    //
+    // `consumes` is descriptive:
+    // the daemon doesn't read it. It lists the modules AFT opens routes to: the
+    // fleet status holder always, and synapse only when it is the configured
+    // embedding backend. The manifest is static, so the config-dependent synapse
+    // route is declared unconditionally. Neither is a `capabilities.requires`
+    // entry, because a required capability with no provider would hold AFT
+    // not-ready.
+    //
+    // The Subconscious transport requires daemon 0.39 for project-free route
+    // opens. The manifest's wire shape itself first required daemon 0.17.20.
+    let mut manifest = ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
+        .protocol_ver(PROTOCOL_VERSION)
+        .trust_tier(Some(TrustTier::FirstParty))
+        .ready(false)
+        .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec![
+                cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY.to_owned(),
+                cortexkit_role_tool_provider::PROVIDES.to_string(),
+                cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
+                "tool-views/v1".to_string(),
+                super::tool_provider::SESSION_NOTICES.to_string(),
+                super::scope_background_tasks::CAPABILITY.to_string(),
+                super::call_yield::CALL_YIELD.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
+                subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
+                subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY.to_string(),
+                subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+                crate::page_collect::CAPABILITY.to_string(),
+                super::permissions::CAPABILITY.to_string(),
+                super::shells::CAPABILITY.to_string(),
+                cortexkit_role_user_commands::PROVIDES.to_string(),
+                // Core attaches plan facts to a provider's system-text item
+                // only when this manifest list names the token; declaring it
+                // in role.describe alone leaves core sending no facts.
+                cortexkit_role_tool_provider::SYSTEM_TEXT_FACTS_V1.to_string(),
+            ]
+            .into_iter()
+            .chain(super::rich_ui::notices::WRITER_CAPABILITY.map(str::to_owned))
+            .collect(),
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
+        .provides(vec![
+            ProviderRole::ToolProvider {
+                tools: [
+                    Some(tool("status")),
+                    Some(tool("bash")),
+                    powershell_available.then(|| tool("powershell")),
+                ]
+                .into_iter()
+                .flatten()
+                .chain([
+                    tool("read"),
+                    tool("write"),
+                    tool("edit"),
+                    tool("apply_patch"),
+                    tool("grep"),
+                    tool("glob"),
+                    tool("search"),
+                    tool("outline"),
+                    tool("zoom"),
+                    tool("inspect"),
+                    tool("callgraph"),
+                    tool("conflicts"),
+                    tool("ast_search"),
+                    tool("ast_replace"),
+                    tool("delete"),
+                    tool("move"),
+                    tool("import"),
+                    tool("safety"),
+                    // Companions for the task ids `bash`/`powershell` hand back
+                    // (explicit background, PTY, promotion after the wait
+                    // window, detach on restart). The bash reply text tells
+                    // the model to call them, so a consumer that builds its
+                    // tool surface from this catalog must be offered them.
+                    // There is no `bash_watch` here: that waiting loop is
+                    // implemented inside the OpenCode and Pi plugins, not by
+                    // the module, and the catalog text does not mention it.
+                    tool("bash_status"),
+                    tool("bash_kill"),
+                    tool("bash_write"),
+                ])
+                .collect(),
+                identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: true,
+                sub_supervises: true,
+            },
+            // subc-protocol defines management operations as a name plus a
+            // Query/Mutate kind. Each operation carries its target in its request;
+            // the management route itself is not bound to that target.
+            ProviderRole::ManagementSurface {
+                operations: vec![
+                    ManagementOperation {
+                        name: cortexkit_role_tool_display::DISPLAY_READ.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: Some("Read a retained display snapshot as the discovered display server.".into()),
+                    },
+                    ManagementOperation {
+                        name: super::scope_background_tasks::OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION
+                            .to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::commands::health_digest::HEALTH_DIGEST_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: super::diagnostics_findings::OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: Some(
+                            "Read AFT's recorded health findings without scheduling work."
+                                .to_owned(),
+                        ),
+                    },
+                    ManagementOperation {
+                        name: crate::commands::memory_census::MEMORY_CENSUS_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::commands::writes_census::WRITES_CENSUS_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    // The gh shim's bot-write relay. It is plumbing, not an agent
+                    // tool: the caller's per-command ticket is its only
+                    // authority (see `crate::gh_shim_relay`).
+                    ManagementOperation {
+                        name: crate::gh_shim_relay::BOT_REQUEST_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::gh_shim_relay::BINDINGS_READ_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::gh_shim_relay::SESSION_CONTEXT_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::gh_shim_relay::READ_REQUEST_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    // Operator-only early removal of undo backups (`aft backups
+                    // purge`). The daemon owns live backup caches, so the purge
+                    // runs here to change memory, disk and database together.
+                    ManagementOperation {
+                        name: crate::backup::purge::BACKUPS_PURGE_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    // Core's page-bundle operations (`page-collect/v1`): read an
+                    // HTML page and the files it names under one agent
+                    // session's read policy into a private snapshot, read the
+                    // snapshot back, and release it.
+                    ManagementOperation {
+                        name: crate::page_collect::COLLECT_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::page_collect::READ_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::page_collect::RELEASE_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    // `permissions/v1`: the operator's permissions page lists
+                    // saved folder-access answers and revokes them.
+                    ManagementOperation {
+                        name: super::permissions::LIST_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: super::permissions::REVOKE_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.list".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.watch".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.output".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "aft.status".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "commands.describe".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "commands.preview".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "commands.run".into(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                ],
+                config_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                observability: Vec::new(),
+                identity_scope: Vec::new(),
+                // Explicitly the value the daemon assumes when this field is
+                // absent: management calls keep the concurrent delivery they
+                // received before the protocol could express the choice.
+                concurrency: Concurrency::ModuleManaged,
+            },
+        ])
+        // shells/v1's watch and output replies are streams that stay open
+        // until the caller cancels. Declaring them as watches lets the daemon
+        // catalog say so, and Callosum relays a phone subscription only to an
+        // operation declared this way.
+        .operation_delivery(
+            SHELLS_STREAM_OPERATIONS
+                .iter()
+                .map(|op| ((*op).to_owned(), subc_protocol::manifest::OperationDelivery::Watch))
+                .collect(),
+        )
+        .flow_operations(Some(
+            FLOW_OPERATIONS.iter().map(|op| (*op).to_owned()).collect(),
+        ))
+        .bindings(Some(Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: true,
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: vec![IdentityScope::Project],
+                optional: vec![IdentityScope::Session],
+            },
+        }))
+        .consumes(vec![
+            ConsumerRole::ServiceClient {
+                of: vec![crate::access_policy::prefrontal::MODULE_ID.to_string()],
+            },
+            ConsumerRole::ServiceClient {
+                of: vec!["synapse".to_string()],
+            },
+        ])
+        .build();
+    if crate::agent_data::CATALOG_ENABLED {
+        if let Some(capabilities) = &mut manifest.capabilities {
+            capabilities
+                .provides
+                .push(cortexkit_role_agent_data::PROVIDES.to_string());
+        }
+        manifest.provides.push(serde_json::from_value(json!({
+            "role":"internal_service", "service_id":cortexkit_role_agent_data::SERVICE_ID,
+            "transport":"bulk", "agent_facing":false, "operations":cortexkit_role_agent_data::REQUIRED_OPS,
+        })).expect("the published agent-data internal-service declaration is valid"));
+    }
+    manifest
+}
+
+pub(super) fn control_ops() -> Option<Vec<String>> {
+    Some(vec![
+        "route.bind".to_string(),
+        "route.status".to_string(),
+        MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
+    ])
+}
+
+pub(super) fn control_flags() -> Flags {
+    Flags::new(false, Priority::Passive, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subc_translate::supports_tool;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn owned_tasks_is_consumer_only() {
+        assert!(is_subc_native_plumbing_tool("bash_owned_tasks"));
+        assert!(!is_subc_agent_core_tool("bash_owned_tasks"));
+        assert_eq!(command_lane("bash_owned_tasks"), Lane::PureRead);
+    }
+
+    const CORE_TOOLS: &[&str] = &[
+        "status",
+        "bash",
+        "powershell",
+        "read",
+        "write",
+        "edit",
+        "apply_patch",
+        "grep",
+        "glob",
+        "search",
+        "outline",
+        "zoom",
+        "inspect",
+        "callgraph",
+        "conflicts",
+        "ast_search",
+        "ast_replace",
+        "delete",
+        "move",
+        "import",
+        "safety",
+        "bash_status",
+        "bash_kill",
+        "bash_write",
+    ];
+
+    /// Tools listed here deliberately skip translation; adding one is a reviewed
+    /// decision because it weakens the registration guard's translation check.
+    const TRANSLATION_EXEMPT: &[&str] = &[];
+
+    fn is_bare_placeholder_schema(schema: &Value) -> bool {
+        schema == &json!({ "type": "object" })
+    }
+
+    #[test]
+    fn build_manifest_serves_embedded_tool_schemas() {
+        let manifest = build_manifest_for_host(true);
+        let tools = match manifest.provides.first() {
+            Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+            _ => panic!("expected ToolProvider"),
+        };
+        let by_name: HashMap<&str, &Tool> = tools.iter().map(|t| (t.name.as_str(), t)).collect();
+        for name in CORE_TOOLS {
+            let tool = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert!(
+                tool.description
+                    .as_deref()
+                    .is_some_and(|description| !description.is_empty()),
+                "{name} must carry a non-empty manifest description"
+            );
+            assert!(
+                !is_bare_placeholder_schema(&tool.schema),
+                "{name} must not use bare placeholder schema"
+            );
+            assert_eq!(
+                tool.schema.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "{name} schema must be an object"
+            );
+            assert!(
+                tool.schema.get("description").is_none(),
+                "{name} carries its description once, as Tool::description, not again at the schema root"
+            );
+            // A consumer may take any subset of these tools by name, so no
+            // description names another tool, and none uses the OpenCode
+            // plugin's `aft_` spelling.
+            let description = tool.description.as_deref().unwrap_or_default();
+            for other in by_name.keys() {
+                assert!(
+                    !description.contains(&format!("aft_{other}")),
+                    "{name} names aft_{other}: {description}"
+                );
+            }
+        }
+        let outline = by_name["outline"].description.as_deref().unwrap();
+        for sibling in ["zoom", "search", "callgraph"] {
+            assert!(
+                !outline.contains(sibling),
+                "outline names {sibling}: {outline}"
+            );
+        }
+
+        // The module manifest is shared across trusted and untrusted routes.
+        // Keep its committed, default-gate description free of GitHub resource
+        // spellings because untrusted consumers are never granted that feature.
+        assert!(!by_name["read"]
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("issue://NUMBER"));
+
+        // The OpenCode tools for read/write/edit advertise `filePath`, because
+        // OpenCode's UI renders file headers from the recorded model input
+        // verbatim. That constraint is OpenCode's alone: the generator renames
+        // the argument to the canonical `path` for the module surfaces, and
+        // `filePath` is still accepted at runtime from older callers.
+        for name in ["read", "write", "edit"] {
+            let properties = by_name[name]
+                .schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .expect("schema properties");
+            assert!(properties.contains_key("path"), "{name} advertises path");
+            assert!(
+                !properties.contains_key("filePath"),
+                "{name} must not advertise the OpenCode-only filePath"
+            );
+            assert_eq!(by_name[name].schema["required"][0], "path", "{name}");
+        }
+
+        let status = &by_name["status"].schema;
+        assert_eq!(
+            status.get("properties").and_then(|v| v.as_object()),
+            Some(&serde_json::Map::new()),
+            "status schema must have empty properties"
+        );
+        assert_eq!(
+            status.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false),
+            "status schema must forbid additionalProperties"
+        );
+    }
+
+    /// A consumer may select `write` without `edit`, so the manifest's write
+    /// description cannot send it to the `edit` tool; nor may grep's send it to
+    /// `read`. The rest of each description stays.
+    #[test]
+    fn manifest_descriptions_do_not_send_a_lone_tool_to_its_siblings() {
+        let write = manifest_tool_description("write").unwrap();
+        assert!(!write.contains("`edit`"), "{write}");
+        assert!(
+            write.contains("Use it to create files or replace whole contents. Write very large"),
+            "{write}"
+        );
+        let grep = manifest_tool_description("grep").unwrap();
+        assert!(!grep.contains("`read`"), "{grep}");
+        assert!(grep.contains("Always case-sensitive."), "{grep}");
+        let edit = manifest_tool_description("edit").unwrap();
+        assert!(!edit.contains("`write` tool"), "{edit}");
+        assert!(
+            edit.contains("`edit` requires an explicit edit mode"),
+            "{edit}"
+        );
+        // A self reference stays.
+        let apply_patch = manifest_tool_description("apply_patch").unwrap();
+        assert!(
+            apply_patch.starts_with("Use the `apply_patch` tool to edit files."),
+            "{apply_patch}"
+        );
+    }
+
+    #[test]
+    fn broca_scope_background_advertisement_and_harness_parse_ship_together() {
+        use crate::harness::Harness;
+        use std::str::FromStr;
+
+        // Broca sends the harness name `broca` only when the module manifest
+        // provides scope-background-tasks/v1. Advertising it without accepting
+        // that harness name would make every Broca bind be refused.
+        let manifest = build_manifest_for_host(true);
+        assert!(manifest
+            .capabilities
+            .as_ref()
+            .expect("capabilities")
+            .provides
+            .iter()
+            .any(|capability| capability == "scope-background-tasks/v1"));
+        assert_eq!(Harness::from_str("broca"), Ok(Harness::Runner));
+    }
+
+    /// A session starter finds tool providers by this catalog field, so a
+    /// manifest without it leaves every worker without a plan or preset.
+    #[test]
+    fn build_manifest_lists_tool_provider_capability_without_requirements() {
+        let manifest = build_manifest_for_host(true);
+        let capabilities = manifest.capabilities.as_ref().expect("capabilities");
+        assert_eq!(
+            capabilities.provides,
+            vec![
+                "call-keepalive/v1".to_string(),
+                "tool-provider/v1".to_string(),
+                "call-modes/v1".to_string(),
+                "tool-views/v1".to_string(),
+                "session-notices/v1".to_string(),
+                "scope-background-tasks/v1".to_string(),
+                "call-yield/v1".to_string(),
+                "flow-scopes/v1".to_string(),
+                "worker-runs/v1".to_string(),
+                "scope-on-behalf-of/v1".to_string(),
+                "scope-workdir/v1".to_string(),
+                "page-collect/v1".to_string(),
+                "permissions/v1".to_string(),
+                "shells/v1".to_string(),
+                "user-commands/v1".to_string(),
+                "system-text-facts/v1".to_string(),
+                "notice-record-writer/v1".to_string(),
+            ]
+        );
+        assert!(capabilities.requires.is_empty());
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            wire.pointer("/capabilities/provides"),
+            Some(&serde_json::json!([
+                "call-keepalive/v1",
+                "tool-provider/v1",
+                "call-modes/v1",
+                "tool-views/v1",
+                "session-notices/v1",
+                "scope-background-tasks/v1",
+                "call-yield/v1",
+                "flow-scopes/v1",
+                "worker-runs/v1",
+                "scope-on-behalf-of/v1",
+                "scope-workdir/v1",
+                "page-collect/v1",
+                "permissions/v1",
+                "shells/v1",
+                "user-commands/v1",
+                "system-text-facts/v1",
+                "notice-record-writer/v1"
+            ]))
+        );
+    }
+
+    #[test]
+    fn shells_streams_are_declared_watches_and_nothing_else_is() {
+        let manifest = build_manifest_for_host(true);
+        for op in ["shells.watch", "shells.output"] {
+            assert!(manifest.is_watch_operation(op), "{op} must be a watch");
+        }
+        for op in ["shells.list", "aft.status", "commands.describe"] {
+            assert!(!manifest.is_watch_operation(op), "{op} is unary");
+        }
+        assert_eq!(manifest.operation_delivery.len(), 2);
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            wire["operation_delivery"],
+            json!({"shells.output": "watch", "shells.watch": "watch"})
+        );
+    }
+
+    #[test]
+    fn build_manifest_declares_management_queries_outside_agent_tools() {
+        let manifest = build_manifest_for_host(true);
+        let tools = manifest
+            .provides
+            .iter()
+            .find_map(|role| match role {
+                ProviderRole::ToolProvider { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .expect("tool provider role");
+        let operations = manifest
+            .provides
+            .iter()
+            .find_map(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => Some(operations),
+                _ => None,
+            })
+            .expect("management surface role");
+
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| (operation.name.as_str(), &operation.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    cortexkit_role_tool_display::DISPLAY_READ,
+                    &ManagementOperationKind::Query
+                ),
+                (
+                    super::super::scope_background_tasks::OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::commands::health_digest::HEALTH_DIGEST_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    super::super::diagnostics_findings::OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::commands::memory_census::MEMORY_CENSUS_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::commands::writes_census::WRITES_CENSUS_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::gh_shim_relay::BOT_REQUEST_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::gh_shim_relay::BINDINGS_READ_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::gh_shim_relay::SESSION_CONTEXT_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::gh_shim_relay::READ_REQUEST_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::backup::purge::BACKUPS_PURGE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::page_collect::COLLECT_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::page_collect::READ_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::page_collect::RELEASE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    super::super::permissions::LIST_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    super::super::permissions::REVOKE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                ("shells.list", &ManagementOperationKind::Query),
+                ("shells.watch", &ManagementOperationKind::Query),
+                ("shells.output", &ManagementOperationKind::Query),
+                ("aft.status", &ManagementOperationKind::Query),
+                ("commands.describe", &ManagementOperationKind::Query),
+                ("commands.preview", &ManagementOperationKind::Query),
+                ("commands.run", &ManagementOperationKind::Mutate),
+            ]
+        );
+        for operation in operations {
+            assert!(
+                tools.iter().all(|tool| tool.name != operation.name),
+                "management operation {} must not enter the agent tool manifest",
+                operation.name
+            );
+            assert!(
+                !SUBC_TOOL_SCHEMAS.contains_key(&operation.name),
+                "management operation {} must not enter the subc tool schema artifact",
+                operation.name
+            );
+        }
+        assert!(!control_ops()
+            .expect("control operations")
+            .iter()
+            .any(|operation| operation == crate::commands::memory_census::MEMORY_CENSUS_OPERATION));
+        assert!(!control_ops()
+            .expect("control operations")
+            .iter()
+            .any(|operation| operation == crate::commands::writes_census::WRITES_CENSUS_OPERATION));
+    }
+
+    #[test]
+    fn embedded_subc_tools_are_registered_across_all_rust_surfaces() {
+        let schema_names: HashSet<&str> = SUBC_TOOL_SCHEMAS.keys().map(String::as_str).collect();
+        let core_names: HashSet<&str> = CORE_TOOLS.iter().copied().collect();
+        assert_eq!(
+            CORE_TOOLS.len(),
+            schema_names.len(),
+            "CORE_TOOLS count must match embedded schema key count"
+        );
+        assert_eq!(
+            core_names, schema_names,
+            "CORE_TOOLS must exactly match embedded schema keys"
+        );
+
+        let manifest = build_manifest_for_host(true);
+        let tools = match manifest.provides.first() {
+            Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+            _ => panic!("expected ToolProvider"),
+        };
+        let manifest_names: HashSet<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+        for name in schema_names {
+            assert!(
+                is_subc_agent_core_tool(name),
+                "tool {name:?} is missing from is_subc_agent_core_tool in crates/aft-subc/src/subc/manifest.rs"
+            );
+            assert!(
+                manifest_names.contains(name),
+                "tool {name:?} is missing from build_manifest in crates/aft-subc/src/subc/manifest.rs"
+            );
+            assert!(
+                command_lane_explicit(name).is_some(),
+                "tool {name:?} is missing an explicit command_lane arm in crates/aft-subc/src/subc/manifest.rs"
+            );
+            if !TRANSLATION_EXEMPT.contains(&name) {
+                assert!(
+                    supports_tool(name),
+                    "tool {name:?} is missing from supports_tool in crates/aft-tools/src/subc_translate.rs"
+                );
+            }
+        }
+
+        // BARE_TOOL_ORDER is TypeScript-only; the embedded schema map is its
+        // generated Rust-side artifact, so the manifest count is the Rust
+        // denominator check for this derived guard.
+        assert_eq!(
+            SUBC_TOOL_SCHEMAS.len(),
+            tools.len(),
+            "registration guard denominator must match manifest tool count"
+        );
+    }
+
+    #[test]
+    fn build_manifest_classifies_execution_mode_by_observable_effect() {
+        let manifest = build_manifest_for_host(true);
+        let tools = match manifest.provides.first() {
+            Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+            _ => panic!("expected ToolProvider"),
+        };
+        let by_name: HashMap<&str, &Tool> = tools.iter().map(|t| (t.name.as_str(), t)).collect();
+
+        // Readers warm AFT's own index/cache/symbol artifacts (internal ctx
+        // mutation), not the user's observable workspace, so they are Pure.
+        for name in [
+            "status",
+            "read",
+            "grep",
+            "glob",
+            "search",
+            "outline",
+            "zoom",
+            "inspect",
+            "callgraph",
+            "conflicts",
+            "ast_search",
+            "bash_status",
+        ] {
+            assert_eq!(
+                by_name[name].execution_mode,
+                ExecutionMode::Pure,
+                "{name} produces no observable side effect and must be Pure"
+            );
+        }
+        // Mutating tools can write files, change safety state, or spawn processes.
+        for name in [
+            "bash",
+            "powershell",
+            "write",
+            "edit",
+            "apply_patch",
+            "ast_replace",
+            "delete",
+            "move",
+            "import",
+            "safety",
+            "bash_kill",
+            "bash_write",
+        ] {
+            assert_eq!(
+                by_name[name].execution_mode,
+                ExecutionMode::Mutating,
+                "{name} writes files and must be Mutating"
+            );
+        }
+    }
+
+    #[test]
+    fn every_advertised_mutating_tool_has_explicit_persistence_classification() {
+        let manifest = build_manifest_for_host(true);
+        let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.first() else {
+            panic!("expected ToolProvider");
+        };
+        let mut mutations = 0;
+        for tool in tools {
+            if tool.execution_mode == ExecutionMode::Mutating {
+                mutations += 1;
+                assert!(
+                    crate::persistence_gate::classification(&tool.name).is_some(),
+                    "new mutating tool {} needs an explicit persistence classification",
+                    tool.name
+                );
+            }
+        }
+        assert!(
+            mutations > 0,
+            "the production catalog must contain mutations"
+        );
+    }
+
+    /// Serializes the HELLO manifest with the two volatile parts replaced by
+    /// markers: the crate version (changes every release) and each tool's
+    /// embedded schema/description (regenerated from the plugin tool map).
+    /// Both are checked against their sources before being replaced, so the
+    /// snapshot still pins everything else AFT puts on the wire.
+    fn normalized_manifest_json() -> Value {
+        let mut manifest =
+            serde_json::to_value(build_manifest_for_host(true)).expect("serialize manifest");
+        assert_eq!(manifest["module_version"], json!(env!("CARGO_PKG_VERSION")));
+        manifest["module_version"] = json!("<CARGO_PKG_VERSION>");
+        let tools = manifest["provides"][0]["tools"]
+            .as_array_mut()
+            .expect("tool provider tools");
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool name").to_string();
+            assert_eq!(tool["schema"], tool_schema(&name), "{name} schema");
+            assert_eq!(
+                tool["description"],
+                json!(manifest_tool_description(&name)),
+                "{name} description"
+            );
+            tool["schema"] = json!("<embedded schema>");
+            tool["description"] = json!("<embedded description>");
+        }
+        manifest
+    }
+
+    /// The fixture is the manifest AFT sent on subc-protocol 0.10, captured
+    /// before the move to 0.22. Every difference the newer protocol crate
+    /// forces is applied to it explicitly below, so any other drift in what
+    /// AFT sends fails this test.
+    ///
+    /// The two removed keys are real wire differences, not equivalences: a
+    /// subc daemon older than 0.17.20 requires them and refuses the HELLO
+    /// ("missing field `consumes`"), so this manifest needs daemon 0.17.20 or
+    /// newer.
+    #[test]
+    fn hello_manifest_wire_shape_matches_snapshot() {
+        let actual = normalized_manifest_json();
+        let mut expected: Value = serde_json::from_str(include_str!(
+            "../../../aft/tests/fixtures/subc_hello_manifest.json"
+        ))
+        .expect("parse manifest snapshot");
+        let top = expected.as_object_mut().expect("manifest object");
+        // `consumes` names the modules AFT opens service routes to.
+        assert_eq!(top.remove("consumes"), Some(json!([])));
+        top.insert(
+            "consumes".to_string(),
+            json!([
+                {"role": "service_client", "of": ["prefrontal"]},
+                {"role": "service_client", "of": ["synapse"]}
+            ]),
+        );
+        // The scheduled-task vocabulary was retired from the manifest.
+        assert_eq!(top.remove("scheduled_tasks"), Some(json!([])));
+        // The snapshot predates the catalog capability that lets a session
+        // starter discover AFT as a tool provider.
+        assert_eq!(
+            top.insert(
+                "capabilities".to_string(),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-on-behalf-of/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1", "shells/v1", "user-commands/v1", "system-text-facts/v1", "notice-record-writer/v1"], "requires": [], "must_never_reach": []}),
+            ),
+            None
+        );
+        // The management role now always serializes its delivery concurrency;
+        // AFT declares the value the daemon assumes when the key is absent.
+        let management = expected["provides"][1]
+            .as_object_mut()
+            .expect("management surface role");
+        assert_eq!(management["role"], json!("management_surface"));
+        assert_eq!(
+            management.insert("concurrency".to_string(), json!("module_managed")),
+            None
+        );
+        // The snapshot predates the gh shim relay operations, the backup purge
+        // and the page-bundle operations, so they are appended to its
+        // management operation list here.
+        // It also predates the scope task operations listed before older queries.
+        let operations = management
+            .get_mut("operations")
+            .and_then(Value::as_array_mut)
+            .expect("management operations");
+        operations.insert(
+            0,
+            json!({"name": crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION, "kind": "mutate"}),
+        );
+        operations.insert(
+            2,
+            json!({
+                "name": "diagnostics.findings", "kind": "query",
+                "description": "Read AFT's recorded health findings without scheduling work.",
+            }),
+        );
+        operations.insert(
+            0,
+            json!({"name": "scope.background_tasks", "kind": "query"}),
+        );
+        operations.extend([
+            json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
+            json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
+            json!({"name": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "kind": "query"}),
+            json!({"name": crate::gh_shim_relay::READ_REQUEST_OPERATION, "kind": "query"}),
+            json!({"name": crate::backup::purge::BACKUPS_PURGE_OPERATION, "kind": "mutate"}),
+            json!({"name": crate::page_collect::COLLECT_OPERATION, "kind": "mutate"}),
+            json!({"name": crate::page_collect::READ_OPERATION, "kind": "query"}),
+            json!({"name": crate::page_collect::RELEASE_OPERATION, "kind": "mutate"}),
+            json!({"name": super::super::permissions::LIST_OPERATION, "kind": "query"}),
+            json!({"name": super::super::permissions::REVOKE_OPERATION, "kind": "mutate"}),
+            json!({"name": "shells.list", "kind": "query"}),
+            json!({"name": "shells.watch", "kind": "query"}),
+            json!({"name": "shells.output", "kind": "query"}),
+            json!({"name": "aft.status", "kind": "query"}),
+            json!({"name": "commands.describe", "kind": "query"}),
+            json!({"name": "commands.preview", "kind": "query"}),
+            json!({"name": "commands.run", "kind": "mutate"}),
+        ]);
+        operations.insert(
+            0,
+            json!({
+                "name": cortexkit_role_tool_display::DISPLAY_READ, "kind": "query",
+                "description": "Read a retained display snapshot as the discovered display server.",
+            }),
+        );
+        // AFT registers not-ready and flips itself ready after warm-up (see
+        // `subc::readiness`); this is the only field readiness adds.
+        let top = expected.as_object_mut().expect("manifest object");
+        assert_eq!(top.insert("ready".to_string(), json!(false)), None);
+        assert_eq!(
+            top.insert(
+                "flow_operations".to_owned(),
+                json!(["diagnostics.findings"])
+            ),
+            None
+        );
+        assert_eq!(
+            top.insert(
+                "operation_delivery".to_owned(),
+                json!({"shells.output": "watch", "shells.watch": "watch"})
+            ),
+            None
+        );
+        // The snapshot predates the bash companion tools, which the catalog
+        // appends after `safety`.
+        expected["provides"][0]["tools"]
+            .as_array_mut()
+            .expect("tool provider tools")
+            .extend(
+                [
+                    ("bash_status", "pure"),
+                    ("bash_kill", "mutating"),
+                    ("bash_write", "mutating"),
+                ]
+                .map(|(name, mode)| {
+                    json!({
+                        "name": name,
+                        "description": "<embedded description>",
+                        "execution_mode": mode,
+                        "schema": "<embedded schema>",
+                    })
+                }),
+            );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn subc_agent_lanes_classify_new_read_tools() {
+        assert_eq!(command_lane("callgraph"), Lane::HeavyInit);
+        assert_eq!(command_lane("conflicts"), Lane::PureRead);
+        assert_eq!(command_lane("bash_status"), Lane::PureRead);
+        assert_eq!(command_lane("bash_wait_detach"), Lane::PureRead);
+        assert!(is_subc_native_plumbing_tool("bash_status"));
+    }
+
+    #[test]
+    fn bash_write_runs_on_a_reader_lane() {
+        // Terminal input changes no project state, and a write waiting for a
+        // program to read its input must not hold the root's writer lane,
+        // which would queue every other call on the root (`bash_kill` too).
+        assert_eq!(command_lane("bash_write"), Lane::PureRead);
+    }
+
+    #[test]
+    fn plumbing_call_classification_follows_the_caller_for_shared_bash_tools() {
+        // Plumbing-only names are plumbing whatever they carry.
+        assert!(is_native_plumbing_call(
+            "bash_drain_completions",
+            &json!({ "session_id": "s" })
+        ));
+        assert!(is_native_plumbing_call("bash_wait_detach", &json!({})));
+        // Agent-only tools are never plumbing.
+        assert!(!is_native_plumbing_call(
+            "read",
+            &json!({ "filePath": "a" })
+        ));
+        // Shared names: the plugins' native snake_case call is plumbing, the
+        // catalog's camelCase call is the agent's.
+        for name in ["bash_status", "bash_kill", "bash_write"] {
+            assert!(
+                is_native_plumbing_call(name, &json!({ "task_id": "bash-1" })),
+                "{name} native call"
+            );
+            assert!(
+                !is_native_plumbing_call(name, &json!({ "taskId": "bash-1" })),
+                "{name} catalog call"
+            );
+            assert!(
+                !is_native_plumbing_call(name, &json!({ "params": { "taskId": "bash-1" } })),
+                "{name} catalog call wrapped in params"
+            );
+        }
+    }
+
+    #[test]
+    fn native_plumbing_allowlist_admits_exactly_the_plugin_consumer_surface() {
+        // BC2: the route gate admits a name when it's an agent core tool OR a
+        // native plumbing command. These carry no agent surface and no
+        // config/trust surface, so they're admitted to dispatch over a bound
+        // route while everything else (notably `configure`) stays fail-closed.
+        assert!(is_subc_native_plumbing_tool("bash_drain_completions"));
+        assert!(is_subc_native_plumbing_tool("bash_ack_completions"));
+        // Safety-tool permission previews: read-only, session-scoped. Without
+        // these, aft_safety undo/restore breaks over the subc transport.
+        assert!(is_subc_native_plumbing_tool("undo_preview"));
+        assert!(is_subc_native_plumbing_tool("checkpoint_paths"));
+        assert!(is_subc_native_plumbing_tool("safety_purge_paths"));
+        // The rest of the plugins' background-bash consumer surface plus the
+        // Tier-2 refresh trigger (each was shipped plugin-side without a gate
+        // entry and silently rejected in prod; see subc_plumbing_drift_test).
+        assert!(is_subc_native_plumbing_tool("bash_kill"));
+        assert!(is_subc_native_plumbing_tool("bash_write"));
+        assert!(is_subc_native_plumbing_tool("bash_notify"));
+        assert!(is_subc_native_plumbing_tool("bash_unnotify"));
+        assert!(is_subc_native_plumbing_tool("bash_wait_detach"));
+        // Regex validation is session-scoped plumbing with no config/trust input.
+        assert!(is_subc_native_plumbing_tool("bash_regex_match"));
+        assert!(is_subc_native_plumbing_tool("inspect_tier2_run"));
+        // Hashline preflight parses the patch and reports permission paths; it
+        // does not mutate files or expose configuration or trust controls.
+        assert!(is_subc_native_plumbing_tool("hashline_preflight"));
+
+        // The allowlist is TIGHT — it must not admit the config-bypass vector
+        // the fail-closed gate exists to block, nor mutation commands the
+        // plugins never send natively.
+        assert!(!is_subc_native_plumbing_tool("configure"));
+        assert!(!is_subc_native_plumbing_tool("bash"));
+        assert!(!is_subc_native_plumbing_tool("db_set_state"));
+        assert!(!is_subc_native_plumbing_tool("undo"));
+
+        // The plumbing commands are NOT agent-facing tools — they must stay out
+        // of the manifest gate so they never reach the model surface.
+        assert!(!is_subc_agent_core_tool("bash_drain_completions"));
+        assert!(!is_subc_agent_core_tool("bash_ack_completions"));
+        assert!(!is_subc_agent_core_tool("hashline_preflight"));
+        assert!(!is_subc_agent_core_tool("bash_regex_match"));
+
+        // Parse-only preflight and completion drain are reads; ack mutates.
+        assert_eq!(command_lane("hashline_preflight"), Lane::PureRead);
+        assert_eq!(command_lane("bash_drain_completions"), Lane::PureRead);
+        assert_eq!(command_lane("bash_ack_completions"), Lane::Mutating);
+    }
+
+    /// Every property name the generator marked consumer-only, per tool, read
+    /// from the raw embedded artifact before any stripping.
+    fn marked_consumer_only_properties() -> Vec<(String, String)> {
+        let mut marked = Vec::new();
+        for (tool, schema) in SUBC_TOOL_SCHEMAS.iter() {
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                for (name, property) in properties {
+                    if is_consumer_only(property) {
+                        marked.push((tool.clone(), name.clone()));
+                    }
+                }
+            }
+        }
+        marked
+    }
+
+    /// Collects every `properties` entry at any depth of a served schema.
+    fn collect_properties<'a>(schema: &'a Value, out: &mut Vec<(&'a str, &'a Value)>) {
+        match schema {
+            Value::Object(object) => {
+                if let Some(Value::Object(properties)) = object.get("properties") {
+                    for (name, property) in properties {
+                        out.push((name.as_str(), property));
+                    }
+                }
+                for value in object.values() {
+                    collect_properties(value, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_properties(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn default_artifacts_omit_runon_and_enabled_overrides_add_it_for_bash_only() {
+        for schema in SUBC_TOOL_SCHEMAS.values() {
+            assert!(schema["properties"].get("runon").is_none());
+            assert!(!schema["description"]
+                .as_str()
+                .unwrap()
+                .contains("When remote runs are available"));
+        }
+        for preset in SUBC_TOOL_PRESETS.values() {
+            for schema in preset.as_object().unwrap().values() {
+                assert!(schema["properties"].get("runon").is_none());
+                assert!(!schema["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("When remote runs are available"));
+            }
+        }
+        for preset in [None, Some("worker")] {
+            let (schema, description) = remote_tool(preset, "bash").expect("enabled bash override");
+            assert_eq!(schema["properties"]["runon"]["type"], "string");
+            assert!(description
+                .unwrap()
+                .contains("When remote runs are available"));
+            assert!(remote_tool(preset, "powershell").is_none());
+        }
+        for powershell_available in [true, false] {
+            let manifest = build_manifest_for_host(powershell_available);
+            let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.first() else {
+                panic!("expected ToolProvider");
+            };
+            for tool in tools {
+                assert!(
+                    tool.schema["properties"].get("runon").is_none(),
+                    "{} offers runon in the manifest",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    /// `ref` (reading at a git revision) is advertised only by the enabled
+    /// overrides, for read, outline and zoom, never by the default artifacts
+    /// or the HELLO manifest.
+    #[test]
+    fn default_artifacts_omit_ref_and_revision_overrides_add_it_for_read_outline_zoom() {
+        for schema in SUBC_TOOL_SCHEMAS.values() {
+            assert!(schema["properties"].get("ref").is_none());
+        }
+        for preset in SUBC_TOOL_PRESETS.values() {
+            for schema in preset.as_object().unwrap().values() {
+                assert!(schema["properties"].get("ref").is_none());
+            }
+        }
+        for name in ["read", "outline", "zoom"] {
+            let (schema, description) = revision_tool(name).expect("revision override");
+            assert_eq!(schema["properties"]["ref"]["type"], "string", "{name}");
+            assert!(description.unwrap().contains("`ref`"), "{name}");
+            // Apart from `ref`, the override is the default schema.
+            let mut without_ref = schema.clone();
+            without_ref["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("ref");
+            assert_eq!(
+                without_ref["properties"],
+                tool_schema(name)["properties"],
+                "{name}"
+            );
+        }
+        assert_eq!(SUBC_REVISION_TOOL_SCHEMAS.len(), 3);
+        let manifest = build_manifest_for_host(true);
+        let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.first() else {
+            panic!("expected ToolProvider");
+        };
+        for tool in tools {
+            assert!(
+                tool.schema["properties"].get("ref").is_none(),
+                "{}",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn served_catalog_carries_no_consumer_only_property() {
+        let marked = marked_consumer_only_properties();
+        // Guards against a vacuous pass: the plugins' bash flags must still be
+        // marked in the artifact, or there would be nothing to strip.
+        for expected in ["foreground_orchestrate", "block_to_completion", "shell"] {
+            assert!(
+                marked
+                    .iter()
+                    .any(|(tool, name)| tool == "bash" && name == expected),
+                "bash.{expected} must carry {CONSUMER_ONLY_MARKER} in subc_tool_schemas.json"
+            );
+        }
+
+        for powershell_available in [true, false] {
+            let manifest = build_manifest_for_host(powershell_available);
+            let tools = match manifest.provides.first() {
+                Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+                _ => panic!("expected ToolProvider"),
+            };
+            for tool in tools {
+                let mut properties = Vec::new();
+                collect_properties(&tool.schema, &mut properties);
+                for (name, property) in properties {
+                    assert!(
+                        !is_consumer_only(property),
+                        "{}.{name} is marked consumer-only but is served to consumers",
+                        tool.name
+                    );
+                    assert!(
+                        !marked
+                            .iter()
+                            .any(|(marked_tool, marked_name)| marked_tool == &tool.name
+                                && marked_name == name),
+                        "{}.{name} is consumer-only but is served to consumers",
+                        tool.name
+                    );
+                    // Backstop for a consumer flag added without the marker:
+                    // the generator describes these as "Consumer-set".
+                    assert!(
+                        !property
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .is_some_and(|description| description.contains("Consumer-set")),
+                        "{}.{name} describes itself as consumer-set but is served to consumers",
+                        tool.name
+                    );
+                }
+                let required = tool
+                    .schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for (marked_tool, marked_name) in &marked {
+                    assert!(
+                        !(marked_tool == &tool.name
+                            && required.iter().any(|name| name == marked_name.as_str())),
+                        "{}.{marked_name} is consumer-only but still listed as required",
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_is_advertised_only_where_pwsh_can_run() {
+        let names = |powershell_available: bool| -> Vec<String> {
+            match build_manifest_for_host(powershell_available)
+                .provides
+                .first()
+            {
+                Some(ProviderRole::ToolProvider { tools, .. }) => {
+                    tools.iter().map(|tool| tool.name.clone()).collect()
+                }
+                _ => panic!("expected ToolProvider"),
+            }
+        };
+        let without = names(false);
+        assert!(
+            !without.iter().any(|name| name == "powershell"),
+            "a host without pwsh must not advertise the powershell tool: {without:?}"
+        );
+        assert!(without.iter().any(|name| name == "bash"));
+        assert_eq!(without.len(), CORE_TOOLS.len() - 1);
+
+        let with = names(true);
+        assert!(with.iter().any(|name| name == "powershell"));
+        assert_eq!(with.len(), CORE_TOOLS.len());
+
+        // Hiding the tool does not unroute it: a stray call still reaches the
+        // executor, which refuses it with an install-or-use-bash error.
+        assert!(is_subc_agent_core_tool("powershell"));
+
+        // The served default follows the host's real pwsh lookup.
+        let served = match build_manifest().provides.first() {
+            Some(ProviderRole::ToolProvider { tools, .. }) => {
+                tools.iter().any(|tool| tool.name == "powershell")
+            }
+            _ => panic!("expected ToolProvider"),
+        };
+        assert_eq!(served, crate::bash_background::powershell_available());
+    }
+
+    /// Every `bash_*` identifier in `text` (e.g. `bash_status` in
+    /// "use bash_status({ taskId })"). Config keys are spelled with a dot
+    /// (`bash.watch_sync_max_ms`), so they are not picked up.
+    fn bash_companion_mentions(text: &str) -> HashSet<String> {
+        let mut names = HashSet::new();
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        while let Some(offset) = text[start..].find("bash_") {
+            let at = start + offset;
+            let preceded_by_word =
+                at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let end = text[at..]
+                .find(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+                .map_or(text.len(), |len| at + len);
+            if !preceded_by_word {
+                names.insert(text[at..end].trim_end_matches('_').to_string());
+            }
+            start = end.max(at + 1);
+        }
+        names
+    }
+
+    /// Reply text the server renders for the bash family and its companions,
+    /// i.e. what a catalog consumer shows the model after a `bash`/`powershell`
+    /// call hands back a task id and the model follows up on it.
+    fn server_rendered_bash_reply_texts() -> Vec<String> {
+        use crate::commands::bash_orchestrate as orchestrate;
+        let task = "bash-0123456789abcdef";
+        let running_status = |mode: &str| {
+            crate::subc_format::format_response(
+                "bash_status",
+                &crate::protocol::Response::success(
+                    "status",
+                    json!({ "task_id": task, "status": "running", "mode": mode }),
+                ),
+                false,
+            )
+        };
+        let mut texts = Vec::new();
+        // Both roles' wording: a catalog consumer may be a delegated worker.
+        for worker_session in [false, true] {
+            texts.extend([
+                orchestrate::format_background_launch(task, false, worker_session, false),
+                orchestrate::format_background_launch(task, true, worker_session, false),
+                orchestrate::format_promotion_message(task, None, 30_000, worker_session, false),
+                orchestrate::format_wait_detach_message(task, worker_session, false),
+                orchestrate::format_module_drain_detach_message(task, worker_session, false),
+            ]);
+        }
+        texts.extend([running_status("pty"), running_status("pipes")]);
+        texts
+    }
+
+    /// A consumer that builds its tool surface from this catalog can only offer
+    /// the model what the catalog lists. Whenever `bash` or `powershell` is
+    /// advertised, every companion tool named by any advertised description,
+    /// property description, or server-rendered bash reply must be advertised
+    /// too; otherwise the model is told to call a tool its host refuses.
+    #[test]
+    fn catalog_advertises_every_bash_companion_its_text_names() {
+        for powershell_available in [true, false] {
+            let manifest = build_manifest_for_host(powershell_available);
+            let tools = match manifest.provides.first() {
+                Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+                _ => panic!("expected ToolProvider"),
+            };
+            let advertised: HashSet<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+            if !advertised.contains("bash") && !advertised.contains("powershell") {
+                continue;
+            }
+
+            let mut sources: Vec<(String, String)> = Vec::new();
+            for tool in tools {
+                if let Some(description) = &tool.description {
+                    sources.push((format!("{} description", tool.name), description.clone()));
+                }
+                let mut properties = Vec::new();
+                collect_properties(&tool.schema, &mut properties);
+                for (name, property) in properties {
+                    if let Some(description) = property.get("description").and_then(Value::as_str) {
+                        sources.push((
+                            format!("{}.{name} description", tool.name),
+                            description.to_string(),
+                        ));
+                    }
+                }
+            }
+            for text in server_rendered_bash_reply_texts() {
+                sources.push(("server-rendered bash reply".to_string(), text));
+            }
+
+            let mut referenced = HashSet::new();
+            let mut missing = Vec::new();
+            for (source, text) in &sources {
+                for name in bash_companion_mentions(text) {
+                    if !advertised.contains(name.as_str()) {
+                        missing.push(format!("{name} (named by {source})"));
+                    }
+                    referenced.insert(name);
+                }
+            }
+            missing.sort();
+            missing.dedup();
+            assert!(
+                missing.is_empty(),
+                "catalog (powershell_available={powershell_available}) names bash companions it does not advertise: {missing:?}"
+            );
+            // Guards against a vacuous pass: the launch text alone names
+            // bash_status, bash_kill and bash_write.
+            for expected in ["bash_status", "bash_kill", "bash_write"] {
+                assert!(
+                    referenced.contains(expected),
+                    "scan found no mention of {expected}; the text sources are not being read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consumer_only_bash_flags_still_reach_the_runtime() {
+        // Our plugins send these flags explicitly; stripping them from the
+        // served schema must not stop translation from carrying them through.
+        let translated = crate::subc_translate::subc_translate_owned(
+            "bash",
+            json!({
+                "command": "echo hi",
+                "foreground_orchestrate": false,
+                "block_to_completion": true,
+                "shell": "powershell",
+            }),
+            std::path::Path::new("/project"),
+        )
+        .expect("bash with consumer flags must translate");
+        assert_eq!(translated.command, "bash");
+        assert_eq!(translated.args["foreground_orchestrate"], json!(false));
+        assert_eq!(translated.args["block_to_completion"], json!(true));
+        assert_eq!(translated.args["shell"], json!("powershell"));
+
+        let bash_properties = tool_schema("bash");
+        let bash_properties = bash_properties["properties"]
+            .as_object()
+            .expect("bash properties");
+        for flag in ["foreground_orchestrate", "block_to_completion", "shell"] {
+            assert!(!bash_properties.contains_key(flag), "bash.{flag} leaked");
+        }
+    }
+}

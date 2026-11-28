@@ -1,0 +1,251 @@
+//! Reply budgets for tools that deliberately wait, independent of task lifetime.
+
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
+
+// Without a client deadline, use the default worker wait plus the reply
+// margin advertised by the tool catalog.
+#[doc(hidden)]
+pub const WORKER_REPLY_MARGIN_MS: u64 = 240_000;
+const LEGACY_TRANSPORT_MS: u64 =
+    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS + WORKER_REPLY_MARGIN_MS;
+pub(crate) const MAX_BLOCKING_WAIT_MS: u64 =
+    LEGACY_TRANSPORT_MS - safety_margin_ms(LEGACY_TRANSPORT_MS);
+
+const fn safety_margin_ms(window_ms: u64) -> u64 {
+    // Thirty seconds proved insufficient for dispatch and reply delivery. Keep
+    // at least twice that, or 10% for long calls. Short transport classes retain
+    // half their original window instead of losing it all to the 60-second floor.
+    let fraction = window_ms / 10;
+    let margin = if fraction > 60_000 { fraction } else { 60_000 };
+    let half = window_ms / 2;
+    if margin < half {
+        margin
+    } else {
+        half
+    }
+}
+
+fn safety_margin(window: Duration) -> Duration {
+    Duration::from_millis(safety_margin_ms(
+        window.as_millis().min(u64::MAX as u128) as u64
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct ReplyBudget {
+    pub received_at: Instant,
+    pub deadline: Instant,
+    clock: WaitClock,
+}
+
+/// Project suspend-inclusive elapsed time onto the receipt's Instant timeline.
+/// Task lifetime and hard-kill deadlines keep using their original clock.
+#[derive(Clone, Copy, Debug)]
+struct WaitClock {
+    awake: Instant,
+    continuous: Duration,
+    #[cfg(any(test, feature = "test-support"))]
+    base_now: Option<fn() -> Instant>,
+    #[cfg(any(test, feature = "test-support"))]
+    suspend: Option<&'static std::sync::atomic::AtomicU64>,
+}
+
+impl WaitClock {
+    fn new() -> Self {
+        Self {
+            awake: Instant::now(),
+            continuous: continuous_now(),
+            #[cfg(any(test, feature = "test-support"))]
+            base_now: None,
+            #[cfg(any(test, feature = "test-support"))]
+            suspend: None,
+        }
+    }
+
+    fn now(self) -> Instant {
+        let elapsed = continuous_now().saturating_sub(self.continuous);
+        #[cfg(any(test, feature = "test-support"))]
+        let elapsed = self
+            .base_now
+            .map_or(elapsed, |now| now().saturating_duration_since(self.awake));
+        #[cfg(any(test, feature = "test-support"))]
+        let elapsed = elapsed
+            + Duration::from_millis(
+                self.suspend
+                    .map_or(0, |clock| clock.load(std::sync::atomic::Ordering::SeqCst)),
+            );
+        self.awake + elapsed
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn continuous_now() -> Duration {
+    #[cfg(target_os = "linux")]
+    let id = libc::CLOCK_BOOTTIME;
+    // Darwin's CLOCK_MONOTONIC includes suspend; Linux's does not.
+    #[cfg(target_os = "macos")]
+    let id = libc::CLOCK_MONOTONIC;
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: clock_gettime initializes the timespec on success.
+    let result = unsafe { libc::clock_gettime(id, time.as_mut_ptr()) };
+    assert_eq!(result, 0, "suspend-inclusive clock unavailable");
+    // SAFETY: the successful clock_gettime call initialized time.
+    let time = unsafe { time.assume_init() };
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn continuous_now() -> Duration {
+    // Windows Instant uses QueryPerformanceCounter, which includes standby
+    // and hibernation.
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed()
+}
+
+impl ReplyBudget {
+    #[doc(hidden)]
+    pub fn from_envelope(received_at: Instant, body: &Value) -> Self {
+        let now = Instant::now();
+        let wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        Self::from_clocks(received_at, body, now, wall_ms)
+    }
+
+    pub(crate) fn from_clocks(
+        received_at: Instant,
+        body: &Value,
+        now: Instant,
+        wall_ms: u64,
+    ) -> Self {
+        let deadline = body.get("deadline_ms").and_then(Value::as_u64).map(|ms| {
+            // Pair clocks at the same point, not receipt: receipt can predate
+            // decoding by a long queue wait. An expired deadline stays expired.
+            if ms >= wall_ms {
+                now.checked_add(Duration::from_millis(ms - wall_ms))
+                    .unwrap_or(now)
+            } else {
+                now.checked_sub(Duration::from_millis(wall_ms - ms))
+                    .unwrap_or(received_at)
+            }
+        });
+        Self::new(received_at, deadline)
+    }
+
+    #[doc(hidden)]
+    pub fn new(received_at: Instant, client_deadline: Option<Instant>) -> Self {
+        let end = client_deadline
+            .unwrap_or_else(|| received_at + Duration::from_millis(LEGACY_TRANSPORT_MS));
+        let window = end.saturating_duration_since(received_at);
+        Self::with_deadline(received_at, end - safety_margin(window))
+    }
+
+    #[doc(hidden)]
+    pub fn with_deadline(received_at: Instant, deadline: Instant) -> Self {
+        Self {
+            received_at,
+            deadline,
+            clock: WaitClock::new(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn cap(&self, deadline: Instant) -> Instant {
+        deadline.min(self.deadline)
+    }
+
+    #[doc(hidden)]
+    pub fn now(&self) -> Instant {
+        self.clock.now()
+    }
+
+    #[doc(hidden)]
+    pub fn elapsed(&self) -> Duration {
+        self.now().saturating_duration_since(self.received_at)
+    }
+
+    #[doc(hidden)]
+    pub fn io_deadline(&self, deadline: Instant) -> Instant {
+        Instant::now() + deadline.saturating_duration_since(self.now())
+    }
+
+    /// Short scheduler sleeps ensure an awake-only runtime timer cannot retain
+    /// a long pre-suspend remainder. Only the continuous clock decides expiry.
+    #[doc(hidden)]
+    pub async fn sleep_until(&self, deadline: Instant) {
+        loop {
+            let remaining = deadline.saturating_duration_since(self.now());
+            if remaining.is_zero() {
+                return;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn timeout_at<F: std::future::Future>(
+        &self,
+        deadline: Instant,
+        future: F,
+    ) -> Result<F::Output, ()> {
+        tokio::select! {
+            biased;
+            output = future => Ok(output),
+            _ = self.sleep_until(deadline) => Err(()),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_suspend_clock(
+        mut self,
+        clock: &'static std::sync::atomic::AtomicU64,
+    ) -> Self {
+        self.clock.suspend = Some(clock);
+        self
+    }
+
+    /// A test driving Tokio time must use that same clock for expiry, not just
+    /// for scheduler wakeups. Opt in per budget so native-clock suspend tests
+    /// and other calls keep their independent time sources.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_runtime_clock(mut self) -> Self {
+        self.clock.awake = tokio::time::Instant::now().into_std();
+        self.clock.base_now = Some(|| tokio::time::Instant::now().into_std());
+        self
+    }
+
+    /// Exclude restoration from elapsed startup time without changing the
+    /// caller's absolute reply deadline or its delivery margin.
+    #[doc(hidden)]
+    pub fn after_launch_restore(self, elapsed: Duration) -> Self {
+        Self {
+            received_at: self.received_at + elapsed,
+            deadline: self.deadline,
+            ..self
+        }
+    }
+}
+
+impl From<Instant> for ReplyBudget {
+    fn from(received_at: Instant) -> Self {
+        Self::new(received_at, None)
+    }
+}
+
+#[doc(hidden)]
+pub fn clamp_worker_wait_ms(configured: u64) -> u64 {
+    if configured > MAX_BLOCKING_WAIT_MS {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            log::warn!(
+                "bash.worker_wait_max_ms={configured} clamped to {MAX_BLOCKING_WAIT_MS} ms so blocking waits reply before the transport deadline"
+            );
+        });
+    }
+    configured.min(MAX_BLOCKING_WAIT_MS)
+}

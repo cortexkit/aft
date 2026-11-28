@@ -76,6 +76,7 @@ fi
 job_kinds=()
 job_targets=()
 job_filters=()
+lib_packages=(-p aft-base -p aft-db -p aft-engine -p aft-tools -p aft-subc)
 add_job() {
   local kind=$1 target=$2 test_filter=$3 i
   for ((i = 0; i < ${#job_kinds[@]}; i++)); do
@@ -92,10 +93,12 @@ select_path() {
   case "$path" in
     Cargo.toml|Cargo.lock|build.rs|crates/aft/Cargo.toml|crates/aft/build.rs|crates/aft/src/lib.rs|crates/aft/src/context.rs|crates/aft/src/db.rs|crates/aft/src/executor.rs|crates/aft/src/config*.rs|crates/aft/src/subc_config.rs|crates/aft/src/executor/*|crates/aft/src/db/*|crates/aft-tokenizer/*|crates/aft-base/*|crates/aft-db/*)
       shared=1 ;;
+    crates/aft-engine/Cargo.toml|crates/aft-tools/Cargo.toml|crates/aft-subc/Cargo.toml|crates/aft-engine/src/lib.rs|crates/aft-tools/src/lib.rs|crates/aft-subc/src/lib.rs|crates/aft-engine/src/context.rs|crates/aft-engine/src/executor.rs|crates/aft-engine/src/executor/*)
+      shared=1 ;;
     crates/aft/src/main.rs)
       add_job bin aft '' ;;
-    crates/aft/src/*.rs)
-      module=${path#crates/aft/src/}; module=${module%%/*}; module=${module%.rs}
+    crates/aft/src/*.rs|crates/aft-engine/src/*.rs|crates/aft-tools/src/*.rs|crates/aft-subc/src/*.rs)
+      module=${path#*/src/}; module=${module%%/*}; module=${module%.rs}
       add_job lib '' "$module::" ;;
     crates/aft/tests/*.rs)
       rest=${path#crates/aft/tests/}; target=${rest%%/*}; test_file=${rest##*/}
@@ -176,7 +179,7 @@ fi
 print_job() {
   local kind=$1 target=$2 test_filter=$3
   local -a args=(test --locked -j 4 -p agent-file-tools)
-  [[ "$kind" != lib ]] || args+=(-p aft-base -p aft-db)
+  [[ "$kind" != lib ]] || args+=("${lib_packages[@]}")
   args+=("--$kind")
   [[ -z "$target" ]] || args+=("$target")
   [[ "$kind" != test ]] || args+=(--features test-hooks)
@@ -241,7 +244,7 @@ started=$SECONDS
 run_job() {
   local kind=$1 target=$2 test_filter=$3 label=$4 remaining output code
   local -a args=(test --locked -j 4 -p agent-file-tools)
-  [[ "$kind" != lib ]] || args+=(-p aft-base -p aft-db)
+  [[ "$kind" != lib ]] || args+=("${lib_packages[@]}")
   args+=("--$kind")
   [[ -z "$target" ]] || args+=("$target")
   [[ "$kind" != test ]] || args+=(--features test-hooks)
