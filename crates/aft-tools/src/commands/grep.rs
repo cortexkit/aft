@@ -583,7 +583,7 @@ pub(crate) fn trigram_index_disclosure(ctx: &AppContext) -> serde_json::Value {
 pub(crate) fn append_git_index_disclosure(body: &mut serde_json::Value) {
     if let Some(reason) = body["index"]["trigram"]["reason"]
         .as_str()
-        .filter(|reason| reason.starts_with(crate::feature_status::cause::GIT_IDENTITY_UNAVAILABLE))
+        .filter(|reason| crate::feature_status::is_git_identity_unavailable(reason))
     {
         let text = body["text"].as_str().unwrap_or_default();
         body["text"] = serde_json::json!(format!("{text}\ntrigram: unavailable: {reason}"));

@@ -741,7 +741,7 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
         "{rendered}"
     );
     assert!(
-        rendered.contains("DEGRADED: git_identity_unavailable:")
+        rendered.contains("DEGRADED: identity provisional: git_identity_unavailable:")
             && rendered.contains("dubious ownership"),
         "{rendered}"
     );

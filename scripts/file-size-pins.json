@@ -16,7 +16,7 @@
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft-engine/src/context.rs": {
-    "lines": 14653,
+    "lines": 11157,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft-engine/src/lsp/manager.rs": {
@@ -28,7 +28,7 @@
     "reason": "Split sandbox spawning by platform pending; AFT crate split lane."
   },
   "crates/aft-tools/src/commands/semantic_search/mod.rs": {
-    "lines": 10373,
+    "lines": 10371,
     "reason": "Split semantic search command responsibilities pending; AFT crate split lane."
   },
   "crates/aft-engine/src/semantic_index.rs": {

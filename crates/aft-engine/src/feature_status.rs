@@ -97,7 +97,7 @@ pub mod cause {
     /// it was bound (retried in the background until the database is free).
     pub const IDENTITY_PROVISIONAL: &str = "identity_provisional";
     /// Git could not determine the root's artifact identity.
-    pub const GIT_IDENTITY_UNAVAILABLE: &str = super::GIT_IDENTITY_UNAVAILABLE_REASON;
+    pub const GIT_IDENTITY_UNAVAILABLE: &str = "git_identity_unavailable";
     /// The configured embedding backend is currently unreachable.
     pub const SEMANTIC_BACKEND_UNAVAILABLE: &str = "semantic_backend_unavailable";
     /// The local embedding backend needs an ONNX Runtime that AFT cannot
@@ -168,6 +168,13 @@ impl IndexObservation {
     pub fn disk_paused(&self) -> bool {
         self.unavailable_reason.as_deref()
             == Some(crate::data_layer::surfaces::reason::DISK_RESERVE)
+    }
+
+    #[doc(hidden)]
+    pub fn git_identity_unavailable(&self) -> bool {
+        self.unavailable_reason
+            .as_deref()
+            .is_some_and(is_git_identity_unavailable)
     }
 
     #[doc(hidden)]
@@ -266,7 +273,8 @@ pub fn observed_index_status(
     }
 }
 
-fn is_git_identity_unavailable(reason: &str) -> bool {
+#[doc(hidden)]
+pub fn is_git_identity_unavailable(reason: &str) -> bool {
     reason.starts_with(GIT_IDENTITY_UNAVAILABLE_REASON)
 }
 

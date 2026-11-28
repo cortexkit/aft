@@ -1843,11 +1843,10 @@ impl SearchLaneStatus {
                     && !lane.is_ready()
                     && lane.effective != IndexEffective::Off
                     && !lane.disk_paused()
+                    && !lane.git_identity_unavailable()
                 {
                     let backend = ctx.semantic_backend_health_snapshot();
                     if !backend.available && backend.paused_until_ms.is_some() {
-                        // A scheduled pause is not an ordinary unavailable-index
-                        // state, even when no lane is ready to run this request.
                         return paused_backend_detail(&backend);
                     }
                 }
@@ -2216,8 +2215,7 @@ fn handle_semantic_search_inner(
     if let Some(external_root) = external_root {
         return handle_external_unindexed_fallback(req, ctx, &params, top_k, &shape, external_root);
     }
-    // An unsettled artifact identity keeps indexes off until the next bind;
-    // answer through the bounded grep fallback and disclose the bind failure.
+    // An unsettled identity prevents index reads; use bounded grep instead.
     if let Some(reason) = ctx.artifact_identity_provisional_reason() {
         return semantic_unavailable_grep_fallback_response(
             req,

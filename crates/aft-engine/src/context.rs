@@ -3778,17 +3778,11 @@ impl AppContext {
                 },
             }
         };
-        // The data layer's meaning plane, once it reports for the root,
-        // stands in for today's semantic index, as on the status tool. An
-        // unreachable embedding backend still reports as such: no fill can
-        // embed either.
-        if semantic_backend.available {
-            if let Some(meaning) = data_store
-                .as_ref()
-                .and_then(|report| report.meaning.as_ref())
-            {
-                semantic_index = meaning.health();
-            }
+        if let Some(health) = data_store
+            .as_ref()
+            .and_then(|report| report.meaning_health(semantic_backend.available))
+        {
+            semantic_index = health;
         }
         let callgraph_writer = self.callgraph_writer.load(Ordering::SeqCst);
         if cache_unavailable {
