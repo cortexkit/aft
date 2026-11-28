@@ -7606,10 +7606,10 @@ mod tests {
             "direct tools must remain usable: {response:?}"
         );
         assert!(ctx.artifact_identity_provisional());
-        assert!(!ctx.config().indexes.trigram);
+        assert!(ctx.config().indexes.trigram);
         assert!(!ctx.config().indexes.semantic);
         assert!(!ctx.config().indexes.callgraph);
-        assert!(!false);
+        assert!(ctx.data_checkout().is_none());
         let reason = ctx.artifact_identity_provisional_reason().unwrap();
         assert!(reason.contains("git_identity_unavailable"), "{reason}");
         assert!(reason.contains("Too many open files"), "{reason}");
@@ -7622,6 +7622,7 @@ mod tests {
         assert!(!storage.join("index").join(&path_key).exists());
         assert!(!storage.join("semantic").join(&path_key).exists());
         assert!(!storage.join("callgraph").join(&path_key).exists());
+        assert!(!storage.join("data").exists());
     }
 
     /// Hold aft.db in an exclusive transaction. In rollback-journal mode this
