@@ -1255,11 +1255,13 @@ fn audit_worker_read_still_reaches_the_broker() {
                 unexpected => panic!("worker read sent an unexpected broker op: {unexpected}"),
             };
             let reply = serde_json::to_vec(&json!({"status": "ok", "data": data})).unwrap();
+            // The shim can return as soon as it reads this reply. Record the
+            // request first so the assertion cannot race the broker thread.
+            served.lock().unwrap().push(operation.clone());
             stream
                 .write_all(&(reply.len() as u32).to_be_bytes())
                 .unwrap();
             stream.write_all(&reply).unwrap();
-            served.lock().unwrap().push(operation.clone());
             if operation == "gh_shim.read_request" {
                 break;
             }
