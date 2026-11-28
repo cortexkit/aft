@@ -19,7 +19,8 @@ enum ViewState {
     #[default]
     Unloaded,
     UnknownProject,
-    // A definite refusal uses the user view, but the next bind can retry.
+    // When the daemon refuses the project settings request, use only the user
+    // settings and let the next bind retry.
     // Remember the last refusal code so repeated binds do not flood the log.
     User(Option<String>),
     Project {
@@ -222,7 +223,7 @@ mod tests;
 
 impl Drop for Project {
     fn drop(&mut self) {
-        // A root can retain its source handle after its last route closes.
+        // A project can retain its settings source after its last route closes.
         // That handle must not keep the old project's effective text alive.
         self.settings.use_user_view();
     }

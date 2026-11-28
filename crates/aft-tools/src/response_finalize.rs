@@ -241,7 +241,7 @@ fn acknowledge_terminal_bash_reply(
 ) {
     let registry = ctx.bash_background();
     if matches!(command, "bash_status" | "bash_kill") {
-        // Status and kill may consume an awaited result, but not a legacy notice.
+        // Status and kill may consume awaited results, but leave ordinary completion notices queued.
         if let Some(task_id) = terminal_bash_task_id(response) {
             registry.ack_awaited_terminal_reply(task_id, session_id);
         }

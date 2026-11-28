@@ -416,7 +416,7 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
   function prepareFilesystem(params: unknown, normalize: boolean) {
     const args = asRecord(params);
     if (tool.name === "grep" && normalize && args) {
-      // Keep OMP's explicit paths out of the string-only Pi schema. The grep
+      // Keep OMP's explicit paths out of the string-only tool schema. The grep
       // executor uses the same permission check for each string or array target.
       const { normalized, options } = separateOmpGrepOptions(args);
       rejectNativeOnlyArguments(tool.name, filesystemSchema, normalized);

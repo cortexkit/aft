@@ -2467,7 +2467,7 @@ pub fn handle_cache_recovery(
     handle_configure_prepared(req, ctx, Some(prepared))
 }
 
-/// Reconcile the existing session's artifact lifecycle without changing its
+/// Reconcile the existing session's managed indexes without changing its
 /// bind-time settings or restarting its route.
 #[doc(hidden)]
 pub fn apply_managed_indexes(ctx: &AppContext, settings: &crate::subc_config::ApprovedUser) {

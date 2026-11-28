@@ -174,7 +174,7 @@ fn delegate_allowed(guard: Option<&manifest_guard::ManifestGuard<'_>>, args: &[O
         }
     };
     // The ticket lookup can wait on the daemon while policy changes.
-    // Recheck the policy state, list digest and pin just before execution.
+    // Recheck the routing manifest and its pinned signing key just before execution.
     match guard {
         Some(guard) => guard.delegate(args, execute),
         None => execute(args),

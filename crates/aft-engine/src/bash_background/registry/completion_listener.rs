@@ -106,7 +106,7 @@ pub struct BgCompletion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compressed_tokens: Option<u32>,
     /// True when exact token counts are unavailable, including capture/read
-    /// failures, pre-tokenizer errors and counts that cannot be represented.
+    /// failures, errors before tokenization and counts that cannot be represented.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tokens_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

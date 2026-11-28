@@ -6,7 +6,7 @@ impl AppContext {
         crate::lsp::manager::DiagnosticsActivityGuard::begin(&self.lsp_diagnostics_activity)
     }
 
-    /// Start one inspect producer, holding the LSP manager lock only to
+    /// Start one language server for inspect, holding the LSP manager lock only to
     /// reserve the server and to publish it; the spawn and `initialize`
     /// handshake run unlocked (see
     /// [`crate::lsp::manager::start_applicable_server_unlocked`]).

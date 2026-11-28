@@ -48,9 +48,8 @@ impl ReliableIngress {
         // Hold two full session batches (128 registry completion notices each),
         // shared with watch matches and warnings. Larger bursts rely on replay,
         // not a daemon-wide reservation for every root's pending notices.
-        let (tx, rx) = mpsc::channel(
-            2 * crate::bash_background::registry::completion_queue::MAX_QUEUED_PER_SESSION,
-        );
+        let (tx, rx) =
+            mpsc::channel(2 * crate::bash_background::registry::MAX_COMPLETION_NOTICES_PER_SESSION);
         (Self { tx, state }, rx)
     }
 

@@ -17326,6 +17326,8 @@ use kill_state::KillStateSave;
 pub mod awaited_work;
 #[path = "completion_queue.rs"]
 pub(crate) mod completion_queue;
+#[doc(hidden)]
+pub use completion_queue::MAX_QUEUED_PER_SESSION as MAX_COMPLETION_NOTICES_PER_SESSION;
 
 use completion_preview::{append_remote_report, rendered_execution_note};
 

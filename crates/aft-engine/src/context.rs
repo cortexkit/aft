@@ -9748,7 +9748,7 @@ impl AppContext {
         self.validate_read_path_with_approval(req_id, session_id, path, ReadPathPurpose::File, true)
     }
 
-    /// Keep the live path policy check for zoom at a Git ref, without requiring
+    /// Keep the live path policy check when reading at a Git ref, without requiring
     /// the file to exist in today's checkout.
     pub fn validate_revision_read_path(
         &self,

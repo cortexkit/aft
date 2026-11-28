@@ -8,7 +8,7 @@ pub(super) fn with_refresh_worker(
     connection_file: &Path,
     control: Arc<readiness::DaemonControl>,
 ) -> A0Egress {
-    crate::agent_child_env::coauthor::install(connection_file.to_path_buf());
+    aft_engine::agent_child_env::coauthor::install(connection_file.to_path_buf());
     a0.with_manifest_sync(manifest_sync::start(
         connection_file.to_path_buf(),
         move || {
@@ -42,7 +42,7 @@ pub(super) fn speech_launch_seed(
     });
     let heads = routes.values().filter_map(|route| route.scope.as_ref());
     let coauthor_agent =
-        crate::agent_child_env::coauthor::agent_id(&lifecycle, worker_parent, heads)
+        aft_engine::agent_child_env::coauthor::agent_id(&lifecycle, worker_parent, heads)
             .map(str::to_owned);
     let origin = |channel: RouteChannel| {
         control.and_then(|control| {

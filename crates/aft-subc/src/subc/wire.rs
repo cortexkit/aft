@@ -961,7 +961,7 @@ const TRANSPORT_TRUNCATION_REASON: &str = "transport_frame_limit";
 enum StructuredContent {
     Omit,
     Full,
-    // Programs can read matching data fields, such as `content` or `output`.
+    // Programs can read the text through native result fields such as `content` or `output`.
     OmitDuplicateText,
 }
 

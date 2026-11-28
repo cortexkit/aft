@@ -437,7 +437,7 @@ fn pattern_notice_frame(session_id: &str, mut pattern: PatternMatch) -> BashPatt
 }
 
 /// Notices queued for one session.
-pub(crate) const MAX_QUEUED_PER_SESSION: usize = 128;
+pub const MAX_QUEUED_PER_SESSION: usize = 128;
 /// Notices queued across all sessions.
 const MAX_QUEUED: usize = 4096;
 /// Notices one refill loads for a session.
