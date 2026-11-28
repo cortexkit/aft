@@ -21,6 +21,11 @@ const TOOL_KEYS: &[&str] = &[
     "bash_status",
 ];
 
+/// The macOS-only worker Commands sentence, in the exact approved wording.
+/// Tests pin its presence when AFT runs on macOS and its absence elsewhere.
+#[cfg(test)]
+pub(super) const MACOS_PS_NOTE: &str = "On macOS the sandbox can't run setuid tools such as `ps` and `top` (they fail with EPERM); use `pgrep`/`pkill`, or run tests that need `ps` with `runon`.";
+
 static GUIDANCE: LazyLock<GuidanceSet> = LazyLock::new(|| {
     checked_set([
         ("main", include_str!("guidance/main.j2")),
@@ -42,6 +47,7 @@ fn checked_set(
         "type": "object",
         "properties": {
             "preset": {"type": "string"},
+            "os": {"type": "string"},
             "facts": serde_json::from_str::<Value>(SYSTEM_TEXT_FACTS_SCHEMA)
                 .expect("published SystemTextFacts schema must be JSON"),
             "tools": {"type": "object", "properties": tools},
@@ -69,6 +75,10 @@ fn render_facts(
         .collect();
     let mut rendered = json!({
         "preset": preset.name(),
+        // The host OS AFT runs on, mirroring cfg!(target_os): "macos",
+        // "linux", "windows", and so on. Templates use it only to hide
+        // platform-specific notes from other platforms.
+        "os": std::env::consts::OS,
         "tools": tools,
         "worker": worker,
         "hashline_tags": hashline_tags.unwrap_or_default()

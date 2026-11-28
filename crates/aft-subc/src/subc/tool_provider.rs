@@ -5513,7 +5513,49 @@ mod tests {
             )
         };
         let request = fixture["request"].clone();
-        let actual = catalog(request.clone(), &disabled, available).unwrap();
+        let mut actual = catalog(request.clone(), &disabled, available).unwrap();
+        let pristine = actual.clone();
+        // The worker Commands paragraph names the macOS setuid limit only
+        // when AFT itself runs on macOS. The committed fixtures hold the
+        // platform-neutral text, so expect the sentence exactly on a macOS
+        // worker that serves bash. Its digests cover the text and follow it;
+        // align them with the fixture for the byte comparison below. Their
+        // correctness stays pinned by the self-consistency checks on the
+        // unaligned values and by worker_preset_adds_bash_watch, which
+        // checks item_digest against the rendered text.
+        let generation = actual["generation"].clone();
+        let catalog_digest = actual["catalog_digest"].clone();
+        if let Some(text) = actual
+            .get("system_text")
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+        {
+            let text = text.to_string();
+            let serves_bash = actual["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .any(|name| name == "bash" || super::same_tool(name, "bash"));
+            let is_worker = fixture["request"]["preset"].as_str() == Some("worker");
+            assert_eq!(
+                text.contains(super::guidance::MACOS_PS_NOTE),
+                cfg!(target_os = "macos") && is_worker && serves_bash,
+                "{}",
+                fixture["name"]
+            );
+            if text.contains(super::guidance::MACOS_PS_NOTE) {
+                actual["system_text"]["text"] = Value::String(
+                    text.replace(&format!(" {}", super::guidance::MACOS_PS_NOTE), ""),
+                );
+                actual["system_text"]["item_digest"] =
+                    fixture["reply"]["system_text"]["item_digest"].clone();
+                actual["system_text"]["preflight_digest"] =
+                    fixture["reply"]["system_text"]["preflight_digest"].clone();
+                actual["generation"] = fixture["reply"]["generation"].clone();
+                actual["catalog_digest"] = fixture["reply"]["catalog_digest"].clone();
+            }
+        }
         // `runon` is in bash's schema exactly when the session may run remotely.
         let bash_has_runon = actual["tools"]
             .as_array()
@@ -5539,16 +5581,16 @@ mod tests {
             catalog_golden_difference(&fixture["reply"], &actual, "reply"),
             REGENERATE_CATALOG
         );
-        assert_eq!(actual["generation"], actual["catalog_digest"]);
+        assert_eq!(generation, catalog_digest);
         let mut digest_request = request;
         digest_request["digest_only"] = json!(true);
         assert_eq!(
             catalog(digest_request, &disabled, available).unwrap(),
-            json!({"generation": actual["generation"], "catalog_digest": actual["catalog_digest"]})
+            json!({"generation": generation, "catalog_digest": catalog_digest})
         );
         assert_eq!(
             catalog(fixture["request"].clone(), &disabled, available).unwrap(),
-            actual
+            pristine
         );
     }
 
