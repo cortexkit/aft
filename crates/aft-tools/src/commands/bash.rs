@@ -373,9 +373,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 
     crate::bash_background::enter_runon_phase("workdir_return_paths");
     let requested_workdir = resolve_workdir(params.workdir.as_deref(), ctx);
-    // Keep the received arguments and the routing decision intact. The inferred
-    // cwd goes through the same scanner, sandbox and spawn path as an explicit cwd.
-    let (command, workdir) = if cfg!(unix)
+    // A leading cd provides a base for interpreting relative paths, but the
+    // shell must perform the cd to set PWD and OLDPWD itself.
+    let inferred = if cfg!(unix)
         && !params.shell.is_powershell()
         && params.workdir.is_none()
         && !remote_requested
@@ -388,16 +388,20 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             || std::env::var_os("CDPATH").is_some_and(|value| !value.is_empty())
             || ctx.config().shell.env_provider.is_some();
         infer_cd_workdir(&params.command, &requested_workdir, may_use_cdpath)
-            .unwrap_or((&params.command, requested_workdir))
     } else {
-        (params.command.as_str(), requested_workdir)
+        None
     };
-    let execution_command = params.shell.command_text(command);
+    let (analysis_command, analysis_workdir) = inferred.as_ref().map_or(
+        (params.command.as_str(), requested_workdir.as_path()),
+        |(rest, cwd)| (*rest, cwd.as_path()),
+    );
+    let execution_command = params.shell.command_text(&params.command);
     let mut remote = remote;
-    if let Err(response) = attach_return_paths(&req.id, ctx, &params, &workdir, &mut remote) {
+    if let Err(response) =
+        attach_return_paths(&req.id, ctx, &params, &requested_workdir, &mut remote)
+    {
         return response;
     }
-    let duplicate_workdir = workdir.clone();
     let duplicate_project_root = ctx
         .config()
         .project_root
@@ -427,14 +431,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             .config()
             .project_root
             .clone()
-            .unwrap_or_else(|| workdir.clone());
+            .unwrap_or_else(|| requested_workdir.clone());
         crate::agent_child_env::inject_worker_test_threads(&bound_root, &mut params.env);
     }
 
     #[cfg(unix)]
-    let mut spawn_workdir = Some(workdir.clone());
+    let mut spawn_workdir = requested_workdir.clone();
     #[cfg(not(unix))]
-    let spawn_workdir = Some(workdir.clone());
+    let spawn_workdir = requested_workdir.clone();
     #[cfg(unix)]
     let mut host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
     #[cfg(not(unix))]
@@ -460,7 +464,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         };
-        let cwd = match std::fs::canonicalize(&workdir) {
+        let cwd = match std::fs::canonicalize(&requested_workdir) {
             Ok(cwd) => cwd,
             Err(error) => {
                 return Response::error(
@@ -495,7 +499,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 shell_path,
                 environment,
             });
-            spawn_workdir = Some(cwd);
+            spawn_workdir = cwd;
         } else {
             let mut snapshot = None;
             if ctx.config().shell.env_provider.is_some() {
@@ -572,9 +576,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else if defer_permission_asks || params.permissions_requested || ctx.config().bash_permissions
     {
         crate::bash_permissions::scan::scan_with_cwd_for_session(
-            command,
+            analysis_command,
             ctx,
-            &workdir,
+            analysis_workdir,
             req.session(),
         )
     } else {
@@ -605,10 +609,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         && host_escalation.is_none()
         && remote.is_none()
         && params.env.is_empty()
-        && workdir_matches_project_root(&workdir, ctx)
+        && workdir_matches_project_root(analysis_workdir, ctx)
     {
         if let Some(response) = crate::bash_rewrite::try_rewrite_for_request(
-            command,
+            analysis_command,
             &req.id,
             req.session_id.as_deref(),
             &req.host_tool_names(),
@@ -649,7 +653,6 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let workdir = spawn_workdir;
     let env = (!params.env.is_empty()).then_some(params.env.clone());
     // pty:true silently implies background:true so agents don't need to know
     // both flags. The PTY runtime requires a polling lifecycle regardless.
@@ -671,7 +674,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         req.session(),
         &execution_command,
         &duplicate_project_root,
-        &duplicate_workdir,
+        &spawn_workdir,
     );
     #[cfg(unix)]
     let secret_launch = match secret_preflight {
@@ -692,7 +695,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         &execution_command,
         params.shell,
         shell_path,
-        workdir,
+        Some(spawn_workdir),
         env,
         hard_kill_for(&params),
         ctx,

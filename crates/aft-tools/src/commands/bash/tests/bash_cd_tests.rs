@@ -118,38 +118,84 @@ fn leading_cd_does_not_change_the_blocked_home_override_refusal() {
 }
 
 #[test]
-fn leading_cd_starts_native_subdirectory_commands_there_and_keeps_cargo_compression() {
+fn leading_cd_to_the_project_root_enables_the_cat_rewrite() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let dir = project.path().join("nested");
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::write(dir.join("needle.txt"), "find this nested needle\n").unwrap();
+    std::fs::write(project.path().join("f"), "root file\n").unwrap();
     let ctx = local_context(project.path(), storage.path());
-    let request = spawn_test_request(
-        "literal-cd-native",
-        &format!("cd {} && grep needle needle.txt", dir.display()),
-        false,
-    );
+    let request = spawn_test_request("literal-cd-cat-rewrite", "cd . && cat f", false);
+    let response = handle(&request, &ctx);
+    assert!(response.success, "{response:?}");
+    assert!(response.data.to_string().contains("root file"));
+    assert!(matches!(
+        take_route_record(&request.id).unwrap().route,
+        DispatchRoute::Rewritten { rule_id, .. } if rule_id == "cat"
+    ));
+}
+
+#[test]
+fn leading_cd_keeps_the_native_command_and_starting_directory() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let dir = project.path().join("sub");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(project.path().join("f"), "root file\n").unwrap();
+    std::fs::write(dir.join("f"), "nested file\n").unwrap();
+    let ctx = local_context(project.path(), storage.path());
+    let command = "cd sub && cat f";
+    let request = spawn_test_request("literal-cd-native", command, false);
     let (snapshot, record) = run_native(&ctx, project.path(), &request);
     assert_eq!(snapshot.exit_code, Some(0));
-    assert!(snapshot.output_preview.contains("find this nested needle"));
-    assert_eq!(record.workdir, dir);
-    assert_eq!(record.command, "grep needle needle.txt");
+    assert_eq!(snapshot.output_preview.trim(), "nested file");
+    assert_eq!(record.workdir, project.path());
+    assert_eq!(record.command, command);
+}
 
-    let line = format!("cd {} && cargo test", dir.display());
-    let (command, workdir) = infer_cd_workdir(&line, project.path(), false).unwrap();
-    assert_eq!(workdir, dir);
-    assert_eq!(command, "cargo test");
+#[test]
+fn leading_cd_keeps_cargo_compression_for_the_full_shell_line() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = local_context(project.path(), storage.path());
     let passing = (0..48)
         .map(|i| format!("test cd_compressor_case_{i} ... ok\n"))
         .collect::<String>();
     let output = format!("running 48 tests\n{passing}\ntest result: ok. 48 passed; 0 failed\n");
-    let compressed =
-        crate::compress::compress_with_registry(command, &output, &ctx.filter_registry());
+    let compressed = crate::compress::compress_with_registry(
+        "cd ./nested && cargo test",
+        &output,
+        &ctx.filter_registry(),
+    );
     assert!(compressed
         .text
         .contains("test result: ok. 48 passed; 0 failed"));
     assert!(!compressed.text.contains("cd_compressor_case_0"));
+}
+
+#[test]
+fn leading_cd_sets_oldpwd_and_preserves_logical_symlink_paths() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("nested")).unwrap();
+    std::os::unix::fs::symlink("nested", root.join("linkdir")).unwrap();
+    let ctx = local_context(&root, storage.path());
+    for (id, command, expected) in [
+        (
+            "literal-cd-oldpwd",
+            "cd nested && cd - >/dev/null && pwd",
+            root.clone(),
+        ),
+        (
+            "literal-cd-symlink",
+            "cd linkdir && pwd",
+            root.join("linkdir"),
+        ),
+    ] {
+        let request = spawn_test_request(id, command, false);
+        let (snapshot, _) = run_native(&ctx, &root, &request);
+        assert_eq!(snapshot.exit_code, Some(0), "{command}: {snapshot:?}");
+        assert_eq!(snapshot.output_preview.trim(), expected.to_str().unwrap());
+    }
 }
 
 #[test]
