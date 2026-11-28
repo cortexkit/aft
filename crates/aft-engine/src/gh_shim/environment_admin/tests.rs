@@ -47,7 +47,7 @@ impl Fixture {
         manifest.bindings.clear();
         if declares_rows {
             let additions: Value = serde_json::from_str(include_str!(
-                "../../../tests/fixtures/gh_shim/v30-additions.json"
+                "../../../../aft/tests/fixtures/gh_shim/v30-additions.json"
             ))
             .unwrap();
             manifest.tiers.get_mut(&Tier::Admin).unwrap().extend(

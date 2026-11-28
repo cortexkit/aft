@@ -13,7 +13,7 @@ fn manifest(version: u64, declared: bool) -> Manifest {
     manifest.manifest_version = version;
     if declared {
         let additions: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/gh_shim/v30-additions.json"
+            "../../../aft/tests/fixtures/gh_shim/v30-additions.json"
         ))
         .unwrap();
         manifest.tiers.get_mut(&Tier::Admin).unwrap().extend(

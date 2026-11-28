@@ -1216,7 +1216,7 @@ impl LineEnding {
         }
     }
 
-    pub(crate) fn normalize(self, text: &str) -> Cow<'_, str> {
+    pub fn normalize(self, text: &str) -> Cow<'_, str> {
         let wants_crlf = matches!(self, Self::Crlf);
         if !text.match_indices('\n').any(|(index, _)| {
             let has_crlf = index > 0 && text.as_bytes()[index - 1] == b'\r';
@@ -1230,7 +1230,7 @@ impl LineEnding {
     }
 
     /// Normalize only the inserted text. A carriage return not followed by LF is content.
-    pub(crate) fn push_normalized(self, output: &mut String, text: &str) {
+    pub fn push_normalized(self, output: &mut String, text: &str) {
         for segment in text.split_inclusive('\n') {
             if let Some(line) = segment.strip_suffix('\n') {
                 output.push_str(line.strip_suffix('\r').unwrap_or(line));

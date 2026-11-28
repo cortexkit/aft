@@ -125,7 +125,8 @@ pub fn install(connection_file: PathBuf) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cache);
 }
 
-pub(crate) fn agent_id<'a>(
+#[doc(hidden)]
+pub fn agent_id<'a>(
     scope: &'a ScopeStamp,
     worker_parent: Option<&'a ScopeStamp>,
     head_candidates: impl IntoIterator<Item = &'a ScopeStamp>,

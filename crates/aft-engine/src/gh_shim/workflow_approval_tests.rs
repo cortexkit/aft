@@ -97,7 +97,7 @@ impl Fixture {
         manifest.manifest_version = version;
         if declares_approval {
             let additions: Value = serde_json::from_str(include_str!(
-                "../../tests/fixtures/gh_shim/v30-additions.json"
+                "../../../aft/tests/fixtures/gh_shim/v30-additions.json"
             ))
             .unwrap();
             manifest.api_rules.extend(
