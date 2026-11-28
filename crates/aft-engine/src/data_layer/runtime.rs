@@ -2191,7 +2191,11 @@ pub fn root_bound(ctx: &dyn crate::data_layer::host::IndexHost) {
         } else {
             checkout.request_refresh();
         }
-        checkout.configure_meaning(ctx.data_meaning_config().as_ref());
+        checkout
+            .work
+            .meaning
+            .configure_for_root(true, || ctx.data_meaning_config());
+        checkout.meaning_and_request_fill();
     }
 }
 
@@ -2364,24 +2368,26 @@ impl DataCheckout {
 pub(crate) type StatusListener = Arc<dyn Fn() + Send + Sync>;
 
 impl DataCheckout {
-    /// Gives meaning search the root's semantic configuration, `None` when
-    /// semantic search is off or not admitted for it, as a configure binds
-    /// the root; a changed one is filled under from now on. Starts a fill
-    /// when files wait for vectors.
+    /// Sets a test checkout's meaning configuration and requests a fill.
+    #[cfg(feature = "test-support")]
     pub(crate) fn configure_meaning(&self, config: Option<&crate::config::SemanticBackendConfig>) {
         self.work.meaning.configure(config);
-        self.meaning(|| None);
+        self.meaning_and_request_fill();
     }
 
     /// How meaning search stands for the current view. `config` works out
-    /// the root's semantic configuration if no configure has given one yet.
+    /// the root's semantic configuration if none was given or admission changed.
     /// Starts a fill when files wait for vectors and none is running, or
     /// none has learned the model yet.
     pub(crate) fn meaning(
         &self,
         config: impl FnOnce() -> Option<crate::config::SemanticBackendConfig>,
     ) -> MeaningState {
-        self.work.meaning.configure_once(config);
+        self.work.meaning.configure_for_root(false, config);
+        self.meaning_and_request_fill()
+    }
+
+    fn meaning_and_request_fill(&self) -> MeaningState {
         self.work.meaning.refresh_read_only();
         let state = self.meaning_status();
         let wanted = match &state {
@@ -2464,9 +2470,8 @@ impl DataCheckout {
         self.work.meaning.times()
     }
 
-    /// Gives meaning search `config` as [`Self::configure_meaning`] does,
-    /// without starting a fill, so a test can read how the plane reports
-    /// before any model loads.
+    /// Sets a test checkout's meaning configuration without starting a fill,
+    /// so a test can read the meaning-search state before any model loads.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn configure_meaning_without_fill_for_test(
         &self,

@@ -57,16 +57,30 @@ async fn run() {
         .await
         .expect("connect test scope owner");
     let serving = tokio::spawn(serve);
-    let scope = ScopeRecord::new("e2e-project", 1, ScopeKind::Head)
+    let kind = if std::env::var_os("AFT_TEST_SCOPE_WORKER").is_some() {
+        ScopeKind::Worker
+    } else {
+        ScopeKind::Head
+    };
+    let scope = ScopeRecord::new("e2e-project", 1, kind)
         .with_workdir(Some(project.to_string_lossy().into_owned()))
         .with_carriers(vec![ScopeCarrier::new(Principal::Direct)]);
     let legacy_scope = ScopeRecord::new("e2e-no-workdir", 1, ScopeKind::Head)
         .with_carriers(vec![ScopeCarrier::new(Principal::Direct)]);
+    let mut scopes = vec![scope, legacy_scope];
+    if std::env::var_os("AFT_TEST_SCOPE_STATUS_OBSERVER").is_some() {
+        scopes.push(
+            ScopeRecord::new("e2e-status-observer", 1, ScopeKind::Worker)
+                .with_workdir(Some(project.to_string_lossy().into_owned()))
+                .with_carriers(vec![ScopeCarrier::new(Principal::Direct)]),
+        );
+    }
+    let scope_count = scopes.len();
     let reply = handle
-        .scope_sync(1, vec![scope, legacy_scope])
+        .scope_sync(1, scopes)
         .await
         .expect("register test scope");
-    assert_eq!(reply.results.len(), 2, "{reply:?}");
+    assert_eq!(reply.results.len(), scope_count, "{reply:?}");
     for result in &reply.results {
         assert_ne!(result.outcome, ScopeRecordOutcome::Refused, "{reply:?}");
     }

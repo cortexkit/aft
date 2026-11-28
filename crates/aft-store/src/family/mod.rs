@@ -53,7 +53,7 @@ mod model;
 #[cfg(test)]
 mod tests;
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -70,6 +70,19 @@ use crate::ids::{CheckoutId, FamilyId, Generation, SegmentId};
 use crate::segment::SegmentError;
 use lease::Owner;
 use record::{Kind, RecordError};
+
+/// Owns an acquired file lock until the protected operation ends.
+#[derive(Debug)]
+struct AdvisoryLockGuard(File);
+
+impl Drop for AdvisoryLockGuard {
+    fn drop(&mut self) {
+        // A child spawned from another thread can inherit the descriptor
+        // until it execs. Closing only the parent's descriptor can leave
+        // the flock held, so explicitly unlock before closing it.
+        let _ = self.0.unlock();
+    }
+}
 
 /// A failure in a family's files, naming the file.
 #[derive(Debug, thiserror::Error)]
@@ -382,7 +395,7 @@ impl Family {
         }
         let lock = options.open(&path).map_err(FamilyError::io(&path))?;
         match lock.try_lock() {
-            Ok(()) => WriteSession::start(self, lock).map(Some),
+            Ok(()) => WriteSession::start(self, AdvisoryLockGuard(lock)).map(Some),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(FamilyError::io(&path)(error)),
         }

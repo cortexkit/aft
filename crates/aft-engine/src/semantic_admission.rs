@@ -9,8 +9,9 @@
 //!
 //! A root is *opened* when one of these holds:
 //!
-//! 1. An interactive harness session (OpenCode or Pi, the AFT plugins' routes)
-//!    has the root bound right now.
+//! 1. A route whose daemon scope stamp is `Head` (a main agent's session), or
+//!    an unscoped standalone OpenCode or Pi session, has the root bound right
+//!    now.
 //! 2. The root belongs to the same Git repository (the same Git common
 //!    directory) as a root an interactive session has bound: a delegated
 //!    worker's linked worktree of a repository the user has open.
@@ -27,9 +28,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
+use subc_protocol::scope::ScopeKind;
 
 use crate::config::{IndexKind, IndexRootConfig};
 use crate::harness::Harness;
@@ -62,18 +65,36 @@ impl SemanticAdmission {
     }
 }
 
-/// Whether a bind under `harness` opens its root. Only the interactive AFT
-/// plugins (OpenCode and Pi) do; every route a program opens on its own
-/// behalf (`runner`, `mcp:*`, `fed:*`, internal helpers) does not.
-pub fn harness_opens_root(harness: &str) -> bool {
-    harness
-        .parse::<Harness>()
-        .is_ok_and(|harness| opens_root(&harness))
+/// Only a head stamp opens a scoped route's root. Without a daemon stamp,
+/// only the standalone OpenCode and Pi plugin paths open their roots.
+pub fn opens_root(harness: Option<&Harness>, scope: Option<ScopeKind>) -> bool {
+    match scope {
+        Some(kind) => kind == ScopeKind::Head,
+        None => matches!(harness, Some(Harness::Opencode | Harness::Pi)),
+    }
 }
 
-/// [`harness_opens_root`] for an already parsed harness.
-pub fn opens_root(harness: &Harness) -> bool {
-    matches!(harness, Harness::Opencode | Harness::Pi)
+thread_local! {
+    // The outer option distinguishes a standalone configure from an unscoped daemon bind.
+    static DAEMON_BIND_SCOPE: std::cell::Cell<Option<Option<ScopeKind>>> = const { std::cell::Cell::new(None) };
+}
+
+#[doc(hidden)]
+pub fn daemon_bind_scope() -> Option<Option<ScopeKind>> {
+    DAEMON_BIND_SCOPE.get()
+}
+
+/// Passes the daemon's scope to configure out of band, never through request arguments.
+#[doc(hidden)]
+pub fn with_daemon_bind_scope<T>(scope: Option<ScopeKind>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<ScopeKind>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DAEMON_BIND_SCOPE.set(self.0);
+        }
+    }
+    let _restore = Restore(DAEMON_BIND_SCOPE.replace(Some(scope)));
+    run()
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +111,13 @@ struct Registry {
 }
 
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Lets a bound checkout recheck admission after an opener changes, without
+/// looking up Git identity on every query.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
 
 /// Per-session record of the roots whose "semantic search is off" notice the
 /// session has already been shown, so it is shown once per session and root.
@@ -106,17 +134,30 @@ fn canonical(root: &Path) -> PathBuf {
 pub fn note_opened(session: &str, root: &Path) {
     let root = canonical(root);
     let repository = repository_identity(&root);
-    REGISTRY.lock().opened.insert(
-        (session.to_string(), root.clone()),
-        OpenedRoot { root, repository },
-    );
+    let mut registry = REGISTRY.lock();
+    let key = (session.to_string(), root.clone());
+    if registry
+        .opened
+        .get(&key)
+        .is_none_or(|previous| previous.repository != repository)
+    {
+        registry.opened.insert(key, OpenedRoot { root, repository });
+        GENERATION.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Record that `session` no longer has `root` bound. A root another session
 /// still has open stays opened.
 pub fn note_closed(session: &str, root: &Path) {
     let root = canonical(root);
-    REGISTRY.lock().opened.remove(&(session.to_string(), root));
+    let mut registry = REGISTRY.lock();
+    if registry
+        .opened
+        .remove(&(session.to_string(), root))
+        .is_some()
+    {
+        GENERATION.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// The one predicate deciding whether `root` may build or refresh a semantic
@@ -328,12 +369,13 @@ mod tests {
 
     #[test]
     fn only_interactive_harnesses_open_roots() {
-        assert!(harness_opens_root("opencode"));
-        assert!(harness_opens_root("pi"));
-        assert!(!harness_opens_root("runner"));
-        assert!(!harness_opens_root("mcp:claude-code"));
-        assert!(!harness_opens_root("aft-gh-shim"));
-        assert!(!harness_opens_root(&format!("fed:{}", "a".repeat(32))));
+        let standalone_opens = |label: &str| opens_root(label.parse().ok().as_ref(), None);
+        assert!(standalone_opens("opencode"));
+        assert!(standalone_opens("pi"));
+        assert!(!standalone_opens("runner"));
+        assert!(!standalone_opens("mcp:claude-code"));
+        assert!(!standalone_opens("aft-gh-shim"));
+        assert!(!standalone_opens(&format!("fed:{}", "a".repeat(32))));
     }
 
     #[test]

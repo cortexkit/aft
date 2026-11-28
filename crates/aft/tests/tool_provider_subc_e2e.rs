@@ -33,6 +33,9 @@ use tokio::net::TcpStream;
 mod aft_binary;
 #[path = "helpers/real_daemon_diagnostics.rs"]
 mod diagnostics;
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+#[path = "tool_provider_subc_e2e/hosted_meaning.rs"]
+mod hosted_meaning;
 
 /// An embedded daemon with supervised children, all using fixture-only paths.
 /// Aborting its task drops the supervisor and its kill-on-drop children.
@@ -458,12 +461,31 @@ async fn open(
     session: &str,
     role_versions: Option<&[(&str, &str)]>,
 ) -> Result<RouteHandle, CallError> {
+    open_with_harness(
+        consumer,
+        project,
+        "e2e-project",
+        "runner",
+        session,
+        role_versions,
+    )
+    .await
+}
+
+async fn open_with_harness(
+    consumer: &SubcConsumer,
+    project: &Path,
+    scope_id: &str,
+    harness: &str,
+    session: &str,
+    role_versions: Option<&[(&str, &str)]>,
+) -> Result<RouteHandle, CallError> {
     wait_for_scope_owner(project).await;
     let scope = subc_protocol::scope::ScopeSelector::new(
         subc_protocol::Principal::Reserved {
             module_id: "aft-test-scope-owner".into(),
         },
-        "e2e-project",
+        scope_id,
         Some(1),
     );
     consumer
@@ -471,7 +493,7 @@ async fn open(
             RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            BindIdentity::new("runner", session),
+            BindIdentity::new(harness, session),
             scope,
             options(role_versions),
         )
@@ -497,6 +519,22 @@ async fn request(
     consumer
         .request(route, serde_json::to_vec(&body).unwrap(), options(None))
         .await
+}
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+#[tokio::test]
+#[ignore = "opt-in real-daemon index test; needs test-scope-owner"]
+async fn hosted_meaning_serves_daemon_head_routes() {
+    for harness in ["runner", "opencode2", "claude-code"] {
+        hosted_meaning::check_route(harness, false).await;
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+#[tokio::test]
+#[ignore = "opt-in real-daemon index test; needs test-scope-owner"]
+async fn hosted_meaning_stays_off_with_only_a_worker_route() {
+    hosted_meaning::check_route("runner", true).await;
 }
 
 fn refusal_code(error: &CallError) -> Option<String> {

@@ -1,0 +1,7 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "note": "A language-server regression test fills its event queue without made-up receive orders, without changing search ranking."
+}

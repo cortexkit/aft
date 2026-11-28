@@ -11,6 +11,7 @@ use crate::context::AppContext;
 #[cfg(feature = "wasm-grammars")]
 use crate::data_layer::checkout::CheckoutView;
 use crate::data_layer::checkout::{Checkout, DataLayer};
+use crate::data_layer::runtime::Fresh;
 use crate::protocol::{RawRequest, Response};
 
 #[cfg(all(
@@ -252,10 +253,11 @@ fn audit_resolution_macro_mention_overflow_discloses_file_gap() {
     let root = root.canonicalize().unwrap();
     let ctx = context(&root, &dir.path().join("storage"));
     let checkout = ctx.data_checkout().unwrap();
-    assert!(matches!(
-        checkout.fresh_view(Duration::from_secs(60)),
-        crate::data_layer::runtime::Fresh::Ready(_)
-    ));
+    match checkout.fresh_view(Duration::from_secs(60)) {
+        Fresh::Ready(_) => {}
+        Fresh::Building => panic!("expected Fresh::Ready, got Fresh::Building after 60 seconds"),
+        Fresh::Failed(reason) => panic!("expected Fresh::Ready, got Fresh::Failed: {reason}"),
+    }
     let reply = ask(
         &ctx,
         "callers",

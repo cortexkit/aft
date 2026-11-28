@@ -29,6 +29,7 @@ use contention::{
 };
 #[path = "health/demand.rs"]
 mod demand;
+mod index_planes;
 #[path = "health/legacy_root.rs"]
 mod legacy_root;
 #[path = "health/reply_tracking.rs"]
@@ -2732,6 +2733,7 @@ fn protected_health_field(field: &str) -> bool {
                 | "cache_roots"
                 | "cache_unavailable"
                 | "root_count"
+                | "index_plane_counts"
                 | "actor_count"
                 | "warming_roots"
                 | "healthy_roots"
@@ -2782,6 +2784,7 @@ impl HealthDiagnosticRollup {
         let metrics = json!({
             "actor_count": Value::Null,
             "root_count": Value::Null,
+            "index_plane_counts": Value::Null,
             "warming_roots": Value::Null,
             "root_details_omitted": Value::Null,
             "callgraph_repair_entries_60s_total": Value::Null,
@@ -4104,6 +4107,8 @@ fn build_health_diagnostic_rollup_from_actors(
     struct RootCandidate {
         root_label: String,
         health: RootHealthSnapshot,
+        semantic_enabled: bool,
+        backend_failure: Option<crate::semantic_index::EmbeddingBackendBuildHealth>,
         busy: bool,
         fully_ready: bool,
         attributed_bytes: u64,
@@ -4228,14 +4233,14 @@ fn build_health_diagnostic_rollup_from_actors(
                 (current, candidate) => current.or(candidate),
             };
         }
-        if let Some(backend) =
+        let backend_failure =
             crate::semantic_index::embedding_backend_build_health(root_id.as_path())
-                .filter(|_| crate::synapse_embed::lane_pause_for_root(root_id.as_path()).is_none())
-        {
+                .filter(|_| crate::synapse_embed::lane_pause_for_root(root_id.as_path()).is_none());
+        if let Some(backend) = &backend_failure {
             embedding_backend_available = false;
             embedding_backend_down = true;
             if embedding_backend_since_ms.is_none_or(|since| backend.since_ms <= since) {
-                embedding_backend_last_error = Some(backend.last_error);
+                embedding_backend_last_error = Some(backend.last_error.clone());
             }
             embedding_backend_since_ms = Some(
                 embedding_backend_since_ms
@@ -4254,6 +4259,8 @@ fn build_health_diagnostic_rollup_from_actors(
             refresh_counts: root_evidence::refresh_counts(&ctx),
             root_label,
             health: health_summary.into_snapshot(root_id.as_path()),
+            semantic_enabled: config.indexes.semantic,
+            backend_failure,
             busy,
             fully_ready,
             attributed_bytes,
@@ -4281,6 +4288,8 @@ fn build_health_diagnostic_rollup_from_actors(
             root_label: health.project_root.clone(),
             disclaim_privacy: None,
             health,
+            semantic_enabled: false,
+            backend_failure: None,
             busy: false,
             fully_ready: false,
             attributed_bytes: 0,
@@ -4362,6 +4371,14 @@ fn build_health_diagnostic_rollup_from_actors(
         .filter(|candidate| healthy_candidate(candidate))
         .count();
     let root_count = candidates.len();
+    let mut index_plane_counts = index_planes::IndexPlaneCounts::default();
+    for candidate in &candidates {
+        index_plane_counts.add_root(
+            &candidate.health,
+            candidate.semantic_enabled,
+            candidate.backend_failure.is_some(),
+        );
+    }
     candidates.sort_by(|left, right| {
         ordinary_candidate(left)
             .cmp(&ordinary_candidate(right))
@@ -4395,39 +4412,8 @@ fn build_health_diagnostic_rollup_from_actors(
             snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
             let root_label = snapshot.project_root.clone();
             let mut value = standing_root_health_value(snapshot, candidate.standing.as_ref());
-            if let Some(backend) =
-                crate::semantic_index::embedding_backend_build_health(Path::new(&root_label))
-                    .filter(|_| {
-                        crate::synapse_embed::lane_pause_for_root(Path::new(&root_label)).is_none()
-                    })
-            {
-                if let Some(semantic) = value
-                    .get_mut("semantic_index")
-                    .and_then(Value::as_object_mut)
-                {
-                    semantic.insert("status".to_string(), json!("backend_unavailable"));
-                    semantic.insert("reason".to_string(), json!(backend.last_error));
-                    semantic.insert("since_ms".to_string(), json!(backend.since_ms));
-                    semantic.insert("next_retry_ms".to_string(), json!(backend.next_retry_ms));
-                    semantic.remove("stage");
-                    semantic.remove("embedded_chunks");
-                    semantic.remove("total_chunks");
-                    semantic.remove("current_batch");
-                    semantic.remove("total_batches");
-                    // The meaning plane's fill progress stops with the
-                    // backend too; its failure counts stay.
-                    for progress in [
-                        "files",
-                        "files_embedded",
-                        "files_pending",
-                        "files_too_large",
-                        "files_past_cap",
-                        "filling",
-                        "last_progress_at_ms",
-                    ] {
-                        semantic.remove(progress);
-                    }
-                }
+            if let Some(backend) = &candidate.backend_failure {
+                index_planes::annotate_backend_failure(&mut value, backend);
             }
             cache.annotate_plane_timings(&root_label, &mut value);
             let query_embed =
@@ -4584,6 +4570,7 @@ fn build_health_diagnostic_rollup_from_actors(
         "cache_unavailable_omitted": cache_unavailable_omitted,
         "actor_count": actor_count,
         "root_count": root_count,
+        "index_plane_counts": index_plane_counts,
         "healthy_roots": healthy_roots,
         "warming_roots": warming_roots,
         "root_details_omitted": root_details_omitted,
@@ -10687,7 +10674,7 @@ mod tests {
                 let ctx = test_ctx();
                 ctx.update_config(|config| {
                     config.indexes.trigram = false;
-                    config.indexes.semantic = false;
+                    config.indexes.semantic = index % 2 != 0;
                     config.indexes.callgraph = false;
                     config.inspect.enabled = false;
                 });
@@ -10724,6 +10711,17 @@ mod tests {
         let report_metrics = report.metrics.expect("health metrics");
 
         assert_eq!(report_metrics["root_count"].as_u64(), Some(50));
+        for (plane, off) in [
+            ("search_index", 50),
+            ("semantic_index", 25),
+            ("callgraph_store", 50),
+        ] {
+            assert_eq!(
+                report_metrics["index_plane_counts"][plane],
+                json!({"ready": 0, "building": 0, "unavailable": 0, "off": off, "disabled": 50 - off}),
+                "{plane} counts should include roots without detail rows"
+            );
+        }
         let rendered_roots = report_metrics["roots"]
             .as_array()
             .expect("rendered root details")

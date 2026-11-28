@@ -2,7 +2,6 @@
 //! reclaiming files nothing can read any more.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::lease::{self, LeaseScan};
 use super::manifest::{Manifest, SegmentEntry, StateRef};
 use super::record::{self, Kind, RecordError};
-use super::{Family, FamilyError, HORIZON_PREFIX, MANIFEST_PREFIX, STATE_PREFIX, numbered_desc};
+use super::{
+    AdvisoryLockGuard, Family, FamilyError, HORIZON_PREFIX, MANIFEST_PREFIX, STATE_PREFIX,
+    numbered_desc,
+};
 use crate::checkout::CheckoutState;
 use crate::ids::{CheckoutId, Digest128, Generation, SegmentId, WriterIncarnation};
 use crate::segment::{SegmentMeta, SegmentWriter};
@@ -20,7 +22,7 @@ use crate::segment::{SegmentMeta, SegmentWriter};
 #[derive(Debug)]
 pub struct WriteSession<'f> {
     family: &'f Family,
-    _lock: File,
+    _lock: AdvisoryLockGuard,
     incarnation: WriterIncarnation,
     base: Manifest,
     next_generation: Generation,
@@ -58,7 +60,7 @@ pub struct BuildScratch<E> {
     path: PathBuf,
     /// The checkout's `checkout.lock`, locked for the workspace's life;
     /// `None` for a workspace no family sweeps.
-    _lock: Option<File>,
+    _lock: Option<AdvisoryLockGuard>,
     admit: Box<dyn Fn(u64) -> Result<(), E> + Send + Sync>,
 }
 
@@ -94,7 +96,7 @@ impl<E> BuildScratch<E> {
     /// Makes a fresh workspace folder under `parent`, which must exist.
     fn create_in(
         parent: &Path,
-        lock: Option<File>,
+        lock: Option<AdvisoryLockGuard>,
         admit: impl Fn(u64) -> Result<(), E> + Send + Sync + 'static,
     ) -> Result<Self, FamilyError> {
         let path = parent.join(lease::fresh_id().to_string());
@@ -298,6 +300,45 @@ mod build_scratch_tests {
         std::fs::create_dir(&torn).unwrap();
         drop(family.try_write().unwrap().unwrap());
         assert!(!torn.exists(), "startup removes a half-made workspace");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_scratch_unlocks_before_inherited_descriptor_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = FamilyId::from_digest(Digest128::of(b"scratch-handoff"));
+        let first = Family::open(dir.path(), id).unwrap();
+        let second = Family::open(dir.path(), id).unwrap();
+        let checkout = checkout(b"checkout");
+        let scratch = first
+            .try_write()
+            .unwrap()
+            .unwrap()
+            .create_scratch(checkout, |_| Ok::<_, ()>(()))
+            .unwrap();
+        // A cloned descriptor shares the same flock, just like the copy a
+        // concurrently spawned child holds until it execs.
+        let inherited = scratch._lock.as_ref().unwrap().0.try_clone().unwrap();
+        let (checked, before_release) = std::sync::mpsc::channel();
+        let (released, after_release) = std::sync::mpsc::channel();
+
+        let next = std::thread::spawn(move || {
+            let mut session = second.try_write().unwrap().unwrap();
+            checked.send(session.claim_scratch(checkout)).unwrap();
+            drop(session);
+            after_release.recv().unwrap();
+            let result = second.try_write().unwrap().unwrap().claim_scratch(checkout);
+            drop(inherited);
+            result
+        });
+        let while_live = before_release.recv().unwrap();
+        scratch.remove().unwrap();
+        drop(scratch);
+        released.send(()).unwrap();
+        assert!(matches!(while_live, Err(FamilyError::CheckoutBusy(_))));
+        next.join()
+            .unwrap()
+            .expect("the next claim must succeed while the inherited descriptor is still open");
     }
 
     #[test]
@@ -672,7 +713,7 @@ mod build_scratch_tests {
 
 /// Opens `dir`'s `checkout.lock`, creating it, and takes it if no live
 /// build holds it. `None` means a live build does.
-fn try_checkout_lock(dir: &Path) -> Result<Option<File>, FamilyError> {
+fn try_checkout_lock(dir: &Path) -> Result<Option<AdvisoryLockGuard>, FamilyError> {
     let path = dir.join("checkout.lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -683,7 +724,7 @@ fn try_checkout_lock(dir: &Path) -> Result<Option<File>, FamilyError> {
     }
     let file = options.open(&path).map_err(FamilyError::io(&path))?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(AdvisoryLockGuard(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => Err(FamilyError::io(&path)(error)),
     }
@@ -862,7 +903,7 @@ fn pause_before_deletion_for_test(workspace: &Path) {
 #[derive(Debug)]
 pub struct ScratchClaim {
     dir: PathBuf,
-    lock: File,
+    lock: AdvisoryLockGuard,
 }
 
 impl ScratchClaim {
@@ -1029,7 +1070,7 @@ pub enum ReclaimOutcome {
 }
 
 impl<'f> WriteSession<'f> {
-    pub(super) fn start(family: &'f Family, lock: File) -> Result<Self, FamilyError> {
+    pub(super) fn start(family: &'f Family, lock: AdvisoryLockGuard) -> Result<Self, FamilyError> {
         let layout = &family.layout;
         // A generation a newer build wrote, or one naming a file it wrote,
         // is refused before anything here is removed or written: an older

@@ -255,11 +255,7 @@ pub(super) fn quiesce_connection_roots(
         }
     }
 
-    for route in routes.values() {
-        installed_routes::status_unbound(route);
-        runner_notices::route_unbound(route);
-    }
-    routes.clear();
+    installed_routes::clear_installed_routes(routes);
     route_delivery::publish_sessions(delivery, routes);
     root_channels.clear();
     installed_route_epochs.clear();

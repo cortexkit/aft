@@ -1,0 +1,7 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "note": "Index-store file locks are released explicitly before their descriptor closes, without changing search ranking."
+}

@@ -1,0 +1,7 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "note": "A grammar test prints why a checkout view was not ready, without changing search ranking."
+}

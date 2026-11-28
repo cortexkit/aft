@@ -104,6 +104,25 @@ fn daemon_cleanup_bounds_wait_even_if_kill_does_not_stop_the_child() {
         .unwrap_err()
         .contains("daemon did not exit within 30ms after kill"));
 }
+
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+#[tokio::test]
+async fn scope_fixture_reuses_prepared_linux_image() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("module");
+    let _daemon = Daemon::spawn(&root, &[]).await;
+    let images = scope_storage_root(&root).join("run/aft-images");
+    let image = std::fs::read_dir(images).unwrap().next().unwrap().unwrap();
+    let pin = image.path().join("aft");
+    assert!(
+        pin.metadata().unwrap().nlink() > 1,
+        "the child published its own copy at {} instead of using the shared seed",
+        pin.display(),
+    );
+}
+
 fn flags() -> Flags {
     Flags::new(false, Priority::Interactive, false)
 }
@@ -131,21 +150,20 @@ fn sleep_command(seconds: u64) -> String {
     format!("sleep {seconds}")
 }
 
-fn startup_debug_logs(directory: &Path) -> String {
-    let mut logs = String::new();
-    if let Ok(entries) = std::fs::read_dir(directory) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                logs.push_str(&startup_debug_logs(&path));
-            } else if path.extension().is_some_and(|extension| extension == "log") {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    logs.push_str(&format!("{}:\n{text}\n", path.display()));
-                }
-            }
-        }
+fn scope_storage_root(root: &Path) -> PathBuf {
+    root.join("data/cortexkit/aft")
+}
+
+fn startup_log_report(path: &Path) -> String {
+    match path.metadata() {
+        Ok(metadata) => format!(
+            "{} ({} bytes):\n{}",
+            path.display(),
+            metadata.len(),
+            std::fs::read_to_string(path).unwrap_or_else(|error| error.to_string()),
+        ),
+        Err(error) => format!("{} (size unavailable: {error})", path.display()),
     }
-    logs
 }
 
 impl Daemon {
@@ -200,6 +218,8 @@ impl Daemon {
             .env_remove("SUBC_MODULE_ID")
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("AFT_STORAGE_DIR")
+            .env_remove("AFT_CACHE_DIR")
+            .env("AFT_TEST_SUBC_STARTUP_TRACE", "1")
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
             .env("AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS", "200")
             .stdin(Stdio::null())
@@ -219,53 +239,76 @@ impl Daemon {
             std::fs::create_dir_all(&path).unwrap();
             command.env(variable, path);
         }
-        let mut child = command.spawn().unwrap();
-        // A module start is a positive wait: on a loaded shared CI Mac, two of
-        // these starts once took over 10 s while the same tests started in
-        // under 2 s natively. 30 s keeps a hung start a failure.
-        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "module did not attach: {error}; child status: {:?}; stderr: {}; AFT debug logs: {}",
-                    child.try_wait(),
-                    std::fs::read_to_string(&stderr_path).unwrap_or_default(),
-                    startup_debug_logs(&root.join("data")),
-                )
-            })
-            .unwrap();
-        authenticate_server(
-            &mut socket,
-            &[0x42; subc_transport::KEY_LEN],
-            &[0x24; subc_transport::DAEMON_ID_LEN],
-            "scope-tests",
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        let hello = read_frame(&mut socket).await.unwrap().unwrap();
-        assert_eq!(hello.header.ty, FrameType::Hello);
-        let ack = ModuleHelloAckBody {
-            negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: ops.iter().map(|op| (*op).into()).collect(),
-            subc_capabilities: vec![],
-            storage: None,
-            machine_id: None,
-        };
-        write_frame(
-            &mut socket,
-            &Frame::build(
-                FrameType::HelloAck,
-                flags(),
-                0,
-                0,
-                hello.header.corr,
-                serde_json::to_vec(&ack).unwrap(),
+        // Keep the full executable copy and flush out of each Linux child's
+        // pre-attach path. The child still validates its private pin as usual.
+        #[cfg(all(target_os = "linux", feature = "test-hooks"))]
+        crate::test_helpers::subc_pin::prepare_within(&command, root)
+            .expect("prepare scope fixture pin");
+        let mut child = command.spawn().expect("spawn scope fixture AFT");
+        let mut connected = false;
+        let attached = async {
+            // The fixture sends nothing until AFT connects. This deadline
+            // leaves room for a slow launch but still fails a hung child.
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                .await
+                .map_err(|error| format!("waiting for TCP connection: {error}"))?
+                .map_err(|error| format!("accepting TCP connection: {error}"))?;
+            connected = true;
+            authenticate_server(
+                &mut socket,
+                &[0x42; subc_transport::KEY_LEN],
+                &[0x24; subc_transport::DAEMON_ID_LEN],
+                "scope-tests",
+                Duration::from_secs(5),
             )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+            .await
+            .map_err(|error| format!("authenticating TCP connection: {error}"))?;
+            let hello = read_frame(&mut socket)
+                .await
+                .map_err(|error| format!("reading Hello: {error}"))?
+                .ok_or("connection closed before Hello")?;
+            if hello.header.ty != FrameType::Hello {
+                return Err(format!("expected Hello, received {:?}", hello.header.ty));
+            }
+            let ack = ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: ops.iter().map(|op| (*op).into()).collect(),
+                subc_capabilities: vec![],
+                storage: None,
+                machine_id: None,
+            };
+            write_frame(
+                &mut socket,
+                &Frame::build(
+                    FrameType::HelloAck,
+                    flags(),
+                    0,
+                    0,
+                    hello.header.corr,
+                    serde_json::to_vec(&ack).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .map_err(|error| format!("sending HelloAck: {error}"))?;
+            Ok(socket)
+        }
+        .await;
+        let socket = attached.unwrap_or_else(|error| {
+            let status = child.try_wait();
+            let stderr =
+                std::fs::read_to_string(&stderr_path).unwrap_or_else(|error| error.to_string());
+            let log = scope_storage_root(root)
+                .join("logs")
+                .join(format!("aft-{}.log", child.id()));
+            let log = startup_log_report(&log);
+            let _ = child.kill();
+            let cleanup = wait_for_child_exit(&mut child, Duration::from_secs(2));
+            panic!(
+                "module did not attach: {error}; TCP connection opened: {connected}; child status: {status:?}; cleanup: {cleanup:?}\n\
+                 child stderr (including startup phases):\n{stderr}\nAFT log: {log}"
+            );
+        });
         let (mut read, writer) = socket.into_split();
         let (tx, frames) = mpsc::unbounded_channel();
         let reader = tokio::spawn(async move {
@@ -1559,7 +1602,7 @@ async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let run = root.join("data/cortexkit/aft/run");
+    let run = scope_storage_root(&root).join("run");
     // Exit removes the daemon's owner directory, not Linux's shared image.
     assert!(!std::fs::read_dir(&run).unwrap().any(|entry| entry
         .unwrap()

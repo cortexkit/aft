@@ -11,7 +11,6 @@
 //! naming the generation it reads. Dropping the snapshot removes the record.
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -19,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use super::record::{self, Kind, Payload, RecordError};
-use super::{FamilyError, Layout};
+use super::{AdvisoryLockGuard, FamilyError, Layout};
 use crate::ids::{Digest128, FamilyId, Generation};
 
 const OWNER_SUFFIX: &str = ".owner";
@@ -43,7 +42,7 @@ thread_local! {
 pub(super) struct Owner {
     id: Digest128,
     /// Holds the lock that marks this process alive.
-    _file: File,
+    _lock: AdvisoryLockGuard,
     leases_dir: PathBuf,
     next: AtomicU64,
     /// Lease records whose removal failed. A leftover record of a live
@@ -63,20 +62,20 @@ impl Owner {
             crate::fault::point("owner.create").map_err(FamilyError::io(&incoming))?;
             let file =
                 crate::fs::create_new_private(&incoming).map_err(FamilyError::io(&incoming))?;
-            match file.try_lock() {
-                Ok(()) => {}
+            let lock = match file.try_lock() {
+                Ok(()) => AdvisoryLockGuard(file),
                 Err(std::fs::TryLockError::WouldBlock) => {
                     return Err(FamilyError::Misuse("a new owner file was already locked"));
                 }
                 Err(std::fs::TryLockError::Error(error)) => {
                     return Err(FamilyError::io(&incoming)(error));
                 }
-            }
+            };
             match crate::fs::rename_new_durable(&incoming, &target) {
                 Ok(()) => {
                     return Ok(Self {
                         id,
-                        _file: file,
+                        _lock: lock,
                         leases_dir: layout.leases_dir(),
                         next: AtomicU64::new(1),
                         stale: Mutex::new(Vec::new()),
@@ -177,7 +176,7 @@ impl Drop for LeaseFile {
 #[derive(Debug)]
 pub(super) struct DeadOwner {
     pub(super) path: PathBuf,
-    pub(super) _lock: File,
+    pub(super) _lock: AdvisoryLockGuard,
 }
 
 /// What a reclaimer learns from the `leases/` directory.
@@ -268,10 +267,10 @@ pub(super) fn scan(layout: &Layout, family: FamilyId) -> Result<LeaseScan, Famil
 /// owner is alive, or that the answer is unknown, which counts the same: a
 /// file that cannot be opened (removed since the listing, or on Windows a
 /// file being removed) proves nothing about its process.
-fn free_lock(path: &Path) -> Option<File> {
+fn free_lock(path: &Path) -> Option<AdvisoryLockGuard> {
     let file = crate::fs::open_read(path).ok()?;
     match file.try_lock() {
-        Ok(()) => Some(file),
+        Ok(()) => Some(AdvisoryLockGuard(file)),
         Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => None,
     }
 }

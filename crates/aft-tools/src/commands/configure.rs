@@ -3592,14 +3592,16 @@ fn handle_configure_inner(
         && !semantic_build_inputs_changed;
     let first_session_bind =
         ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
-    // An interactive session binding this root opens it for semantic indexing
-    // before the artifact scheduling below consults that (see
-    // `semantic_admission`). Route teardown closes it again.
-    if crate::semantic_admission::opens_root(&harness) {
+    // Schedule for the incoming daemon route without opening its repository
+    // for other checkouts until the ACK installs it. Standalone configure has
+    // no route installation step. Cache recovery does not create a new bind.
+    let daemon_scope = crate::semantic_admission::daemon_bind_scope();
+    let opens = crate::semantic_admission::opens_root(Some(&harness), daemon_scope.flatten());
+    if opens && daemon_scope.is_none() && prepared.is_none() {
         crate::semantic_admission::note_opened(req.session(), &canonical_cache_root);
     }
-    let semantic_admitted =
-        crate::semantic_admission::admission(&canonical_cache_root, &next_config.index.roots)
+    let semantic_admitted = opens && daemon_scope.is_some()
+        || crate::semantic_admission::admission(&canonical_cache_root, &next_config.index.roots)
             .admits();
     ctx.begin_configure_ack_step("tier2_reset");
     if !equivalent_warm_config {
