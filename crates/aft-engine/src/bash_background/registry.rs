@@ -22568,7 +22568,8 @@ mod tests {
         // paths to stdout and stderr. Check the optional panic messages
         // separately from the required verdict.
         let golden =
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/verdict.txt").trim_end();
+            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/verdict.txt")
+                .trim_end();
         let message = include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/stdout")
             .lines()
             .find(|line| line.starts_with("engine: LFM2 Metal step metallib is missing beside"))
