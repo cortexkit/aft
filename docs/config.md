@@ -1076,10 +1076,12 @@ prevents new worker rust-analyzer starts; inspect reports **PARTIAL** with
 `rust_analyzer_capacity_exhausted` when it cannot start one. Head analyzers do
 not count toward this limit. The general `lsp.max_servers` limit still applies.
 
-Both limits are budgets for the whole AFT process, shared by every harness's
-sessions, so they come from the top-level user value. A value in a
-`harnesses.<name>` block, like a project value, can lower the limit for that
-harness's roots but never raises the shared budget.
+Under the daemon, one AFT process serves every harness's sessions, so both
+limits are budgets shared by all of them and come from the top-level user
+value. A value in a `harnesses.<name>` block, like a project value, can lower
+the limit for that harness's roots but never raises the shared budget. In
+standalone mode each AFT process serves one harness, so that harness's value
+sets the process budget.
 
 TypeScript packages in one repository share a server per resolved SDK version,
 even with separate `node_modules` installs and no root `package.json`. Packages
