@@ -3718,8 +3718,8 @@ impl ToolProviderSubject for Subject {
             stamp.principal = if stamp.principal == "reserved:conformance-carrier" {
                 "direct".into()
             } else {
-                // Basal with a head stamp is an exact-read route, not an
-                // ordinary non-carrier ToolProvider peer.
+                // The daemon restricts Basal routes bound to a head session
+                // to exact file reads. Use a peer that can call ordinary tools.
                 "reserved:conformance-peer".into()
             };
             if let Some(scope) = &mut stamp.scope {
