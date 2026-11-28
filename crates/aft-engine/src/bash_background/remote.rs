@@ -3708,7 +3708,7 @@ impl BgTaskRegistry {
         } else {
             let point = remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?;
             match self
-                .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+                .attach_remote(&mut client, point, &remote, &task, &mut recovery)
                 .await?
             {
                 Attached::Stream(stream) => stream,
@@ -3759,7 +3759,7 @@ impl BgTaskRegistry {
                         return Ok(());
                     }
                     stream = match self
-                        .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+                        .attach_remote(&mut client, point, &remote, &task, &mut recovery)
                         .await?
                     {
                         Attached::Stream(stream) => stream,
@@ -4059,7 +4059,7 @@ impl BgTaskRegistry {
                     // Use the same bounded attach path as an AFT restart.
                     recovery.pause(point.job_id).await?;
                     stream = match self
-                        .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+                        .attach_remote(&mut client, point, &remote, &task, &mut recovery)
                         .await?
                     {
                         Attached::Stream(stream) => stream,
@@ -4383,27 +4383,26 @@ impl BgTaskRegistry {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn attach_remote(
         &self,
         client: &mut ExecRemoteClient,
         point: ResumePoint,
         remote: &RemoteTask,
-        _root: &Path,
         task: &Arc<BgTask>,
         recovery: &mut ReattachBudget,
     ) -> Result<Attached, String> {
         point.attach_request().map_err(|e| e.to_string())?;
         loop {
-            let cancel = task
-                .state
-                .lock()
-                .map_err(|_| "task lock poisoned")?
-                .metadata
-                .remote
-                .as_ref()
-                .is_some_and(|r| r.cancel_requested);
-            let cancel = cancel && recovery.cancel_acknowledged != Some(point.job_id);
+            let cancel = {
+                let state = task.state.lock().map_err(|_| "task lock poisoned")?;
+                let Some(remote) = state.metadata.remote.as_ref() else {
+                    return Err("remote record absent".into());
+                };
+                if remote.owner_pause_cancel.is_some() && !remote.cancel_pending {
+                    return Ok(Attached::OwnerPauseSettled);
+                }
+                remote.cancel_requested && recovery.cancel_acknowledged != Some(point.job_id)
+            };
             let mut cancel_acknowledged = false;
             recovery.attach_attempts = recovery.attach_attempts.saturating_add(1);
             let attempt = recovery
@@ -4419,7 +4418,8 @@ impl BgTaskRegistry {
                             return Ok(Attached::OwnerPauseSettled);
                         }
                     }
-                    client.attach(point.clone()).await.map(Attached::Stream)
+                    let stream = client.attach_once(point.clone()).await?;
+                    Ok(Attached::Stream(stream))
                 })
                 .await;
             if cancel_acknowledged {

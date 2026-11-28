@@ -112,7 +112,7 @@ struct OpenedRoute {
 enum StreamRequest<'a> {
     Run(&'a RunRequest),
     ReturnRetry(&'a RunRequest),
-    Attach(ResumePoint),
+    Attach { point: ResumePoint, reopen: bool },
 }
 
 impl StreamRequest<'_> {
@@ -121,7 +121,7 @@ impl StreamRequest<'_> {
             Self::Run(run) | Self::ReturnRetry(run) => {
                 run.queue_wait_limit_s.map(Duration::from_secs)
             }
-            Self::Attach(_) => None,
+            Self::Attach { .. } => None,
         }
     }
 }
@@ -414,8 +414,23 @@ impl ExecRemoteClient {
     /// Resume from the last durably delivered seq, not from the last received
     /// packet. `from_seq` on the wire is inclusive, so this sends last_seq + 1.
     pub async fn attach(&self, point: ResumePoint) -> Result<RemoteStream, Error> {
+        self.attach_on_route(point, true).await
+    }
+
+    /// Background recovery owns route reopening so it can honor a
+    /// `bash.kill_scope` request before issuing another attach.
+    #[cfg(unix)]
+    pub(crate) async fn attach_once(&self, point: ResumePoint) -> Result<RemoteStream, Error> {
+        self.attach_on_route(point, false).await
+    }
+
+    async fn attach_on_route(
+        &self,
+        point: ResumePoint,
+        reopen: bool,
+    ) -> Result<RemoteStream, Error> {
         self.stream(
-            StreamRequest::Attach(point),
+            StreamRequest::Attach { point, reopen },
             None,
             #[cfg(unix)]
             None,
@@ -446,7 +461,7 @@ impl ExecRemoteClient {
                         let record_return = !run.return_paths.is_empty() && !cap_retry;
                         (body, consumer, false, record_return.then_some(run))
                     }
-                    StreamRequest::Attach(point) => (
+                    StreamRequest::Attach { point, .. } => (
                         envelope("exec.attach", &point.attach_request()?)?,
                         StreamConsumer::resume(point.clone()),
                         true,
@@ -505,7 +520,10 @@ impl ExecRemoteClient {
                 .await
             {
                 Ok(subscription) => break (subscription, consumer, attached, return_request),
-                Err(error) if route_failed_before_send(&error) => {
+                Err(error)
+                    if !matches!(request, StreamRequest::Attach { reopen: false, .. })
+                        && route_failed_before_send(&error) =>
+                {
                     #[cfg(unix)]
                     if let Some(copy) = consumer.capture.take() {
                         copy.discard();
