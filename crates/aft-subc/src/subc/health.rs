@@ -3334,10 +3334,26 @@ mod findings_snapshot_tests {
             .collect()
     }
 
+    fn meaning_test_route(root: &ProjectRootId, kind: &str) -> crate::subc::RouteIdentity {
+        use crate::subc::test_support::route_identity_with_harness;
+        use crate::subc::BindTrust;
+
+        let mut route = route_identity_with_harness(root, kind, BindTrust::FirstParty, "runner");
+        Arc::get_mut(&mut route.0).unwrap().scope = Some(
+            serde_json::from_value(json!({
+                "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+                "ref": kind, "scope_epoch": 1, "kind": kind, "owner_authorized": true,
+            }))
+            .unwrap(),
+        );
+        route
+    }
+
     #[test]
     fn index_plane_outage_degrades_health_and_recovers() {
         use crate::context::SemanticIndexStatus;
         use crate::subc::test_support::{test_ctx, test_root};
+        use crate::subc::{installed_routes, route_delivery, route_key};
 
         let cache = HealthRollupCache::new();
         let executor = Executor::new();
@@ -3350,7 +3366,19 @@ mod findings_snapshot_tests {
             config.indexes.trigram = false;
             config.indexes.callgraph = false;
         });
-        assert!(executor.register_actor(root, Arc::clone(&ctx)));
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut routes = HashMap::new();
+        let mut channels = HashMap::new();
+        route_delivery::install_route(
+            &executor,
+            &app.route_delivery_sessions,
+            &mut routes,
+            &mut channels,
+            route_key(1, 1),
+            meaning_test_route(&root, "head"),
+            &root,
+            &metrics,
+        );
 
         let check = |at_ms| {
             cache.clock_ms.store(at_ms, Ordering::Relaxed);
@@ -3404,13 +3432,73 @@ mod findings_snapshot_tests {
             1
         );
         assert!(outages.is_empty());
+        installed_routes::clear_installed_routes(&mut routes);
+    }
+
+    #[test]
+    fn index_plane_outage_ignores_worker_with_default_meaning_status() {
+        use crate::subc::test_support::{test_ctx, test_root};
+        use crate::subc::{route_delivery, route_key};
+
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let (_dir, root) = test_root("semantic-worker-default-status");
+        let ctx = test_ctx();
+        ctx.update_config(|config| {
+            config.indexes.semantic = true;
+            config.indexes.trigram = false;
+            config.indexes.callgraph = false;
+        });
+        assert!(executor.register_actor(root.clone(), ctx));
+
+        let worker = route_key(1, 1);
+        let mut routes = HashMap::new();
+        let mut channels = HashMap::new();
+        route_delivery::install_route(
+            &executor,
+            &app.route_delivery_sessions,
+            &mut routes,
+            &mut channels,
+            worker,
+            meaning_test_route(&root, "worker"),
+            &root,
+            &metrics,
+        );
+
+        for at_ms in [0, 3_600_001] {
+            cache.clock_ms.store(at_ms, Ordering::Relaxed);
+            cache.refresh_for_test(&executor, &app);
+            let rollup = cache.published_snapshot();
+            assert_eq!(
+                rollup.metrics["roots"][0]["semantic_index"]["status"],
+                "disabled"
+            );
+            assert_eq!(
+                rollup.metrics["index_plane_counts"]["semantic_index"]["off"],
+                1
+            );
+            assert_eq!(rollup.status, HealthStatus::Ok);
+            let findings = json!(cache.findings(10_000_000 + at_ms, 1));
+            assert!(
+                findings
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|finding| finding["check"] != "index_plane_outage"),
+                "{findings}"
+            );
+        }
+        assert!(routes.contains_key(&worker));
+        assert!(channels[&root].contains(&worker));
     }
 
     #[test]
     fn index_plane_outage_not_opened_requires_an_installed_meaning_opener() {
         use crate::context::SemanticIndexStatus;
-        use crate::subc::test_support::{route_identity_with_harness, test_ctx, test_root};
-        use crate::subc::{remove_route_channel, route_delivery, route_key, BindTrust};
+        use crate::subc::test_support::{test_ctx, test_root};
+        use crate::subc::{remove_route_channel, route_delivery, route_key};
 
         let cache = HealthRollupCache::new();
         let executor = Executor::new();
@@ -3430,22 +3518,13 @@ mod findings_snapshot_tests {
         let mut routes = HashMap::new();
         let mut channels = HashMap::new();
         let mut install = |channel, kind| {
-            let mut route =
-                route_identity_with_harness(&root, kind, BindTrust::FirstParty, "runner");
-            Arc::get_mut(&mut route.0).unwrap().scope = Some(
-                serde_json::from_value(json!({
-                    "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
-                    "ref": kind, "scope_epoch": 1, "kind": kind, "owner_authorized": true,
-                }))
-                .unwrap(),
-            );
             route_delivery::install_route(
                 &executor,
                 &app.route_delivery_sessions,
                 &mut routes,
                 &mut channels,
                 channel,
-                route,
+                meaning_test_route(&root, kind),
                 &root,
                 &metrics,
             );
