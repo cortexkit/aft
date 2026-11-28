@@ -890,6 +890,8 @@ fn handle_inspect_payload(
     for category in InspectCategory::active().iter().copied() {
         if !snapshot.config.inspect.category_enabled(category) {
             outcomes.insert(category, JobOutcome::off());
+        } else if let Some(outcome) = git_withheld_dead_code(ctx, category, &snapshot.config) {
+            outcomes.insert(category, outcome);
         } else if scope_was_provided
             && !sections.detail_categories.is_empty()
             && !sections.includes(category)
@@ -2523,8 +2525,9 @@ fn compact_inspect_reason(reason: &str) -> String {
 
 mod gap_render;
 use gap_render::{
-    attach_complexity_size_skips, incomplete_analysis_reason,
-    incomplete_analysis_reason_with_files, render_complexity_skipped_files,
+    attach_complexity_size_skips, dead_code_callgraph_observation, git_withheld_dead_code,
+    incomplete_analysis_reason, incomplete_analysis_reason_with_files,
+    render_complexity_skipped_files,
 };
 
 const MAX_PARSE_FAILURE_FILES: usize = 5;
@@ -4804,25 +4807,6 @@ fn format_diagnostic_location(d: &Map<String, Value>) -> String {
 /// not usable.
 fn dead_code_callgraph_unavailable(payload: &Value) -> bool {
     payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
-}
-
-fn dead_code_callgraph_observation(
-    ctx: &AppContext,
-) -> (crate::feature_status::IndexObservation, bool) {
-    let (query_observation, transient_lock_contention) =
-        crate::feature_status::observe_callgraph_query_with_contention(ctx, ctx);
-    if transient_lock_contention {
-        (query_observation, true)
-    } else {
-        (
-            crate::feature_status::observed_index_status(
-                ctx,
-                ctx,
-                crate::feature_status::IndexPlane::Callgraph,
-            ),
-            false,
-        )
-    }
 }
 
 /// Mark an unavailable dead-code summary with the analysis code, the callgraph

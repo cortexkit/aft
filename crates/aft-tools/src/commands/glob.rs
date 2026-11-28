@@ -421,6 +421,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         crate::commands::grep::trigram_index_disclosure(ctx)
     };
+    crate::commands::grep::append_git_index_disclosure(&mut body);
     body["fallback"] = if source == "index" {
         serde_json::Value::Null
     } else {

@@ -931,7 +931,7 @@ fn oxc_skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) 
         .collect()
 }
 
-pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
+pub fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
     callgraph_unavailable_aggregate_with_reason(scanned_files, None)
 }
 

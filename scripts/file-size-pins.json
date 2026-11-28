@@ -16,7 +16,7 @@
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft-engine/src/context.rs": {
-    "lines": 11117,
+    "lines": 14653,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft-engine/src/lsp/manager.rs": {
@@ -76,7 +76,7 @@
     "reason": "Split callgraph storage operations pending; AFT crate split lane."
   },
   "crates/aft-tools/src/commands/inspect.rs": {
-    "lines": 5424,
+    "lines": 5408,
     "reason": "Split inspect command assembly by area pending; AFT crate split lane."
   },
   "crates/aft-subc/src/subc/health.rs": {

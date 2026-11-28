@@ -60,8 +60,8 @@ impl IndexHost for AppContext {
     fn cache_unavailable_reason(&self) -> Option<String> {
         self.cache_unavailable_reason()
     }
-    fn artifact_identity_provisional(&self) -> bool {
-        self.artifact_identity_provisional()
+    fn artifact_identity_provisional_reason(&self) -> Option<String> {
+        self.artifact_identity_provisional_reason()
     }
     fn cache_dir(&self) -> PathBuf {
         self.cache_dir()

@@ -604,7 +604,6 @@ fn assert_no_artifact_state(storage: &Path) {
 fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let tools = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(project.path()).unwrap();
     let source = root.join("marker.rs");
     fs::write(&source, "pub fn unreadable_git_marker() {}\n").unwrap();
@@ -632,24 +631,16 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
             .unwrap()
             .success());
     }
-    let blocked = tools.path().join("blocked");
-    fs::write(&blocked, "").unwrap();
-    // A switchable Git stand-in reproduces an ownership refusal without
-    // requiring the test runner to change the checkout's owner.
-    let script = format!(
-        "#!/bin/sh\nif [ \"$1\" != '--version' ] && [ -f '{}' ]; then\n  echo 'fatal: detected dubious ownership in repository' >&2\n  exit 128\nfi\nexec '{}' \"$@\"\n",
-        blocked.display(), real_git.display()
-    );
-    super::helpers::link_cached_executable(&tools.path().join("git"), script.as_bytes()).unwrap();
-    let path = std::env::join_paths(
-        std::iter::once(tools.path().to_path_buf())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    // Do not inherit the test runner checkout's safe.directory entry.
+    // Ask real Git to treat the fixture as owned by another user, using a
+    // private Git config so trusting the fixture cannot affect other repos.
+    let trust = storage.path().join("gitconfig");
+    fs::write(&trust, "[safe]\n\tdirectory =\n").unwrap();
     let mut aft = AftProcess::spawn_with_env(&[
-        ("PATH", path.as_os_str()),
+        ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1".as_ref()),
+        ("GIT_CONFIG_GLOBAL", trust.as_os_str()),
+        ("GIT_CONFIG_NOSYSTEM", "1".as_ref()),
         ("GIT_CONFIG_PARAMETERS", "".as_ref()),
+        ("GIT_CONFIG_COUNT", "0".as_ref()),
     ]);
     let bind = json!({
         "id": "cfg", "command": "configure", "harness": "opencode",
@@ -690,20 +681,30 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     assert_eq!(grep["success"], true, "{grep}");
     assert_eq!(grep["fallback"], "filesystem", "{grep}");
     assert_index_unavailable(&grep["index"]["trigram"]);
+    assert_git_unavailable_text(&grep);
     let glob = aft.send(&json!({"id": "glob", "command": "glob", "pattern": "*.rs"}).to_string());
     assert_eq!(glob["success"], true, "{glob}");
     assert_index_unavailable(&glob["index"]["trigram"]);
-    let search = aft.send(
-        &json!({"id": "search", "command": "semantic_search", "query": "unreadable_git_marker", "top_k": 5}).to_string(),
-    );
+    assert_git_unavailable_text(&glob);
+    let search_request = json!({"id": "search", "command": "semantic_search", "query": "unreadable_git_marker", "top_k": 5});
+    let search = aft.send(&search_request.to_string());
     assert_eq!(search["success"], true, "{search}");
+    assert_git_unavailable_text(&search);
     for lane in ["trigram", "semantic"] {
         assert_index_unavailable(&search["lanes"][lane]);
     }
+    assert_eq!(
+        search["enrichment"]["code"], "callgraph_unavailable",
+        "{search}"
+    );
+    assert_index_unavailable(&search["enrichment"]["index"]);
     let callers_request = json!({"id": "callers", "command": "callers", "file": source, "symbol": "unreadable_git_marker"});
     let callers = aft.send(&callers_request.to_string());
     assert_eq!(callers["code"], "callgraph_unavailable", "{callers}");
     assert_index_unavailable(&callers["index"]["callgraph"]);
+    let message = callers["message"].as_str().unwrap_or_default();
+    assert!(message.contains("dubious ownership"), "{callers}");
+    assert!(!message.contains("enable it"), "{callers}");
     let zoom = aft.send(&json!({"id": "zoom-graph", "command": "zoom", "file": source, "symbol": "unreadable_git_marker", "callgraph": true}).to_string());
     assert_eq!(zoom["success"], true, "{zoom}");
     assert_eq!(zoom["callgraph"]["code"], "callgraph_unavailable", "{zoom}");
@@ -712,15 +713,40 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
         &json!({"id": "inspect", "command": "inspect", "sections": ["dead_code"]}).to_string(),
     );
     assert_eq!(inspect["success"], true, "{inspect}");
-    let dead_code = &inspect["analyses"]["dead_code"];
+    let dead_code = &inspect["summary"]["dead_code"];
     assert_eq!(dead_code["code"], "callgraph_unavailable", "{inspect}");
     assert_index_unavailable(&dead_code["index"]);
+    assert_git_unavailable_text(&inspect);
     let status_request = json!({ "id": "status", "command": "status" });
     let status = aft.send(&status_request.to_string());
     for index in ["search_index", "semantic_index", "callgraph_store"] {
         assert_index_unavailable(&status[index]);
     }
+    let rendered = aft_tools::subc_format::format_response(
+        "status",
+        &aft::protocol::Response::success("status", status),
+        false,
+    );
+    let indexes = rendered
+        .lines()
+        .find(|line| line.starts_with("indexes: "))
+        .unwrap_or_default();
+    assert!(
+        indexes.contains("search unavailable (git_identity_unavailable)"),
+        "{rendered}"
+    );
+    assert!(indexes.contains("semantic unavailable"), "{rendered}");
+    assert!(
+        indexes.contains("callgraph unavailable (git_identity_unavailable)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("DEGRADED: git_identity_unavailable:")
+            && rendered.contains("dubious ownership"),
+        "{rendered}"
+    );
     assert_no_artifact_state(storage.path());
+    assert!(entry_names(storage.path(), "data").is_empty());
 
     let mut off = bind.clone();
     off["config"] = super::helpers::user_config(json!({
@@ -730,13 +756,26 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     assert_eq!(response["success"], true, "{response}");
     let callers = aft.send(&callers_request.to_string());
     assert_eq!(callers["code"], "callgraph_off", "{callers}");
+    let search = aft.send(&search_request.to_string());
+    for lane in ["trigram", "semantic"] {
+        assert_eq!(search["lanes"][lane]["status"], "off", "{search}");
+    }
     let status = aft.send(&status_request.to_string());
     assert_eq!(status["search_index"]["status"], "off", "{status}");
     assert_eq!(status["callgraph_store"]["status"], "off", "{status}");
     assert_eq!(status["semantic_index"]["status"], "disabled", "{status}");
     assert_no_artifact_state(storage.path());
 
-    fs::remove_file(blocked).unwrap();
+    let mut command = std::process::Command::new(real_git);
+    crate::test_helpers::apply_hermetic_git_env(&mut command);
+    assert!(command
+        .args(["config", "--file"])
+        .arg(trust)
+        .args(["--add", "safe.directory"])
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
     let response = aft.send(&bind.to_string());
     assert_eq!(response["success"], true, "{response}");
     assert!(!degraded_reasons(&mut aft)
@@ -753,9 +792,20 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
 fn assert_index_unavailable(index: &Value) {
     assert_eq!(index["status"], "unavailable", "{index}");
     let reason = index["reason"].as_str().unwrap_or_default();
+    let detail = index["error"].as_str().unwrap_or(reason);
     assert!(reason.contains("git_identity_unavailable"), "{index}");
-    assert!(reason.contains("dubious ownership"), "{index}");
-    assert!(!reason.contains("enable it"), "{index}");
+    assert!(detail.contains("dubious ownership"), "{index}");
+    assert!(!detail.contains("enable it"), "{index}");
+}
+
+#[cfg(unix)]
+fn assert_git_unavailable_text(response: &Value) {
+    let text = response["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("unavailable") && text.contains("dubious ownership"),
+        "{response}"
+    );
+    assert!(!text.contains("enable it"), "{response}");
 }
 
 /// After a finalizing bind, wait until the index store has built exactly one

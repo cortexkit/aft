@@ -6685,12 +6685,8 @@ impl AppContext {
         }
     }
 
-    /// Why this root's checkout is never bound in the data layer, as
-    /// configure leaves today's indexes off for it: the root is a
-    /// filesystem, volume or drive root, or the home folder, or every index
-    /// is switched off. Semantic search alone still binds it: the meaning
-    /// plane fills from the checkout's file list, which a build publishes
-    /// even with the text index and call graph off.
+    /// Why this root cannot bind a data layer checkout. Semantic search
+    /// alone still binds it: meaning search needs the checkout's file list.
     pub(crate) fn data_layer_withheld(&self) -> Option<crate::data_layer::surfaces::Withheld> {
         use crate::data_layer::surfaces::Withheld;
         let planes = self.data_layer_planes();
@@ -6698,6 +6694,8 @@ impl AppContext {
             Some(Withheld::TooBroad)
         } else if self.is_home_root() {
             Some(Withheld::Home)
+        } else if let Some(reason) = crate::feature_status::git_identity_unavailable_reason(self) {
+            Some(Withheld::GitIdentity(reason))
         } else if !planes.text && !planes.callgraph && self.data_meaning_config().is_none() {
             Some(Withheld::IndexesOff)
         } else {
@@ -6990,7 +6988,7 @@ impl AppContext {
     }
 
     /// The bound root's artifact identity was provisional at its last bind
-    /// (aft.db was busy or Git was unreadable), so its index lanes are off.
+    /// (aft.db was busy or Git was unreadable), so its indexes cannot serve.
     /// A busy aft.db is retried in the background
     /// ([`crate::provisional_identity_retry`]); an unreadable Git identity
     /// waits for the next bind.

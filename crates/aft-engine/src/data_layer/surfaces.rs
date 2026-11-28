@@ -93,12 +93,14 @@ pub enum DataCheckoutProbe {
 }
 
 /// Why a root's checkout is never bound in the data layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Withheld {
     /// The root is a filesystem, volume or drive root.
     TooBroad,
     /// The root is the home folder.
     Home,
+    /// Git could not identify the repository that owns the index store.
+    GitIdentity(String),
     /// The text and call-graph indexes are both switched off.
     IndexesOff,
 }
@@ -596,6 +598,21 @@ fn report_inner(ctx: &dyn IndexHost, cached_only: bool) -> Option<DataStoreRepor
         }
         DataCheckoutProbe::Withheld(Withheld::Home) => {
             DataStoreReport::both(PlaneReport::because(UNAVAILABLE, reason::HOME_ROOT, None))
+        }
+        DataCheckoutProbe::Withheld(Withheld::GitIdentity(detail)) => {
+            use crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON as CODE;
+            let config = ctx.config();
+            let plane = |enabled| {
+                if enabled {
+                    PlaneReport::because(UNAVAILABLE, CODE, Some(detail.clone()))
+                } else {
+                    PlaneReport::of(OFF)
+                }
+            };
+            DataStoreReport {
+                callgraph: plane(config.indexes.callgraph),
+                ..DataStoreReport::both(plane(config.indexes.trigram))
+            }
         }
         DataCheckoutProbe::Withheld(Withheld::IndexesOff) => {
             DataStoreReport::both(PlaneReport::of(OFF))
@@ -1703,10 +1720,16 @@ pub fn zoom_callgraph_field(ctx: &dyn IndexHost) -> Option<Option<Value>> {
         BUILDING => "callgraph_building",
         _ => "callgraph_unavailable",
     };
+    let reason = if plane.reason == Some(crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON)
+    {
+        plane.error.as_deref()
+    } else {
+        plane.reason
+    };
     Some(Some(json!({
         "status": "unavailable",
         "code": code,
-        "index": { "status": plane.status, "reason": plane.reason },
+        "index": { "status": plane.status, "reason": reason },
     })))
 }
 

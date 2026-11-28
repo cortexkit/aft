@@ -1,5 +1,40 @@
 use super::*;
 
+pub(super) fn git_withheld_dead_code(
+    ctx: &AppContext,
+    category: InspectCategory,
+    config: &crate::config::Config,
+) -> Option<JobOutcome> {
+    if category != InspectCategory::DeadCode || !config.indexes.callgraph {
+        return None;
+    }
+    let reason = crate::feature_status::git_identity_unavailable_reason(ctx)?;
+    // A root without a safe store key cannot supply a current graph, even
+    // if the inspect manager previously cached an aggregate for this root.
+    let mut payload = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0);
+    payload["callgraph_unavailable_reason"] = serde_json::json!(reason);
+    Some(JobOutcome::Fresh { payload })
+}
+
+pub(super) fn dead_code_callgraph_observation(
+    ctx: &AppContext,
+) -> (crate::feature_status::IndexObservation, bool) {
+    let (query_observation, transient_lock_contention) =
+        crate::feature_status::observe_callgraph_query_with_contention(ctx, ctx);
+    if transient_lock_contention {
+        (query_observation, true)
+    } else {
+        (
+            crate::feature_status::observed_index_status(
+                ctx,
+                ctx,
+                crate::feature_status::IndexPlane::Callgraph,
+            ),
+            false,
+        )
+    }
+}
+
 pub(super) fn incomplete_analysis_reason(value: &Value) -> String {
     incomplete_analysis_reason_with_files(value, true)
 }

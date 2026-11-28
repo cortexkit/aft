@@ -262,7 +262,19 @@ impl AppContext {
         let semantic_index_info = if self.root_too_broad() {
             safety_disabled_info()
         } else if config.indexes.semantic {
-            refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
+            if let Some(reason) = crate::feature_status::git_identity_unavailable_reason(self) {
+                serde_json::json!({
+                    "status": "unavailable",
+                    "state": "unavailable",
+                    "reason": crate::feature_status::cause::GIT_IDENTITY_UNAVAILABLE,
+                    "error": reason,
+                    "backend": config.semantic_backend_label(),
+                    "model": config.semantic.model.as_str(),
+                })
+            } else {
+                refused_info(crate::feature_status::IndexPlane::Semantic)
+                    .unwrap_or(semantic_index_info)
+            }
         } else {
             semantic_index_info
         };

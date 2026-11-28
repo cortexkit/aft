@@ -487,6 +487,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         trigram_index_disclosure(ctx)
     };
+    append_git_index_disclosure(&mut body);
     body["fallback"] = if result.index_status == IndexStatus::Ready {
         serde_json::Value::Null
     } else {
@@ -577,6 +578,16 @@ pub(crate) fn trigram_index_disclosure(ctx: &AppContext) -> serde_json::Value {
         )
         .consumer_json(),
     })
+}
+
+pub(crate) fn append_git_index_disclosure(body: &mut serde_json::Value) {
+    if let Some(reason) = body["index"]["trigram"]["reason"]
+        .as_str()
+        .filter(|reason| reason.starts_with(crate::feature_status::cause::GIT_IDENTITY_UNAVAILABLE))
+    {
+        let text = body["text"].as_str().unwrap_or_default();
+        body["text"] = serde_json::json!(format!("{text}\ntrigram: unavailable: {reason}"));
+    }
 }
 
 pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> String {

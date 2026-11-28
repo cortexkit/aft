@@ -190,7 +190,14 @@ fn summary(source: &Value, string_limit: usize) -> Value {
         ),
         (
             "search_index",
-            &["status", "files", "trigrams", "indexed_files"],
+            &[
+                "status",
+                "files",
+                "trigrams",
+                "indexed_files",
+                "reason",
+                "error",
+            ],
         ),
         // Present only while the data layer runs (see
         // `data_layer::surfaces::apply_to_status`).

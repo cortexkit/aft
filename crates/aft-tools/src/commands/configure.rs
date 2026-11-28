@@ -2203,6 +2203,7 @@ fn configure_warm_key(
     root_too_broad: bool,
     is_worktree_bridge: bool,
     shared_artifacts_read_only: bool,
+    identity_provisional: bool,
 ) -> String {
     // Keys a live config reload may change are left out: they select no
     // artifact, so a connect after a live edit must not reload artifacts
@@ -2212,7 +2213,7 @@ fn configure_warm_key(
     semantic.query_timeout_ms = 0;
     semantic.query_instruction.clear();
     format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}",
+        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={};identity_provisional={}",
         canonical_root,
         (config.cache_storage_dir(), config.cache_epoch),
         root_too_broad,
@@ -2224,6 +2225,7 @@ fn configure_warm_key(
         semantic,
         false,
         config.indexes.callgraph,
+        identity_provisional,
     )
 }
 
@@ -3164,6 +3166,7 @@ fn handle_configure_inner(
         root_too_broad,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
+        false,
     );
     if ctx.configure_generation() > 0
         && !root_too_broad
@@ -3357,6 +3360,7 @@ fn handle_configure_inner(
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    let was_identity_provisional = ctx.artifact_identity_provisional();
     let mut identity_provisional = false;
     let project_key = match project_key_result {
         Some(Ok(Some(key))) => Some(key),
@@ -3364,6 +3368,10 @@ fn handle_configure_inner(
             identity_provisional = true;
             degraded_reasons
                 .push(crate::root_identity::key::PROVISIONAL_IDENTITY_REASON.to_string());
+            // A busy database still uses the background identity retry.
+            next_config.indexes.trigram = false;
+            next_config.indexes.semantic = false;
+            next_config.indexes.callgraph = false;
             None
         }
         Some(Err(error)) => {
@@ -3386,17 +3394,6 @@ fn handle_configure_inner(
         }
         None => None,
     };
-    if identity_provisional {
-        // An unreadable legacy identity pin in aft.db or a failed Git probe
-        // leaves the identity unsettled. Serve tools that do not need indexes,
-        // but write no artifacts, ownership or retention records under a key
-        // the next bind may replace. A busy aft.db is retried in the
-        // background (`crate::provisional_identity_retry`); a failed Git probe
-        // waits for the next bind.
-        next_config.indexes.trigram = false;
-        next_config.indexes.semantic = false;
-        next_config.indexes.callgraph = false;
-    }
     drop(cache_key_profile);
     let project_key = project_key.unwrap_or_default();
     ctx.begin_configure_ack_phase("storage_capability_probe");
@@ -3572,8 +3569,10 @@ fn handle_configure_inner(
         root_too_broad,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
+        identity_provisional,
     );
     let semantic_build_inputs_changed = project_root_changed
+        || was_identity_provisional != identity_provisional
         || previous_config.indexes.semantic != next_config.indexes.semantic
         || semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic)
         || previous_config.semantic.max_files != next_config.semantic.max_files
@@ -3610,6 +3609,7 @@ fn handle_configure_inner(
             // The cold-seed gate holds Tier-2 work until a semantic build
             // finishes; a root that will not build must not hold it.
             if cache_available
+                && !identity_provisional
                 && next_config.indexes.semantic
                 && !ctx.shared_artifacts_read_only()
                 && !root_too_broad
@@ -6839,7 +6839,8 @@ mod tests {
     #[test]
     fn warm_key_ignores_keys_a_live_config_reload_may_change() {
         let root = std::path::Path::new("/warm-key-root");
-        let key = |config: &Config| super::configure_warm_key(root, config, false, false, false);
+        let key =
+            |config: &Config| super::configure_warm_key(root, config, false, false, false, false);
         let base = Config::default();
 
         let mut live = base.clone();
@@ -7985,6 +7986,8 @@ mod tests {
 
     #[test]
     fn dubious_ownership_identity_does_not_retry_in_the_background() {
+        use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+
         let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
@@ -8017,7 +8020,19 @@ mod tests {
                 );
             },
         );
-        assert!(!ctx.config().indexes.trigram);
+        assert!(ctx.config().indexes.trigram);
+        assert!(ctx.data_checkout().is_none());
+        let snapshot = ctx.try_build_status_push_snapshot().unwrap();
+        assert_eq!(snapshot["search_index"]["status"], "unavailable");
+        assert_eq!(
+            snapshot["search_index"]["reason"],
+            "git_identity_unavailable"
+        );
+        assert!(snapshot["search_index"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("dubious ownership")));
+        assert_eq!(snapshot["semantic_index"]["status"], "disabled");
+        assert_eq!(snapshot["callgraph_store"]["status"], "off");
     }
 
     #[test]

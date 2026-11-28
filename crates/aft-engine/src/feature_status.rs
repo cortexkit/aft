@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use crate::data_layer::host::IndexHost;
 use crate::data_layer::status::SemanticIndexStatus;
 use crate::read_policy::ReadPolicy;
+use crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON;
 
 /// One background index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,10 +94,10 @@ pub mod cause {
     /// The root is too broad for watching or project-wide indexing.
     pub const ROOT_TOO_BROAD: &str = "root_too_broad";
     /// The root's artifact identity is not settled yet: aft.db was busy when
-    /// it was bound (retried in the background until the database is free),
-    /// or its Git identity was unreadable (retried at the root's next bind).
-    /// Indexes stay off until the identity settles.
+    /// it was bound (retried in the background until the database is free).
     pub const IDENTITY_PROVISIONAL: &str = "identity_provisional";
+    /// Git could not determine the root's artifact identity.
+    pub const GIT_IDENTITY_UNAVAILABLE: &str = super::GIT_IDENTITY_UNAVAILABLE_REASON;
     /// The configured embedding backend is currently unreachable.
     pub const SEMANTIC_BACKEND_UNAVAILABLE: &str = "semantic_backend_unavailable";
     /// The local embedding backend needs an ONNX Runtime that AFT cannot
@@ -239,9 +240,14 @@ pub fn observed_index_status(
     if policy.is_home_root() {
         return IndexObservation::unavailable(cause::HOME_ROOT);
     }
-    // Configure also forces every index off while the root's identity is
-    // provisional; that too is not the user's choice.
-    if ctx.artifact_identity_provisional() {
+    if let Some(reason) = ctx.artifact_identity_provisional_reason() {
+        if is_git_identity_unavailable(&reason) {
+            return if plane.enabled_in(&ctx.config()) {
+                IndexObservation::unavailable(reason)
+            } else {
+                IndexObservation::off()
+            };
+        }
         return IndexObservation::unavailable(cause::IDENTITY_PROVISIONAL);
     }
     if !plane.enabled_in(&ctx.config()) {
@@ -258,6 +264,16 @@ pub fn observed_index_status(
         IndexPlane::Semantic => observe_semantic(ctx),
         IndexPlane::Callgraph => observe_callgraph(ctx),
     }
+}
+
+fn is_git_identity_unavailable(reason: &str) -> bool {
+    reason.starts_with(GIT_IDENTITY_UNAVAILABLE_REASON)
+}
+
+#[doc(hidden)]
+pub fn git_identity_unavailable_reason(ctx: &dyn IndexHost) -> Option<String> {
+    ctx.artifact_identity_provisional_reason()
+        .filter(|reason| is_git_identity_unavailable(reason))
 }
 
 fn observe_callgraph(ctx: &dyn IndexHost) -> IndexObservation {

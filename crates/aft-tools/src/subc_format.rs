@@ -4717,6 +4717,10 @@ fn format_status(data: &Value) -> String {
         {
             s = format!("{s}; {summary}");
         }
+        let git_unavailable = crate::feature_status::cause::GIT_IDENTITY_UNAVAILABLE;
+        if data["semantic_index"]["reason"] == git_unavailable {
+            s = format!("{s} ({git_unavailable})");
+        }
         s
     };
     let callgraph = match data
