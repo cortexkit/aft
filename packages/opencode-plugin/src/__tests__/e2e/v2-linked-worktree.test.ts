@@ -20,7 +20,12 @@ test.skipIf(!hostBinary)(
       label: "linked-worktree",
       removeBuiltins: true,
       permissions: [{ action: "shell", resource: denied, effect: "deny" }],
-      script: { deny: { name: "shell", arguments: { command: denied } } },
+      script: {
+        deny: {
+          name: "shell",
+          arguments: { command: denied, description: "Run the denied worktree command" },
+        },
+      },
     });
     try {
       const git = (...args: string[]) =>

@@ -89,7 +89,12 @@ describe("background bash lifecycle (real Pi RPC)", () => {
       await enableAftBash(env);
       aimock.registerToolCallFixture({
         predicate: (request) => latestUserText(request).includes("Run a foreground echo."),
-        toolCalls: [{ name: "bash", arguments: { command: "echo pi-inline" } }],
+        toolCalls: [
+          {
+            name: "bash",
+            arguments: { command: "echo pi-inline", description: "Print inline output" },
+          },
+        ],
         followupText: "Ran.",
       });
 
@@ -130,7 +135,12 @@ describe("background bash lifecycle (real Pi RPC)", () => {
         // The command must still be running when the orchestrator first polls
         // after the 25 ms window: a 0.2 s sleep lost that race on a loaded CI
         // runner (first poll at 610 ms, command already done, no promotion).
-        toolCalls: [{ name: "bash", arguments: { command: "sleep 5 && echo late" } }],
+        toolCalls: [
+          {
+            name: "bash",
+            arguments: { command: "sleep 5 && echo late", description: "Print delayed output" },
+          },
+        ],
         followupText: "Started.",
       });
       process.env.AFT_TEST_FOREGROUND_WAIT_MS = "25";
@@ -172,7 +182,16 @@ describe("background bash lifecycle (real Pi RPC)", () => {
       await enableAftBash(env);
       aimock.registerToolCallFixture({
         predicate: (request) => latestUserText(request).includes("Start a background echo."),
-        toolCalls: [{ name: "bash", arguments: { command: "echo hello", background: true } }],
+        toolCalls: [
+          {
+            name: "bash",
+            arguments: {
+              command: "echo hello",
+              description: "Print a background greeting",
+              background: true,
+            },
+          },
+        ],
         followupText: "Started.",
       });
       aimock.registerTextFixture({
@@ -238,7 +257,11 @@ describe("background bash lifecycle (real Pi RPC)", () => {
         toolCalls: [
           {
             name: "bash",
-            arguments: { command: "echo bg-done | tee bg-marker.txt", background: true },
+            arguments: {
+              command: "echo bg-done | tee bg-marker.txt",
+              description: "Write the background completion marker",
+              background: true,
+            },
           },
         ],
         followupText: "Started.",

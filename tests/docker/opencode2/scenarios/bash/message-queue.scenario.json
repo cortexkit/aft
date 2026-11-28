@@ -22,6 +22,7 @@
                 "name": "bash",
                 "arguments": {
                   "command": "sleep 8; printf finished-inline",
+                  "description": "Wait before printing inline output",
                   "wait": true
                 },
                 "non_mutating_evidence": {

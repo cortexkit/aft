@@ -60,6 +60,7 @@ const mock = Bun.serve({
       {
         name: "bash",
         arguments: {
+          description: "Print a simulated merge conflict",
           command:
             "printf 'CONFLICT (content): file.ts\\nAutomatic merge failed; fix conflicts and then commit the result.\\n'",
         },

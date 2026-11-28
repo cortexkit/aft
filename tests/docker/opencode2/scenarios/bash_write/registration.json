@@ -23,6 +23,7 @@
                 "name": "bash",
                 "arguments": {
                   "command": "read line; printf '%s\\n' \"$line\"",
+                  "description": "Echo a line read from the PTY",
                   "pty": true,
                   "background": true
                 },

@@ -52,7 +52,14 @@ describe("background bash idle wakeup (real Pi RPC)", () => {
       aimock.registerToolCallFixture({
         predicate: (request) => latestUserText(request).includes("Start idle background bash."),
         toolCalls: [
-          { name: "bash", arguments: { command: "sleep 3; echo idle-done", background: true } },
+          {
+            name: "bash",
+            arguments: {
+              command: "sleep 3; echo idle-done",
+              description: "Print a background marker after idle",
+              background: true,
+            },
+          },
         ],
         followupText: "The background task is running.",
       });

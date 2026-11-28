@@ -149,6 +149,7 @@ describe.skipIf(!binary.binaryPath)("outside-file always scope", () => {
           const shell = await h.bridge.send("bash", {
             session_id: `shell-${version}-${label}`,
             command: `cat "${first.replaceAll("\\", "/")}"`,
+            description: "Read the external test file",
           });
           expect(shell.code).toBe("permission_required");
           const external = (

@@ -121,7 +121,15 @@ ${out}`,
   test.skipIf(!python)("Test 28: pty_e2e_python_repl", async () => {
     const { h, bash, status, write } = await pluginHarness();
     const launched = toolResultText(
-      await bash.execute({ command: `${python} -q`, pty: true, background: true }, runtime(h)),
+      await bash.execute(
+        {
+          command: `${python} -q`,
+          description: "Start a Python REPL",
+          pty: true,
+          background: true,
+        },
+        runtime(h),
+      ),
     );
     const taskId = launched.match(/bash-[a-zA-Z0-9_-]+/)?.[0];
     expect(taskId).toBeDefined();
@@ -135,7 +143,10 @@ ${out}`,
     const { h, bash, status } = await pluginHarness();
     const command = `printf '\\033[2J\\033[Halpha\\033[10;5Hbeta'`;
     const launched = toolResultText(
-      await bash.execute({ command, pty: true, background: true }, runtime(h)),
+      await bash.execute(
+        { command, description: "Render ANSI text on the PTY", pty: true, background: true },
+        runtime(h),
+      ),
     );
     const taskId = launched.match(/bash-[a-zA-Z0-9_-]+/)?.[0];
     expect(taskId).toBeDefined();

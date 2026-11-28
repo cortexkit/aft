@@ -90,7 +90,12 @@ maybeDescribe("e2e bridge transport resilience (Pi)", () => {
     // duration so the test still proves dispatch < transport < command.
     const launched = await h.bridge.send(
       "bash",
-      { command: "sleep 1 && echo slow", timeout: 5_000, compressed: false },
+      {
+        command: "sleep 1 && echo slow",
+        description: "Print output after the transport deadline",
+        timeout: 5_000,
+        compressed: false,
+      },
       { transportTimeoutMs: 500 },
     );
 
@@ -126,6 +131,7 @@ maybeDescribe("e2e bridge transport resilience (Pi)", () => {
 
     const commandCollision = await h.bridge.send("bash", {
       command: "printf collision-ok",
+      description: "Print the reserved-parameter probe marker",
       method: "not-a-bridge-method",
       session_id: "reserved-session",
       lsp_hints: { completions: ["test"] },

@@ -118,7 +118,12 @@ maybeDescribe("e2e bash PTY (Pi adapter + bridge + Rust)", () => {
 
   test.skipIf(!python)("Test 28: pty_e2e_python_repl", async () => {
     const { h, bash, status, write } = await pluginHarness();
-    const launched = await call(bash, h, { command: `${python} -q`, pty: true, background: true });
+    const launched = await call(bash, h, {
+      command: `${python} -q`,
+      description: "Start a Python REPL",
+      pty: true,
+      background: true,
+    });
     const taskId = launched.match(/bash-[a-zA-Z0-9_-]+/)?.[0];
     expect(taskId).toBeDefined();
     await call(write, h, { task_id: taskId, input: "print('hello')\n" });
@@ -130,7 +135,12 @@ maybeDescribe("e2e bash PTY (Pi adapter + bridge + Rust)", () => {
   test("Test 29: pty_e2e_ansi_screen_rendering", async () => {
     const { h, bash, status } = await pluginHarness();
     const command = `printf '\\033[2J\\033[Halpha\\033[10;5Hbeta'`;
-    const launched = await call(bash, h, { command, pty: true, background: true });
+    const launched = await call(bash, h, {
+      command,
+      description: "Render ANSI text on the PTY",
+      pty: true,
+      background: true,
+    });
     const taskId = launched.match(/bash-[a-zA-Z0-9_-]+/)?.[0];
     expect(taskId).toBeDefined();
     const out = await waitForScreenText(status, h, taskId!, ["alpha", "beta"]);

@@ -231,7 +231,14 @@ describe("hoisted tool replacement matrix (real Pi RPC)", () => {
 
   test("bash accepts AFT-only compressed flag", async () => {
     const toolEnd = await withPiTool(
-      { name: "bash", arguments: { command: "echo hi", compressed: false } },
+      {
+        name: "bash",
+        arguments: {
+          command: "echo hi",
+          description: "Print an uncompressed greeting",
+          compressed: false,
+        },
+      },
       {
         message: "Run echo hi without output compression.",
         setup: enableAftBash,

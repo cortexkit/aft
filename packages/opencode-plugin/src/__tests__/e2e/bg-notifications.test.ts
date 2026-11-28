@@ -154,6 +154,7 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
           process.platform === "win32"
             ? "Start-Sleep -Seconds 40; Write-Output finished"
             : "sleep 40; printf finished",
+        description: "Wait for delayed output",
         wait: true,
         timeout: 45_000,
       },
@@ -257,6 +258,7 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
           process.platform === "win32"
             ? "Start-Sleep -Seconds 40; Write-Output finished"
             : "sleep 40; printf finished",
+        description: "Run the command that will be promoted",
         timeout: 45_000,
       },
       {
@@ -336,17 +338,20 @@ async function spawnBackground(
   bash: ReturnType<typeof createBashTool>,
   command: string,
 ): Promise<string> {
-  const result = await bash.execute({ command, background: true }, {
-    sessionID: "e2e-session",
-    messageID: "e2e-message",
-    agent: "e2e-agent",
-    directory: h.tempDir,
-    worktree: h.tempDir,
-    abort: new AbortController().signal,
-    metadata: () => {},
-    ask: noopAsk,
-    callID: `call-${Date.now()}`,
-  } as ToolContext);
+  const result = await bash.execute(
+    { command, description: "Start a background notification probe", background: true },
+    {
+      sessionID: "e2e-session",
+      messageID: "e2e-message",
+      agent: "e2e-agent",
+      directory: h.tempDir,
+      worktree: h.tempDir,
+      abort: new AbortController().signal,
+      metadata: () => {},
+      ask: noopAsk,
+      callID: `call-${Date.now()}`,
+    } as ToolContext,
+  );
   // The bash tool returns `{ output, title, metadata }` (UI metadata on the
   // result); the agent-visible text is `output`.
   const output = typeof result === "string" ? result : (result?.output ?? "");

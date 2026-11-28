@@ -35,11 +35,15 @@ test.skipIf(!hostBinary)(
       script: {
         "start the background task": {
           name: COMMAND_TOOL,
-          arguments: { command: BACKGROUND, background: true },
+          arguments: {
+            command: BACKGROUND,
+            description: "Start background task",
+            background: true,
+          },
         },
         "wait for the long command": {
           name: COMMAND_TOOL,
-          arguments: { command: WAITING, wait: true },
+          arguments: { command: WAITING, description: "Wait for long command", wait: true },
         },
       },
     });

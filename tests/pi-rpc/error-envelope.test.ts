@@ -190,7 +190,7 @@ describe("tool error envelopes (real Pi RPC)", () => {
 
   test("bash non-zero exit is a successful tool call with exit_code 1", async () => {
     const toolEnd = await withPiTool(
-      { name: "bash", arguments: { command: "exit 1" } },
+      { name: "bash", arguments: { command: "exit 1", description: "Exit with status one" } },
       {
         message: "Run a command that exits non-zero.",
         setup: enableAftBash,

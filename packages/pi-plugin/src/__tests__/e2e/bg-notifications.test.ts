@@ -128,7 +128,7 @@ async function spawnBackground(
   } as MockExtensionContext;
   const result = await bash.execute(
     `test-bash-${Date.now()}`,
-    { command, background: true },
+    { command, description: "Start a background notification probe", background: true },
     undefined,
     undefined,
     extCtx,

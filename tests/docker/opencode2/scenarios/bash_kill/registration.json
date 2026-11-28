@@ -23,6 +23,7 @@
                 "name": "bash",
                 "arguments": {
                   "command": "sleep 30",
+                  "description": "Start a task to terminate",
                   "background": true
                 },
                 "non_mutating_evidence": {

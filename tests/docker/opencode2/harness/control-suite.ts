@@ -464,7 +464,12 @@ export async function runHarnessControlSuite(root: string): Promise<HarnessContr
           label: "control-call",
           response: {
             kind: "tool_calls",
-            calls: [call({ name: "bash", arguments: { command: "printf control" } })],
+            calls: [
+              call({
+                name: "bash",
+                arguments: { command: "printf control", description: "Print the fallback control marker" },
+              }),
+            ],
           },
         },
       ],

@@ -23,6 +23,7 @@
                 "name": "bash",
                 "arguments": {
                   "command": "sleep 30; printf 'watch fixture\\n'",
+                  "description": "Print a delayed watch marker",
                   "background": true
                 },
                 "non_mutating_evidence": {

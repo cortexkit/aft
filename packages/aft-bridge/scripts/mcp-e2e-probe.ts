@@ -126,7 +126,10 @@ check(
 check("outside-root content NOT leaked", !outText.includes("secret-outside-root"));
 
 // 4. bash denied for mcp
-const bash = await callTool(name("bash"), { command: "echo mcp-bash-should-be-denied" });
+const bash = await callTool(name("bash"), {
+  command: "echo mcp-bash-should-be-denied",
+  description: "Run the denied MCP shell probe",
+});
 const bashText = toolText(bash);
 check(
   "bash DENIED for mcp bind",

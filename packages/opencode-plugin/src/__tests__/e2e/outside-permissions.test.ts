@@ -173,6 +173,7 @@ describe.skipIf(!binary.binaryPath)("real engine outside exemptions", () => {
         const task = await h.bridge.send("bash", {
           session_id: session,
           command: "echo own-engine-output",
+          description: "Print output to the engine spool",
           background: true,
         });
         expect(typeof task.task_id).toBe("string");

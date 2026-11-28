@@ -47,7 +47,12 @@ test.skipIf(!hostBinary)(
       files: { "probe.txt": "rewrite-probe-line\n" },
       // Presence of a connection file puts the plugin in subc mode.
       userAftConfig: { subc: { connection_file: rig.connectionFile } },
-      script: { "run the rewrite probe": { name: "shell", arguments: { command: REWRITE } } },
+      script: {
+        "run the rewrite probe": {
+          name: "shell",
+          arguments: { command: REWRITE, description: "Read the rewrite probe file" },
+        },
+      },
     }).catch(async (error) => {
       await rig.cleanup();
       throw error;
@@ -68,6 +73,7 @@ test.skipIf(!hostBinary)(
         const reply = await headBridge.send("bash", {
           session_id: "opencode-1-head",
           command: REWRITE,
+          description: "Read the rewrite probe file",
           workdir: host.project,
           compressed: false,
         });

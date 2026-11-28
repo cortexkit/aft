@@ -63,6 +63,7 @@ for (const scenario of [
           name: "shell",
           arguments: {
             command,
+            description: "Wait for the release marker",
             ...(scenario === "foreground" ? {} : { background: true }),
           },
         };
@@ -102,7 +103,11 @@ for (const scenario of [
           const holdingMarker = join(host.project, "holding");
           script.hold = {
             name: "shell",
-            arguments: { command: `echo holding > '${holdingMarker}'; sleep 40`, wait: true },
+            arguments: {
+              command: `echo holding > '${holdingMarker}'; sleep 40`,
+              description: "Hold execution for the stop test",
+              wait: true,
+            },
           };
           await host.client.session.prompt({ sessionID, text: "hold" });
           await until("an active execution after watch registration", async () =>
@@ -165,7 +170,10 @@ for (const scenario of [
           ).toEqual([]);
           expect(host.requests.length).toBe(requestsBefore);
           if (scenario !== "foreground") {
-            script.resume = { name: "shell", arguments: { command: "echo resumed" } };
+            script.resume = {
+              name: "shell",
+              arguments: { command: "echo resumed", description: "Print the resume marker" },
+            };
             await host.turn(sessionID, "resume");
             const resumed = toolResult(host.requests, "echo resumed");
             if (scenario === "sync-gap") expect(resumed).toMatch(/killed|stop-test-done/);

@@ -48,7 +48,10 @@ test.skipIf(!binary)(
       script: Object.fromEntries(
         Object.entries(commands).map(([name, command]) => [
           name,
-          { name: "shell", arguments: { command } },
+          {
+            name: "shell",
+            arguments: { command, description: `Run the ${name} permission probe` },
+          },
         ]),
       ),
     });

@@ -47,6 +47,7 @@ test.skipIf(!initialBinary.binaryPath)(
       consumer.registerSession?.(sessionID, h.bridge);
       const started = await h.bridge.send("bash", {
         command: "echo done",
+        description: "Print a background completion marker",
         background: true,
         session_id: sessionID,
       });
