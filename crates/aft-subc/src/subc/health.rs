@@ -10670,6 +10670,13 @@ mod tests {
         let report_metrics = report.metrics.expect("health metrics");
 
         assert_eq!(report_metrics["root_count"].as_u64(), Some(50));
+        for plane in ["search_index", "semantic_index", "callgraph_store"] {
+            assert_eq!(
+                report_metrics["index_plane_counts"][plane],
+                json!({"ready": 0, "building": 0, "unavailable": 0, "off": 0, "disabled": 50}),
+                "{plane} counts should include roots without detail rows"
+            );
+        }
         let rendered_roots = report_metrics["roots"]
             .as_array()
             .expect("rendered root details")

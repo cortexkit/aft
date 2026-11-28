@@ -114,7 +114,223 @@ pub(super) fn insert_route_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subc::test_support::{route_identity, test_root};
+    use crate::subc::test_support::{
+        route_identity, route_identity_with_harness, test_ctx, test_root,
+    };
+    use aft_engine::data_layer::meaning_query::DataSemantic;
+
+    fn meaning_route(root: &ProjectRootId, harness: &str, scope: Option<&str>) -> RouteIdentity {
+        let mut route = route_identity_with_harness(
+            root,
+            "alfonso:head/meaning",
+            BindTrust::FirstParty,
+            harness,
+        );
+        Arc::get_mut(&mut route.0).unwrap().scope = scope.map(|kind| {
+            serde_json::from_value(json!({
+                "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+                "ref": format!("meaning-{kind}"), "scope_epoch": 1, "kind": kind,
+                "owner_authorized": true,
+            }))
+            .unwrap()
+        });
+        route
+    }
+
+    fn meaning_context(root: &ProjectRootId) -> Arc<AppContext> {
+        let ctx = test_ctx();
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        ctx.update_config(|config| {
+            config.project_root = Some(root.as_path().to_path_buf());
+            config.indexes.semantic = true;
+            config.indexes.trigram = true;
+            config.indexes.callgraph = false;
+        });
+        ctx
+    }
+
+    fn wait_for_meaning_vectors(ctx: &AppContext) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = DataSemantic::probe(ctx);
+            if matches!(&status, Some(DataSemantic::Serving(meaning)) if meaning.dimension() == Some(2))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "meaning did not fill: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn meaning_hosted_heads_fill_on_bind() {
+        use crate::semantic_admission::{admission, SemanticAdmission};
+        use aft_engine::test_bridge::display_data::meaning::fill_with_constant_vectors_for_test;
+
+        for harness in ["opencode2", "claude-code", "broca"] {
+            let (_dir, root) = test_root("meaning-hosted-head");
+            std::fs::write(
+                root.as_path().join("lib.rs"),
+                "pub fn needle() -> u32 { 1 }\n",
+            )
+            .unwrap();
+            let ctx = meaning_context(&root);
+            let _model = fill_with_constant_vectors_for_test(root.as_path(), 2);
+            let mut routes = HashMap::new();
+            let mut roots = HashMap::new();
+            let channel = route_key(61, 1);
+            insert_route_channel(
+                &mut routes,
+                &mut roots,
+                channel,
+                meaning_route(&root, harness, Some("head")),
+            );
+            assert_eq!(
+                admission(root.as_path(), &[]),
+                SemanticAdmission::InteractiveSession,
+                "{harness}"
+            );
+            aft_engine::data_layer::runtime::root_bound(ctx.as_ref());
+            wait_for_meaning_vectors(&ctx);
+            remove_route_channel(&mut routes, &mut roots, channel);
+        }
+    }
+
+    #[test]
+    fn meaning_only_qualifying_routes_hold_the_root_open() {
+        use crate::semantic_admission::{admission, SemanticAdmission::*};
+
+        let (_dir, root) = test_root("meaning-route-lifetime");
+        let mut routes = HashMap::new();
+        let mut roots = HashMap::new();
+        let plugin = route_key(61, 1);
+        for (harness, scope, expected) in [
+            ("opencode", None, InteractiveSession),
+            ("pi", None, InteractiveSession),
+            ("opencode2", None, NotOpened),
+            ("claude-code", None, NotOpened),
+            ("broca", None, NotOpened),
+            ("opencode", Some("worker"), NotOpened),
+            ("pi", Some("ephemeral"), NotOpened),
+        ] {
+            insert_route_channel(
+                &mut routes,
+                &mut roots,
+                plugin,
+                meaning_route(&root, harness, scope),
+            );
+            let observed = admission(root.as_path(), &[]);
+            remove_route_channel(&mut routes, &mut roots, plugin);
+            assert_eq!(observed, expected, "{harness} {scope:?}");
+        }
+
+        let first = route_key(62, 1);
+        let second = route_key(63, 1);
+        let worker = route_key(64, 1);
+        for (channel, scope) in [(first, "head"), (second, "head"), (worker, "worker")] {
+            insert_route_channel(
+                &mut routes,
+                &mut roots,
+                channel,
+                meaning_route(&root, "broca", Some(scope)),
+            );
+        }
+        remove_route_channel(&mut routes, &mut roots, first);
+        assert_eq!(admission(root.as_path(), &[]), InteractiveSession);
+        remove_route_channel(&mut routes, &mut roots, second);
+        assert_eq!(
+            admission(root.as_path(), &[]),
+            NotOpened,
+            "a worker with the same session does not hold the opener"
+        );
+        remove_route_channel(&mut routes, &mut roots, worker);
+    }
+
+    #[test]
+    fn meaning_already_bound_worker_fills_on_query_after_its_git_family_opens() {
+        use crate::semantic_admission::{admission, SemanticAdmission};
+        use aft_engine::test_bridge::display_data::meaning::fill_with_constant_vectors_for_test;
+
+        let (_head_dir, head) = test_root("meaning-family-head");
+        let (_worker_dir, worker) = test_root("meaning-family-worker");
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .current_dir(head.as_path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "git {args:?}: {result:?}");
+        };
+        git(&["init"]);
+        std::fs::write(
+            head.as_path().join("lib.rs"),
+            "pub fn needle() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        git(&["add", "lib.rs"]);
+        git(&[
+            "-c",
+            "user.name=AFT",
+            "-c",
+            "user.email=aft@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "fixture",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            worker.as_path().to_str().unwrap(),
+            "HEAD",
+        ]);
+
+        let ctx = meaning_context(&worker);
+        let _model = fill_with_constant_vectors_for_test(worker.as_path(), 2);
+        let mut routes = HashMap::new();
+        let mut roots = HashMap::new();
+        let worker_channel = route_key(61, 1);
+        let head_channel = route_key(62, 1);
+        insert_route_channel(
+            &mut routes,
+            &mut roots,
+            worker_channel,
+            meaning_route(&worker, "broca", Some("worker")),
+        );
+        aft_engine::data_layer::runtime::root_bound(ctx.as_ref());
+        assert!(
+            DataSemantic::current(ctx.as_ref()).is_none(),
+            "a worker alone stays off"
+        );
+
+        insert_route_channel(
+            &mut routes,
+            &mut roots,
+            head_channel,
+            meaning_route(&head, "opencode", Some("head")),
+        );
+        assert_eq!(
+            admission(worker.as_path(), &[]),
+            SemanticAdmission::OpenedRepository
+        );
+        let status = DataSemantic::current(ctx.as_ref());
+        assert!(
+            status.is_some(),
+            "the next query must refresh the cached off configuration"
+        );
+        wait_for_meaning_vectors(&ctx);
+        remove_route_channel(&mut routes, &mut roots, head_channel);
+        assert_eq!(
+            admission(worker.as_path(), &[]),
+            SemanticAdmission::NotOpened
+        );
+        remove_route_channel(&mut routes, &mut roots, worker_channel);
+    }
 
     #[test]
     fn parsed_project_config_leaves_with_last_route_but_survives_replacement() {
