@@ -1,5 +1,37 @@
 use super::*;
 
+const BASH_DESCRIPTION: &str = "Wait for the yield fixture release";
+
+pub(super) type BashReady = Arc<Mutex<HashMap<String, PathBuf>>>;
+
+pub(super) fn bash_ready_dir(root: &Path) -> PathBuf {
+    root.join("bash-wait-ready")
+}
+
+pub(super) fn configure(command: &mut Command, root: &Path) -> Result<(), HarnessError> {
+    let dir = bash_ready_dir(root);
+    std::fs::create_dir_all(&dir).map_err(harness_error)?;
+    command.env("AFT_TEST_CONFORMANCE_BASH_WAIT_READY", dir);
+    Ok(())
+}
+
+/// Match the conformance call key to the exact request on this provider connection.
+pub(super) fn track_bash_call(route: &Route, body: &Value, request: &Frame) {
+    if body["name"] != "bash" || body["arguments"]["description"] != BASH_DESCRIPTION {
+        return;
+    }
+    let (Some((dir, ready)), Some(key)) = (&route.yield_bash_ready, body["call_key"].as_str())
+    else {
+        return;
+    };
+    let header = &request.header;
+    let marker = dir.join(format!(
+        "{}-{}-{}",
+        header.channel, header.epoch, header.corr
+    ));
+    ready.lock().unwrap().insert(key.to_owned(), marker);
+}
+
 pub(super) struct ReleaseGuard<'a>(pub(super) &'a Subject);
 
 impl Drop for ReleaseGuard<'_> {
@@ -35,14 +67,13 @@ pub(super) fn call(subject: &Subject, tagged: bool) -> Option<CallSpec> {
         let done = release.with_extension("done");
         let release = release.display().to_string().replace('\'', "'\\''");
         let command = format!(
-            "{}; while [ ! -e '{}' ]; do sleep 0.2; done; {}",
-            marker_command(&file),
+            "while [ ! -e '{}' ]; do sleep 0.2; done; {}",
             release,
             marker_command(&done)
         );
         Some((
             "bash".into(),
-            json!({"command": command, "description":"Wait for the yield fixture release", "wait": true, "timeout": 300000}),
+            json!({"command": command, "description": BASH_DESCRIPTION, "wait": true, "timeout": 300000}),
         ))
     } else {
         std::fs::write(&file, b"read fixture\n").expect("write read fixture");
@@ -50,36 +81,37 @@ pub(super) fn call(subject: &Subject, tagged: bool) -> Option<CallSpec> {
     }
 }
 
-pub(super) async fn wait(subject: &Subject, _key: &str) -> Result<(), HarnessError> {
+pub(super) async fn wait(subject: &Subject, key: &str) -> Result<(), HarnessError> {
     let (file, tagged) = subject
         .yield_probe
         .lock()
         .unwrap()
         .clone()
         .ok_or_else(|| HarnessError::new("no call-yield probe"))?;
-    let ready = if tagged {
-        file.clone()
-    } else {
-        file.with_extension("held")
-    };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !ready.exists() {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(HarnessError::new(format!(
-                "call-yield probe did not start: {}",
-                ready.display()
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let release = file.with_extension("release");
     if tagged {
-        subject
-            .yield_releases
-            .lock()
-            .unwrap()
-            .push(file.with_extension("release"));
-    } else {
-        let release = file.with_extension("release");
+        subject.yield_releases.lock().unwrap().push(release.clone());
+    }
+    let mut ready = (!tagged).then(|| file.with_extension("held"));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if ready.is_none() {
+                ready = subject.yield_bash_ready.lock().unwrap().remove(key);
+            }
+            // Only the provider knows when a running shell can be yielded.
+            if ready.as_ref().is_some_and(|path| path.is_file()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        HarnessError::new(format!(
+            "call-yield probe {key:?} did not become ready: {ready:?}"
+        ))
+    })?;
+    if !tagged {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let _ = std::fs::write(release, b"release");

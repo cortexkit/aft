@@ -4019,6 +4019,17 @@ async fn run_deferred_bash_wait(
     // test waiting on this event sees exactly what a drain census taken next
     // would report for this call.
     if let Some(foreground_phase) = metrics.held_bash_calls.phase(route, corr) {
+        #[cfg(feature = "test-hooks")]
+        if let Some(dir) = std::env::var_os("AFT_TEST_CONFORMANCE_BASH_WAIT_READY") {
+            let marker =
+                PathBuf::from(dir).join(format!("{}-{}-{corr}", route.channel, route.epoch));
+            if let Err(error) = std::fs::write(&marker, b"ready") {
+                log::warn!(
+                    "cannot write bash wait marker {}: {error}",
+                    marker.display()
+                );
+            }
+        }
         if let Ok(guard) = metrics.lifecycle_probe.lock() {
             if let Some(probe) = guard.as_ref() {
                 probe.bash_foreground_wait(route, corr, foreground_phase.label());

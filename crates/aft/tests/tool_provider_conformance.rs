@@ -439,6 +439,8 @@ struct Subject {
     #[cfg(feature = "test-hooks")]
     yield_probe: Mutex<Option<(PathBuf, bool)>>,
     #[cfg(feature = "test-hooks")]
+    yield_bash_ready: yield_fixture::BashReady,
+    #[cfg(feature = "test-hooks")]
     yield_sequence: AtomicU64,
     #[cfg(feature = "test-hooks")]
     yield_releases: Mutex<Vec<PathBuf>>,
@@ -459,6 +461,8 @@ impl Subject {
             catalog_powershell: false,
             #[cfg(feature = "test-hooks")]
             yield_probe: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            yield_bash_ready: Default::default(),
             #[cfg(feature = "test-hooks")]
             yield_sequence: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
@@ -653,6 +657,8 @@ struct Route {
     channel: u16,
     scoped_preset: Option<&'static str>,
     legacy_diagnostics: Option<Arc<Mutex<HashMap<String, Value>>>>,
+    #[cfg(feature = "test-hooks")]
+    yield_bash_ready: Option<(PathBuf, yield_fixture::BashReady)>,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -963,7 +969,10 @@ impl Harness for Subject {
         })?;
         let mut command = provider_command(root, &connection_path)?;
         #[cfg(feature = "test-hooks")]
-        command.env("AFT_TEST_CONFORMANCE_READ_GATE", root.join("project"));
+        {
+            command.env("AFT_TEST_CONFORMANCE_READ_GATE", root.join("project"));
+            yield_fixture::configure(&mut command, root)?;
+        }
         if let Some(bytes) = windows_sized_main_stack().filter(|_| self.one_mib_main_stack) {
             #[cfg(unix)]
             {
@@ -1308,6 +1317,8 @@ async fn premature_trigger_diagnostics_include_response_error_and_eof() {
             channel: 1,
             scoped_preset: None,
             legacy_diagnostics: None,
+            #[cfg(feature = "test-hooks")]
+            yield_bash_ready: None,
         };
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let server = async move {
@@ -3344,6 +3355,8 @@ async fn bind_route_stamped_with_mode(
         channel,
         scoped_preset: stamp.scope.as_ref().map(|_| "head"),
         legacy_diagnostics: None,
+        #[cfg(feature = "test-hooks")]
+        yield_bash_ready: None,
     })
 }
 fn decode_principal(principal: &str) -> Result<Principal, HarnessError> {
@@ -3381,22 +3394,21 @@ impl Route {
     ) -> Result<Exchange, HarnessError> {
         self.adapt_preset(&mut body);
         let corr = self.wire.corr();
+        let request = Frame::build(
+            FrameType::Request,
+            flags(),
+            self.channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .map_err(harness_error)?;
+        #[cfg(feature = "test-hooks")]
+        yield_fixture::track_bash_call(self, &body, &request);
         // Registered before sending, so no reply can arrive unclaimed. Other
         // requests on the same connection proceed concurrently.
         let mut replies = self.wire.expect(self.channel, corr);
-        self.wire
-            .send(
-                &Frame::build(
-                    FrameType::Request,
-                    flags(),
-                    self.channel,
-                    1,
-                    corr,
-                    serde_json::to_vec(&body).unwrap(),
-                )
-                .map_err(harness_error)?,
-            )
-            .await?;
+        self.wire.send(&request).await?;
         if cancel {
             tokio::time::sleep(Duration::from_millis(100)).await;
             self.wire
@@ -3738,6 +3750,13 @@ impl ToolProviderSubject for Subject {
         )
         .await?;
         route.scoped_preset = self.preset.or(Some("head"));
+        #[cfg(feature = "test-hooks")]
+        {
+            route.yield_bash_ready = Some((
+                yield_fixture::bash_ready_dir(&handle.root),
+                self.yield_bash_ready.clone(),
+            ));
+        }
         wait_for_route_ready(&route, self.quick_call()).await;
         Ok(route)
     }
