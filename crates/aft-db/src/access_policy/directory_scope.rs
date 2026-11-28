@@ -496,3 +496,26 @@ pub(crate) fn scan_root_alias(directory: &Path, root: &Path) -> Option<bool> {
     }
     Some(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_level_file_read_approval_keeps_exact_file_scope() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = cwd.ancestors().last().unwrap();
+        let home = root.join("aft-test-home").join("user");
+        assert_eq!(
+            probe_directory_scope_at_home(root, &home, |_, _| Some(false)),
+            Ok(false)
+        );
+
+        let grant = AccessGrant {
+            path: root.join("aft-test-read.txt"),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        assert_eq!(directory_scope(&grant), grant);
+    }
+}

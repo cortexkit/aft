@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, parse } from "node:path";
 import { Effect } from "effect";
@@ -10,6 +10,12 @@ import { decidePermission, type V2PermissionRule } from "../v2-permission-host.j
 import { configureParamsFromLegacyOverrides, createHarness, prepareBinary } from "./helpers.js";
 
 const binary = await prepareBinary();
+
+async function existingFileTargets(folder: string): Promise<string[]> {
+  return (await readdir(folder, { withFileTypes: true }))
+    .filter((entry) => entry.isFile())
+    .map((entry) => join(folder, entry.name));
+}
 
 describe.skipIf(!binary.binaryPath)("outside-file always scope", () => {
   for (const version of [1, 2] as const) {
@@ -35,18 +41,41 @@ describe.skipIf(!binary.binaryPath)("outside-file always scope", () => {
             ? [process.env.SystemRoot ?? join(root, "Windows")]
             : ["/etc", "/usr/local"];
         const folders = [
-          { label: "home", directory: home, narrow: true },
-          { label: "home ancestor", directory: dirname(home), narrow: true },
-          { label: "root", directory: root, narrow: true },
-          ...systemFolders.map((directory) => ({ label: directory, directory, narrow: true })),
-          { label: "normal", directory: normal, narrow: false },
+          { label: "home", directory: home, narrow: true, fixture: true },
+          { label: "home ancestor", directory: dirname(home), narrow: true, fixture: true },
+          { label: "root", directory: root, narrow: true, fixture: false },
+          ...systemFolders.map((directory) => ({
+            label: directory,
+            directory,
+            narrow: true,
+            fixture: false,
+          })),
+          { label: "normal", directory: normal, narrow: false, fixture: true },
         ];
-        for (const { label, directory, narrow } of folders) {
+        for (const { label, directory, narrow, fixture } of folders) {
           const folder = await realpath(directory);
           const first = join(folder, "aft-always-first.txt");
           const sibling = join(folder, "aft-always-second.txt");
-          const expected = narrow ? first : join(folder, "*");
+          if (fixture) {
+            await writeFile(first, "first fixture\n");
+            await writeFile(sibling, "second fixture\n");
+          }
+          // Reads require existing files. Directories instead ask for their
+          // subtree, and the test must not create files in system locations.
+          let readTargets = fixture ? [first, sibling] : await existingFileTargets(folder);
+          if (label === "/usr/local" && readTargets.length < 2) {
+            // Some hosts have no local software installed. Zoneinfo still
+            // exercises a nested system folder with existing files.
+            readTargets = await existingFileTargets(await realpath("/usr/share/zoneinfo/Etc"));
+          }
           for (const operation of ["read", "write"] as const) {
+            const [firstTarget, siblingTarget] = operation === "read" ? readTargets : [first, sibling];
+            if (!firstTarget || !siblingTarget) {
+              if (label !== "root") throw new Error(`need two existing files for ${label}: read`);
+              console.warn(`SKIP OpenCode ${version} root read: ${folder} has fewer than two regular files`);
+              continue;
+            }
+            const expected = narrow ? firstTarget : join(folder, "*");
             const rules: V2PermissionRule[] = [];
             const prompts: V2PermissionRequest[] = [];
             const approve = (request: V2PermissionRequest) => {
@@ -88,7 +117,7 @@ describe.skipIf(!binary.binaryPath)("outside-file always scope", () => {
                 );
               },
             };
-            for (const file of [first, first, sibling]) {
+            for (const file of [firstTarget, firstTarget, siblingTarget]) {
               // Get a real permission-required response without approving a write to a system folder.
               const response = await h.bridge.toolCall(
                 `scope-${version}-${label}-${operation}`,
@@ -111,7 +140,7 @@ describe.skipIf(!binary.binaryPath)("outside-file always scope", () => {
               expected,
             ]);
             expect(prompts.length, `${label}: ${operation} sibling prompts`).toBe(narrow ? 2 : 1);
-            if (narrow) expect(prompts[1]?.always).toEqual([sibling]);
+            if (narrow) expect(prompts[1]?.always).toEqual([siblingTarget]);
           }
           // Shell scans have their own external-directory ask construction.
           const shell = await h.bridge.send("bash", {
