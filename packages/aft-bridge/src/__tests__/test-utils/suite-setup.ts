@@ -1,6 +1,6 @@
 import { afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { isolatedAftEnvironment } from "../../test-child-environment.js";
 import {
   assertAftDatabaseUnchanged,
@@ -17,6 +17,10 @@ const database = liveAftDatabasePath();
 const before = snapshotAftDatabase(database);
 Object.assign(process.env, isolatedAftEnvironment(root));
 process.env.AFT_TEST_ISOLATION_ROOT = root;
+// Both the suite home and an outer test-driver home can live under target/.
+// Stop discovery there without hiding repositories created inside fixtures.
+const gitCeilings = process.env.GIT_CEILING_DIRECTORIES;
+process.env.GIT_CEILING_DIRECTORIES = gitCeilings ? `${scratch}${delimiter}${gitCeilings}` : scratch;
 delete process.env.AFT_ALLOW_PRODUCTION_MIGRATION;
 
 // Register at preload time, before any test can spawn a bridge. Missing stores
