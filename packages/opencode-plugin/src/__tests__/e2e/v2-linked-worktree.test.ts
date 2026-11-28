@@ -54,7 +54,9 @@ test.skipIf(!hostBinary)(
       });
       await host.turn(session.id, "deny");
       const result = toolResult(host.requests, denied);
-      expect(result).toContain("permission rules deny");
+      expect(JSON.parse(result ?? "null")).toMatchObject({
+        error: { type: "permission.rejected", message: expect.stringContaining(denied) },
+      });
       expect(result).not.toContain("worktree-denied-probe\n");
     } catch (error) {
       throw new Error(`${String(error)}\n${host.logs().slice(-18000)}`, { cause: error });

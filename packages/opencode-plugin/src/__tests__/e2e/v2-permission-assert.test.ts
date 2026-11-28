@@ -88,7 +88,10 @@ test.skipIf(!binary)(
         await host.client.permission.saved.list({ projectID: session.projectID }),
       ).toHaveLength(0);
       await host.turn(session.id, "deny");
-      expect(toolResult(host.requests, commands.deny)).toContain("permission rules deny");
+      const denied = toolResult(host.requests, commands.deny);
+      expect(JSON.parse(denied ?? "null")).toMatchObject({
+        error: { type: "permission.rejected", message: expect.stringContaining(commands.deny) },
+      });
       expect(await host.client.permission.list({ sessionID: session.id })).toHaveLength(0);
       expect(await reply("feedback", "reject", "Use a narrower command")).toContain(
         "Use a narrower command",
