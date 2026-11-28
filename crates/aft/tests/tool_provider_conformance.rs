@@ -3718,7 +3718,9 @@ impl ToolProviderSubject for Subject {
             stamp.principal = if stamp.principal == "reserved:conformance-carrier" {
                 "direct".into()
             } else {
-                "reserved:basal".into()
+                // Basal with a head stamp is an exact-read route, not an
+                // ordinary non-carrier ToolProvider peer.
+                "reserved:conformance-peer".into()
             };
             if let Some(scope) = &mut stamp.scope {
                 scope.owner = "reserved:prefrontal".into();
