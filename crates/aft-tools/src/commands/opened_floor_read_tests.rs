@@ -59,7 +59,7 @@ impl Fixture {
         };
         config.backup.enabled = Some(false);
         config.sandbox.read_deny = vec![self.secret.parent().unwrap().to_path_buf()];
-        AppContext::new(Box::new(StubProvider), config)
+        crate::test_context(Box::new(StubProvider), config)
     }
 }
 

@@ -110,6 +110,7 @@
 /lsp/servers/*/root_markers/*: user
 /lsp/versions: user
 /lsp/versions/*: user
+/lsp/worker_rust_analyzers: all
 /memory: user
 /pi: all
 /pi/external_access_ask: raise_only [false,true]

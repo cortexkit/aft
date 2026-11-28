@@ -103,7 +103,7 @@ describe("OMP internal URL hand-back", () => {
       const { prepareArguments } = tool as unknown as {
         prepareArguments(args: unknown): Record<string, unknown>;
       };
-      const control = { command: "pwd", workdir: ".", timeout: 500 };
+      const control = { command: "pwd", description: "Show the working directory", workdir: ".", timeout: 500 };
       const padded = {
         ...control,
         cwd: "",

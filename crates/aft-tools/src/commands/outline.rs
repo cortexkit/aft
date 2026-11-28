@@ -5344,7 +5344,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             "export function directorySecond() {}\n",
         )
         .unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root),
@@ -5403,7 +5403,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         for name in ["a.ts", "b.ts"] {
             std::fs::write(directory.join(name), &source).unwrap();
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root),

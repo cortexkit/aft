@@ -7940,7 +7940,7 @@ mod deferred_terminal_tests {
                 ..Config::default()
             };
             config.inspect.categories.diagnostics = diagnostics;
-            let ctx = Arc::new(AppContext::new(
+            let ctx = Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 config,
             ));
