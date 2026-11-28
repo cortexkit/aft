@@ -27,7 +27,7 @@ impl Failure {
 
 struct Budget {
     limit: usize,
-    deadline: Instant,
+    deadline: Option<Instant>,
     entries: usize,
 }
 
@@ -35,7 +35,10 @@ impl Budget {
     fn check(&self) -> Result<(), &'static str> {
         if self.entries >= self.limit {
             Err("entry_limit")
-        } else if Instant::now() >= self.deadline {
+        } else if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             Err("time_limit")
         } else {
             Ok(())
@@ -55,13 +58,20 @@ pub(super) fn expand(
     matcher: &SharedGitignore,
     paths: &[PathBuf],
 ) -> Result<Vec<PathBuf>, Failure> {
-    expand_with_limits(
-        config,
-        matcher,
-        paths,
-        ENTRY_LIMIT,
-        Instant::now() + TIME_LIMIT,
-    )
+    expand_with_limits(config, matcher, paths, ENTRY_LIMIT, arrival_deadline())
+}
+
+fn arrival_deadline() -> Option<Instant> {
+    let now = Instant::now();
+    // Windows watcher tests can exercise subtree work independently of scheduling, or
+    // force expiry without delaying the watcher. Both retain the entry cap.
+    #[cfg(all(windows, feature = "test-hooks"))]
+    match std::env::var_os("AFT_TEST_WATCHER_DIRECTORY_ARRIVAL_DEADLINE").as_deref() {
+        Some(mode) if mode == "no_expiry" => return None,
+        Some(mode) if mode == "expired" => return Some(now),
+        _ => {}
+    }
+    Some(now + TIME_LIMIT)
 }
 
 fn expand_with_limits(
@@ -69,7 +79,7 @@ fn expand_with_limits(
     matcher: &SharedGitignore,
     paths: &[PathBuf],
     limit: usize,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<Vec<PathBuf>, Failure> {
     let mut budget = Budget {
         limit,
@@ -244,14 +254,7 @@ mod tests {
         for i in 0..8 {
             fs::write(path.join(format!("{i}.skip")), b"ignored").unwrap();
         }
-        let error = expand_with_limits(
-            &config,
-            &matcher,
-            &[path],
-            3,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .unwrap_err();
+        let error = expand_with_limits(&config, &matcher, &[path], 3, None).unwrap_err();
         assert_eq!(error.reason, "entry_limit");
         assert_eq!(error.entries, 3);
         error.report(&config);
@@ -268,7 +271,7 @@ mod tests {
             let mut entries = (0..10).inspect(|_| advances.set(advances.get() + 1));
             let mut budget = Budget {
                 limit,
-                deadline,
+                deadline: Some(deadline),
                 entries: 0,
             };
             assert_eq!(budget.next(&mut entries).unwrap_err(), reason);
