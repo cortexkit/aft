@@ -2153,5 +2153,7 @@ test("top-level formatter map with a non-refusal invalid value keeps the whole-s
     const config = JSON.parse(loaded.stdout);
     expect(config.formatter).toBeUndefined();
     expect(loaded.stderr).toContain("Discarded invalid configuration section: formatter");
+    // The summary must name the offending keys, like the generic branch does.
+    expect(loaded.stderr).toContain("formatter: formatter.");
   }
 });

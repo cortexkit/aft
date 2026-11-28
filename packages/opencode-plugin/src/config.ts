@@ -1389,9 +1389,16 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig | n
             .join(", ")}`,
         );
       } else {
-        // Not (only) a refusal we may recover: drop the section as before.
+        // Not (only) a refusal we may recover: drop the section as before,
+        // with the same per-issue detail the generic branch reports.
         warn(`Discarded invalid configuration section: ${key}`);
-        invalidSections.push(key);
+        const sectionErrors = sectionResult.error.issues
+          .filter((i) => i.path[0] === key)
+          .map((i) => `${i.path.join(".")}: ${i.message}`)
+          .join(", ");
+        if (sectionErrors) {
+          invalidSections.push(`${key}: ${sectionErrors}`);
+        }
       }
     } else if (key === "harnesses" && isConfigRecord(configForParsing.harnesses)) {
       // A harness block that fails only on refused formatter pairs keeps the
