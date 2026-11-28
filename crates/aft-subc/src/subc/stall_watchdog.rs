@@ -1995,7 +1995,9 @@ mod tests {
 
     #[test]
     fn pruning_keeps_only_the_newest_capture_files() {
-        let dir = tempfile::tempdir().expect("diagnostics dir");
+        // Cleanup requires the diagnostics directory and its parent to be owned by AFT's user.
+        let root = tempfile::tempdir().expect("storage root");
+        let dir = tempfile::tempdir_in(root.path()).expect("diagnostics dir");
         let now = SystemTime::now();
         let boot = now - ONE_HOUR;
         for second in 0..8 {
@@ -2029,7 +2031,8 @@ mod tests {
 
     #[test]
     fn interrupted_run_cleanup_prunes_profiler_sidecars_only_when_inactive() {
-        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().expect("storage root");
+        let dir = tempfile::tempdir_in(root.path()).expect("diagnostics dir");
         let now = SystemTime::now();
         let boot = now - 3 * ONE_HOUR;
         let path = |index, extension| {
