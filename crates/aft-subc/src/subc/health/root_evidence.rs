@@ -1,7 +1,18 @@
-use crate::context::AppContext;
+use crate::context::{AppContext, RootHealthSnapshot};
 use crate::data_layer::checkout::RefreshCounts;
 use crate::data_layer::surfaces::DataCheckoutProbe;
-use serde_json::Value;
+use serde_json::{json, Value};
+
+pub(super) fn root_findings_evidence(health: &RootHealthSnapshot, evidence: &Value) -> Value {
+    json!({
+        "project_root": health.project_root,
+        "state": health.state,
+        "cache_unavailable_reason": health.cache_unavailable_reason,
+        "view_storage_reserve": health.view_storage_reserve,
+        "suspended_domains": health.suspended_domains,
+        "diagnostics_evidence": evidence,
+    })
+}
 
 pub(super) fn refresh_counts(ctx: &AppContext) -> Option<RefreshCounts> {
     let DataCheckoutProbe::Bound(checkout) = ctx.probe_data_checkout()? else {
@@ -48,7 +59,6 @@ pub(super) fn health_nondefault(value: &Value) -> bool {
 mod tests {
     use super::super::{compact_health_root, reduce_health_root_details};
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn refresh_fallback_counters_survive_compaction_without_marking_a_root_failed() {

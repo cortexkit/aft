@@ -3275,7 +3275,7 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert(
             route_key(1, 1),
-            RouteIdentity(Arc::new(RouteIdentityData {
+            RouteIdentity::new(Arc::new(RouteIdentityData {
                 output_scope: Default::default(),
                 root: root.clone(),
                 project_root: root.as_path().to_path_buf(),

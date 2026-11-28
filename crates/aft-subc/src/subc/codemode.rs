@@ -765,7 +765,7 @@ fn effective_identity(
     if let Some(scope) = run.run_scope.get() {
         let _ = run_scope.set(Arc::clone(scope));
     }
-    RouteIdentity(Arc::new(RouteIdentityData {
+    RouteIdentity::new(Arc::new(RouteIdentityData {
         output_scope: owner.output_scope.clone(),
         root: owner.root.clone(),
         project_root: owner.project_root.clone(),

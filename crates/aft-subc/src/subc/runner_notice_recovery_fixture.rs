@@ -95,7 +95,7 @@ impl RunnerNoticeRecoveryForTest {
             Some(Principal::Reserved { module_id }) => Some(format!("reserved:{module_id}")),
             _ => panic!("fixture expects a supervised runner carrier"),
         };
-        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+        let identity = RouteIdentity::new(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: self.root.clone(),
             project_root: self.root.as_path().into(),

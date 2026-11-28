@@ -275,11 +275,18 @@ pub(super) fn from_health(
     stale_reason: Option<&str>,
     now: u64,
     window: u64,
+    index_plane_outages: &[super::health::index_planes::IndexPlaneOutage],
 ) -> Vec<Finding> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
-    from_health_with_budget(metrics, age_ms, stale_reason, now, window, || {
-        std::time::Instant::now() >= deadline
-    })
+    from_health_with_budget(
+        metrics,
+        age_ms,
+        stale_reason,
+        now,
+        window,
+        index_plane_outages,
+        || std::time::Instant::now() >= deadline,
+    )
 }
 
 fn from_health_with_budget(
@@ -288,6 +295,7 @@ fn from_health_with_budget(
     stale_reason: Option<&str>,
     now: u64,
     window: u64,
+    index_plane_outages: &[super::health::index_planes::IndexPlaneOutage],
     mut exhausted: impl FnMut() -> bool,
 ) -> Vec<Finding> {
     let mut findings = vec![];
@@ -300,6 +308,19 @@ fn from_health_with_budget(
         return findings;
     }
     let observed = now.saturating_sub(age_ms.unwrap_or(0));
+    for outage in index_plane_outages {
+        findings.push(condition(
+            "index_plane_outage",
+            outage.plane,
+            Severity::Error,
+            outage.root_count as u64,
+            observed.saturating_sub(outage.elapsed_ms),
+            now,
+            &outage.summary(),
+            vec![json!({"reason": outage.reason, "roots": outage.reason_count})],
+            "See index_plane_counts in AFT's health report, and each project's index details.",
+        ));
+    }
     // Omitted diagnostic evidence is still unknown. The caller must supply the
     // complete in-memory snapshot, never the size-budgeted presentation report.
     for field in ["root_details_omitted", "cache_unavailable_omitted"] {
@@ -592,7 +613,7 @@ mod tests {
     }
 
     fn snapshot(metrics: &Value) -> Vec<Finding> {
-        from_health(metrics, Some(0), None, 1_000_000, 60_000)
+        from_health(metrics, Some(0), None, 1_000_000, 60_000, &[])
     }
 
     #[test]
@@ -790,7 +811,7 @@ mod tests {
             (Some(FINDINGS_SNAPSHOT_MAX_AGE_MS + 1), None),
             (Some(0), Some("cache_contended")),
         ] {
-            let findings = from_health(&metrics, age, reason, 1_000_000, 1);
+            let findings = from_health(&metrics, age, reason, 1_000_000, 1, &[]);
             assert_eq!(findings.len(), 1);
             assert_eq!(findings[0].severity, Severity::Error);
         }
@@ -836,7 +857,7 @@ mod tests {
             })
             .collect::<Vec<_>>());
         let mut calls = 0;
-        let findings = from_health_with_budget(&metrics, Some(0), None, 1_000_000, 1, || {
+        let findings = from_health_with_budget(&metrics, Some(0), None, 1_000_000, 1, &[], || {
             calls += 1;
             calls > 1
         });
@@ -878,10 +899,11 @@ mod tests {
             metrics["storage_retention"] =
                 json!({"storage": {"at_ms": 1_000_000, "errors": ["failed"]}});
             let mut calls = 0;
-            let findings = from_health_with_budget(&metrics, Some(0), None, 1_000_000, 1, || {
-                calls += 1;
-                calls > 1
-            });
+            let findings =
+                from_health_with_budget(&metrics, Some(0), None, 1_000_000, 1, &[], || {
+                    calls += 1;
+                    calls > 1
+                });
             assert_eq!(findings.len(), 3);
             assert_eq!(findings[0].check, "root_health");
             assert!(findings[0].samples[0]["reason"]
