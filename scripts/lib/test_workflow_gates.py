@@ -57,6 +57,35 @@ def workflow_job(job_id: str) -> str:
     return match.group(1)
 
 
+class BunSetupWorkflowTests(unittest.TestCase):
+    def test_setup_bun_uses_only_the_committed_version_file_and_workflow_token(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        github = root / ".github"
+        self.assertRegex((root / ".bun-version").read_text().strip(), r"\A\d+\.\d+\.\d+\Z")
+        paths = [
+            path
+            for directory in (github / "workflows", github / "actions")
+            for pattern in ("*.yml", "*.yaml")
+            for path in directory.rglob(pattern)
+            if "oven-sh/setup-bun@" in path.read_text()
+        ]
+        for path in paths:
+            config = workflow_gates.parse_workflow(str(path))
+            groups = config.get("jobs", {"composite": config.get("runs", {})})
+            installs = [(group, index, step.get("with", {}))
+                        for group, job in groups.items()
+                        for index, step in enumerate(job.get("steps", []))
+                        if step.get("uses", "").startswith("oven-sh/setup-bun@")]
+            self.assertTrue(installs, f"unrecognized Bun setup steps in {path.relative_to(root)}")
+            for group, index, inputs in installs:
+                with self.subTest(path=path.relative_to(root), group=group, step=index):
+                    self.assertNotIn("bun-version", inputs, "direct versions, including latest, override .bun-version")
+                    self.assertNotIn("bun-download-url", inputs, "custom URLs bypass the shared version pin")
+                    self.assertEqual(inputs.get("bun-version-file"), ".bun-version")
+                    self.assertEqual(inputs.get("token"), "${{ github.token }}")
+        self.assertTrue(paths, "no Bun setup manifests checked")
+
+
 class ReleaseDebugArtifactWorkflowTests(unittest.TestCase):
     def setUp(self):
         path = Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"

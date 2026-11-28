@@ -10,7 +10,8 @@ runs:
 
     - uses: oven-sh/setup-bun@v2
       with:
-        bun-version: latest
+        bun-version-file: .bun-version
+        token: ${{ github.token }}
 
     - uses: dtolnay/rust-toolchain@stable
       with:

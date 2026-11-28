@@ -174,7 +174,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       # The E2E Dockerfile copies `packages/opencode-plugin/dist/` into the
       # image, so we have to produce that on the runner first. The plugin
@@ -265,7 +266,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - name: Download same-SHA OpenCode 2 binary
         uses: ./.github/actions/download-artifact-retry
@@ -438,7 +440,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - uses: actions/setup-node@v5
         with:
@@ -498,7 +501,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -611,7 +615,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:

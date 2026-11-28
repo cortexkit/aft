@@ -253,7 +253,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
 
       - uses: actions/setup-node@v5
         with:
@@ -462,7 +463,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
@@ -821,7 +823,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -919,7 +922,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1027,7 +1031,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1109,7 +1114,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1223,7 +1229,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1252,7 +1259,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1281,7 +1289,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1320,7 +1329,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1417,7 +1427,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1514,7 +1525,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1692,7 +1704,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1834,7 +1847,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1921,7 +1935,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -1994,7 +2009,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -2022,7 +2038,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -2050,7 +2067,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -2089,7 +2107,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:
@@ -2185,7 +2204,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
           no-cache: true
       - uses: actions/setup-node@v5
         with:

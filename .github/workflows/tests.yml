@@ -101,7 +101,8 @@ jobs:
           retention-days: 7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
@@ -133,7 +134,8 @@ jobs:
           components: rustfmt
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
+          token: ${{ github.token }}
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
