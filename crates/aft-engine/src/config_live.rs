@@ -408,9 +408,19 @@ pub fn reload_daemon_settings(
         return ReloadOutcome::NotConfigured;
     }
     // A project's cap limits its own language servers, not the shared pool.
-    let user_lsp_limit = source.user_lsp_limit();
-    if ctx.config_unpinned().lsp_user_max_servers != user_lsp_limit {
-        ctx.update_config(|config| config.lsp_user_max_servers = user_lsp_limit);
+    let user_lsp_limits = source.user_lsp_limits();
+    let published = ctx.config_unpinned();
+    if (
+        published.lsp_user_max_servers,
+        published.lsp_user_worker_rust_analyzers,
+    ) != user_lsp_limits
+    {
+        ctx.update_config(|config| {
+            (
+                config.lsp_user_max_servers,
+                config.lsp_user_worker_rust_analyzers,
+            ) = user_lsp_limits;
+        });
     }
     if !source.uses(changed) {
         return ReloadOutcome::NotConfigured;
@@ -555,7 +565,10 @@ fn reload_config_inner_with(ctx: &AppContext, approved_only: bool) -> ReloadOutc
             );
         }
         if let Some(settings) = &sources.approved_user {
-            candidate.lsp_user_max_servers = settings.user_lsp_limit();
+            (
+                candidate.lsp_user_max_servers,
+                candidate.lsp_user_worker_rust_analyzers,
+            ) = settings.user_lsp_limits();
         }
         let dropped: Vec<String> = diagnostics
             .dropped

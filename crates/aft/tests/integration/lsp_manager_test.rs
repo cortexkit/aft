@@ -424,6 +424,104 @@ fn rust_worker_user_capacity_of_three_admits_three_analyzers() {
 }
 
 #[test]
+fn rust_worker_daemon_project_cap_does_not_spend_the_peer_roots_slot() {
+    use aft::config_live::{reload_daemon_settings, ReloadOutcome};
+    use aft::config_resolve::ConfigTier;
+    use aft::context::AppContext;
+    use aft::harness::Harness;
+    use aft::subc_config::{with_prepared_bind_config, ApprovedUser, PreparedBindConfig};
+
+    let _guard = rust_worker_policy_test_guard();
+    crate::helpers::disable_in_process_file_watcher();
+    let (peer, peer_file, _) = rust_fixture_files();
+    let (project, project_file, _) = rust_fixture_files();
+    let root = canonicalize_lsp_root(&project.path().join("workspace"));
+    let user_tier = |limit| ConfigTier {
+        tier: "user".into(),
+        source: "daemon user settings".into(),
+        doc: json!({"lsp":{"worker_rust_analyzers":limit}}).to_string(),
+    };
+    let project_tier = |format_on_edit| ConfigTier {
+        tier: "user".into(),
+        source: "daemon effective project settings".into(),
+        doc: json!({
+            "lsp":{"worker_rust_analyzers":1},
+            "format_on_edit":format_on_edit,
+            "indexes":{"trigram":false,"semantic":false,"callgraph":false},
+        })
+        .to_string(),
+    };
+    let user = ApprovedUser::new(user_tier(2));
+    let settings = ApprovedUser::project(&user);
+    settings.replace(project_tier(true));
+    let prepared =
+        PreparedBindConfig::read_with_approved(None, Some(&settings), &root, &Harness::Opencode)
+            .unwrap();
+    let assert_limits = |config: &Config, ceiling| {
+        assert_eq!(config.lsp_worker_rust_analyzers, 1);
+        assert_eq!(config.lsp_user_worker_rust_analyzers, Some(ceiling));
+    };
+    assert_limits(prepared.resolved(), 2);
+
+    let storage = project.path().join("storage");
+    let ctx = AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config {
+            storage_dir: Some(storage.clone()),
+            ..Config::default()
+        }),
+    )
+    .with_test_checkpoint_store();
+    let request = serde_json::from_value(json!({
+        "id":"configure-worker-project-limit", "command":"configure", "harness":"opencode",
+        "project_root":root, "storage_dir":storage,
+    }))
+    .unwrap();
+    let configured = with_prepared_bind_config(prepared, || {
+        aft::commands::configure::handle_configure(&request, &ctx)
+    });
+    assert!(configured.success, "{configured:?}");
+    assert_limits(&ctx.config(), 2);
+
+    user.replace(user_tier(3));
+    let _ = reload_daemon_settings(&ctx, &user);
+    assert_limits(&ctx.config(), 3);
+    user.replace(user_tier(2));
+    let _ = reload_daemon_settings(&ctx, &user);
+    settings.replace(project_tier(false));
+    assert!(matches!(
+        reload_daemon_settings(&ctx, &settings),
+        ReloadOutcome::Reloaded { .. }
+    ));
+    assert_limits(&ctx.config(), 2);
+
+    let peer_config = PreparedBindConfig::read_with_approved(
+        None,
+        Some(&user),
+        &peer.path().join("workspace"),
+        &Harness::Opencode,
+    )
+    .unwrap();
+    let project_config = ctx.config();
+    let mut peer_manager = rust_worker_logged_manager(&peer.path().join("initialization.jsonl"));
+    let mut project_manager =
+        rust_worker_logged_manager(&project.path().join("initialization.jsonl"));
+    for (manager, file, config) in [
+        (&mut peer_manager, &peer_file, peer_config.resolved()),
+        (&mut project_manager, &project_file, project_config.as_ref()),
+    ] {
+        manager.disable_rust_cargo_for_worker();
+        assert_eq!(
+            crate::test_helpers::settled_lsp(manager, |manager| manager
+                .ensure_server_for_file(file, config))
+            .len(),
+            1,
+            "{file:?} should have a slot in the two-worker pool"
+        );
+    }
+}
+
+#[test]
 fn rust_worker_cap_never_counts_or_refuses_head_analyzers() {
     let _guard = rust_worker_policy_test_guard();
     let fixtures = (0..4).map(|_| rust_fixture_files()).collect::<Vec<_>>();

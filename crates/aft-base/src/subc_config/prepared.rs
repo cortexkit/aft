@@ -100,7 +100,10 @@ impl PreparedBindConfig {
             });
         }
         if let Some(approved) = approved_user {
-            resolution.config.lsp_user_max_servers = approved.user_lsp_limit();
+            (
+                resolution.config.lsp_user_max_servers,
+                resolution.config.lsp_user_worker_rust_analyzers,
+            ) = approved.user_lsp_limits();
         }
         let tiers = files.map(|file| file.tier.clone()).collect();
         if let Some(user) = user {

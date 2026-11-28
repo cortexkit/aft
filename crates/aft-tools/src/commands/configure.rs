@@ -2702,6 +2702,8 @@ fn handle_configure_inner(
         .filter(|snapshot| snapshot.daemon_managed())
     {
         next_config.lsp_user_max_servers = snapshot.resolved().lsp_user_max_servers;
+        next_config.lsp_user_worker_rust_analyzers =
+            snapshot.resolved().lsp_user_worker_rust_analyzers;
     }
     ctx.begin_configure_ack_step("source_tracking");
     if !recovery {

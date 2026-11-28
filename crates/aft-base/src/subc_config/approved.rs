@@ -41,14 +41,16 @@ impl ApprovedUser {
         }
     }
 
-    pub fn user_lsp_limit(&self) -> Option<usize> {
+    pub fn user_lsp_limits(&self) -> (Option<usize>, Option<usize>) {
         let user = match self.0.as_ref() {
             Approved::User(_) => self,
             Approved::Project(_, user) => user,
         };
-        crate::config_resolve::resolve_config(&[user.snapshot()])
-            .config
-            .lsp_user_max_servers
+        let config = crate::config_resolve::resolve_config(&[user.snapshot()]).config;
+        (
+            config.lsp_user_max_servers,
+            config.lsp_user_worker_rust_analyzers,
+        )
     }
 
     pub fn uses(&self, changed: &Self) -> bool {
