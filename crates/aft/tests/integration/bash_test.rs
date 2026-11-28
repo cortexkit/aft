@@ -1122,11 +1122,7 @@ fn assert_changed_files_completion_with_git_budget(
                 "{completion}"
             );
             assert_changed_file_image(&completion["_bash_changed_files"], name, exhausted);
-            assert_eq!(
-                completion["_bash_changed_files"]["incomplete"],
-                serde_json::json!([]),
-                "{completion}"
-            );
+            assert_changed_files_completeness(&completion, exhausted);
             let ack = aft.send(&serde_json::json!({"id":"ack-changes", "command":"bash_ack_completions", "params":{"task_ids":[result["task_id"]]}}).to_string());
             assert_eq!(ack["success"], true);
             let drained = aft.send(&serde_json::json!({"id":"drain-changes-again", "command":"bash_drain_completions"}).to_string());
@@ -1155,11 +1151,7 @@ fn assert_changed_files_completion_with_git_budget(
                 !files.iter().any(|file| file["path"] == "config.local.json"),
                 "ignored file leaked: {result}"
             );
-            assert_eq!(
-                result["_bash_changed_files"]["incomplete"],
-                serde_json::json!([]),
-                "{result}"
-            );
+            assert_changed_files_completeness(&result, exhausted);
             assert!(
                 result["_bash_changed_files"]["text"]
                     .as_str()
@@ -1170,6 +1162,23 @@ fn assert_changed_files_completion_with_git_budget(
             assert_changed_file_image(&result["_bash_changed_files"], name, exhausted);
         }
     }
+}
+
+#[cfg(unix)]
+fn assert_changed_files_completeness(reply: &serde_json::Value, git_exhausted: bool) {
+    let incomplete = &reply["_bash_changed_files"]["incomplete"];
+    // A zero Git before-image budget does not wait for the watcher. The
+    // ordinary completion test still requires no warnings, and
+    // `bash_changed_files_flush_timeout_reports_incomplete` requires the exact
+    // warning when the watcher fails to acknowledge the completion marker.
+    if git_exhausted
+        && incomplete == &serde_json::json!([
+            "Incomplete: the file watcher had not caught up when the command ended, so some changes may be missing."
+        ])
+    {
+        return;
+    }
+    assert_eq!(incomplete, &serde_json::json!([]), "{reply}");
 }
 
 #[cfg(unix)]
