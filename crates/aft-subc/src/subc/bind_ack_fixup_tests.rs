@@ -36,7 +36,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GateWrite<W> {
     }
 }
 
-fn bind(root: &Path, tool: bool, epoch: u32, corr: u64) -> Frame {
+fn bind(root: &Path, tool: bool, head: bool, epoch: u32, corr: u64) -> Frame {
     let request = {
         let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
             route_channel: 7,
@@ -60,6 +60,13 @@ fn bind(root: &Path, tool: bool, epoch: u32, corr: u64) -> Frame {
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root);
+        if head {
+            bind["scope"] = serde_json::json!({
+                "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+                "ref": "retracted-head", "scope_epoch": 1, "kind": "head",
+                "owner_authorized": true, "workdir": root,
+            });
+        }
 
         bind
     };
@@ -75,7 +82,22 @@ fn bind(root: &Path, tool: bool, epoch: u32, corr: u64) -> Frame {
 }
 
 async fn retracted_bind(tool: bool, trigger: &str, expected_code: &str) {
-    let (dir, root) = test_support::test_root("retracted-control-bind");
+    use crate::semantic_admission::{admission, SemanticAdmission};
+
+    let head = tool && trigger == "goodbye";
+    let (dir, root, sibling) = if head {
+        let (dir, root, sibling_dir, sibling) =
+            test_support::test_git_family("retracted-head-bind");
+        (dir, root, Some((sibling_dir, sibling)))
+    } else {
+        let (dir, root) = test_support::test_root("retracted-control-bind");
+        (dir, root, None)
+    };
+    let sibling_admission = || {
+        sibling
+            .as_ref()
+            .map(|(_, root)| admission(root.as_path(), &[]))
+    };
     let app = crate::test_app();
     let executor = Arc::new(Executor::new());
     let storage = dir.path().join("storage");
@@ -168,7 +190,7 @@ async fn retracted_bind(tool: bool, trigger: &str, expected_code: &str) {
     .await
     .unwrap();
     entering.await.unwrap();
-    write_frame(&mut daemon, &bind(root.as_path(), tool, 1, 891))
+    write_frame(&mut daemon, &bind(root.as_path(), tool, head, 1, 891))
         .await
         .unwrap();
     let queued = tokio::time::timeout(Duration::from_secs(15), async {
@@ -181,12 +203,13 @@ async fn retracted_bind(tool: bool, trigger: &str, expected_code: &str) {
         }
     })
     .await;
+    let pre_ack_admission = sibling_admission();
     if queued.is_ok() {
         let frame = match trigger {
             "goodbye" => {
                 Frame::build(FrameType::Goodbye, control_flags(), 7, 1, 0, Vec::new()).unwrap()
             }
-            "replacement" => bind(root.as_path(), tool, 2, 892),
+            "replacement" => bind(root.as_path(), tool, false, 2, 892),
             "stop" => {
                 Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 0, Vec::new()).unwrap()
             }
@@ -256,6 +279,10 @@ async fn retracted_bind(tool: bool, trigger: &str, expected_code: &str) {
         "an open bind control request needs one terminal"
     );
     assert_eq!(terminals[0].header.ty, FrameType::Error);
+    if head {
+        assert_eq!(pre_ack_admission, Some(SemanticAdmission::NotOpened));
+        assert_eq!(sibling_admission(), Some(SemanticAdmission::NotOpened));
+    }
     assert_eq!(
         serde_json::from_slice::<Value>(&terminals[0].body).unwrap()["code"],
         expected_code

@@ -1786,33 +1786,11 @@ impl SearchLaneStatus {
                 observation => observation,
             }
         };
-        let mut semantic_reload_started = false;
-        let semantic = match observed_index_status(ctx, ctx, IndexPlane::Semantic) {
-            // Enabled but not resident: a query is the signal that recovers an
-            // idle-evicted semantic index, as the semantic branch did before.
-            // A read-only root may also recover a failed shared snapshot; the
-            // reload trigger itself decides what is reloadable, and a missing
-            // ONNX Runtime is never retried.
-            observation
-                if (Self::not_observed(&observation)
-                    || observation.unavailable_reason.as_deref()
-                        == Some(feature_cause::SEMANTIC_BUILD_FAILED))
-                    && false =>
-            {
-                semantic_reload_started = true;
-                IndexObservation::building()
-            }
-            observation => observation,
-        };
         Self {
             trigram,
-            semantic,
-            semantic_reload_started,
+            semantic: observed_index_status(ctx, ctx, IndexPlane::Semantic),
+            semantic_reload_started: false,
         }
-    }
-
-    fn not_observed(observation: &IndexObservation) -> bool {
-        observation.unavailable_reason.as_deref() == Some(feature_cause::RUNTIME_NOT_OBSERVED)
     }
 
     fn observe_current(ctx: &AppContext) -> Self {

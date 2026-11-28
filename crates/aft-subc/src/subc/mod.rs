@@ -3622,22 +3622,6 @@ async fn end_withdrawn_bash_ask(
     Ok(())
 }
 
-/// Keeps semantic admission (see `semantic_admission`) in step with the
-/// installed routes: a session whose last route on a root is gone no longer
-/// holds that root open. Configure records the opening, before the route is
-/// installed, so a bind that never installs must release it here too.
-fn release_semantic_opener_if_unrouted(
-    routes: &HashMap<RouteChannel, RouteIdentity>,
-    identity: &RouteIdentity,
-) {
-    let still_routed = routes
-        .values()
-        .any(|route| route.root == identity.root && route.session == identity.session);
-    if !still_routed {
-        crate::semantic_admission::note_closed(&identity.session, identity.root.as_path());
-    }
-}
-
 fn insert_bg_subscription_index(
     bg_sub_by_session: &mut BgSubsBySession,
     root: ProjectRootId,
@@ -7294,7 +7278,6 @@ async fn handle_route_bind_completion(
             "subc attach: dropping RouteBind completion for non-pending route {}",
             completion.route
         );
-        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -7329,7 +7312,6 @@ async fn handle_route_bind_completion(
         metrics.record_bind_ack(pending.started_at.elapsed());
     }
     if pending.cancelled {
-        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -7363,7 +7345,6 @@ async fn handle_route_bind_completion(
     };
 
     if let Some((response, fallback)) = failure {
-        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -8330,13 +8311,13 @@ async fn handle_control_request(
                         log_ctx::with_session(Some(configure_session.clone()), || {
                             let bind_started = Instant::now();
                             job_snapshot.store(0, Ordering::Release);
-                            let response = match prepared_config.as_ref() {
-                                Some(snapshot) => crate::subc_config::with_prepared_bind_config(
-                                    Arc::clone(snapshot),
-                                    || dispatch(configure_req.clone(), ctx),
-                                ),
-                                None => dispatch(configure_req.clone(), ctx),
-                            };
+                            let response = installed_routes::configure_for_bind(
+                                dispatch,
+                                &configure_req,
+                                ctx,
+                                &output_identity,
+                                prepared_config.as_ref(),
+                            );
                             if response.success {
                                 output_identity.output_scope.get_or_init(|| {
                                     Arc::new(crate::output_store::OutputScope::new(
@@ -12687,6 +12668,52 @@ pub(crate) mod test_support {
             .expect("temp root");
         let root = ProjectRootId::from_path(dir.path()).expect("project root id");
         (dir, root)
+    }
+
+    pub(super) fn test_git_family(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        ProjectRootId,
+        tempfile::TempDir,
+        ProjectRootId,
+    ) {
+        let (main_dir, main) = test_root(&format!("{name}-main"));
+        let (linked_dir, linked) = test_root(&format!("{name}-linked"));
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .current_dir(main.as_path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "git {args:?}: {result:?}");
+        };
+        git(&["init"]);
+        std::fs::write(
+            main.as_path().join("lib.rs"),
+            "pub fn needle() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        git(&["add", "lib.rs"]);
+        git(&[
+            "-c",
+            "user.name=AFT",
+            "-c",
+            "user.email=aft@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "fixture",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked.as_path().to_str().unwrap(),
+            "HEAD",
+        ]);
+        (main_dir, main, linked_dir, linked)
     }
 
     pub(super) fn test_ctx() -> Arc<AppContext> {
