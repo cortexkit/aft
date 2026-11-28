@@ -218,23 +218,20 @@ class InstallerReleaseAssetTests(unittest.TestCase):
         self.assertLess(package, assemble)
         self.assertLess(assemble, indexes["Create GitHub Release"])
 
-        for target in self.TARGETS:
-            raw = target.replace("windows-", "win32-") + ".exe" if target.startswith("windows-") else target
-            (self.output / f"aft-{raw}").write_text("fixture binary bytes")
         binary = self.output / "aft-linux-x64"
         binary.write_text('#!/bin/sh\n[ "$1" = "--version" ] || exit 2\nprintf "aft 99.8.7-rc.1\\n"\n')
         binary.chmod(0o755)
+        self.stage_assets(linux_x64_payload=binary.read_bytes())
         (self.workdir / "scripts").mkdir()
         shutil.copy(self.script, self.workdir / "scripts")
-        for index in (package, assemble):
-            result = subprocess.run(
-                ["bash", "-e", "-c", steps[index]["run"]],
-                cwd=self.workdir,
-                env={**os.environ, "GITHUB_REF_NAME": self.TAG},
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(result.returncode, 0, result)
+        result = subprocess.run(
+            ["bash", "-e", "-c", steps[assemble]["run"]],
+            cwd=self.workdir,
+            env={**os.environ, "GITHUB_REF_NAME": self.TAG},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result)
         self.assertEqual(
             {path.name for path in self.output.glob("ck-aft-*")},
             {f"ck-aft-{target}.zip{suffix}" for target in self.TARGETS for suffix in ("", ".sha256")},
@@ -248,14 +245,14 @@ class InstallerReleaseAssetTests(unittest.TestCase):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         path.with_suffix(".zip.sha256").write_text(f"{digest}  {path.name}\n")
 
-    def stage_assets(self) -> Path:
+    def stage_assets(self, *, linux_x64_payload: bytes = b"fixture binary bytes") -> Path:
         self.stage.mkdir(exist_ok=True)
         for target in self.TARGETS:
             path = self.stage / f"ck-aft-{target}.zip"
             member = zipfile.ZipInfo("ck-aft.exe" if target.startswith("windows-") else "ck-aft")
             member.external_attr = 0o100755 << 16
             with zipfile.ZipFile(path, "w") as archive:
-                archive.writestr(member, b"fixture binary bytes")
+                archive.writestr(member, linux_x64_payload if target == "linux-x64" else b"fixture binary bytes")
             self.write_sidecar(path)
         return self.stage / "ck-aft-darwin-x64.zip"
 
