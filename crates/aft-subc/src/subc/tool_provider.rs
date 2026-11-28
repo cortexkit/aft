@@ -8591,7 +8591,11 @@ pub(in crate::subc) mod route_tests {
 
     #[tokio::test]
     async fn carried_unconfined_bash_is_refused_after_ledger_wait_and_older_epoch_save() {
-        carried_unconfined_after_ledger_wait("bash", json!({"command":"true"})).await;
+        carried_unconfined_after_ledger_wait(
+            "bash",
+            json!({"command":"true", "description":"Run the ledger fixture"}),
+        )
+        .await;
     }
 
     async fn carried_unconfined_after_ledger_wait(name: &str, arguments: Value) {

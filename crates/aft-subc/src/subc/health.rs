@@ -5795,8 +5795,9 @@ mod tests {
             let group = &metrics["root_groups"][0];
             assert_eq!(group["count"], count);
             assert_eq!(group["callgraph_store"]["status"], "building");
-            assert_eq!(group["examples"].as_array().unwrap().len(), 3);
-            assert_eq!(group["examples_omitted"], count - 3);
+            let examples = count.min(3);
+            assert_eq!(group["examples"].as_array().unwrap().len(), examples);
+            assert_eq!(group["examples_omitted"], count - examples);
             let once = metrics.clone();
             budget_health_metrics(&mut metrics);
             assert_eq!(metrics, once);
@@ -8842,7 +8843,7 @@ mod tests {
         let liveness = executor.dispatch_loop_liveness();
         assert!(liveness.has_pending_work());
         let contended = report();
-        assert_eq!(contended.status, HealthStatus::Degraded);
+        assert_eq!(contended.status, HealthStatus::Ok);
         let metrics = contended.metrics.unwrap();
         assert_eq!(metrics["generated_at_ms"], 1_900);
         assert_eq!(metrics["stale_reason"], "executor_contended");

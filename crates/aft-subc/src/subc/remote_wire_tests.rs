@@ -563,7 +563,7 @@ fn remote_pins_match_runon_variant_without_widening_base_arguments() {
             serde_json::from_value(request(
                 "bash",
                 "worker",
-                json!({"command":"not-dispatched", "runon":"linux"}),
+                json!({"command":"not-dispatched", "description":"Validate the remote pin", "runon":"linux"}),
                 "pin-only",
                 pin("bash", CatalogPreset::Head, offer_runon, false, None),
             ))

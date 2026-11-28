@@ -1275,7 +1275,7 @@ mod tests {
             .unwrap();
 
         let body = json!({
-            "name":"bash", "arguments":{"command":"true"},
+            "name":"bash", "arguments":{"command":"true", "description":"Run the admission fixture"},
             "call_key":"held-before-end", "preset":"head"
         });
         let decoded = DecodedFrame {

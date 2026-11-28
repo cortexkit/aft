@@ -24,14 +24,14 @@ struct DaemonState {
     root: Option<StoredRoot>,
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 static DAEMON: Mutex<DaemonState> = Mutex::new(DaemonState {
     history: None,
     read_at: None,
     root: None,
 });
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DAEMON: std::sync::LazyLock<
     Mutex<std::collections::HashMap<std::path::PathBuf, DaemonState>>,
 > = std::sync::LazyLock::new(Mutex::default);
@@ -40,9 +40,9 @@ fn daemon_state<T>(_paths: &StatePaths, f: impl FnOnce(&mut DaemonState) -> T) -
     let mut daemon = DAEMON
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     return f(&mut daemon);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     f(daemon.entry(_paths.root.clone()).or_default())
 }
 

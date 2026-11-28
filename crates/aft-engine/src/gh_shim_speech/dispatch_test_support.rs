@@ -29,7 +29,7 @@ impl SpeechManifest {
     pub fn sign_and_load(&self, root: PathBuf) {
         let paths = StatePaths::from_root(root);
         write_signed_manifest(&paths, self.0.clone(), unix_seconds());
-        load_manifest(&paths, unix_seconds()).unwrap();
+        load_manifest(&paths.for_daemon(), unix_seconds()).unwrap();
     }
 
     pub fn issue_comment_wire(

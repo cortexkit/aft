@@ -1158,6 +1158,9 @@ mod tests {
         }
         for (index, stamp) in invalid_scopes.into_iter().enumerate() {
             let channel = 50 + index as u16;
+            let head_read = stamp
+                .as_ref()
+                .is_some_and(|stamp| stamp.kind == ScopeKind::Head);
             let answer = request(
                 &mut daemon,
                 0,
@@ -1167,11 +1170,15 @@ mod tests {
             .await;
             assert_eq!(answer.header.ty, FrameType::Error, "{answer:?}");
             let error: ErrorBody = serde_json::from_slice(&answer.body).unwrap();
-            assert_eq!(error.code, "route_refused");
-            assert_eq!(
-                error.message,
-                "AFT management routes require a first-party principal"
-            );
+            if head_read {
+                assert_eq!(error.code, "file_read_exact_route_not_admitted");
+            } else {
+                assert_eq!(error.code, "route_refused");
+                assert_eq!(
+                    error.message,
+                    "AFT management routes require a first-party principal"
+                );
+            }
             assert_eq!(error.detail, None);
             assert!(!root.exists(), "refused bind must not initialize storage");
             assert_eq!(executor.actor_count(), 0);

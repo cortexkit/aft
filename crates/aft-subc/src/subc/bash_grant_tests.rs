@@ -280,7 +280,7 @@ async fn tool_provider_route_refuses_a_grant_the_model_put_in_its_arguments() {
         &case.executor,
         &case.routes,
         8,
-        json!({"command": COMMAND, "permissions_granted": grants}),
+        json!({"command": COMMAND, "description": "Run the grant fixture", "permissions_granted": grants}),
     )
     .await;
     assert_refused_at_admission(retry, "permissions_granted");
@@ -304,7 +304,7 @@ async fn tool_provider_route_refuses_a_grant_nested_under_params() {
         &case.executor,
         &case.routes,
         8,
-        json!({"params": {"command": COMMAND, "permissions_granted": grants}}),
+        json!({"params": {"command": COMMAND, "description": "Run the grant fixture", "permissions_granted": grants}}),
     )
     .await;
     assert_refused_at_admission(retry, "params");

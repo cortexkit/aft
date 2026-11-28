@@ -211,13 +211,8 @@ fn pty_replay_stops_a_live_process_and_reports_it_killed() {
         BgMode::Pty,
         BgTaskStatus::Running,
     );
-    task.child_pid = Some(pid);
-    task.pgid = Some(pid as i32);
-    // Replay trusts a live pid only when its process started no later than
-    // shortly after the task, so record the process's own start time.
-    if let Some(started_at) = aft::process_identity::process_start_time_ms(pid) {
-        task.started_at = started_at;
-    }
+    // Replay signals the group only when the saved birth matches its leader.
+    task.mark_running(pid, i32::try_from(pid).unwrap());
     write_task(
         &task_paths(storage.path(), SESSION, task_id).unwrap().json,
         &task,

@@ -1513,9 +1513,16 @@ async fn send_tool_call_with_preset(
     stream: &mut TcpStream,
     corr: u64,
     name: &str,
-    arguments: Value,
+    mut arguments: Value,
     preset: Option<&str>,
 ) {
+    if name == "bash" {
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .entry("description")
+            .or_insert_with(|| json!("Run the timing fixture"));
+    }
     let mut body = json!({ "name": name, "arguments": arguments });
     if let Some(preset) = preset {
         body["preset"] = json!(preset);

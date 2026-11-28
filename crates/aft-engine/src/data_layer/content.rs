@@ -1047,8 +1047,8 @@ mod tests {
             ("lib.ts", "import type { Shape } from './types';\nexport * from './other';\n// FIXME: keep type references\nexport function draw(shape: Shape): Shape { return shape; }\n"),
             ("notes.md", "# Notes\n<!-- TODO(writer): document the API -->\n<!-- FIXME: check examples -->\n"),
         ];
-        // These surface/body bytes were captured before moving syntax facts
-        // out of inspect. A refactor must not invalidate persisted records.
+        // Compare the exact surface/body bytes, including the extractor epoch.
+        // Only an intentional persisted-format change should alter the fixture.
         let expected: Vec<(String, Vec<u8>, Vec<u8>)> =
             serde_json::from_str(include_str!("content_compatibility.json")).unwrap();
         assert_eq!(expected.len(), corpus.len());

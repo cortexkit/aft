@@ -153,7 +153,7 @@ fn notice_records_match_occipital_phone_reader_sample_contract() {
                     "sha256:53f6286e704b9de70510c7dcce03b7fbe89991cdd2bc27c32d510f0a688fe59e"
                 }
                 ("finished", "page") => {
-                    "sha256:43583eb8147cd2f6a5c370b8226ee4a002b70bcb54d61f83958b1ef2dc105601"
+                    "sha256:7a920615fa74f40654b4d34ebb59bba9c09e26b8a05826bc43909eb1f8c9a7e1"
                 }
                 ("watch", "page") => {
                     "sha256:6d77314d5b03d3d40743b632bccf6f85c41ec693bd0bad570f7e953dcf781fc0"

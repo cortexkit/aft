@@ -2120,7 +2120,11 @@ mod tests {
                 .await;
         assert_eq!(response.data["status"], "completed", "{response:?}");
         let original = response.data["output"].as_str().unwrap().to_owned();
-        assert!(original.contains(&"x".repeat(2 * 1024 * 1024)));
+        let output_path = response.data["output_path"].as_str().unwrap();
+        let saved = std::fs::read_to_string(output_path).unwrap();
+        assert_eq!(saved, format!("{}\n", "x".repeat(2 * 1024 * 1024)));
+        assert!(original.contains(output_path), "{original}");
+        assert!(original.len() <= 51_200);
         let mut text = original.clone();
         crate::response_finalize::finalize_tool_response(
             &mut response,
@@ -2131,20 +2135,8 @@ mod tests {
             false,
         );
         assert!(text.len() <= 51_200);
-        let path = text
-            .rsplit_once("; full result saved to ")
-            .unwrap()
-            .1
-            .split_once("; read it with read and a line range]")
-            .unwrap()
-            .0;
-        let saved = std::fs::read_to_string(path).unwrap();
-        assert!(saved.starts_with(&original));
-        assert!(text.lines().any(|line| line == format!("[output cut at 50 KB of {:.1} KB; full result saved to {path}; read it with read and a line range]", saved.len() as f64 / 1024.0)));
-        assert_eq!(
-            response.data["output"], original,
-            "structured output must remain uncut"
-        );
+        assert_eq!(text, original, "the preview already fits the reply cap");
+        assert_eq!(response.data["output"], original);
     }
 
     #[test]

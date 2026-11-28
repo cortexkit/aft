@@ -99,6 +99,7 @@ pub fn disown_group_identities(registry: &BgTaskRegistry, id: &str) {
     let task = registry.task_for_session(id, "reclaim").unwrap();
     let mut state = task.lock_state().unwrap();
     *state.metadata.child_start_time_ms.as_mut().unwrap() += 1;
+    state.metadata.child_native_birth = None;
     for identity in &mut state.metadata.group_member_identities {
         identity.started_at_ms += 1;
         identity.native_birth = None;

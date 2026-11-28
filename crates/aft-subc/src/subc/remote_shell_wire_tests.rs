@@ -16,7 +16,7 @@ fn shell(corr: u64, timeout: u64) -> Value {
         format!("echo output-{corr}; echo $$ > pid-{corr}; touch started-{corr}; sleep 60; touch survived-{corr}");
     tool(
         "bash",
-        json!({"command":command, "timeout":timeout, "background":false, "pty":false}),
+        json!({"command":command, "description":"Run the remote shell fixture", "timeout":timeout, "background":false, "pty":false}),
         corr,
     )
 }

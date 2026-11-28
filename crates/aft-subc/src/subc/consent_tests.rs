@@ -1127,7 +1127,7 @@ impl Fixture {
         let mut body = json!({
             "name": name,
             "preset": if identity.run_owner.as_ref().is_some_and(|owner| matches!(owner.kind, super::super::codemode::RunKind::Agent { .. })) || identity.scope.as_ref().is_some_and(|s| s.kind == subc_protocol::scope::ScopeKind::Head) { "head" } else { "worker" },
-            "arguments": arguments,
+            "arguments": program_approvals::shell_fixture_arguments(name, arguments),
         });
         if let Some(preset) = preset {
             body["preset"] = json!(preset);

@@ -236,7 +236,7 @@ impl BgTaskRegistry {
             }
             **routed = true;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.inner
             .completion_processing_attempts
             .fetch_add(1, Ordering::SeqCst);
