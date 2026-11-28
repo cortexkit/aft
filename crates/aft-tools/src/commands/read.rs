@@ -993,11 +993,13 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut truncated_line = false;
     let mut read_output_tail = None;
     let width = end.to_string().len();
     for (offset, line) in lines[start..end].iter().enumerate() {
         let line_number = start + offset + 1;
         let display = if line.len() > MAX_LINE_LENGTH {
+            truncated_line = true;
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
             format!(
                 "{:>width$}: {}... (truncated)\n",
@@ -1022,7 +1024,8 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         lines_read = lines_read.saturating_add(1);
     }
     let actual_end = start_line + lines_read - u32::from(lines_read > 0);
-    let truncated = start > 0 || end < lines.len() || truncated_by_size;
+    let truncated =
+        truncated_by_size || truncated_line || (!has_requested_range(req) && end < lines.len());
     Response::success(
         &req.id,
         serde_json::json!({
@@ -1515,9 +1518,10 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 /// Returns for files:
 ///   `{ content, complete, total_lines?, lines_read, start_line, end_line, truncated, byte_size }`
 ///
-/// `complete` is false whenever the returned content is a slice/truncated. Full
-/// reads report exact `total_lines`; explicit ranged reads omit `total_lines`
-/// when they stop after the one-line lookahead and therefore do not know EOF.
+/// `complete` is true when all existing content in the requested range (or the
+/// whole file if no range was requested) was returned. The read checks for more
+/// data after an explicit range without counting the remaining lines, so
+/// `total_lines` may be unknown even when the requested range is complete.
 ///
 /// Returns for directories:
 ///   `{ entries[], total_entries }`
@@ -1815,6 +1819,17 @@ struct ReadWindow {
     start: u32,
     end: Option<u64>,
     limit: u32,
+}
+
+fn has_requested_range(req: &RawRequest) -> bool {
+    ["start_line", "end_line", "limit"]
+        .into_iter()
+        .any(|field| {
+            req.params
+                .get(field)
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+        })
 }
 
 /// Normalize zero placeholders and line bounds once so physical reads and
@@ -2260,6 +2275,7 @@ fn render_text_read(
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut truncated_line_bytes = false;
     let mut read_output_tail = None;
 
     let line_num_width = format!("{}", end_idx).len();
@@ -2272,6 +2288,7 @@ fn render_text_read(
     {
         let line_num = start_idx + i + 1; // 1-based
         let (display_text, truncated_line) = if line.len() > MAX_LINE_LENGTH {
+            truncated_line_bytes = true;
             // Find a safe UTF-8 boundary at or before MAX_LINE_LENGTH to avoid
             // panicking on multi-byte characters (e.g. emoji, CJK).
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
@@ -2327,18 +2344,18 @@ fn render_text_read(
     }
 
     let actual_end = start_line + lines_read - if lines_read > 0 { 1 } else { 0 };
-    let has_more = (start_idx > 0) || (end_idx as u32) < total_lines || truncated_by_size;
+    let truncated = (end_idx as u32) < total_lines || truncated_by_size || truncated_line_bytes;
 
     Response::success(
         &req.id,
         serde_json::json!({
             "content": output,
-            "complete": !has_more,
+            "complete": !truncated,
             "total_lines": total_lines,
             "lines_read": lines_read,
             "start_line": start_line,
             "end_line": actual_end,
-            "truncated": has_more,
+            "truncated": truncated,
             "read_output_tail": read_output_tail,
             "byte_size": byte_size,
         }),
@@ -2575,12 +2592,14 @@ fn handle_streaming_range_read(
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut truncated_line = false;
     let mut read_output_tail = None;
     let line_num_width = format!("{}", requested_start_idx + selected_lines.len()).len();
 
     for (i, line) in selected_lines.iter().enumerate() {
         let line_num = requested_start_idx + i + 1;
         let display_line = if line.len() > MAX_LINE_LENGTH {
+            truncated_line = true;
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
             format!(
                 "{:>width$}: {}... (truncated)\n",
@@ -2608,8 +2627,10 @@ fn handle_streaming_range_read(
     }
 
     let actual_end = start_line + lines_read - if lines_read > 0 { 1 } else { 0 };
-    let has_more = requested_start_idx > 0 || has_more_after_range;
-    let truncated = has_more || truncated_by_size || scan_gap;
+    let truncated = truncated_by_size
+        || truncated_line
+        || scan_gap
+        || (!has_requested_range(req) && has_more_after_range);
     if scan_gap {
         read_output_tail.get_or_insert(output.len());
         output.push_str(&format!("\nshown {lines_read} of at least {observed_lines} examined lines (line or response scan budget) · narrow: start_line/end_line; {scanned_bytes} bytes scanned\n"));
@@ -3657,6 +3678,67 @@ mod tests {
         crate::subc_format::format_response("read", response, agent_specified_range)
     }
 
+    #[test]
+    fn read_requested_window_reports_complete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let content: String = (1..=24).map(|n| format!("line {n}\n")).collect();
+        let path = write_fixture(temp.path(), "window.txt", content.as_bytes());
+
+        for (params, start, end, total) in [
+            (json!({"start_line": 3, "end_line": 20}), 3, 20, None),
+            (json!({"end_line": 20}), 1, 20, None),
+            (json!({"limit": 20}), 1, 20, None),
+            (json!({"start_line": 3}), 3, 24, Some(24)),
+            (json!({"start_line": 3, "end_line": 99}), 3, 24, Some(24)),
+        ] {
+            let response = read_response(temp.path(), &path, params.clone());
+            assert!(response.success, "{params}: {response:?}");
+            let width = end.to_string().len();
+            let text: String = (start..=end)
+                .map(|n| format!("{n:>width$}: line {n}\n"))
+                .collect();
+            assert_eq!(render_read(&response, true), text, "{params}");
+            assert_eq!(response.data["lines_read"], end - start + 1);
+            assert_eq!(response.data["total_lines"].as_u64(), total);
+            assert_eq!(response.data["complete"], true, "{params}: {response:?}");
+            assert_eq!(response.data["truncated"], false, "{params}");
+        }
+
+        let past_end = read_response(temp.path(), &path, json!({"start_line": 25}));
+        assert!(!past_end.success);
+        assert_eq!(past_end.data["code"], "invalid_range");
+    }
+
+    #[test]
+    fn read_requested_window_with_a_clipped_line_is_incomplete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let content = format!("{}\n", "x".repeat(MAX_LINE_LENGTH + 1));
+        let path = write_fixture(temp.path(), "long-line.txt", content.as_bytes());
+
+        for params in [json!({"end_line": 1}), json!({})] {
+            let ranged = params.get("end_line").is_some();
+            let response = read_response(temp.path(), &path, params);
+            assert!(response.success);
+            assert!(render_read(&response, ranged).contains("... (truncated)"));
+            assert_eq!(response.data["complete"], false, "{response:?}");
+            assert_eq!(response.data["truncated"], true);
+        }
+    }
+
+    #[test]
+    fn default_read_window_is_incomplete_when_a_file_exceeds_the_line_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let content = "line\n".repeat(DEFAULT_LIMIT as usize + 1);
+        let path = write_fixture(temp.path(), "many-lines.txt", content.as_bytes());
+        for params in [json!({}), json!({"start_line": 0, "limit": 0})] {
+            let response = read_response(temp.path(), &path, params);
+            assert!(response.success);
+            assert_eq!(response.data["lines_read"], DEFAULT_LIMIT);
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(response.data["truncated"], true);
+        }
+    }
+
     /// Build a text fixture whose rendered line-numbered output exceeds
     /// `MAX_BYTES` (50KB) so a whole-file read truncates.
     fn oversized_text_fixture(root: &Path, name: &str) -> PathBuf {
@@ -3777,6 +3859,22 @@ mod tests {
             !text.contains("File is large"),
             "ranged read must not carry the soft note, got: {text}"
         );
+    }
+
+    #[test]
+    fn ranged_read_cut_by_response_byte_cap_is_incomplete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = oversized_text_fixture(temp.path(), "big.txt");
+        let response = read_response(
+            temp.path(),
+            &path,
+            json!({"start_line": 3, "end_line": 2000}),
+        );
+        assert!(response.success);
+        assert!(response.data["lines_read"].as_u64().unwrap() < 1998);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["truncated"], true);
+        assert!(render_read(&response, true).contains("line or response scan budget"));
     }
 }
 

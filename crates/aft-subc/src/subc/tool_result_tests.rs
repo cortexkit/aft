@@ -319,6 +319,37 @@ fn scratch_project() -> tempfile::TempDir {
 }
 
 #[test]
+fn read_requested_window_keeps_completeness_in_structured_reply() {
+    let project = scratch_project();
+    let root = project.path();
+    let path = root.join("read.txt");
+    std::fs::write(&path, "first\nsecond\nthird\nfourth\n").unwrap();
+    let ctx = context(root);
+    let result = run(
+        &ctx,
+        root,
+        "read",
+        json!({"path": path, "startLine": 2, "endLine": 3}),
+        &|req, ctx| crate::commands::read::handle_read(&req, ctx),
+    );
+    let frame = project_frame(
+        wire::build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            1,
+            control_flags(),
+            &result,
+            opted_in(BindTrust::FirstParty),
+        )
+        .unwrap(),
+    );
+    let body: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(body["content"][0]["text"], "2: second\n3: third\n");
+    assert_eq!(body["structuredContent"]["complete"], true, "{body}");
+    assert_eq!(body["structuredContent"]["truncated"], false);
+}
+
+#[test]
 fn tool_result_images_are_ordered_and_kept_in_structured_content() {
     let project = scratch_project();
     let root = project.path();
