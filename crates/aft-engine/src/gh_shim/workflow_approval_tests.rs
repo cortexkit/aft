@@ -2,6 +2,7 @@ use super::*;
 use std::cell::RefCell;
 use tests::ScopedTestEnvVar as Env;
 
+#[cfg(not(windows))]
 const REPO: &str = "test-org/unbound";
 const ENDPOINT: &str = "repos/test-org/unbound/actions/runs/42/approve";
 const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -144,6 +145,8 @@ impl Fixture {
     }
 }
 
+// Manifest version 30 declares fork-run approval for macOS and Linux only.
+#[cfg(not(windows))]
 #[test]
 fn hosted_workflow_is_checked_at_the_fork_head_and_audited_before_post() {
     let fixture = Fixture::new(30, true);
@@ -184,6 +187,7 @@ fn hosted_workflow_is_checked_at_the_fork_head_and_audited_before_post() {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn unsafe_workflow_refuses_even_for_an_unbound_operator_bypass() {
     let fixture = Fixture::new(30, true);
@@ -226,6 +230,7 @@ fn unsafe_workflow_refuses_even_for_an_unbound_operator_bypass() {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn missing_workflow_wrong_event_and_wrong_status_refuse_before_post() {
     let fixture = Fixture::new(30, true);
@@ -299,6 +304,7 @@ fn approval_cannot_override_the_checked_endpoint_or_host() {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 fn approval_requires_the_operator_bypass_and_no_bot_credentials() {
     let fixture = Fixture::new(30, true);
@@ -318,5 +324,17 @@ fn approval_requires_the_operator_bypass_and_no_bot_credentials() {
         replies("pull_request", "action_required", Ok(HOSTED)),
         0,
         "gh_shim_bypass_bot_credentials",
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_refuses_fork_run_approval_as_unclassified_before_preflight() {
+    let fixture = Fixture::new(30, true);
+    fixture.refuses(
+        &["api", "-XPOST", ENDPOINT],
+        replies("pull_request", "action_required", Ok(HOSTED)),
+        0,
+        "gh_shim_unclassified: api POST /repos/test-org/unbound/actions/runs/42/approve is not declared in manifest 30",
     );
 }

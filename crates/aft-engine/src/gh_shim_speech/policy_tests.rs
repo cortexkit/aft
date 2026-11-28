@@ -789,8 +789,7 @@ fn provisioned_worker_run_rerun_never_suggests_the_operator_bypass() {
     }
 }
 
-#[test]
-fn audited_operator_write_rechecks_manifest_before_native_delegation() {
+fn operator_write_after_manifest_loss() -> (bool, Vec<String>) {
     let _lock = crate::test_env::process_env_lock();
     let manifest = super::tests::fixture_manifest();
     let fixture = RunWithFixture::new(&manifest);
@@ -857,16 +856,27 @@ fn audited_operator_write_rechecks_manifest_before_native_delegation() {
         },
     );
     assert_eq!(lookups, 1);
-    assert_eq!(exit, 86);
+    assert_eq!(exit, REFUSAL_EXIT_STATUS);
     assert_eq!(delegated, 0);
-    // The audited operator bypass exists only where the fixture manifest
-    // governs writes (macOS, Linux). Elsewhere the write is not governed, so
-    // nothing is audited, but the missing manifest must still refuse it.
-    assert_eq!(
-        fixture.paths.bypass_audit.is_file(),
-        current_platform() != "unsupported"
-    );
-    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_manifest_unavailable: GitHub routing policy changed before the command could run. Start the command again.".to_string()]);
+    let lines = lines.lock().unwrap().clone();
+    (fixture.paths.bypass_audit.is_file(), lines)
+}
+
+// Only the macOS and Linux manifest policy reaches the audited operator path.
+#[cfg(not(windows))]
+#[test]
+fn audited_operator_write_rechecks_manifest_before_native_delegation() {
+    let (audited, lines) = operator_write_after_manifest_loss();
+    assert!(audited);
+    assert_eq!(lines, ["gh-shim: gh_shim_manifest_unavailable: GitHub routing policy changed before the command could run. Start the command again."]);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_refuses_operator_write_when_manifest_disappears_without_auditing() {
+    let (audited, lines) = operator_write_after_manifest_loss();
+    assert!(!audited);
+    assert_eq!(lines, ["gh-shim: gh_shim_manifest_unavailable: GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work."]);
 }
 
 #[test]
