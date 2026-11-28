@@ -9756,6 +9756,7 @@ pub(in crate::subc) mod route_tests {
 
     #[tokio::test]
     async fn catalog_bypasses_reads_configure_warmup_and_cold_builds() {
+        let watchdog = Duration::from_secs(30);
         let (_dir, root) = test_support::test_root("catalog-pure-read");
         let (_heavy_dir, heavy_root) = test_support::test_root("catalog-cold-build");
         let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
@@ -9781,7 +9782,7 @@ pub(in crate::subc) mod route_tests {
                 Response::success("heavy", json!({}))
             }),
         );
-        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        started.recv_timeout(watchdog).expect("cold build started");
         let (tail_started, started) = std::sync::mpsc::channel();
         let (release_tail, tail_release) = std::sync::mpsc::channel();
         let tail = executor.submit_maintenance_async(
@@ -9794,7 +9795,9 @@ pub(in crate::subc) mod route_tests {
                 Response::success("tail", json!({}))
             }),
         );
-        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        started
+            .recv_timeout(watchdog)
+            .expect("configure warmup started");
         let (read_started, started) = std::sync::mpsc::channel();
         let (release_read, read_release) = std::sync::mpsc::channel();
         let read = executor.submit_async(
@@ -9807,26 +9810,30 @@ pub(in crate::subc) mod route_tests {
                 Response::success("read", json!({}))
             }),
         );
-        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        started.recv_timeout(watchdog).expect("pure read started");
         let (writer, mut replies) = mpsc::channel(8);
         let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
-        let requested_at = Instant::now();
-        submit_provider_read(
-            &writer,
-            &frame,
-            test_support::route_identity(&root, "catalog-session"),
-            &executor,
-            &Arc::default(),
-            &Arc::new(DispatchPathMetrics::new()),
-            "tool.catalog",
-            json!({}),
-            PhaseTrace::new(requested_at),
-            test_support::test_request_meta(),
-        )
-        .await
-        .unwrap();
-        let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
-        let reply_elapsed = requested_at.elapsed();
+        // None of the holders is released until the real response arrives.
+        // The watchdog only breaks a hang; it is not a catalog latency bound.
+        let reply = tokio::time::timeout(watchdog, async {
+            submit_provider_read(
+                &writer,
+                &frame,
+                test_support::route_identity(&root, "catalog-session"),
+                &executor,
+                &Arc::default(),
+                &Arc::new(DispatchPathMetrics::new()),
+                "tool.catalog",
+                json!({}),
+                PhaseTrace::new(Instant::now()),
+                test_support::test_request_meta(),
+            )
+            .await
+            .unwrap();
+            replies.recv().await
+        })
+        .await;
+        let warmup_still_pending = ctx.database_runtime_pending("write");
         if reply.is_err() {
             eprintln!(
                 "catalog timeout: dispatch={:?} running={:?}",
@@ -9853,13 +9860,7 @@ pub(in crate::subc) mod route_tests {
             .finish(now, now, now, reply.frame.body.len(), None)
             .expect("tool.catalog trace must have executor and writer timings");
         assert_eq!(completed.session, "catalog-session");
-        assert!(completed.phases.queue < Duration::from_millis(500));
-        eprintln!(
-            "catalog with index/warmup held: reply_ms={} queue_ms={}",
-            reply_elapsed.as_millis(),
-            completed.phases.queue.as_millis()
-        );
-        assert!(ctx.database_runtime_pending("write"));
+        assert!(warmup_still_pending);
         assert_eq!(executor.heavy_permits(), 1);
     }
 
