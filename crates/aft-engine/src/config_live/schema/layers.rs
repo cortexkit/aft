@@ -68,7 +68,10 @@ pub(super) fn set(node: &mut Map<String, Value>, path: &str) {
         "remote_exec.enabled" | "indexes.trigram" | "indexes.semantic" | "indexes.callgraph" => {
             ("lower_only", Some(json!([false, true])))
         }
-        "lsp.max_servers" | "lsp.idle_minutes" | "bash.memory_limit_mib" => ("lower_only", None),
+        "lsp.max_servers"
+        | "lsp.worker_rust_analyzers"
+        | "lsp.idle_minutes"
+        | "bash.memory_limit_mib" => ("lower_only", None),
         "lsp.idle_shutdown" | "bash.disclaim_privacy" | "pi.external_access_ask" => {
             ("raise_only", Some(json!([false, true])))
         }

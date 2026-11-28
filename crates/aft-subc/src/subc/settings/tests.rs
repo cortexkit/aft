@@ -682,6 +682,45 @@ async fn settings_review_refuses_the_entire_workspace_or_project_snapshot() {
 }
 
 #[tokio::test]
+async fn settings_review_refuses_higher_worker_rust_analyzer_limits() {
+    let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
+    for layer in [ConfigLayer::Workspace, ConfigLayer::Project] {
+        let user = ConfigLayerSnapshot::file(
+            "aft",
+            ConfigLayer::User,
+            "user/aft.jsonc",
+            Some(br#"{"lsp":{"max_servers":2,"worker_rust_analyzers":2}}"#.to_vec()),
+        );
+        for key in ["max_servers", "worker_rust_analyzers"] {
+            let mut snapshot = ConfigLayerSnapshot::file(
+                "aft",
+                layer.clone(),
+                "root/.cortexkit/aft.jsonc",
+                Some(serde_json::to_vec(&json!({"lsp":{(key):3}})).unwrap()),
+            );
+            snapshot.project_id = Some("p".into());
+            if layer == ConfigLayer::Workspace {
+                snapshot.workspace_id = Some("w".into());
+            }
+            let request = frame(
+                FrameType::Request,
+                8,
+                json!(ConfigReviewRequest::new(
+                    0,
+                    vec![user.clone(), snapshot],
+                    None
+                )),
+            );
+            let reply = review::response(&schema, &request).await.unwrap().unwrap();
+            let body: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+            assert!(body.fields.is_empty(), "{layer:?} {key}: {body:?}");
+            assert_eq!(body.refusals.len(), 1, "{layer:?} {key}: {body:?}");
+            assert_eq!(body.refusals[0].paths, [format!("/lsp/{key}")]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn settings_two_routes_share_the_project_view_and_unknown_falls_back() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (writer, mut written) = mpsc::channel(16);
