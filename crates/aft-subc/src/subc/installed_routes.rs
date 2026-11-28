@@ -71,6 +71,58 @@ pub(super) fn status_unbound(route: &RouteIdentity) {
     crate::late_result_bus::status::route_unbound(Arc::as_ptr(&route.0) as usize, &route.session);
 }
 
+fn opens_meaning_root(route: &RouteIdentity) -> bool {
+    crate::semantic_admission::opens_root(
+        route.harness.parse().ok().as_ref(),
+        route.scope.as_ref().map(|stamp| stamp.kind),
+    )
+}
+
+fn release_semantic_opener_if_unrouted(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    identity: &RouteIdentity,
+) {
+    if opens_meaning_root(identity)
+        && !routes.values().any(|route| {
+            route.root == identity.root
+                && route.session == identity.session
+                && opens_meaning_root(route)
+        })
+    {
+        crate::semantic_admission::note_closed(&identity.session, identity.root.as_path());
+    }
+}
+
+pub(super) fn clear_installed_routes(routes: &mut HashMap<RouteChannel, RouteIdentity>) {
+    for (_, route) in routes.drain() {
+        status_unbound(&route);
+        runner_notices::route_unbound(&route);
+        if opens_meaning_root(&route) {
+            crate::semantic_admission::note_closed(&route.session, route.root.as_path());
+        }
+    }
+}
+
+pub(super) fn configure_for_bind(
+    dispatch: DispatchFn,
+    request: &RawRequest,
+    ctx: &AppContext,
+    route: &RouteIdentity,
+    prepared: Option<&Arc<crate::subc_config::PreparedBindConfig>>,
+) -> Response {
+    crate::semantic_admission::with_daemon_bind_scope(
+        route.scope.as_ref().map(|stamp| stamp.kind),
+        || match prepared {
+            Some(snapshot) => {
+                crate::subc_config::with_prepared_bind_config(Arc::clone(snapshot), || {
+                    dispatch(request.clone(), ctx)
+                })
+            }
+            None => dispatch(request.clone(), ctx),
+        },
+    )
+}
+
 pub(super) fn remove_route_channel(
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -92,7 +144,7 @@ pub(super) fn insert_route_channel(
     channel: RouteChannel,
     identity: RouteIdentity,
 ) {
-    if crate::semantic_admission::harness_opens_root(&identity.harness) {
+    if opens_meaning_root(&identity) {
         crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
     }
     crate::late_result_bus::status::route_bound(
@@ -115,7 +167,7 @@ pub(super) fn insert_route_channel(
 mod tests {
     use super::*;
     use crate::subc::test_support::{
-        route_identity, route_identity_with_harness, test_ctx, test_root,
+        route_identity, route_identity_with_harness, test_ctx, test_git_family, test_root,
     };
     use aft_engine::data_layer::meaning_query::DataSemantic;
 
@@ -246,7 +298,19 @@ mod tests {
             NotOpened,
             "a worker with the same session does not hold the opener"
         );
-        remove_route_channel(&mut routes, &mut roots, worker);
+        insert_route_channel(
+            &mut routes,
+            &mut roots,
+            first,
+            meaning_route(&root, "broca", Some("head")),
+        );
+        assert_eq!(admission(root.as_path(), &[]), InteractiveSession);
+        clear_installed_routes(&mut routes);
+        assert_eq!(
+            admission(root.as_path(), &[]),
+            NotOpened,
+            "connection teardown closes the opener"
+        );
     }
 
     #[test]
@@ -254,41 +318,7 @@ mod tests {
         use crate::semantic_admission::{admission, SemanticAdmission};
         use aft_engine::test_bridge::display_data::meaning::fill_with_constant_vectors_for_test;
 
-        let (_head_dir, head) = test_root("meaning-family-head");
-        let (_worker_dir, worker) = test_root("meaning-family-worker");
-        let git = |args: &[&str]| {
-            let result = std::process::Command::new("git")
-                .current_dir(head.as_path())
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(result.status.success(), "git {args:?}: {result:?}");
-        };
-        git(&["init"]);
-        std::fs::write(
-            head.as_path().join("lib.rs"),
-            "pub fn needle() -> u32 { 1 }\n",
-        )
-        .unwrap();
-        git(&["add", "lib.rs"]);
-        git(&[
-            "-c",
-            "user.name=AFT",
-            "-c",
-            "user.email=aft@example.test",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-m",
-            "fixture",
-        ]);
-        git(&[
-            "worktree",
-            "add",
-            "--detach",
-            worker.as_path().to_str().unwrap(),
-            "HEAD",
-        ]);
+        let (_head_dir, head, _worker_dir, worker) = test_git_family("meaning-family");
 
         let ctx = meaning_context(&worker);
         let _model = fill_with_constant_vectors_for_test(worker.as_path(), 2);
@@ -328,6 +358,10 @@ mod tests {
         assert_eq!(
             admission(worker.as_path(), &[]),
             SemanticAdmission::NotOpened
+        );
+        assert!(
+            DataSemantic::current(ctx.as_ref()).is_none(),
+            "the sibling closes with the last opener"
         );
         remove_route_channel(&mut routes, &mut roots, worker_channel);
     }

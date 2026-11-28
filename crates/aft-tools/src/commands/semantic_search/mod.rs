@@ -1793,10 +1793,6 @@ impl SearchLaneStatus {
         }
     }
 
-    fn not_observed(observation: &IndexObservation) -> bool {
-        observation.unavailable_reason.as_deref() == Some(feature_cause::RUNTIME_NOT_OBSERVED)
-    }
-
     fn observe_current(ctx: &AppContext) -> Self {
         Self {
             trigram: observed_index_status(ctx, ctx, IndexPlane::Trigram),

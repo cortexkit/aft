@@ -2191,7 +2191,7 @@ pub fn root_bound(ctx: &dyn crate::data_layer::host::IndexHost) {
         } else {
             checkout.request_refresh();
         }
-        checkout.configure_meaning(ctx.data_meaning_config().as_ref());
+        checkout.configure_meaning(|| ctx.data_meaning_config());
     }
 }
 
@@ -2368,20 +2368,27 @@ impl DataCheckout {
     /// semantic search is off or not admitted for it, as a configure binds
     /// the root; a changed one is filled under from now on. Starts a fill
     /// when files wait for vectors.
-    pub(crate) fn configure_meaning(&self, config: Option<&crate::config::SemanticBackendConfig>) {
-        self.work.meaning.configure(config);
-        self.meaning(|| None);
+    pub(crate) fn configure_meaning(
+        &self,
+        config: impl FnOnce() -> Option<crate::config::SemanticBackendConfig>,
+    ) {
+        self.work.meaning.configure_for_root(true, config);
+        self.meaning_and_request_fill();
     }
 
     /// How meaning search stands for the current view. `config` works out
-    /// the root's semantic configuration if no configure has given one yet.
+    /// the root's semantic configuration if none was given or admission changed.
     /// Starts a fill when files wait for vectors and none is running, or
     /// none has learned the model yet.
     pub(crate) fn meaning(
         &self,
         config: impl FnOnce() -> Option<crate::config::SemanticBackendConfig>,
     ) -> MeaningState {
-        self.work.meaning.configure_once(config);
+        self.work.meaning.configure_for_root(false, config);
+        self.meaning_and_request_fill()
+    }
+
+    fn meaning_and_request_fill(&self) -> MeaningState {
         self.work.meaning.refresh_read_only();
         let state = self.meaning_status();
         let wanted = match &state {

@@ -176,6 +176,7 @@ struct PendingRetry {
     /// The configure request whose bind left a retryable degradation.
     request: RawRequest,
     prepared_bind: Option<std::sync::Arc<crate::subc_config::PreparedBindConfig>>,
+    daemon_bind_scope: Option<Option<subc_protocol::scope::ScopeKind>>,
     kind: RetryKind,
     root: std::path::PathBuf,
     connect_generation: u64,
@@ -269,6 +270,7 @@ pub fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, success: b
     *slot = Some(PendingRetry {
         request: request.clone(),
         prepared_bind: crate::subc_config::current_prepared_bind_config(),
+        daemon_bind_scope: crate::semantic_admission::daemon_bind_scope(),
         kind,
         root,
         connect_generation: ctx.connect_generation(),
@@ -542,9 +544,13 @@ impl PreparedReplay {
                 )
             }
         };
-        let response = match retry.prepared_bind.as_ref() {
+        let run_prepared = || match retry.prepared_bind.as_ref() {
             Some(prepared) => crate::subc_config::with_prepared_bind_config(prepared.clone(), run),
             None => run(),
+        };
+        let response = match retry.daemon_bind_scope {
+            Some(scope) => crate::semantic_admission::with_daemon_bind_scope(scope, run_prepared),
+            None => run_prepared(),
         };
         if response.data["code"] == "configure_needs_exclusive" {
             // A shared-hold run handed its worker back before changing the

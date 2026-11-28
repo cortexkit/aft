@@ -137,10 +137,10 @@ pub(crate) struct Meaning {
     memory_epoch: std::sync::atomic::AtomicU64,
     /// AFT's storage folder, where the plugin downloads ONNX Runtime.
     storage: PathBuf,
-    /// The root's semantic configuration as the last configure (or, before
-    /// any, the first search) gave it: `Some(None)` while semantic search
-    /// is off or not admitted for the root, `None` before anything gave one.
-    config: Mutex<Option<Option<SemanticBackendConfig>>>,
+    /// The last bind or query's semantic configuration. A missing backend
+    /// means meaning search is off; a missing configuration means the
+    /// checkout has not checked admission yet.
+    config: Mutex<Option<ConfiguredMeaning>>,
     /// The plane for `config`, made by the first fill round under it.
     plane: Mutex<Option<Configured>>,
     /// The embedding model a fill uses, with the configuration it was made
@@ -172,6 +172,11 @@ pub(crate) struct Meaning {
     /// a new plane, whose first fill is a build again. Kept in memory only:
     /// after a restart the plane counts as built once a fill finishes.
     filled: std::sync::atomic::AtomicBool,
+}
+
+struct ConfiguredMeaning {
+    admission_generation: u64,
+    backend: Option<SemanticBackendConfig>,
 }
 
 /// How long a read-only plane serves the generation it read before it looks
@@ -219,14 +224,24 @@ impl Meaning {
     /// plane, so the next fill round loads the new model and embeds with it.
     /// Returns whether it changed.
     pub(crate) fn configure(&self, config: Option<&SemanticBackendConfig>) -> bool {
+        self.apply_config(crate::semantic_admission::generation(), config)
+    }
+
+    fn apply_config(&self, generation: u64, config: Option<&SemanticBackendConfig>) -> bool {
         let mut current = lock(&self.config);
-        if current
-            .as_ref()
-            .is_some_and(|current| current.as_ref() == config)
-        {
-            return false;
+        if let Some(current) = current.as_mut() {
+            if current.admission_generation > generation {
+                return false;
+            }
+            if current.backend.as_ref() == config {
+                current.admission_generation = generation;
+                return false;
+            }
         }
-        *current = Some(config.cloned());
+        *current = Some(ConfiguredMeaning {
+            admission_generation: generation,
+            backend: config.cloned(),
+        });
         drop(current);
         // A round in progress keeps its model; the next round sees the
         // configuration changed and loads the new one.
@@ -305,22 +320,38 @@ impl Meaning {
         }
     }
 
-    /// Takes `config()` as the root's semantic configuration unless one was
-    /// given already: working it out reads the filesystem, so searches ask
-    /// once and each configure gives it again ([`Self::configure`]).
-    pub(crate) fn configure_once(&self, config: impl FnOnce() -> Option<SemanticBackendConfig>) {
-        if lock(&self.config).is_none() {
-            self.configure(config().as_ref());
+    /// Recheck with each bind, or on a query if no configuration was given
+    /// or an opener changed. Probing Git on every query would read the
+    /// filesystem even for a checkout whose admission is unchanged.
+    pub(crate) fn configure_for_root(
+        &self,
+        binding: bool,
+        config: impl FnOnce() -> Option<SemanticBackendConfig>,
+    ) {
+        let generation = crate::semantic_admission::generation();
+        if binding
+            || (!self.reads_only()
+                && lock(&self.config)
+                    .as_ref()
+                    .is_none_or(|current| current.admission_generation != generation))
+        {
+            // Capture the generation before resolving admission so a racing
+            // change leaves this answer eligible for another check.
+            self.apply_config(generation, config().as_ref());
         }
     }
 
     /// Whether semantic search is on for the root.
     pub(crate) fn enabled(&self) -> bool {
-        matches!(&*lock(&self.config), Some(Some(_)))
+        lock(&self.config)
+            .as_ref()
+            .is_some_and(|config| config.backend.is_some())
     }
 
     fn config(&self) -> Option<SemanticBackendConfig> {
-        lock(&self.config).clone().flatten()
+        lock(&self.config)
+            .as_ref()
+            .and_then(|config| config.backend.clone())
     }
 
     pub(super) fn synapse_lane(&self) -> Option<String> {
