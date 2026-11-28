@@ -23,7 +23,8 @@ mod allocator;
 use allocator::CachedAllocatorObservation;
 #[path = "health/demand.rs"]
 mod demand;
-mod index_planes;
+pub(super) mod index_planes;
+use index_planes::data_store_failure_reason;
 #[path = "health/legacy_root.rs"]
 mod legacy_root;
 #[path = "health/reply_tracking.rs"]
@@ -2760,6 +2761,7 @@ struct HealthDiagnosticRollup {
     /// Compact evidence for every root, independent of the public report's
     /// root-count and byte budgets. Freshness metadata travels with the evidence.
     findings_metrics: Value,
+    index_plane_outages: Vec<index_planes::IndexPlaneOutage>,
     /// The full memory census `memory.census` serves. It is measured at its
     /// own cadence (see [`HEALTH_MEMORY_CENSUS_INTERVAL_MS`]), so a rollup may
     /// carry forward the census an earlier rollup measured; sharing it by
@@ -2824,6 +2826,7 @@ impl HealthDiagnosticRollup {
             generation: 0,
             stale_reason: Some("not_yet_sampled"),
             findings_metrics: metrics.clone(),
+            index_plane_outages: Vec::new(),
             metrics,
             memory_census: Arc::new(placeholder_memory_census()),
             memory_census_at_ms: None,
@@ -2882,6 +2885,7 @@ pub(super) struct HealthRollupCache {
     // dropping its payload outside the lock makes blocking readers cheap.
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
+    index_plane_outages: index_planes::IndexPlaneOutageTracker,
     allocator: std::sync::Mutex<Option<CachedAllocatorObservation>>,
     allocator_requested: AtomicBool,
     health_requested: AtomicBool,
@@ -2934,6 +2938,7 @@ impl HealthRollupCache {
             reason,
             now_ms,
             window_ms,
+            &snapshot.index_plane_outages,
         )
     }
 
@@ -2950,6 +2955,7 @@ impl HealthRollupCache {
             root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
+            index_plane_outages: Default::default(),
             allocator: std::sync::Mutex::new(None),
             allocator_requested: AtomicBool::new(false),
             health_requested: AtomicBool::new(false),
@@ -3324,6 +3330,74 @@ mod findings_snapshot_tests {
             .filter(|finding| finding["check"] == "health_snapshot")
             .cloned()
             .collect()
+    }
+
+    #[test]
+    fn index_plane_outage_degrades_health_and_recovers() {
+        use crate::context::SemanticIndexStatus;
+        use crate::subc::test_support::{test_ctx, test_root};
+
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let (_dir, root) = test_root("semantic-outage-rollup");
+        let ctx = test_ctx();
+        ctx.update_config(|config| {
+            config.indexes.semantic = true;
+            config.indexes.trigram = false;
+            config.indexes.callgraph = false;
+        });
+        assert!(executor.register_actor(root, Arc::clone(&ctx)));
+
+        let check = |at_ms| {
+            cache.clock_ms.store(at_ms, Ordering::Relaxed);
+            cache.refresh_for_test(&executor, &app);
+            let health = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
+            let findings = serde_json::to_value(cache.findings(10_000_000 + at_ms, 1)).unwrap();
+            let outages = findings
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| finding["check"] == "index_plane_outage")
+                .cloned()
+                .collect::<Vec<_>>();
+            (health, outages)
+        };
+        let start = 300;
+        let hour = 3_600_000;
+        let (health, outages) = check(start);
+        assert_eq!(health.status, HealthStatus::Ok);
+        assert_eq!(
+            health.metrics.unwrap()["index_plane_counts"]["semantic_index"]["off"],
+            1
+        );
+        let (health, outages_at_hour) = check(start + hour);
+        assert_eq!(health.status, HealthStatus::Ok);
+        assert!(outages.is_empty() && outages_at_hour.is_empty());
+
+        let (health, outages) = check(start + hour + 1);
+        let summary = "The semantic index plane has had no ready or building roots for over one hour (most common reason: runtime_not_observed).";
+        assert_eq!(health.status, HealthStatus::Degraded);
+        assert_eq!(health.detail.as_deref(), Some(summary));
+        assert_eq!(outages.len(), 1, "{outages:?}");
+        assert_eq!(outages[0]["key"], "semantic");
+        assert_eq!(outages[0]["severity"], "error");
+        assert_eq!(outages[0]["first_seen_ms"], 10_000_000 + start);
+        assert_eq!(outages[0]["summary"], summary);
+        assert_eq!(
+            outages[0]["samples"],
+            json!([{ "reason":"runtime_not_observed", "roots":1 }])
+        );
+
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let (health, outages) = check(start + hour + 2);
+        assert_eq!(health.status, HealthStatus::Ok);
+        assert_eq!(
+            health.metrics.unwrap()["index_plane_counts"]["semantic_index"]["ready"],
+            1
+        );
+        assert!(outages.is_empty());
     }
 
     #[test]
@@ -4148,7 +4222,6 @@ fn build_health_diagnostic_rollup_from_actors(
     struct RootCandidate {
         root_label: String,
         health: RootHealthSnapshot,
-        semantic_enabled: bool,
         backend_failure: Option<crate::semantic_index::EmbeddingBackendBuildHealth>,
         busy: bool,
         fully_ready: bool,
@@ -4177,6 +4250,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let mut census_roots = std::collections::BTreeMap::new();
     let mut census_ages = std::collections::BTreeMap::new();
     let mut candidates = Vec::with_capacity(actor_count.saturating_add(standing_entries.len()));
+    let mut index_plane_counts = index_planes::IndexPlaneCounts::default();
     let mut repair_roots_annotated = 0usize;
     let mut embedding_backend_available = true;
     let mut embedding_backend_paused_until_ms: Option<u64> = None;
@@ -4296,11 +4370,17 @@ fn build_health_diagnostic_rollup_from_actors(
         rollup_mark!(timer, "index readiness / view status");
         let busy = health_summary.is_busy();
         let fully_ready = health_summary.is_fully_ready();
+        let health = health_summary.into_snapshot(root_id.as_path());
+        index_plane_counts.add_root(
+            &health,
+            Some(config.indexes),
+            ctx.artifact_identity_provisional_reason().as_deref(),
+            backend_failure.is_some(),
+        );
         candidates.push(RootCandidate {
             refresh_counts: root_evidence::refresh_counts(&ctx),
             root_label,
-            health: health_summary.into_snapshot(root_id.as_path()),
-            semantic_enabled: config.indexes.semantic,
+            health,
             backend_failure,
             busy,
             fully_ready,
@@ -4324,12 +4404,12 @@ fn build_health_diagnostic_rollup_from_actors(
             continue;
         }
         let health = unhosted_standing_health_snapshot(&standing);
+        index_plane_counts.add_root(&health, None, None, false);
         candidates.push(RootCandidate {
             refresh_counts: None,
             root_label: health.project_root.clone(),
             disclaim_privacy: None,
             health,
-            semantic_enabled: false,
             backend_failure: None,
             busy: false,
             fully_ready: false,
@@ -4403,14 +4483,9 @@ fn build_health_diagnostic_rollup_from_actors(
         .filter(|candidate| healthy_candidate(candidate))
         .count();
     let root_count = candidates.len();
-    let mut index_plane_counts = index_planes::IndexPlaneCounts::default();
-    for candidate in &candidates {
-        index_plane_counts.add_root(
-            &candidate.health,
-            candidate.semantic_enabled,
-            candidate.backend_failure.is_some(),
-        );
-    }
+    let index_plane_outages = cache
+        .index_plane_outages
+        .observe(&index_plane_counts, cache.now_ms());
     candidates.sort_by(|left, right| {
         ordinary_candidate(left)
             .cmp(&ordinary_candidate(right))
@@ -4575,6 +4650,7 @@ fn build_health_diagnostic_rollup_from_actors(
         ),
         &data_store_failures,
     );
+    let (status, detail) = index_planes::with_outages((status, detail), &index_plane_outages);
 
     let bash_retention = bash_task_retention_metrics(cache, shared_app);
     rollup_mark!(timer, "bash retention database count");
@@ -4667,6 +4743,7 @@ fn build_health_diagnostic_rollup_from_actors(
         stale_reason: None,
         metrics,
         findings_metrics,
+        index_plane_outages,
         memory_census,
         memory_census_at_ms,
         memory_census_answers,
@@ -4691,40 +4768,6 @@ const HEALTH_DATA_STORE_FAILED_NAMED: usize = 5;
 /// The detail sits outside the metrics byte budget, in the 4 KiB SUBC keeps
 /// for the reply's envelope, so it is capped on its own.
 const HEALTH_DATA_STORE_FAILED_DETAIL_BYTES: usize = 1024;
-
-/// The reason code a root's failed index store is listed with, or `None`
-/// when its store did not fail. A store fails when its checkout could not
-/// bind, build or refresh, or when a newer build wrote it. The reason code
-/// the store reports is kept. A failed build or refresh while the previous
-/// build still answers queries reports no reason code, so its recorded
-/// failure is classified the way the store classifies one.
-fn data_store_failure_reason(
-    store: &crate::data_layer::surfaces::DataStoreHealth,
-) -> Option<&'static str> {
-    use crate::data_layer::surfaces::reason;
-    match (store.reason, &store.failure) {
-        (Some(code @ (reason::BIND_FAILED | reason::REQUIRES_NEWER_READER)), _) => Some(code),
-        (_, None) => None,
-        (
-            Some(
-                code @ (reason::BUILD_FAILED
-                | reason::REFRESH_FAILED
-                | reason::STORE_BUSY
-                | reason::DISK_RESERVE),
-            ),
-            Some(_),
-        ) => Some(code),
-        (_, Some(failure)) => Some(if crate::view_storage_reserve::is_message(&failure.error) {
-            reason::DISK_RESERVE
-        } else if failure.busy {
-            reason::STORE_BUSY
-        } else if failure.stage == "refresh" {
-            reason::REFRESH_FAILED
-        } else {
-            reason::BUILD_FAILED
-        }),
-    }
-}
 
 /// The roots whose index store failed, as the health summary reports them:
 /// how many, and the first few by path with a reason code, so an alert can

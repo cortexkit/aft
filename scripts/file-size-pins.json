@@ -80,7 +80,7 @@
     "reason": "Split inspect command assembly by area pending; AFT crate split lane."
   },
   "crates/aft-subc/src/subc/health.rs": {
-    "lines": 5325,
+    "lines": 5300,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."
   }
 }
