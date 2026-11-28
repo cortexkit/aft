@@ -9723,6 +9723,21 @@ mod tests {
     }
 
     #[test]
+    fn nix_oversized_binding_is_skipped_and_later_ones_still_fit() {
+        // The budget skips what no longer fits, it does not stop the walk:
+        // a binding larger than the whole budget is dropped while the next
+        // sibling is emitted normally, so the kept set is not a prefix.
+        let huge = "x".repeat(nix::NIX_OUTLINE_NAME_BUDGET + 1);
+        let source = format!("{{ {huge} = 1; keepme = 1; }}\n");
+        let names = nix_names(&source);
+        assert_eq!(
+            names,
+            vec!["keepme".to_string()],
+            "the oversized binding is skipped and the smaller sibling survives"
+        );
+    }
+
+    #[test]
     fn nix_collisions_use_full_names_across_every_top_level_binding() {
         let dotted = nix_symbols("let foo.bar = { x = 1; }; in { foo.baz = { y = 2; }; }\n");
         let names: Vec<&str> = dotted.iter().map(|symbol| symbol.name.as_str()).collect();
