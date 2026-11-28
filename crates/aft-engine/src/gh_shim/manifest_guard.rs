@@ -80,10 +80,7 @@ impl<'a> ManifestGuard<'a> {
                 ));
             }
         }
-        if governed_launch
-            || local_provisioned
-            || manifest_state_was_provisioned(&default_root)
-        {
+        if governed_launch || local_provisioned || manifest_state_was_provisioned(&default_root) {
             return Some(refuse(
                 RefusalCode::ManifestUnavailable,
                 "GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.",

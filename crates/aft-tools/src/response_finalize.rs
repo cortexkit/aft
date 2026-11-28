@@ -282,16 +282,17 @@ fn inline_terminal_bash_task_id<'a>(response: &'a Response, command: &str) -> Op
 }
 
 fn terminal_bash_task_id(response: &Response) -> Option<&str> {
-    if !response.success || !response
-        .data
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| {
-            matches!(
-                status,
-                "completed" | "failed" | "killed" | "timed_out" | "fate_unknown"
-            )
-        })
+    if !response.success
+        || !response
+            .data
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    "completed" | "failed" | "killed" | "timed_out" | "fate_unknown"
+                )
+            })
     {
         return None;
     }
@@ -1560,3 +1561,7 @@ mod context_tests;
 
 #[cfg(test)]
 mod repeat_state_tests;
+
+#[cfg(test)]
+#[path = "response_finalize/terminal_watch_ack_tests.rs"]
+mod terminal_watch_ack_tests;

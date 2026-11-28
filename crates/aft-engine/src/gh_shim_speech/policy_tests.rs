@@ -718,7 +718,7 @@ const UNDECLARED_POLICY_REFUSAL: &str = "gh-shim: gh_shim_seam_refusal: task_gh_
 fn captured_policy_undeclared_command_does_not_claim_to_be_a_write() {
     let _lock = crate::test_env::process_env_lock();
     let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../tests/fixtures/gh_shim/v10-manifest.json"
+        "../../../aft/tests/fixtures/gh_shim/v10-manifest.json"
     ))
     .unwrap();
     let _fixture = RunWithFixture::new(&manifest);

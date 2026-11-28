@@ -1707,6 +1707,7 @@ fn codemode_gh_head_read_delegates_in_either_order_with_bot_comment() {
         [BOT_REQUEST_OPERATION, SESSION_CONTEXT_OPERATION],
     ] {
         let seed = service::LaunchSeed {
+            coauthor_agent: None,
             launch: Ok(launch.clone()),
             lifecycle: Some(run.clone()),
             session: session.into(),

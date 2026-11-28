@@ -1065,7 +1065,7 @@ mod tests {
         );
         metadata.mode = BgMode::Pty;
         let mut child = OwnedGroup::spawn();
-        let pid = child.0.id();
+        let pid = child.child().id();
         let pgid = i32::try_from(pid).unwrap();
         metadata.mark_running(pid, pgid);
         write_task_at(&resolved, &metadata).unwrap();
@@ -1077,9 +1077,9 @@ mod tests {
         );
         // An unreaped child keeps the group visible even after it stops.
         let _listing_fault =
-            crate::bash_background::process::test_hooks::scoped_listing_failure(pgid);
+            crate::bash_background::process::group_listing_test::scoped_listing_failure(pgid);
         settle_unattached_pty(&registry, &mut metadata, paths);
-        assert!(child.0.try_wait().unwrap().is_some());
+        assert!(child.child_mut().try_wait().unwrap().is_some());
         assert_eq!(metadata.status, BgTaskStatus::FateUnknown);
         assert_eq!(metadata.exit_code, None);
         assert_eq!(metadata.exit_marker_unavailable, metadata.status_reason);

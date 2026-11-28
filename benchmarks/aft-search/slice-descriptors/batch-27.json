@@ -1,0 +1,48 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "none",
+  "kind": "ranking",
+  "fixtures": [
+    "followup-census:832",
+    "followup-census:900010",
+    "crates/aft/tests/integration/outline_zoom_test.rs",
+    "crates/aft-tools/src/commands/semantic_search/path_lookup.rs",
+    "crates/aft-tools/src/commands/search_permission_tests.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "packages/pi-plugin/src/__tests__/omp-internal-urls.test.ts"
+  ],
+  "order_changes": {
+    "followup-census:832": "Corrected export summaries put the transport selector transport-factory.ts at rank 4 instead of 17, moving subc-transport.ts out of the top ten.",
+    "followup-census:7972": "Changed TypeScript summary candidates reduce the replay's retrieval depth from 141 to 140 without changing the ranked list.",
+    "followup-census:10215": "Changed TypeScript export symbols and summaries reduce retrieval depth from 380 to 379 without moving the storage-root results.",
+    "followup-census:12976": "Changed TypeScript export summaries alter the candidate pool, swapping inspect.rs and bash_orchestrate.rs at page-zero ranks 17 and 18.",
+    "followup-census:900010": "Changed TypeScript summary candidates swap watcher_filter.rs and the v0.37.1 notes at ranks 4 and 5, and config_resolve.rs and STRUCTURE.md at page-zero ranks 40 and 41.",
+    "followup-census:900014": "The corrected transport-factory.ts export summary moves that file from page-zero rank 35 to 33 without changing the top ten.",
+    "followup-census:900017": "Changed TypeScript summary candidates swap lsp-cache.ts and the codegraph comparison CLI at page-zero ranks 29 and 30.",
+    "followup-census:900019": "The changed TypeScript summary pool drops format-on-edit-apply-patch.test.ts from page zero and admits harness.rs at rank 48, with no top-ten change.",
+    "followup-census:900020": "Changed TypeScript export symbols and summaries increase retrieval depth from 223 to 224 without changing the ranked list.",
+    "followup-census:930001": "Changed TypeScript summary candidates reduce the replay's retrieval depth from 140 to 139 without changing the ranked list.",
+    "followup-census:930003": "Changed TypeScript summary candidates reduce the replay's retrieval depth from 118 to 117 without changing the ranked list."
+  },
+  "unreachable_split_rows": [
+    {
+      "episode_id": "followup-census:910001",
+      "predicate": "split_rank1_required",
+      "reason": "The frozen reference already misses: the prose does not place commands/ast_search.rs in the top ten, and the stale name ast_grep_search does not occur in the answer file."
+    },
+    {
+      "episode_id": "followup-census:910002",
+      "predicate": "split_rank1_required",
+      "reason": "The frozen reference already ranks bash_background/registry.rs tenth: the stale name subagent_type does not occur in the answer file and cannot improve the prose-only rank."
+    }
+  ],
+  "note": "Correct TypeScript export symbols. Query 832 gains the transport selector at rank 4; query 900010 swaps ranks 4 and 5. The eleven listed rows are the full observed drift and all accuracy metrics stay unchanged. Approved #1527/#1528 behavior: The filename lane still admits and orders the same candidates. The search reply discloses an observed filename match filtered out by includeTests without enumerating additional candidates.",
+  "slices": [
+    "Rust constants, statics and type aliases in outline and zoom",
+    "#1526 TypeScript export declarations and destructured bindings (reviewed order changes)",
+    "Outline directories in mixed target arrays",
+    "#1527/#1528 filename-lane disclosure (reviewed behavior)",
+    "Use saved outside-folder access for search and handle missing paths without an approval request",
+    "#1534 OMP filesystem grep paths and case sensitivity"
+  ]
+}

@@ -145,6 +145,8 @@ pub mod zoom;
 #[cfg(test)]
 mod opened_floor_read_tests;
 #[cfg(test)]
+mod search_permission_tests;
+#[cfg(test)]
 mod storage_floor_tests;
 #[cfg(test)]
 mod store_diet_tests;

@@ -147,7 +147,10 @@ pub(super) fn dispatch(
     dispatch_with(args, relay, signals, relay_client::worker_session, native)
 }
 
-pub(super) fn delegate(guard: Option<&manifest_guard::ManifestGuard<'_>>, args: &[OsString]) -> i32 {
+pub(super) fn delegate(
+    guard: Option<&manifest_guard::ManifestGuard<'_>>,
+    args: &[OsString],
+) -> i32 {
     dispatch(
         args,
         &RelayContext::from_process(),

@@ -122,11 +122,7 @@ pub(crate) use launch_types::{LaunchContext, PreparedLaunch};
 
 thread_local! {static LAUNCH:RefCell<Option<LaunchContext>>=const{RefCell::new(None)};}
 #[doc(hidden)]
-pub fn with_launch<T>(
-    seed: Option<LaunchSeed>,
-    storage: &Path,
-    run: impl FnOnce() -> T,
-) -> T {
+pub fn with_launch<T>(seed: Option<LaunchSeed>, storage: &Path, run: impl FnOnce() -> T) -> T {
     let _coauthor = crate::agent_child_env::coauthor::enter(
         seed.as_ref()
             .and_then(|seed| seed.coauthor_agent.as_deref()),

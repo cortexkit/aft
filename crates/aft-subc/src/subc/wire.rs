@@ -1575,7 +1575,12 @@ pub(super) fn build_tool_response_frame_with_limit(
                     notices: Default::default(),
                 },
             };
-            aft_tools::tool_output::cap_with_scope(scope, "tool", &capped.response, &mut capped.text);
+            aft_tools::tool_output::cap_with_scope(
+                scope,
+                "tool",
+                &capped.response,
+                &mut capped.text,
+            );
             &capped
         } else {
             result
@@ -1590,8 +1595,15 @@ pub(super) fn build_tool_response_frame_with_limit(
         } else {
             max_body_len
         };
-        let frame =
-            build_legacy_tool_response_frame(ver, route, corr, flags, result, legacy_structured, legacy_limit)?;
+        let frame = build_legacy_tool_response_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            result,
+            legacy_structured,
+            legacy_limit,
+        )?;
         // The ledger retains the full legacy frame. Only the final writer sees
         // the receiving route's projection, just as for tool-result/v1 replies.
         let projection = if policy.model_only {

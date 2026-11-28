@@ -35,6 +35,7 @@ use subc_protocol::{BindIdentity, RouteTarget};
 mod api_rules;
 mod captured_dispatch;
 mod enable_gate;
+mod environment_admin;
 mod manifest_acceptance;
 use manifest_acceptance::{load_verified_manifest, manifest_acceptance_lock, resolve_manifest};
 mod manifest_guard;
@@ -8256,75 +8257,6 @@ pub(crate) mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         serde_json::from_str(&json).expect("producer edit-last vectors fixture")
-    }
-
-    pub(super) fn signed_with(
-        manifest: &Manifest,
-        fetched_at_unix_secs: u64,
-        seed: &[u8; 32],
-        key_id: &str,
-    ) -> SignedManifest {
-        let key = Ed25519KeyPair::from_seed_unchecked(seed).expect("test key");
-        let bytes = serde_json::to_vec(manifest).expect("manifest bytes");
-        SignedManifest {
-            artifact_id: MANIFEST_ARTIFACT_ID.to_string(),
-            envelope_version: ENVELOPE_VERSION,
-            key_id: key_id.to_string(),
-            fetched_at_unix_secs,
-            signature: base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),
-            manifest_bytes: String::from_utf8(bytes).expect("manifest bytes are UTF-8"),
-        }
-    }
-
-    const DEV_MANIFEST_KEY_ID: &str = "21fe31dfa154a261";
-
-    pub(super) fn pin_for(seed: &[u8; 32]) -> trust_root::Pin {
-        let key = Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
-        trust_root::Pin {
-            key_id: trust_root::key_id(key.public_key().as_ref()),
-            public_key_hex: key
-                .public_key()
-                .as_ref()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            retired_key_ids: Vec::new(),
-        }
-    }
-
-    pub(super) fn fixture_pin() -> trust_root::Pin {
-        pin_for(&TEST_SEED)
-    }
-
-    fn publish_pin(paths: &StatePaths, pin: Option<trust_root::Pin>) {
-        trust_root::publish(
-            paths,
-            trust_root::Reply::Root { pin, generation: 1 },
-            unix_seconds(),
-        )
-        .unwrap();
-    }
-
-    pub(super) fn write_fixture_pin(paths: &StatePaths) {
-        publish_pin(paths, Some(fixture_pin()));
-    }
-
-    pub(super) fn signed(manifest: &Manifest, fetched_at_unix_secs: u64) -> SignedManifest {
-        signed_with(
-            manifest,
-            fetched_at_unix_secs,
-            &TEST_SEED,
-            DEV_MANIFEST_KEY_ID,
-        )
-    }
-
-    pub(super) fn write_signed_manifest(paths: &StatePaths, manifest: Manifest, now: u64) {
-        write_fixture_pin(paths);
-        fs::write(
-            &paths.manifest,
-            serde_json::to_vec(&signed(&manifest, now)).expect("signed manifest"),
-        )
-        .expect("manifest cache");
     }
 
     fn write_envelope_fixture(paths: &StatePaths, envelope_json: &str) {
