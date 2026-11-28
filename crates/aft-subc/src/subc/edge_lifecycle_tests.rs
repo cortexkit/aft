@@ -301,6 +301,7 @@ async fn cancel_of_unrelated_corr_keeps_bg_events_stream_open() {
     let ctx = test_support::test_ctx();
     let mut daemon = Daemon::start(root.as_path(), &ctx, &[], dispatch).await;
     daemon.bind_with_role(root.as_path(), 1, false).await;
+    daemon.bind_with_role(root.as_path(), 2, false).await;
     ctx.wait_for_database_settled(Instant::now() + Duration::from_secs(10))
         .await;
     // A second subscribe must end the first. This proves installation rather
@@ -311,34 +312,36 @@ async fn cancel_of_unrelated_corr_keeps_bg_events_stream_open() {
     daemon
         .send(FrameType::Request, 1, 10, json!({"op":"bg_events"}))
         .await;
-    assert_eq!(daemon.reply(1, 9).await.header.ty, FrameType::StreamEnd);
-    daemon.send(FrameType::Cancel, 1, 11, Value::Null).await;
-    daemon.send(FrameType::Ping, 0, 1010, Value::Null).await;
     loop {
-        let frame = daemon.recv().await;
-        assert!(
-            !(frame.header.channel == 1
-                && frame.header.corr == 10
-                && frame.header.ty == FrameType::StreamEnd)
-        );
-        if frame.header.ty == FrameType::Pong && frame.header.corr == 1010 {
+        let frame = daemon.reply(1, 9).await;
+        if frame.header.ty == FrameType::StreamEnd {
             break;
         }
+        assert_eq!(frame.header.ty, FrameType::StreamData);
     }
-    let ended = tokio::time::timeout(Duration::from_millis(150), async {
-        loop {
-            let frame = daemon.reply(1, 10).await;
-            if frame.header.ty == FrameType::StreamEnd {
-                break;
-            }
-            assert_eq!(frame.header.ty, FrameType::StreamData);
+    daemon
+        .send(FrameType::Request, 2, 20, json!({"op":"bg_events"}))
+        .await;
+    daemon.send(FrameType::Cancel, 1, 11, Value::Null).await;
+    // Route 2's replacement end comes after the Cancel and anything it sent
+    // to the same reliable writer queue. Pong could overtake an already
+    // queued end because it uses a separate priority queue.
+    daemon
+        .send(FrameType::Request, 2, 21, json!({"op":"bg_events"}))
+        .await;
+    loop {
+        let frame = daemon.recv().await;
+        match (frame.header.channel, frame.header.corr) {
+            (1, 10) => assert_eq!(
+                frame.header.ty,
+                FrameType::StreamData,
+                "a Cancel for another correlation must not end the stream"
+            ),
+            (2, 20) if frame.header.ty == FrameType::StreamEnd => break,
+            (2, 20) => assert_eq!(frame.header.ty, FrameType::StreamData),
+            _ => {}
         }
-    })
-    .await;
-    assert!(
-        ended.is_err(),
-        "a Cancel for another correlation ended the stream"
-    );
+    }
     daemon.send(FrameType::Cancel, 1, 10, Value::Null).await;
     loop {
         let frame = daemon.reply(1, 10).await;
