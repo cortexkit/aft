@@ -2130,67 +2130,19 @@ fn reject_escaping_symlink(
             continue;
         }
 
-        iterative_follow_chain(req_id, original_path, &current, resolved_root)?;
+        broken_symlink::iterative_follow_chain(
+            req_id,
+            original_path,
+            &current,
+            resolved_root,
+            Path::to_path_buf,
+        )?;
     }
 
     Ok(())
 }
 
-/// Iteratively follow a symlink chain from `link` and reject if any hop's
-/// resolved target is outside `resolved_root`. Depth-capped at 40 hops.
-fn iterative_follow_chain(
-    req_id: &str,
-    original_path: &Path,
-    start: &Path,
-    resolved_root: &Path,
-) -> Result<(), crate::protocol::Response> {
-    let mut link = start.to_path_buf();
-    let mut depth = 0usize;
-
-    loop {
-        if depth > 40 {
-            return Err(path_error_response(req_id, original_path, resolved_root));
-        }
-
-        let target = match std::fs::read_link(&link) {
-            Ok(t) => t,
-            Err(_) => {
-                // Can't read the link — treat as escaping to be safe.
-                return Err(path_error_response(req_id, original_path, resolved_root));
-            }
-        };
-
-        let resolved_target = if target.is_absolute() {
-            normalize_path(&target)
-        } else {
-            let parent = link.parent().unwrap_or_else(|| Path::new(""));
-            normalize_path(&parent.join(&target))
-        };
-
-        // Check boundary: use canonicalized target when available (handles
-        // macOS /var → /private/var aliasing), fall back to the normalized
-        // path when canonicalize fails (e.g. broken symlink on Linux).
-        let canonical_target =
-            std::fs::canonicalize(&resolved_target).unwrap_or_else(|_| resolved_target.clone());
-
-        if !canonical_target.starts_with(resolved_root)
-            && !resolved_target.starts_with(resolved_root)
-        {
-            return Err(path_error_response(req_id, original_path, resolved_root));
-        }
-
-        // If the target is itself a symlink, follow the next hop.
-        match std::fs::symlink_metadata(&resolved_target) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                link = resolved_target;
-                depth += 1;
-            }
-            _ => break, // Non-symlink or non-existent target — chain ends here.
-        }
-    }
-
-    Ok(())
-}
+mod broken_symlink;
 
 pub type LanguageProviderFactory = fn() -> Box<dyn LanguageProvider>;
 
