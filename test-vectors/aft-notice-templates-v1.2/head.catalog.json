@@ -1,6 +1,6 @@
 {
-  "generation": "c92a3903d020e14cd0f956d7105002dac2551c000789c51413d9814010e7fbea",
-  "catalog_digest": "c92a3903d020e14cd0f956d7105002dac2551c000789c51413d9814010e7fbea",
+  "generation": "06d1f7eeed41dd29c0e1a0f2501a3c122bc797e0b1facd767daa1c8e626239e8",
+  "catalog_digest": "06d1f7eeed41dd29c0e1a0f2501a3c122bc797e0b1facd767daa1c8e626239e8",
   "tools": [
     {
       "name": "status",
@@ -436,13 +436,13 @@
       "capabilities": [
         "code.outline/v1"
       ],
-      "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+      "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline files and directories in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "target": {
-            "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+            "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat; arrays may mix files and directories.",
             "anyOf": [
               {
                 "type": "string"

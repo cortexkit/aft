@@ -6,5 +6,5 @@ for completion output tails, which also changes their `generation` and
 `catalog_digest`. The reader catalog and `*.sends.json` files are unchanged.
 Versions 1 and 1.1 remain as published.
 
-Regenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;
+Regenerate with `cargo test -p aft-subc --lib regenerate_notice_template_vectors -- --ignored`;
 `notice_template_vectors_match_samples` compares every byte.
